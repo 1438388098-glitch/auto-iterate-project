@@ -1,0 +1,88 @@
+# Auto Iterate Project
+
+Automatically iterate any git project inside an agent session: analyze the repository, pick the next high-value improvement, implement small changes, verify, commit, and loop until a goal is met or configurable round/time/token limits are reached.
+
+Works with opencode, Claude Code, Codex, and other agent runtimes (auto-detected). Git is the only external dependency.
+
+## Features
+
+- **Self-owned loop**: deterministic state, backlog, branch, and budget management via `scripts/autopilot_state.py`; no host-specific tooling required.
+- **Small scoped commits**: every change is small, verified, and committed; `max_round_scope` enforces a size limit per commit.
+- **Batch support**: by default each round works on 1 backlog candidate; set `candidates_per_round: 3` (or `init --candidates-per-round 3`) to batch multiple independent changes per round while keeping each change a separate commit.
+- **Backlog ranking**: improvement candidates are scored by value-to-effort ratio and worked in order.
+- **Multiple stop conditions**: goals, `max_rounds`, `max_minutes`, `max_tokens`, `max_blocked_in_a_row`.
+- **Safety rails**: refuses to commit user changes, never rewrites history, defaults to no pushing, optional `allow_paths`/`deny_paths` whitelist.
+- **Resumable**: unfinished runs resume from `.autopilot/state.json` instead of starting over.
+
+## Installation
+
+Copy this folder into your agent's skills directory:
+
+- opencode: `~/.config/opencode/skills/auto-iterate-project/`
+- Claude Code: `~/.claude/skills/auto-iterate-project/`
+- Codex / generic: `~/.codex/skills/` or `~/.agents/skills/auto-iterate-project/`
+
+The skill's `SKILL.md` entry point documents the full workflow. The helper script is standalone and works on Windows, macOS, and Linux (Python 3.6+).
+
+## Quick Start
+
+Inside any git repository:
+
+```powershell
+python <skill-dir>/scripts/autopilot_state.py init --repo <repo> --max-rounds 5 --branch-mode feature
+```
+
+Then run the loop described in `SKILL.md`: check → analyze → backlog → begin-round → implement → verify → commit → complete-round.
+
+Typical commands:
+
+```powershell
+python <skill-dir>/scripts/autopilot_state.py check --repo <repo> --brief
+python <skill-dir>/scripts/autopilot_state.py backlog-add --repo <repo> --title "Add docs" --reason "useful" --value 4 --effort 2
+python <skill-dir>/scripts/autopilot_state.py begin-round --repo <repo> --title "..." --reason "..." --candidate-id candidate-001
+python <skill-dir>/scripts/autopilot_state.py commit --repo <repo> --summary "..."
+python <skill-dir>/scripts/autopilot_state.py complete-round --repo <repo> --summary "..." --commit-sha <sha>
+python <skill-dir>/scripts/autopilot_state.py finish --repo <repo> --reason "goal met"
+```
+
+## Configuration
+
+All options live in `.autopilot/config.json` (created by `init`) and can be set via `init` flags or edited directly. Highlights:
+
+| Field | Default | Purpose |
+|---|---|---|
+| `candidates_per_round` | `1` | Backlog candidates worked per round; >1 batches changes into one round (each still a separate commit) |
+| `max_rounds` | `10` | Hard stop after this many completed/blocked rounds |
+| `max_minutes` | `null` | Wall-clock budget since last round activity |
+| `max_tokens` | `null` | Soft token budget |
+| `max_round_scope` | `null` | Max changed lines per commit |
+| `goals` | `[]` | Explicit goals; loop stops when all are met |
+| `check_commands` | `[]` | Exact verification commands to run each round |
+| `branch_mode` | `current` | `feature` isolates work on an `autopilot/<run-id>` branch |
+| `push` | `false` | Push after each completed round |
+| `allow_paths` / `deny_paths` | `[]` | Commit path whitelist/blacklist (fnmatch globs) |
+| `allow_uncommitted_changes` | `false` | Allow starting from a dirty tree |
+| `report_lang` | `zh` | Language for reports (`zh` or `en`) |
+
+See `references/config.md` for the full reference.
+
+## Testing
+
+```powershell
+python <skill-dir>/scripts/test_autopilot_state.py
+python -m py_compile <skill-dir>/scripts/autopilot_state.py
+```
+
+The test suite spins up throwaway git repos and covers state, backlog, round lifecycle, budgets, branches, and JSON output.
+
+## Project Layout
+
+```
+auto-iterate-project/
+├── SKILL.md                     # Skill entry point and workflow
+├── agents/openai.yaml           # Agent store metadata
+├── references/config.md         # Full configuration reference
+└── scripts/
+    ├── autopilot_state.py       # State/backlog/branch/budget helper
+    └── test_autopilot_state.py  # Self-test suite
+```

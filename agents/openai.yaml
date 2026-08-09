@@ -1,0 +1,4 @@
+interface:
+  display_name: "Auto Iterate Project"
+  short_description: "Automatically analyze, improve, test, and commit git projects."
+  default_prompt: "Use the $auto-iterate-project skill to autonomously improve this git project; for Chinese requests, say 全自动迭代这个项目。"
