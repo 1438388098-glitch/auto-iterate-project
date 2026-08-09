@@ -10,7 +10,7 @@ Works with opencode, Claude Code, Codex, and other agent runtimes (auto-detected
 - **Small scoped commits**: every change is small, verified, and committed; `max_round_scope` enforces a size limit per commit.
 - **Batch support**: by default each round works on 1 backlog candidate; set `candidates_per_round: 3` (or `init --candidates-per-round 3`) to batch multiple independent changes per round while keeping each change a separate commit.
 - **Backlog ranking**: improvement candidates are scored by value-to-effort ratio and worked in order.
-- **Multiple stop conditions**: goals, `max_rounds`, `max_minutes`, `max_tokens`, `max_blocked_in_a_row`.
+- **Multiple stop conditions**: goals, `max_rounds`, `max_minutes`, `max_tokens`, `max_blocked_in_a_row`, and a `deadline` timer (e.g. "iterate until tomorrow morning") that stops at an absolute wall-clock moment.
 - **Safety rails**: refuses to commit user changes, never rewrites history, defaults to no pushing, optional `allow_paths`/`deny_paths` whitelist.
 - **Resumable**: unfinished runs resume from `.autopilot/state.json` instead of starting over.
 
@@ -53,7 +53,8 @@ All options live in `.autopilot/config.json` (created by `init`) and can be set 
 |---|---|---|
 | `candidates_per_round` | `1` | Backlog candidates worked per round; >1 batches changes into one round (each still a separate commit) |
 | `max_rounds` | `10` | Hard stop after this many completed/blocked rounds |
-| `max_minutes` | `null` | Wall-clock budget since last round activity |
+| `max_minutes` | `null` | Countdown (倒计时): wall-clock budget since last round activity |
+| `deadline` | `null` | Timer (定时器): absolute stop time; `init --deadline "+8h"` / `"08:00"` / ISO timestamp |
 | `max_tokens` | `null` | Soft token budget |
 | `max_round_scope` | `null` | Max changed lines per commit |
 | `goals` | `[]` | Explicit goals; loop stops when all are met |
@@ -83,6 +84,13 @@ auto-iterate-project/
 ├── agents/openai.yaml           # Agent store metadata
 ├── references/config.md         # Full configuration reference
 └── scripts/
-    ├── autopilot_state.py       # State/backlog/branch/budget helper
-    └── test_autopilot_state.py  # Self-test suite
+    ├── autopilot_state.py       # Thin CLI entry point
+    ├── test_autopilot_state.py  # Self-test suite
+    └── autopilot/               # Implementation package (one module per concern)
+        ├── io.py                # time, JSON, git, lock, token helpers
+        ├── config.py            # .autopilot/config.json schema + validation
+        ├── state.py             # state/backlog, stop conditions, reports
+        ├── agent.py             # runtime agent detection
+        ├── commands.py          # CLI command handlers
+        └── cli.py               # argument parsing + dispatch
 ```

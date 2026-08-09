@@ -786,6 +786,39 @@ class ImportUnitTests(unittest.TestCase):
         config = {"goals": [], "max_rounds": None, "max_minutes": 1, "max_tokens": None, "max_blocked_in_a_row": None}
         self.assertIn("max_minutes", ap.compute_stop_reason(state, config))
 
+    def test_compute_stop_reason_deadline(self):
+        ap = self.ap
+        state = {
+            "finished_at": None, "stop_reason": None, "goals": [], "completed_goals": [],
+            "completed_rounds": 0, "blocked_rounds": 0, "history": [],
+            "estimated_tokens_used": 0, "last_activity_at": None, "started_at": None,
+        }
+        config = {
+            "goals": [], "max_rounds": None, "max_minutes": None, "max_tokens": None,
+            "max_blocked_in_a_row": None, "deadline": "2000-01-01T00:00:00+00:00",
+        }
+        self.assertIn("deadline", ap.compute_stop_reason(state, config))
+        config["deadline"] = "2999-01-01T00:00:00+00:00"
+        self.assertIsNone(ap.compute_stop_reason(state, config))
+
+    def test_parse_deadline(self):
+        ap = self.ap
+        self.assertIsNone(ap.parse_deadline(None))
+        self.assertIsNone(ap.parse_deadline(""))
+        self.assertIsNone(ap.parse_deadline("not-a-time"))
+        # Absolute ISO with offset and naive (treated as UTC).
+        self.assertIn("2026-08-10T08:00:00", ap.parse_deadline("2026-08-10T08:00:00+08:00"))
+        self.assertTrue(ap.parse_deadline("2026-08-10T08:00:00").endswith("+00:00"))
+        self.assertTrue(ap.parse_deadline("2026-08-10T08:00:00Z").endswith("+00:00"))
+        # Relative durations resolve to a future absolute UTC timestamp.
+        self.assertIsNotNone(ap.parse_deadline("+30min"))
+        self.assertIsNotNone(ap.parse_deadline("+8h"))
+        self.assertIsNotNone(ap.parse_deadline("+1d"))
+        self.assertIsNotNone(ap.parse_deadline("+2w"))
+        self.assertIsNotNone(ap.parse_deadline("+90minutes"))
+        # Wall-clock HH:MM resolves to an absolute timestamp (today or tomorrow).
+        self.assertIsNotNone(ap.parse_deadline("08:00"))
+
     def test_autopilot_path(self):
         ap = self.ap
         self.assertTrue(ap._is_autopilot_path(".autopilot"))
@@ -862,6 +895,43 @@ class OptimizationTests(RepoTest):
         data = json.loads(self.run_state("check").stdout)
         self.assertFalse(data["continue"])
         self.assertIn("max_minutes", data["stop_reason"])
+
+    def test_deadline_stop(self):
+        self.run_state("init", "--deadline", "2000-01-01T00:00:00")
+        config = self.read_json("config.json")
+        self.assertIn("deadline", config)
+        self.assertTrue(config["deadline"].endswith("+00:00"))
+        data = json.loads(self.run_state("check", "--brief").stdout)
+        self.assertFalse(data["continue"])
+        self.assertIn("deadline", data["stop_reason"])
+        result = self.run_state("begin-round", "--title", "r", "--reason", "x")
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("stopped", result.stderr.lower())
+
+    def test_deadline_relative_resolves_to_absolute(self):
+        self.run_state("init", "--deadline", "+1h")
+        config = self.read_json("config.json")
+        self.assertTrue(config["deadline"].startswith("20") or config["deadline"].startswith("19"))
+        self.assertIn("+00:00", config["deadline"])
+        data = json.loads(self.run_state("check", "--brief").stdout)
+        self.assertTrue(data["continue"])
+
+    def test_deadline_future_allows_rounds(self):
+        self.run_state("init", "--deadline", "2999-01-01T00:00:00")
+        data = json.loads(self.run_state("check", "--brief").stdout)
+        self.assertTrue(data["continue"])
+
+    def test_deadline_invalid_rejected(self):
+        result = self.run_state("init", "--deadline", "not-a-time")
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("deadline", result.stderr.lower())
+        self.assertFalse((self.repo / ".autopilot" / "state.json").exists())
+
+    def test_deadline_in_config_is_stop_condition(self):
+        self.run_state("init", "--deadline", "2999-01-01T00:00:00")
+        data = json.loads(self.run_state("check", "--brief").stdout)
+        no_stop_warnings = [w for w in data["warnings"] if "stop condition" in w.lower()]
+        self.assertEqual(no_stop_warnings, [])
 
     def test_check_brief(self):
         self.run_state("init")

@@ -29,6 +29,27 @@ Hard stop after this many completed or blocked rounds. Default is `10`.
 
 Hard stop based on wall-clock time elapsed since the most recent round activity (`init`, `begin-round`, `complete-round`, `block-round`, `cancel-round`, or `goal-met`). Pausing the run does not pause the clock: a pause longer than the remaining budget stops the resumed run on the first `check`. `null` means unlimited.
 
+### deadline
+
+Timer (定时器) stop: a hard stop at an **absolute** point in time, independent of how many rounds have run or how much time has passed since the last activity. This complements the `max_minutes` countdown (倒计时): countdown measures duration since the last round; the deadline stops the run at a fixed wall-clock moment, so "iterate until tomorrow morning" is expressed as a deadline instead of a guessable minute count.
+
+The value stored in `config.json` is a normalized **ISO-8601 timestamp** (for example `"2026-08-10T08:00:00+08:00"`). Set it on `init` with `--deadline <expr>`, which accepts:
+
+| Expression | Meaning |
+|---|---|
+| `2026-08-10T08:00:00` | Absolute time (naive timestamps are treated as UTC) |
+| `2026-08-10T08:00:00+08:00` | Absolute time with a timezone offset |
+| `+8h` / `+30min` / `+1d` / `+2w` | Relative duration from **now** (also `+8hours`, `+1day`, `+2weeks`) |
+| `08:00` | Local wall-clock time **today** at 08:00; if that time is already past, **tomorrow** at 08:00 |
+
+```powershell
+python <this-skill>/scripts/autopilot_state.py init --repo <repo> --deadline "+12h"
+python <this-skill>/scripts/autopilot_state.py init --repo <repo> --deadline "08:00"
+python <this-skill>/scripts/autopilot_state.py init --repo <repo> --deadline "2026-08-10T08:00:00+08:00"
+```
+
+The expression is resolved to an absolute UTC timestamp once at `init` time, so re-reading the config never shifts the timer. Because the stored value must be absolute, hand-editing `config.json` requires a full ISO timestamp (the relative `+8h`/`HH:MM` forms are only expanded by `init --deadline`). A deadline in the past stops the run on the first `check`; remove it (set `"deadline": null`) to disable. `null` means no deadline.
+
 ### max_tokens
 
 Soft stop based on `estimated_tokens_used` accumulated by `complete-round`, `block-round`, and `cancel-round`. `null` means unlimited.
@@ -96,6 +117,7 @@ String, default `"zh"`. Language for generated reports and the automatic 10-roun
   "goals": [],
   "max_rounds": 5,
   "max_minutes": 30,
+  "deadline": "2026-08-10T08:00:00+08:00",
   "max_tokens": 80000,
   "max_round_scope": 400,
   "allow_uncommitted_changes": false,
@@ -147,6 +169,7 @@ python <this-skill>/scripts/autopilot_state.py backlog-remove --repo <repo> --id
 
 - `schema`, `run_id`, `repo`, `branch`, `origin_branch`
 - `started_at`, `last_activity_at` (rolling window for `max_minutes`)
+- `deadline` (config): absolute ISO-8601 timer stop; see the `deadline` field above
 - `round`, `completed_rounds`, `blocked_rounds`, `cancelled_rounds`, `reverted_rounds` (cancelled and reverted rounds advance the round-number counter so numbers are never reused)
 - `current_round`, `history`, `completed_goals`
 - `estimated_tokens_used`
@@ -156,7 +179,7 @@ python <this-skill>/scripts/autopilot_state.py backlog-remove --repo <repo> --id
 
 ## State Helper Commands
 
-- `init` — create config + state (+ optional feature branch). Flags cover every config field: `--goal`, `--goals-from-prompt`, `--max-rounds`, `--max-minutes`, `--max-tokens`, `--max-round-scope`, `--branch-mode`, `--allow-uncommitted-changes`, `--track-state`, `--check-commands`, `--push`, `--commit-message-prefix`, `--retries-per-round`, `--candidates-per-round`, `--max-blocked-in-a-row`, `--allow-path`, `--deny-path`, `--report-lang`, `--force`.
+- `init` — create config + state (+ optional feature branch). Flags cover every config field: `--goal`, `--goals-from-prompt`, `--max-rounds`, `--max-minutes`, `--deadline`, `--max-tokens`, `--max-round-scope`, `--branch-mode`, `--allow-uncommitted-changes`, `--track-state`, `--check-commands`, `--push`, `--commit-message-prefix`, `--retries-per-round`, `--candidates-per-round`, `--max-blocked-in-a-row`, `--allow-path`, `--deny-path`, `--report-lang`, `--force`.
 - `read`, `check`, `diagnose` — inspect state, stop conditions, and repository/git health. `check --brief` returns only `continue`/`stop_reason`/`warnings` (saves tokens in the loop).
 - `detect-agent` — detect the runtime agent (opencode / claude-code / codex / generic) and print adaptation context. Honors a `SKILL_DIR` environment variable for the reported skill directory.
 - `begin-round`, `complete-round`, `block-round`, `cancel-round` — round lifecycle. `begin-round` enforces the clean-tree rule and refuses to reuse round numbers; `--candidate-id` is repeatable so one round can pick multiple backlog candidates (`candidates_per_round`). `complete-round` auto-writes a Chinese phase report (`.autopilot/phase-report-round-<N>.md`) every 10 completed rounds.
@@ -191,7 +214,7 @@ Output includes `agent`, `detected_by`, `shell`/`command_style` (`powershell` or
 
 ## Stop-Condition Enforcement
 
-`begin-round` refuses to open a new round when any stop condition is already reached (all goals met, `max_rounds`, `max_minutes`, `max_tokens`, `max_blocked_in_a_row`, or a finished run), so the loop cannot overrun its own limits.
+`begin-round` refuses to open a new round when any stop condition is already reached (all goals met, `max_rounds`, `max_minutes`, `deadline`, `max_tokens`, `max_blocked_in_a_row`, or a finished run), so the loop cannot overrun its own limits.
 
 `commit` requires an open round. It refuses to commit when no round is open unless `--round <n>` is passed explicitly, which prevents orphan commits after `cancel-round` or `block-round` from being committed with a misleading round number.
 

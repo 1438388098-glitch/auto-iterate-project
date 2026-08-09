@@ -67,8 +67,10 @@ python <this-skill>/scripts/autopilot_state.py diagnose --repo <repo>
 6. Read `.autopilot/config.json` if it exists. If it does not exist, initialize with:
 
 ```powershell
-python <this-skill>/scripts/autopilot_state.py init --repo <repo> [--branch-mode feature] [--max-rounds N] [--max-minutes N] [--max-tokens N] [--max-round-scope N] [--goal "<goal>"] [--goals-from-prompt "<request>"] [--check-commands "<cmd>"] [--push] [--commit-message-prefix <prefix>] [--retries-per-round N] [--candidates-per-round N] [--max-blocked-in-a-row N] [--allow-path <glob>] [--deny-path <glob>] [--report-lang zh|en] [--track-state]
+python <this-skill>/scripts/autopilot_state.py init --repo <repo> [--branch-mode feature] [--max-rounds N] [--max-minutes N] [--deadline "<expr>"] [--max-tokens N] [--max-round-scope N] [--goal "<goal>"] [--goals-from-prompt "<request>"] [--check-commands "<cmd>"] [--push] [--commit-message-prefix <prefix>] [--retries-per-round N] [--candidates-per-round N] [--max-blocked-in-a-row N] [--allow-path <glob>] [--deny-path <glob>] [--report-lang zh|en] [--track-state]
 ```
+
+`--deadline` is the **timer (定时器)** stop: an absolute wall-clock moment when the run must stop, unlike the `--max-minutes` countdown (倒计时) which measures duration since the last round activity. Accepts an ISO timestamp (`2026-08-10T08:00:00`), a relative duration (`+8h`, `+30min`, `+1d`, `+2w`), or a local `HH:MM` (today, or tomorrow if already passed — e.g. `08:00` for "iterate until tomorrow morning"). It is resolved to an absolute UTC timestamp at init time. See `references/config.md` for details.
 
 `--goals-from-prompt` splits a natural-language request (Chinese or English) into `goals` automatically. `--allow-path`/`--deny-path` seed the commit path whitelist (repeatable).
 
@@ -185,6 +187,7 @@ Stop when any of these is true:
 - All configured goals are met.
 - `max_rounds` is reached.
 - `max_minutes` is reached. This is wall-clock time since the most recent round activity (`init`/`begin-round`/`complete-round`/`block-round`/`cancel-round`/`goal-met`). Pausing the run does not pause the clock: if the pause is longer than the remaining budget, the resumed run stops on the first `check`. Set `max_minutes` to `null` for unlimited.
+- `deadline` is reached. The timer (定时器) stops the run at an **absolute** wall-clock moment (for example "iterate until tomorrow morning"), independent of round activity. It complements `max_minutes`: the countdown (倒计时) measures duration since the last round; the deadline is a fixed point in time. Set it with `init --deadline <expr>`; a deadline already in the past stops the run on the first `check`. Set `deadline` to `null` to disable.
 - `max_tokens` soft budget is reached (auto-estimated from diffs; see `references/config.md`).
 - `max_blocked_in_a_row` consecutive blocked rounds is reached (default 2).
 - A round's staged diff exceeds `max_round_scope` and cannot be split.
@@ -237,6 +240,7 @@ When the loop stops:
 | `commit` fails with "No round is open" | Nothing began the current round | Run `begin-round` first, or pass `--round <n>` for an intentional orphan commit |
 | "Another autopilot run appears active" | Stale `.autopilot/lock` or a real concurrent run | Wait for the other run, or delete `.autopilot/lock` if that process is dead; the helper now also removes corrupt lock files and locks left by other hosts automatically |
 | `check` reports `max_minutes` right after resume | Budget measures wall-clock since last activity, and the pause consumed it | Expected behavior; raise `max_minutes` or set it to `null` |
+| `check` reports `deadline reached` right after resume | The absolute `deadline` moment has already passed | Expected behavior; raise it with `init --force --deadline <expr>` or set `deadline` to `null` in config |
 | `git log` fails during analysis | Repo has no commits yet | Skip log analysis; the first round creates the initial commit |
 | `begin-round` refuses with "Working tree is dirty" | Dirty tree on the first round with `allow_uncommitted_changes: false` | Commit/stash user changes, or set `allow_uncommitted_changes: true` (or run `init --force` to override) |
 | `push` refuses with "push is disabled" | `push: false` in config | Only push when the config enables it; set `push: true` to allow pushing |

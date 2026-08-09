@@ -1,4 +1,4 @@
 interface:
   display_name: "Auto Iterate Project"
   short_description: "Automatically analyze, improve, test, and commit git projects."
-  default_prompt: "Use the $auto-iterate-project skill to autonomously improve this git project; for Chinese requests, say 全自动迭代这个项目。"
+  default_prompt: "Use the $auto-iterate-project skill to autonomously improve this git project; for Chinese requests, say 全自动迭代这个项目。支持定时器：迭代到明天早上 8 点（init --deadline '08:00' 或 '+8h' 等），也支持按轮次/分钟/token 预算停止。"
