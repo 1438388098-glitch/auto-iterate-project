@@ -8,7 +8,7 @@ description: Automatically iterate any git project inside the current agent sess
 ## Operating Contract
 
 - Operate in the current working directory unless the user names a different git repository path.
-- Keep every change small, scoped, and committed within a single round. Each round works on `candidates_per_round` backlog candidates (default `1`, keeping the original one-change-per-round contract); when it is greater than `1`, each candidate is still implemented, verified, and committed as its own commit inside the same round. When `max_round_scope` is set, the commit helper enforces the size limit per commit.
+- Batch by default for efficiency. Each round works on `candidates_per_round` backlog candidates (default `3`); each candidate is implemented and verified as its own unit inside the round. Full regression verification runs once every `verify_every_rounds` rounds (default `3`). Commits are deferred and flushed once every `commit_every_rounds` rounds (default `5`), so work accumulates across rounds and is committed as one batch instead of per candidate. Set any of these to `1` for the original one-change-per-round / verify-and-commit-every-round contract.
 - Commit only after verification. Do not push by default.
 - Do not rely on host-specific goal tools. This skill owns its loop and state through `.autopilot/`.
 - Maintain a visible improvement backlog in `.autopilot/backlog.json`.
@@ -23,7 +23,7 @@ Resolve this skill directory from this `SKILL.md`:
 2. Resolve the skill root to an **absolute path** and substitute it for every `<this-skill>` below before running any command.
 3. If the environment provides a `$SKILL_DIR` variable, prefer it; otherwise use the path you resolved.
 
-- `scripts/autopilot_state.py` is the deterministic state, backlog, branch, budget, and agent-detection helper.
+- `scripts/autopilot_state.py` is the deterministic state, backlog, branch, budget, ranking, secret-scan, and agent-detection helper.
 - `references/config.md` documents every configuration field.
 - `scripts/test_autopilot_state.py` is the self-test suite for the helper.
 
@@ -67,7 +67,7 @@ python <this-skill>/scripts/autopilot_state.py diagnose --repo <repo>
 6. Read `.autopilot/config.json` if it exists. If it does not exist, initialize with:
 
 ```powershell
-python <this-skill>/scripts/autopilot_state.py init --repo <repo> [--branch-mode feature] [--max-rounds N] [--max-minutes N] [--deadline "<expr>"] [--max-tokens N] [--max-round-scope N] [--goal "<goal>"] [--goals-from-prompt "<request>"] [--check-commands "<cmd>"] [--push] [--commit-message-prefix <prefix>] [--retries-per-round N] [--candidates-per-round N] [--max-blocked-in-a-row N] [--allow-path <glob>] [--deny-path <glob>] [--report-lang zh|en] [--track-state]
+python <this-skill>/scripts/autopilot_state.py init --repo <repo> [--branch-mode feature] [--max-rounds N] [--max-minutes N] [--deadline "<expr>"] [--max-tokens N] [--max-round-scope N] [--goal "<goal>"] [--goals-from-prompt "<request>"] [--check-commands "<cmd>"] [--push] [--commit-message-prefix <prefix>] [--retries-per-round N] [--candidates-per-round N] [--commit-every-rounds N] [--verify-every-rounds N] [--max-blocked-in-a-row N] [--scan-secrets] [--no-scan-secrets] [--secret-pattern <regex>] [--type-saturation-threshold N] [--allow-path <glob>] [--deny-path <glob>] [--report-lang zh|en] [--track-state]
 ```
 
 `--deadline` is the **timer (定时器)** stop: an absolute wall-clock moment when the run must stop, unlike the `--max-minutes` countdown (倒计时) which measures duration since the last round activity. Accepts an ISO timestamp (`2026-08-10T08:00:00`), a relative duration (`+8h`, `+30min`, `+1d`, `+2w`), or a local `HH:MM` (today, or tomorrow if already passed — e.g. `08:00` for "iterate until tomorrow morning"). It is resolved to an absolute UTC timestamp at init time. See `references/config.md` for details.
@@ -87,7 +87,13 @@ Run `python <this-skill>/scripts/autopilot_state.py check --repo <repo>` (add `-
 
 ### 2. Analyze
 
-Gather:
+Use the analysis cache to avoid re-reading the whole repo every round:
+
+1. Run `python <this-skill>/scripts/autopilot_state.py analysis-load --repo <repo>`.
+2. If it reports `"valid": true`, reuse the cached analysis and do **not** re-scan the tree, README, or CI files. Update only what the current candidate needs.
+3. If it reports `missing`/`stale`, gather fresh context and save it back with `analysis-save --content '<json>'` so the next rounds inherit this understanding. The cache auto-invalidates when `git HEAD` moves or `.autopilot/config.json` changes, so it never goes stale silently.
+
+Fresh analysis gathers:
 
 - `git log --oneline -20` (skip silently if the repo has no commits yet)
 - `git status --short`
@@ -109,14 +115,14 @@ To discover the test/build/lint command, do not guess blindly. Decide from the r
 | `Makefile` | documented `test`/`lint` targets | `make -n` dry run |
 | `CMakeLists.txt` | build-then-`ctest` | `cmake --build .` |
 
-When nothing matches, run `python <this-skill>/scripts/autopilot_state.py detect-verify --repo <repo>` to have the helper scan the entry points and recommend `check_commands` (add `--apply` to write them into the config). When nothing matches at all, run the tool's `--help` as a smoke check, and if verification genuinely cannot run, state that explicitly in the round summary and keep the change low-risk. Never run the loop with an unknown verification path when `check_commands` names a command that does not exist — treat that as a stop-and-ask condition (see Escalation).
+When nothing matches, run `python <this-skill>/scripts/autopilot_state.py detect-verify --repo <repo>` to have the helper scan the entry points and recommend `check_commands` (add `--apply` to write them into the config). `detect-verify` also reports `gitleaks`/`detect-secrets` when installed so they can be added to the verification set. When nothing matches at all, run the tool's `--help` as a smoke check, and if verification genuinely cannot run, state that explicitly in the round summary and keep the change low-risk. Never run the loop with an unknown verification path when `check_commands` names a command that does not exist — treat that as a stop-and-ask condition (see Escalation).
 
 ### 3. Maintain the Backlog
 
-- Use `backlog-add` to record 3-5 concrete improvement candidates with title, reason, a numeric `value` (1-5) and `effort` (1-5).
-- Use `backlog-rank` to list pending candidates sorted by value-to-effort ratio.
-- Choose the top `candidates_per_round` pending candidates by value-to-effort ratio (default `1`). Set `candidates_per_round: N` in `.autopilot/config.json` (or `init --candidates-per-round N`) to batch N independent changes per round and amortize the per-round overhead; keep the default `1` for maximal safety.
-- Do not combine unrelated candidates into a single commit; when a round carries multiple candidates, commit each one separately.
+- Use `backlog-add` to record 3-5 concrete improvement candidates with title, reason, a numeric `value` (1-5), `effort` (1-5), a `type` (`bugfix|feature|refactor|perf|test|docs`, default `feature`), an optional `risk` (1-5, default 1), and optional `depends-on <candidate-id>` prereqs.
+- Use `backlog-rank` to list pending candidates sorted by **adjusted** value/effort. The rank is not a raw ratio: it discounts high `risk`, downweights types you have already saturated (see `type_saturation_threshold`, default 2), downweights types that keep blocking, and pushes candidates with unfinished `depends_on` prereqs to the bottom (`"ready": false`, with `blocked_by` reasons and a `score_breakdown` showing every factor). Read the breakdown to pick deliberately instead of reflexively.
+- Choose the top `candidates_per_round` **ready** pending candidates (default `3`). Set `candidates_per_round: N` in `.autopilot/config.json` (or `init --candidates-per-round N`) to batch N independent changes per round and amortize the per-round overhead.
+- Do not combine unrelated candidates into a single change; within a round, each candidate is still implemented and reviewed as its own unit.
 - Quality gate: only open a round whose changes you can justify in one concrete sentence each ("why is this valuable to the user"). If the best available candidate has no clear value, stop and ask the user instead of producing trivial churn.
 
 ### 4. Start the Round
@@ -134,11 +140,17 @@ All passed candidates are marked `picked`; the helper records the list in `curre
 
 Cancelled rounds advance the round-number counter (`cancelled_rounds`), so `cancel-round` followed by `begin-round` produces a new round number instead of reusing the old one.
 
-### 5. Implement
+### 5. Implement & Self-Review
 
-When the round carries multiple candidates, work through them **one at a time**: implement candidate 1, verify, commit, then candidate 2, and so on. For each candidate, make the smallest change that satisfies it. Follow existing project patterns. Do not reformat unrelated code, add dependencies, or touch user-owned files. If a single candidate starts growing beyond `max_round_scope`, cancel it and split the work.
+When the round carries multiple candidates, work through them **one at a time**. For each candidate, make the smallest change that satisfies it. Follow existing project patterns. Do not reformat unrelated code, add dependencies, or touch user-owned files. If a single candidate starts growing beyond `max_round_scope`, cancel it and split the work.
+
+Before a candidate moves on to verification, do a **self-review** of its diff (`git diff --cached` after staging, or `git diff` before): check for scope creep, dead/debug code, broken edge cases, and anything that looks like a secret. For **blast radius**, when a change touches a public API signature or renames a symbol, `grep` for all callers first and confirm every one is updated or intentionally left. If the review finds real problems, fix them inside the `retries_per_round` budget; this is the gate that keeps batched, low-frequency commits from accumulating junk. For a structured pass, you may use your `requesting-code-review` skill here.
 
 ### 6. Verify
+
+Verify **every `verify_every_rounds` rounds** (default 3), and always on a round that commits or when the run is about to stop — never commit unverified work. `check` reports the next verification round in `next_verify_round`. Between verification rounds, run only a fast smoke check when one is cheap (`python -m py_compile`, `node --check`, `cargo check`); if none is cheap, keep the change low-risk and state the lightweight verification method in the round summary.
+
+On a verification round:
 
 - If `check_commands` is set, run each of those commands and require them to pass.
 - Otherwise, if tests exist, run the project's test command and require it to pass. If build or lint exists, run it too.
@@ -147,28 +159,26 @@ When the round carries multiple candidates, work through them **one at a time**:
 
 ### 7. Commit
 
-Only when verification passes. In a multi-candidate round, commit **each candidate's change as its own commit** (all commits in the round share the `<prefix>(round-<N>)` message prefix but carry distinct summaries), then close the round once with `complete-round`.
+Commits are deferred and flushed once every `commit_every_rounds` rounds (default 5): rounds 1-4 implement, verify, and record work without committing, and the boundary round stages **all accumulated changes** and commits them as one batch. `check` reports the next commit round in `next_commit_round`. If the run stops mid-batch (goal met, budget reached), flush the pending changes as a final commit before `finish`. Only commit after verification passes, and only stage this batch's files — never `.autopilot/` (unless `track_state: true`).
 
 1. Run `git status` and review the intended changes for scope before staging.
-2. `git add <intentionally changed files>` (only this candidate's files)
-3. Use the helper to verify the staged scope, check git identity and `max_round_scope`, build the `<prefix>(round-<N>): <summary>` message, and commit:
+2. `git add <intentionally changed files>` for the whole batch.
+3. Use the helper to verify the staged scope, check git identity, `max_round_scope`, `allow_paths`/`deny_paths`, and **scan the staged diff for secret-like content** (AWS keys, private keys, GitHub/Slack/Google tokens, `sk-*`). On a match it refuses to commit — remove the secret, or commit with `--allow-secrets` / set `scan_secrets: false` only when you are certain. It then builds the `<prefix>(round-<N>): <summary>` message and commits:
 
 ```powershell
 python <this-skill>/scripts/autopilot_state.py commit --repo <repo> --summary "<summary>"
 ```
 
-`commit` requires an open round; without one it refuses unless you pass `--round <n>` explicitly (use that only to record an intentional orphan commit, e.g. after `cancel-round`). When `allow_paths`/`deny_paths` are configured, the helper refuses to commit any staged file outside the whitelist.
+`commit` requires an open round; without one it refuses unless you pass `--round <n>` explicitly (use that to record the final flush after the last `complete-round`). If the accumulated diff exceeds `max_round_scope`, stage a subset, commit, then stage the rest and commit again — same round, multiple commits.
 
-4. Repeat steps 1-3 for each remaining candidate, then record the **last** commit SHA from the helper output in `complete-round`.
-
-Do not stage `.autopilot/` unless config sets `track_state: true`. Do not push unless config sets `push: true`; when it does, `complete-round` pushes automatically (explicit `branch:branch` refspec, never force) and you can also run `python <this-skill>/scripts/autopilot_state.py push --repo <repo>` to push explicitly — the `push` command itself refuses to run when `push: false`. The helper logs every state-changing action to `.autopilot/log.jsonl`.
+Do not push unless config sets `push: true`; when it does, `complete-round` pushes automatically on rounds that committed (explicit `branch:branch` refspec, never force) and you can also run `python <this-skill>/scripts/autopilot_state.py push --repo <repo>` to push explicitly — the `push` command itself refuses to run when `push: false`. The helper logs every state-changing action to `.autopilot/log.jsonl`.
 
 ### 8. Record the Round
 
-- On success: run `complete-round` with title, summary, and commit SHA. Token accounting is estimated automatically from the diff unless you pass `--tokens`.
+- On success: run `complete-round` with title and summary. On a commit round, pass `--commit-sha <sha>` from the commit helper; on a deferred round, omit it — the round is recorded and the changes stay in the working tree for the next batch. Token accounting is estimated automatically from the round's own diff (no double counting of earlier uncommitted batches) unless you pass `--tokens`.
 - On blocked: run `block-round` with title and reason, and do not commit that round.
 - To abandon a round without counting it as blocked: run `cancel-round` (the round's candidates return to `pending`).
-- The helper automatically updates every backlog candidate attached to the round to `completed`, `blocked`, or back to `pending`.
+- The helper automatically updates every backlog candidate attached to the round to `completed`, `blocked`, or back to `pending`, and refreshes the per-type stats (`state.type_stats`) that power ranking and the retrospective.
 - **Phase reports**: every time `complete-round` reaches a multiple of 10 completed rounds, the helper writes a Chinese-language phase report to `.autopilot/phase-report-round-<N>.md` (language from config `report_lang`, default `zh`) and prints a `[PHASE]` note. Read it, report the phase summary to the user, and continue.
 - **Undoing a bad commit**: run `undo-round --sha <sha> --summary "<why>"` instead of hand-reverting. It `git revert`s the commit (never rewriting history), records a `revert` history entry, and advances the round-number counter so the revert and the next round get distinct numbers.
 
@@ -207,14 +217,18 @@ Stop the loop and ask the user when any of these is true, instead of grinding on
 
 When the loop stops:
 
-1. Run `finish --reason "<stop reason>"`. It auto-cancels any still-open round (returning its candidate to pending) and, in `feature` mode, returns to the branch you started on; pass `--stay` to remain on the autopilot branch.
-2. Write `.autopilot/last-summary.md` with completed rounds, blocked rounds, commit SHAs, active branch, remaining goals, backlog status, and the next likely improvement. Write it in the user's language when you know it (the default English trigger suggests English output; the Chinese trigger suggests Chinese). You can generate the underlying data deterministically with `python <this-skill>/scripts/autopilot_state.py report --repo <repo> [--lang zh|en] [--output <file>]`.
-3. Report a short summary to the user.
+1. If `commit_every_rounds` is enabled and the last round did not commit, **flush the pending changes** with a final `commit --round <n> --summary "flush accumulated changes"` (or commit within the open round) so no verified work is left uncommitted.
+2. Run `finish --reason "<stop reason>"`. It auto-cancels any still-open round (returning its candidate to pending), writes `.autopilot/retrospective.md` (per-type completion/blocked stats, blocked rounds, verification commands, next likely improvement), and in `feature` mode returns to the branch you started on; pass `--stay` to remain on the autopilot branch.
+3. Write `.autopilot/last-summary.md` with completed rounds, blocked rounds, commit SHAs, active branch, remaining goals, backlog status, and the next likely improvement. Write it in the user's language when you know it (the default English trigger suggests English output; the Chinese trigger suggests Chinese). You can generate the underlying data deterministically with `python <this-skill>/scripts/autopilot_state.py report --repo <repo> [--lang zh|en] [--output <file>]`.
+4. Report a short summary to the user.
 
 ## Reports & Dry-Run
 
 - `report` prints (or writes with `--output`) a deterministic markdown report of the run: goals, round counts, round history, backlog, recent commits, and the next likely improvement. Default language comes from config `report_lang` (`zh` or `en`); override with `--lang`.
-- `detect-verify` scans the repo entry points and prints recommended `check_commands`; `--apply` writes them into the config.
+- `retrospective` prints (or writes with `--output`) the run-level retrospective: per-type completed/blocked/blocked-rate/avg-effort/avg-value, blocked rounds, configured verification commands, and the next ready candidate. `finish` writes it automatically to `.autopilot/retrospective.md`.
+- `analysis-load` / `analysis-save` read and refresh the `.autopilot/analysis.json` repository-analysis cache (invalidated on HEAD or config change).
+- `secret-scan` scans the staged diff for secret-like content; `commit` runs the same scan automatically and refuses on a match (see Safety Rules).
+- `detect-verify` scans the repo entry points and prints recommended `check_commands` (including `gitleaks`/`detect-secrets` when installed); `--apply` writes them into the config.
 - Every state-changing command accepts `--dry-run`: it prints what would happen and changes neither `.autopilot/` nor git. Use it to rehearse a step before committing to it.
 
 ## Safety Rules
@@ -223,6 +237,7 @@ When the loop stops:
 - Never push unless config sets `push: true`; this skill defaults to false, and the `push` command refuses to run when disabled.
 - Never commit user changes that existed before the run unless `allow_uncommitted_changes` is true. The helper now enforces this by refusing `init` and the first `begin-round` on a dirty tree.
 - Never ignore a failing verification result to make a commit.
+- Never commit content that looks like a secret. The `commit` helper scans the staged diff for common secret patterns (AWS `AKIA*` keys, private-key blocks, GitHub/Slack/Google tokens, `sk-*`) and refuses on a match; only bypass with `--allow-secrets` (or `scan_secrets: false`) when you have verified the content is not sensitive. Run `secret-scan` at any time to check the staged diff.
 - Never run without a stop condition. The helper warns when none is configured; enforce at least one of goals, `max_rounds`, `max_minutes`, `max_tokens`, or `max_blocked_in_a_row`.
 - Never delete files outside the change needed for the current round unless the repo's tests prove the deletion is safe.
 - Never switch away from the autopilot feature branch or delete it while a run is active.
@@ -234,7 +249,8 @@ When the loop stops:
 |---|---|---|
 | `commit` fails with "Git identity is not configured" | `user.name`/`user.email` unset | Run `git config user.name ...` and `git config user.email ...`, then retry |
 | `commit` fails after hooks | pre-commit hook rejects the change | Fix the hook failure; never bypass with `--no-verify` unless the user approves |
-| `commit` fails with "exceeds max_round_scope" | The round is too large | Split the change into smaller rounds |
+| `commit` fails with "exceeds max_round_scope" | The accumulated batch is too large | Stage a subset, commit, then stage the rest and commit again within the same round |
+| `commit` fails with "Secret-like content detected" | The staged diff matches a secret pattern | Remove the secret, or commit with `--allow-secrets` / set `scan_secrets: false` after verifying it is not sensitive |
 | `begin-round` says a round is open | A previous round was interrupted | `read` the state, then `complete-round`, `block-round`, or `cancel-round` |
 | `begin-round` fails with "Autopilot is stopped" | A stop condition is already reached | Run `check`, resolve the stop reason (e.g. raise `max_rounds`) or run `finish` |
 | `commit` fails with "No round is open" | Nothing began the current round | Run `begin-round` first, or pass `--round <n>` for an intentional orphan commit |
@@ -243,7 +259,9 @@ When the loop stops:
 | `check` reports `deadline reached` right after resume | The absolute `deadline` moment has already passed | Expected behavior; raise it with `init --force --deadline <expr>` or set `deadline` to `null` in config |
 | `git log` fails during analysis | Repo has no commits yet | Skip log analysis; the first round creates the initial commit |
 | `begin-round` refuses with "Working tree is dirty" | Dirty tree on the first round with `allow_uncommitted_changes: false` | Commit/stash user changes, or set `allow_uncommitted_changes: true` (or run `init --force` to override) |
+| `begin-round` refuses with "depends on unfinished work" | The candidate's `depends_on` prereq is not completed | Complete and record the prereq first, or pick a dependency-ready candidate (`backlog-rank` marks `"ready": false`) |
 | `push` refuses with "push is disabled" | `push: false` in config | Only push when the config enables it; set `push: true` to allow pushing |
+| `complete-round` without a commit SHA | Deferred commit round (default `commit_every_rounds: 5`) | Expected; the round is recorded and changes stay in the working tree until the boundary round commits them. Flush pending changes before `finish` |
 | `complete-round` fails with "commit-sha does not resolve" | The SHA recorded by `commit` was not passed through | Use the exact SHA the `commit` helper printed |
 | `init` refuses with "Working tree is dirty" | Pre-existing uncommitted changes at run start | Commit/stash them, or pass `--allow-uncommitted-changes` / `--force` |
 | `ensure-branch`/`finish` fails with branch errors | `state.json` was hand-edited or the origin branch was deleted | Reset `.autopilot/state.json` and re-run; `finish` only warns when the origin branch is gone |

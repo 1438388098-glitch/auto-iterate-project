@@ -54,7 +54,7 @@ The expression is resolved to an absolute UTC timestamp once at `init` time, so 
 
 Soft stop based on `estimated_tokens_used` accumulated by `complete-round`, `block-round`, and `cancel-round`. `null` means unlimited.
 
-The helper auto-estimates tokens per round when `--tokens` is omitted, using the heuristic `500 + 12 * changed lines + 100 * binary files`, where changed lines come from the diff between the round's start SHA (recorded by `begin-round`) and `HEAD`, plus any still-uncommitted working-tree/staged changes. Binary files are charged a flat cost because line counts are meaningless for them. Anchoring on the round start SHA means a round never re-counts lines committed in earlier rounds. For a tighter estimate, pass `--tokens` with your own value from the session.
+The helper auto-estimates tokens per round when `--tokens` is omitted, using the heuristic `500 + 12 * changed lines + 100 * binary files`, where changed lines come from the diff between the round's start SHA (recorded by `begin-round`) and `HEAD`, plus the working-tree/index delta measured against a snapshot taken at `begin-round`. Anchoring on the round start SHA means a round never re-counts lines committed in earlier rounds, and the worktree baseline means a deferred (batched) round never double counts earlier rounds' still-uncommitted lines. For a tighter estimate, pass `--tokens` with your own value from the session.
 
 ### max_round_scope
 
@@ -82,7 +82,7 @@ Integer. Default `3`. Maximum fix-and-retry attempts within one round before the
 
 ### candidates_per_round
 
-Integer, default `1`. How many backlog candidates one round works on. The default `1` preserves the original one-change-per-round contract. Set it to `N` (for example `3`) to batch N independent changes per round and amortize the per-round overhead (check/analyze/begin/complete); each candidate is still implemented, verified, and committed as its own commit inside the round, and `begin-round --candidate-id` is repeated once per candidate. This is agent-side guidance: the helper accepts any number of `--candidate-id` values and updates every attached candidate's status when the round closes.
+Integer, default `3`. How many backlog candidates one round works on. Each candidate is still implemented and reviewed as its own unit inside the round, so one round batches several independent changes and amortizes the per-round overhead. Set it to `1` for the original one-change-per-round contract. `begin-round --candidate-id` is repeated once per candidate; the helper accepts any number and updates every attached candidate's status when the round closes.
 
 ```json
 {
@@ -90,13 +90,33 @@ Integer, default `1`. How many backlog candidates one round works on. The defaul
 }
 ```
 
+### commit_every_rounds
+
+Integer, default `5`. How often accumulated changes are committed. Rounds before the boundary (`round % commit_every_rounds == 0`) implement, verify, and record work via `complete-round` **without** a commit SHA; their changes stay in the working tree/index. The boundary round stages everything and flushes it as one batch commit. If the run stops mid-batch, flush pending changes as a final commit before `finish`. Set to `1` to commit every round (the original contract). `check` reports the next commit round in `next_commit_round`. Batched commits skip the "round started with a dirty tree" refusal because accumulated changes are expected; `max_round_scope` still applies per commit, so a batch larger than the scope limit must be committed in subsets.
+
+### verify_every_rounds
+
+Integer, default `3`. How often the full verification set (`check_commands`, tests, build, lint) runs. Between verification rounds the agent runs only a cheap smoke check when one exists (`python -m py_compile`, `node --check`, `cargo check`) or states a lightweight verification method. A commit round is always a verification round, and a failing verification is never ignored to make a commit. Set to `1` to run full verification every round. `check` reports the next verification round in `next_verify_round`.
+
+### scan_secrets
+
+Boolean, default `true`. When true, `commit` scans the **added lines** of the staged diff for secret-like content before committing and refuses on a match. Built-in patterns cover AWS access keys (`AKIA...`), private-key blocks, GitHub personal access tokens (`ghp_...`), Slack tokens (`xox...`), Google API keys (`AIza...`), OpenAI-style `sk-...` keys, and `api_key = ...` assignments. Bypass a false positive with `commit --allow-secrets`, or disable entirely by setting this to `false`. Run `secret-scan` at any time to check the staged diff without committing. Use `secret_patterns` to add repository-specific regexes.
+
+### secret_patterns
+
+Array of regex strings, default `[]`. Extra patterns appended to the built-in secret scan. Each pattern is matched against every added line of the staged diff; the commit helper reports the file and matched text when refusing. Patterns are treated as regular expressions, so escape literal dots.
+
+### type_saturation_threshold
+
+Integer, default `2`. After this many candidates of the same `type` have been completed, `backlog-rank` downweights further same-type pending candidates by `0.85` per additional completion (`0.85 ** (completed - threshold)`). This stops the loop from grinding out the same low-hanging-fruit category forever. A type with a blocked history is additionally discounted by `0.9` per blocked candidate. Set to a large number to disable.
+
 ### max_blocked_in_a_row
 
 Integer. Default `2`. Hard stop after this many consecutive blocked rounds, checked by the state helper rather than only by agent judgment.
 
 ### check_commands
 
-Array of strings, default `[]`. Exact verification commands to run each round (for example `["pytest", "python -m py_compile ."]`). When set, the agent prefers these over re-discovering test/build/lint commands, making rounds deterministic and reproducible. The agent runs them; the helper does not execute them itself. If a command in this list does not exist, treat that as a stop-and-ask condition rather than fixing a nonexistent command.
+Array of strings, default `[]`. Exact verification commands to run on each verification round (for example `["pytest", "python -m py_compile ."]`). When set, the agent prefers these over re-discovering test/build/lint commands, making rounds deterministic and reproducible. Full verification runs every `verify_every_rounds` rounds and always on a commit round. The agent runs them; the helper does not execute them itself. If a command in this list does not exist, treat that as a stop-and-ask condition rather than fixing a nonexistent command.
 
 ### track_state
 
@@ -125,12 +145,17 @@ String, default `"zh"`. Language for generated reports and the automatic 10-roun
   "branch_mode": "feature",
   "commit_message_prefix": "autopilot",
   "retries_per_round": 3,
-  "candidates_per_round": 1,
+  "candidates_per_round": 3,
+  "commit_every_rounds": 5,
+  "verify_every_rounds": 3,
   "max_blocked_in_a_row": 2,
   "check_commands": ["pytest", "npm run lint"],
   "track_state": false,
   "allow_paths": ["src/", "tests/"],
   "deny_paths": ["*.secret", "**/keys/**"],
+  "scan_secrets": true,
+  "secret_patterns": [],
+  "type_saturation_threshold": 2,
   "report_lang": "zh"
 }
 ```
@@ -142,7 +167,7 @@ String, default `"zh"`. Language for generated reports and the automatic 10-roun
 Useful commands:
 
 ```powershell
-python <this-skill>/scripts/autopilot_state.py backlog-add --repo <repo> --title "<title>" --reason "<reason>" --value 4 --effort 2
+python <this-skill>/scripts/autopilot_state.py backlog-add --repo <repo> --title "<title>" --reason "<reason>" --value 4 --effort 2 --type refactor --risk 2 --depends-on candidate-001
 python <this-skill>/scripts/autopilot_state.py backlog-list --repo <repo>
 python <this-skill>/scripts/autopilot_state.py backlog-rank --repo <repo>
 ```
@@ -150,16 +175,20 @@ python <this-skill>/scripts/autopilot_state.py backlog-rank --repo <repo>
 Each candidate tracks:
 
 - `id`, `title`, `reason`
-- `value` (1-5) and `effort` (1-5) used for value-to-effort ranking
+- `type` (`bugfix|feature|refactor|perf|test|docs`, default `feature`)
+- `risk` (1-5, default 1) and `depends_on` (ids that must be completed first)
+- `value` (1-5) and `effort` (1-5) used for the base value/effort score
 - `status`: `pending`, `picked`, `completed`, or `blocked`
 - `round` and timestamps
 
-`backlog-rank` sorts pending candidates by `value / effort` descending. `begin-round` marks the chosen candidate(s) `picked` (`--candidate-id` is repeatable for multi-candidate rounds); the helper updates each one to `completed` or `blocked` when the round closes, and back to `pending` on `cancel-round`. Legacy string flags `--impact` and `--effort-level` are still accepted and mapped to numeric scores.
+`backlog-rank` sorts pending, dependency-**ready** candidates by an **adjusted** score: base `value / effort`, discounted for `risk` (factor `max(0.5, 1.0 - 0.08 * (risk - 1))`), for type saturation (`0.85 ** max(0, completed_of_type - type_saturation_threshold)`), and for a blocked type history (`0.9 ** blocked_of_type`). Candidates whose `depends_on` is not yet satisfied are marked `"ready": false` with a `blocked_by` reason and ranked after ready candidates. Every entry carries a `score_breakdown` (base/risk/saturation/blocked factors) so the ranking is transparent. The per-type counts come from the backlog and are also persisted to `state.type_stats` for the retrospective. `begin-round` refuses to pick a candidate whose deps are unresolved.
 
-Candidates can be rescored or re-queued with `backlog-update` (update `--title`, `--reason`, `--value`, `--effort`, or `--status`) and removed with `backlog-remove`:
+`begin-round` marks the chosen candidate(s) `picked` (`--candidate-id` is repeatable for multi-candidate rounds); the helper updates each one to `completed` or `blocked` when the round closes, and back to `pending` on `cancel-round`. Legacy string flags `--impact` and `--effort-level` are still accepted and mapped to numeric scores.
+
+Candidates can be rescored or re-queued with `backlog-update` (update `--title`, `--reason`, `--value`, `--effort`, `--type`, `--risk`, `--depends-on`, or `--status`) and removed with `backlog-remove`:
 
 ```powershell
-python <this-skill>/scripts/autopilot_state.py backlog-update --repo <repo> --id candidate-001 --value 5 --effort 1
+python <this-skill>/scripts/autopilot_state.py backlog-update --repo <repo> --id candidate-001 --value 5 --effort 1 --type bugfix
 python <this-skill>/scripts/autopilot_state.py backlog-remove --repo <repo> --id candidate-001
 ```
 
@@ -173,22 +202,26 @@ python <this-skill>/scripts/autopilot_state.py backlog-remove --repo <repo> --id
 - `round`, `completed_rounds`, `blocked_rounds`, `cancelled_rounds`, `reverted_rounds` (cancelled and reverted rounds advance the round-number counter so numbers are never reused)
 - `current_round`, `history`, `completed_goals`
 - `estimated_tokens_used`
+- `type_stats` (per-type completed/blocked/blocked-rate/avg-effort/avg-value, refreshed on every round close)
 - `stop_reason` and `finished_at`
 
 `repo` is refreshed to the path used on each invocation, so a moved or re-cloned repository resumes correctly. Older state files are migrated automatically on read. Do not hand-edit `state.json` while a run is active; use the helper commands.
 
 ## State Helper Commands
 
-- `init` — create config + state (+ optional feature branch). Flags cover every config field: `--goal`, `--goals-from-prompt`, `--max-rounds`, `--max-minutes`, `--deadline`, `--max-tokens`, `--max-round-scope`, `--branch-mode`, `--allow-uncommitted-changes`, `--track-state`, `--check-commands`, `--push`, `--commit-message-prefix`, `--retries-per-round`, `--candidates-per-round`, `--max-blocked-in-a-row`, `--allow-path`, `--deny-path`, `--report-lang`, `--force`.
-- `read`, `check`, `diagnose` — inspect state, stop conditions, and repository/git health. `check --brief` returns only `continue`/`stop_reason`/`warnings` (saves tokens in the loop).
+- `init` — create config + state (+ optional feature branch). Flags cover every config field: `--goal`, `--goals-from-prompt`, `--max-rounds`, `--max-minutes`, `--deadline`, `--max-tokens`, `--max-round-scope`, `--branch-mode`, `--allow-uncommitted-changes`, `--track-state`, `--check-commands`, `--push`, `--commit-message-prefix`, `--retries-per-round`, `--candidates-per-round`, `--commit-every-rounds`, `--verify-every-rounds`, `--scan-secrets`/`--no-scan-secrets`, `--secret-pattern`, `--type-saturation-threshold`, `--max-blocked-in-a-row`, `--allow-path`, `--deny-path`, `--report-lang`, `--force`.
+- `read`, `check`, `diagnose` — inspect state, stop conditions, and repository/git health. `check --brief` returns only `continue`/`stop_reason`/`warnings`/`next_verify_round`/`next_commit_round` (saves tokens in the loop).
 - `detect-agent` — detect the runtime agent (opencode / claude-code / codex / generic) and print adaptation context. Honors a `SKILL_DIR` environment variable for the reported skill directory.
-- `begin-round`, `complete-round`, `block-round`, `cancel-round` — round lifecycle. `begin-round` enforces the clean-tree rule and refuses to reuse round numbers; `--candidate-id` is repeatable so one round can pick multiple backlog candidates (`candidates_per_round`). `complete-round` auto-writes a Chinese phase report (`.autopilot/phase-report-round-<N>.md`) every 10 completed rounds.
-- `commit` — staged-change check, git identity check, path whitelist check (`allow_paths`/`deny_paths`), scope guard (including binary files), open-round requirement, and prefix message building.
+- `begin-round`, `complete-round`, `block-round`, `cancel-round` — round lifecycle. `begin-round` enforces the clean-tree rule, refuses to pick candidates with unresolved `depends_on`, and refuses to reuse round numbers; `--candidate-id` is repeatable so one round can pick multiple backlog candidates (`candidates_per_round`). `complete-round` accepts an optional `--commit-sha` (omit it on deferred commit rounds when `commit_every_rounds > 1`), auto-writes a Chinese phase report (`.autopilot/phase-report-round-<N>.md`) every 10 completed rounds, and refreshes `state.type_stats`.
+- `commit` — staged-change check, git identity check, path whitelist check (`allow_paths`/`deny_paths`), secret scan (`scan_secrets`, bypassable with `--allow-secrets`), scope guard (including binary files), open-round requirement (skipped in batched mode), and prefix message building.
 - `undo-round` — `git revert` a bad commit (never rewriting history), record a `revert` history entry, and advance the round counter.
-- `goal-met`, `finish` — goals and run closure. `finish` auto-cancels any still-open round and returns to the origin branch in feature mode.
+- `goal-met`, `finish` — goals and run closure. `finish` auto-cancels any still-open round, writes `.autopilot/retrospective.md`, and returns to the origin branch in feature mode.
 - `report` — print (or write with `--output`) a deterministic markdown run report; `--lang zh|en` overrides `report_lang`.
-- `detect-verify` — scan repo entry points and recommend `check_commands`; `--apply` writes them into the config.
-- `backlog-add`, `backlog-update`, `backlog-remove`, `backlog-list`, `backlog-rank`, `backlog-pick` — backlog management
+- `retrospective` — print (or write with `--output`) the run-level retrospective: per-type stats, blocked rounds, verification commands, and the next ready candidate.
+- `detect-verify` — scan repo entry points and recommend `check_commands` (including `gitleaks`/`detect-secrets` when installed); `--apply` writes them into the config.
+- `analysis-save` / `analysis-load` — persist and read the repository-analysis cache in `.autopilot/analysis.json`; the cache auto-invalidates when HEAD or `.autopilot/config.json` changes.
+- `secret-scan` — scan the staged diff for secret-like content and report findings (exit non-zero on a match).
+- `backlog-add`, `backlog-update`, `backlog-remove`, `backlog-list`, `backlog-rank`, `backlog-pick` — backlog management (candidates now carry `type`, `risk`, and `depends_on`; ranking is the adjusted value/effort score).
 - `ensure-branch` — create or check out the autopilot feature branch
 - `push` — push the current branch to its remote using an explicit non-force refspec; refuses to run when `push: false`
 
@@ -220,7 +253,7 @@ Output includes `agent`, `detected_by`, `shell`/`command_style` (`powershell` or
 
 ## JSON Output
 
-State-changing commands accept `--json` and emit a single machine-readable result object `{ "ok": true, "message": "...", ... }` on stdout instead of human text. This now includes `init`, `commit`, `ensure-branch`, and `finish` (informational lines are routed to stderr in JSON mode). Error cases emit `"ok": false` and exit with a non-zero code, so automation can branch on the code and the payload.
+State-changing commands accept `--json` and emit a single machine-readable result object `{ "ok": true, "message": "...", ... }` on stdout instead of human text. This now includes `init`, `commit`, `ensure-branch`, `finish`, `retrospective`, `analysis-save`, and `secret-scan` (informational lines are routed to stderr in JSON mode). Error cases emit `"ok": false` and exit with a non-zero code, so automation can branch on the code and the payload. `check`/`analysis-load`/`backlog-rank` always emit JSON.
 
 ## Audit Log
 

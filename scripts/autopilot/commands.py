@@ -4,11 +4,22 @@ import fnmatch
 import json
 import os
 import re
+import shutil
 import sys
 import uuid
 from pathlib import Path
 
 from . import config, io, state
+
+SECRET_PATTERNS = [
+    r"AKIA[0-9A-Z]{16}",
+    r"-----BEGIN (?:RSA|EC|OPENSSH|PGP|DSA|PRIVATE) PRIVATE KEY-----",
+    r"ghp_[A-Za-z0-9]{36}",
+    r"xox[baprs]-[A-Za-z0-9-]{10,}",
+    r"AIza[0-9A-Za-z_-]{35}",
+    r"sk-[A-Za-z0-9]{20,}",
+    r"(?i)api[_-]?key\s*[:=]\s*[\"']?[A-Za-z0-9+/]{20,}[\"']?",
+]
 
 
 def emit_result(args, ok, message, data=None):
@@ -90,6 +101,25 @@ def cmd_init(args):
             cfg["candidates_per_round"] = args.candidates_per_round
         if args.max_blocked_in_a_row is not None:
             cfg["max_blocked_in_a_row"] = args.max_blocked_in_a_row
+        if args.commit_every_rounds is not None:
+            if args.commit_every_rounds < 1:
+                io.append_log(repo, "init", "error", reason="commit_every_rounds out of range")
+                return emit_result(args, False, "[ERROR] --commit-every-rounds must be a positive integer.")
+            cfg["commit_every_rounds"] = args.commit_every_rounds
+        if args.verify_every_rounds is not None:
+            if args.verify_every_rounds < 1:
+                io.append_log(repo, "init", "error", reason="verify_every_rounds out of range")
+                return emit_result(args, False, "[ERROR] --verify-every-rounds must be a positive integer.")
+            cfg["verify_every_rounds"] = args.verify_every_rounds
+        if args.scan_secrets is not None:
+            cfg["scan_secrets"] = args.scan_secrets
+        if args.secret_pattern:
+            cfg["secret_patterns"] = list(args.secret_pattern)
+        if args.type_saturation_threshold is not None:
+            if args.type_saturation_threshold < 0:
+                io.append_log(repo, "init", "error", reason="type_saturation_threshold out of range")
+                return emit_result(args, False, "[ERROR] --type-saturation-threshold must be a non-negative integer.")
+            cfg["type_saturation_threshold"] = args.type_saturation_threshold
         if args.allow_path:
             cfg["allow_paths"] = list(args.allow_path)
         if args.deny_path:
@@ -133,6 +163,7 @@ def cmd_init(args):
             "cancelled_rounds": 0,
             "reverted_rounds": 0,
             "estimated_tokens_used": 0,
+            "type_stats": {},
             "goals": cfg["goals"],
             "completed_goals": [],
             "current_round": None,
@@ -188,6 +219,15 @@ def cmd_begin_round(args):
                 if candidate is None:
                     io.append_log(repo, "begin-round", "error", reason="candidate not found")
                     return emit_result(args, False, "[ERROR] Candidate not found in backlog: {}".format(cid))
+                missing, ready = state.candidate_deps_status(backlog, candidate)
+                if not ready:
+                    io.append_log(repo, "begin-round", "error", reason="candidate deps unresolved", deps=missing)
+                    return emit_result(
+                        args, False,
+                        "[ERROR] Candidate {} depends on unfinished work and cannot be picked: {}".format(
+                            cid, "; ".join(missing)
+                        ),
+                    )
                 state.update_candidate_status(repo, cid, "picked", round_number)
 
         dirty = io.working_tree_dirty(repo)
@@ -229,6 +269,7 @@ def cmd_begin_round(args):
             "candidate_id": candidate_ids[0] if candidate_ids else None,
             "candidate_ids": candidate_ids,
             "start_sha": start_sha,
+            "worktree_baseline": io.worktree_change_lines(repo),
             "start_clean": not dirty,
             "started_at": io.now_iso(),
         }
@@ -243,10 +284,29 @@ def cmd_begin_round(args):
         return 0
 
 
-def _resolve_tokens(args, repo, start_sha):
-    if args.tokens is None:
-        return io.estimate_tokens_for_round(repo, start_sha)
-    return args.tokens
+def _resolve_tokens(args, repo, start_sha, worktree_baseline=None):
+    """Estimate round tokens. Committed diff since the round's start SHA plus the
+    working-tree/index delta measured against the snapshot taken at begin-round, so
+    deferred (batched) commits never double count earlier rounds' uncommitted lines."""
+    if args.tokens is not None:
+        return args.tokens
+    text = 0
+    binary = 0
+    base = start_sha or io.EMPTY_TREE
+    if io.has_commits(repo):
+        result = io.run_git(repo, "diff", "--numstat", base, "HEAD")
+        if result.returncode == 0:
+            t, b = io._parse_numstat(result.stdout)
+            text += t
+            binary += b
+    if worktree_baseline is not None:
+        delta = max(0, io.worktree_change_lines(repo) - worktree_baseline)
+        text += delta
+    return 500 + text * 12 + binary * 100
+
+
+def _refresh_type_stats(repo, st):
+    st["type_stats"] = state.compute_type_stats(state.load_backlog(repo))
 
 
 def cmd_complete_round(args):
@@ -267,7 +327,7 @@ def cmd_complete_round(args):
                     "[ERROR] --commit-sha does not resolve to a commit: {}".format(args.commit_sha),
                 )
 
-        tokens = _resolve_tokens(args, repo, current.get("start_sha"))
+        tokens = _resolve_tokens(args, repo, current.get("start_sha"), current.get("worktree_baseline"))
         if getattr(args, "dry_run", False):
             print(
                 "[DRY-RUN] Would record round {} as completed with {} estimated tokens.".format(
@@ -293,9 +353,10 @@ def cmd_complete_round(args):
             }
         )
         st["current_round"] = None
-        state.save_state(repo, st)
         for cid in state.round_candidate_ids(current):
             state.update_candidate_status(repo, cid, "completed", current["round"])
+        _refresh_type_stats(repo, st)
+        state.save_state(repo, st)
         io.append_log(
             repo, "complete-round", "success",
             round=current["round"], commit_sha=args.commit_sha, estimated_tokens=tokens,
@@ -306,7 +367,7 @@ def cmd_complete_round(args):
             state.write_phase_report(repo, st, cfg)
 
         push_warning = None
-        if cfg.get("push"):
+        if cfg.get("push") and args.commit_sha:
             output, err = io.git_push(repo)
             if err:
                 io.append_log(repo, "push", "error", error=err)
@@ -329,7 +390,7 @@ def cmd_block_round(args):
             io.append_log(repo, "block-round", "error", reason="no open round")
             return emit_result(args, False, "[ERROR] No open round to block.")
 
-        tokens = _resolve_tokens(args, repo, current.get("start_sha"))
+        tokens = _resolve_tokens(args, repo, current.get("start_sha"), current.get("worktree_baseline"))
         if getattr(args, "dry_run", False):
             print(
                 "[DRY-RUN] Would mark round {} as blocked: {}.".format(current["round"], args.reason),
@@ -350,9 +411,10 @@ def cmd_block_round(args):
             }
         )
         st["current_round"] = None
-        state.save_state(repo, st)
         for cid in state.round_candidate_ids(current):
             state.update_candidate_status(repo, cid, "blocked", current["round"])
+        _refresh_type_stats(repo, st)
+        state.save_state(repo, st)
         io.append_log(repo, "block-round", "success", round=current["round"], reason=args.reason)
         return emit_result(args, True, "[OK] Round blocked.")
 
@@ -366,7 +428,7 @@ def cmd_cancel_round(args):
             io.append_log(repo, "cancel-round", "error", reason="no open round")
             return emit_result(args, False, "[ERROR] No open round to cancel.")
 
-        tokens = _resolve_tokens(args, repo, current.get("start_sha"))
+        tokens = _resolve_tokens(args, repo, current.get("start_sha"), current.get("worktree_baseline"))
         if getattr(args, "dry_run", False):
             print(
                 "[DRY-RUN] Would cancel round {}: {}.".format(current["round"], args.reason or ""),
@@ -387,9 +449,10 @@ def cmd_cancel_round(args):
             }
         )
         st["current_round"] = None
-        state.save_state(repo, st)
         for cid in state.round_candidate_ids(current):
             state.update_candidate_status(repo, cid, "pending")
+        _refresh_type_stats(repo, st)
+        state.save_state(repo, st)
         io.append_log(repo, "cancel-round", "success", round=current["round"], reason=args.reason)
         return emit_result(args, True, "[OK] Round cancelled.")
 
@@ -475,8 +538,17 @@ def cmd_finish(args):
                             file=sys.stderr,
                         )
         io.append_log(repo, "finish", "success", reason=args.reason, returned_to=returned_to)
+        retrospective_path = None
+        try:
+            markdown = state.build_retrospective(repo, st, cfg, cfg.get("report_lang", "zh"))
+            path = repo / io.AUTOPILOT_DIR / "retrospective.md"
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_text(markdown, encoding="utf-8")
+            retrospective_path = str(path)
+        except OSError:
+            pass
         message = "[OK] Autopilot run finished."
-        data = {"returned_to": returned_to}
+        data = {"returned_to": returned_to, "retrospective": retrospective_path}
         return emit_result(args, True, message, data=data)
 
 
@@ -493,10 +565,22 @@ def cmd_backlog_add(args):
         if effort < 1 or effort > 5:
             io.append_log(repo, "backlog-add", "error", reason="effort out of range")
             return emit_result(args, False, "[ERROR] --effort must be between 1 and 5.")
+        if args.risk is not None and (args.risk < 1 or args.risk > 5):
+            io.append_log(repo, "backlog-add", "error", reason="risk out of range")
+            return emit_result(args, False, "[ERROR] --risk must be between 1 and 5.")
+        if args.type and args.type not in state.VALID_CANDIDATE_TYPES:
+            io.append_log(repo, "backlog-add", "error", reason="unknown type")
+            return emit_result(
+                args, False,
+                "[ERROR] --type must be one of {}.".format("|".join(state.VALID_CANDIDATE_TYPES)),
+            )
         candidate = {
             "id": candidate_id,
             "title": args.title,
             "reason": args.reason or "",
+            "type": args.type or "feature",
+            "risk": args.risk if args.risk is not None else 1,
+            "depends_on": list(args.depends_on) if args.depends_on else [],
             "impact": args.impact or ("high" if value >= 4 else "medium" if value == 3 else "low"),
             "value": value,
             "effort": effort,
@@ -543,12 +627,34 @@ def cmd_backlog_update(args):
                 return emit_result(args, False, "[ERROR] --effort must be between 1 and 5.")
             candidate["effort"] = args.effort
             changed.append("effort")
+        if args.type is not None:
+            if args.type not in state.VALID_CANDIDATE_TYPES:
+                io.append_log(repo, "backlog-update", "error", reason="unknown type")
+                return emit_result(
+                    args, False,
+                    "[ERROR] --type must be one of {}.".format("|".join(state.VALID_CANDIDATE_TYPES)),
+                )
+            candidate["type"] = args.type
+            changed.append("type")
+        if args.risk is not None:
+            if args.risk < 1 or args.risk > 5:
+                io.append_log(repo, "backlog-update", "error", reason="risk out of range")
+                return emit_result(args, False, "[ERROR] --risk must be between 1 and 5.")
+            candidate["risk"] = args.risk
+            changed.append("risk")
+        if args.depends_on is not None:
+            candidate["depends_on"] = list(args.depends_on)
+            changed.append("depends_on")
         if args.status is not None:
             candidate["status"] = args.status
             changed.append("status")
         if not changed:
             io.append_log(repo, "backlog-update", "error", reason="nothing to update")
-            return emit_result(args, False, "[ERROR] Nothing to update. Pass --title, --reason, --value, --effort, or --status.")
+            return emit_result(
+                args, False,
+                "[ERROR] Nothing to update. Pass --title, --reason, --value, --effort, "
+                "--type, --risk, --depends-on, or --status.",
+            )
         candidate["updated_at"] = io.now_iso()
         state.save_backlog(repo, backlog)
         io.append_log(repo, "backlog-update", "success", candidate_id=args.id, fields=changed)
@@ -583,12 +689,8 @@ def cmd_backlog_rank(args):
     if not config.state_path_for(repo).exists():
         return emit_result(args, False, "[ERROR] Autopilot not initialized. Run init first.")
     backlog = state.load_backlog(repo)
-    ranked = []
-    for candidate in backlog.get("candidates", []):
-        entry = dict(candidate)
-        entry["score"] = round(state._candidate_score(candidate), 3)
-        ranked.append(entry)
-    ranked.sort(key=lambda item: (item.get("status") != "pending", -item.get("score", 0), item.get("id")))
+    cfg = config.load_config(repo)
+    ranked = state.rank_candidates(backlog, cfg)
     print(json.dumps(ranked, indent=2, ensure_ascii=False))
     return 0
 
@@ -694,6 +796,19 @@ def cmd_commit(args):
                     "[ERROR] Staged files violate allow_paths/deny_paths: {}".format(", ".join(blocked)),
                 )
 
+        if cfg.get("scan_secrets", True) and not getattr(args, "allow_secrets", False):
+            findings = scan_staged_diff(repo, cfg.get("secret_patterns"))
+            if findings:
+                io.append_log(repo, "commit", "error", reason="secrets detected", findings=findings)
+                detail = "; ".join(
+                    "{}: {}".format(f.get("file") or "?", f.get("text")) for f in findings[:5]
+                )
+                return emit_result(
+                    args, False,
+                    "[ERROR] Secret-like content detected in the staged diff: {}. "
+                    "Remove it, or commit with --allow-secrets / set scan_secrets: false.".format(detail),
+                )
+
         stat = io.run_git(repo, "diff", "--cached", "--stat")
         if stat.returncode == 0 and not getattr(args, "json", False):
             print(stat.stdout.rstrip())
@@ -715,12 +830,14 @@ def cmd_commit(args):
             round_no = args.round
         elif open_round is not None:
             round_no = open_round.get("round")
-            if not cfg.get("allow_uncommitted_changes") and not open_round.get("start_clean"):
+            batch_mode = (cfg.get("commit_every_rounds") or 1) > 1
+            if not cfg.get("allow_uncommitted_changes") and not batch_mode and not open_round.get("start_clean"):
                 io.append_log(repo, "commit", "error", reason="round started with dirty tree")
                 return emit_result(
                     args, False,
                     "[ERROR] This round began with a dirty working tree and allow_uncommitted_changes "
-                    "is false. Commit only the round's own changes, or set allow_uncommitted_changes: true.",
+                    "is false. Commit only the round's own changes, or set allow_uncommitted_changes: true. "
+                    "When commit_every_rounds > 1, uncommitted changes from earlier batched rounds are expected.",
                 )
         else:
             io.append_log(repo, "commit", "error", reason="no open round")
@@ -752,6 +869,54 @@ def cmd_commit(args):
         return 0
 
 
+def scan_staged_diff(repo, extra_patterns=None):
+    """Scan the added lines of the staged diff for secret-like content. Returns a
+    list of findings (pattern, file, text), deduplicated per pattern+line."""
+    diff = io.run_git(repo, "diff", "--cached")
+    if diff.returncode != 0:
+        return []
+    patterns = list(SECRET_PATTERNS) + [p for p in (extra_patterns or []) if p]
+    findings = []
+    seen = set()
+    current_file = None
+    for line in diff.stdout.splitlines():
+        if line.startswith("+++ b/"):
+            current_file = line[6:]
+            continue
+        if line.startswith("+++"):
+            continue
+        if not line.startswith("+"):
+            continue
+        for pat in patterns:
+            if re.search(pat, line):
+                key = (pat, line[:80])
+                if key in seen:
+                    continue
+                seen.add(key)
+                findings.append(
+                    {"pattern": pat, "file": current_file, "text": line[1:].strip()[:120]}
+                )
+    return findings
+
+
+def cmd_secret_scan(args):
+    repo = Path(args.repo).resolve()
+    if not config.state_path_for(repo).exists():
+        return emit_result(args, False, "[ERROR] Autopilot not initialized. Run init first.")
+    cfg = config.load_config(repo)
+    findings = scan_staged_diff(repo, cfg.get("secret_patterns"))
+    payload = {"findings": findings, "clean": not findings}
+    if getattr(args, "json", False):
+        print(json.dumps(payload, indent=2, ensure_ascii=False))
+        return 0 if not findings else 2
+    if findings:
+        for f in findings:
+            print("{}: {} (matched {})".format(f.get("file"), f.get("text"), f.get("pattern")))
+        return 2
+    print("[OK] No secret-like content found in the staged diff.")
+    return 0
+
+
 def _staged_numstat_lines(repo):
     result = io.run_git(repo, "diff", "--cached", "--numstat")
     if result.returncode != 0:
@@ -772,6 +937,67 @@ def cmd_report(args):
         output.write_text(markdown, encoding="utf-8")
         return emit_result(args, True, "[OK] Report written to {}".format(output), data={"path": str(output)})
     print(markdown)
+    return 0
+
+
+def cmd_retrospective(args):
+    repo = Path(args.repo).resolve()
+    if not config.state_path_for(repo).exists():
+        return emit_result(args, False, "[ERROR] Autopilot not initialized. Run init first.")
+    st = state.load_state(repo)
+    cfg = config.load_config(repo)
+    lang = args.lang or cfg.get("report_lang", "zh")
+    markdown = state.build_retrospective(repo, st, cfg, lang)
+    if args.output:
+        output = Path(args.output)
+        output.parent.mkdir(parents=True, exist_ok=True)
+        output.write_text(markdown, encoding="utf-8")
+        return emit_result(args, True, "[OK] Retrospective written to {}".format(output), data={"path": str(output)})
+    print(markdown)
+    return 0
+
+
+def cmd_analysis_save(args):
+    repo = Path(args.repo).resolve()
+    with io.run_lock(repo):
+        if not config.state_path_for(repo).exists():
+            return emit_result(args, False, "[ERROR] Autopilot not initialized. Run init first.")
+        if not args.content:
+            return emit_result(args, False, "[ERROR] --content is required.")
+        try:
+            content = json.loads(args.content)
+        except ValueError:
+            return emit_result(args, False, "[ERROR] --content must be a JSON value.")
+        git_head = None
+        if io.has_commits(repo):
+            git_head = io.run_git(repo, "rev-parse", "HEAD").stdout.strip()
+        data = {
+            "saved_at": io.now_iso(),
+            "git_head": git_head,
+            "config_mtime": state.config_mtime(repo),
+            "analysis": content,
+        }
+        state.save_analysis(repo, data)
+        io.append_log(repo, "analysis-save", "success", name=args.name)
+        return emit_result(
+            args, True, "[OK] Analysis cached.",
+            data={"git_head": git_head, "valid_until": "next HEAD or config change"},
+        )
+
+
+def cmd_analysis_load(args):
+    repo = Path(args.repo).resolve()
+    if not config.state_path_for(repo).exists():
+        return emit_result(args, False, "[ERROR] Autopilot not initialized. Run init first.")
+    validity, reason = state.analysis_validity(repo)
+    data = state.load_analysis(repo)
+    payload = {
+        "valid": validity == "fresh",
+        "status": validity,
+        "reason": reason,
+        "analysis": (data or {}).get("analysis") if isinstance(data, dict) else None,
+    }
+    print(json.dumps(payload, indent=2, ensure_ascii=False))
     return 0
 
 
@@ -859,6 +1085,10 @@ def detect_verify_commands(repo):
                 signals.append(("make", "make test"))
         except OSError:
             pass
+    if shutil.which("gitleaks"):
+        signals.append(("secrets", "gitleaks git --no-banner ."))
+    if shutil.which("detect-secrets"):
+        signals.append(("secrets", "detect-secrets scan"))
     return signals
 
 
@@ -943,6 +1173,17 @@ def cmd_check(args):
         "stop_reason": stop_reason,
         "warnings": warnings,
     }
+    completed_total = (
+        st.get("completed_rounds", 0)
+        + st.get("blocked_rounds", 0)
+        + st.get("cancelled_rounds", 0)
+        + st.get("reverted_rounds", 0)
+    )
+    current_number = completed_total + (1 if st.get("current_round") else 0)
+    verify_every = cfg.get("verify_every_rounds") or 1
+    commit_every = cfg.get("commit_every_rounds") or 1
+    payload["next_verify_round"] = ((current_number // verify_every) + 1) * verify_every
+    payload["next_commit_round"] = ((current_number // commit_every) + 1) * commit_every
     if not getattr(args, "brief", False):
         payload["state"] = st
         payload["config"] = cfg

@@ -88,7 +88,10 @@ class InitTests(RepoTest):
         self.assertEqual(config["max_rounds"], 10)
         self.assertFalse(config["track_state"])
         self.assertEqual(config["check_commands"], [])
-        self.assertEqual(config["candidates_per_round"], 1)
+        self.assertEqual(config["candidates_per_round"], 3)
+        self.assertEqual(config["commit_every_rounds"], 5)
+        self.assertEqual(config["verify_every_rounds"], 3)
+        self.assertTrue(config["scan_secrets"])
 
     def test_init_adds_exclude(self):
         self.run_state("init")
@@ -144,7 +147,7 @@ class UnbornBranchTests(AutopilotTestBase):
         result = self.run_state("init")
         self.assertEqual(result.returncode, 0, result.stderr)
         state = self.read_json("state.json")
-        self.assertEqual(state["schema"], 4)
+        self.assertEqual(state["schema"], 5)
 
     def test_diagnose_reports_unborn(self):
         result = self.run_state("diagnose")
@@ -365,7 +368,7 @@ class RoundFlowTests(RepoTest):
         state_path.write_text(json.dumps(old), encoding="utf-8")
         result = self.run_state("read")
         data = json.loads(result.stdout)
-        self.assertEqual(data["schema"], 4)
+        self.assertEqual(data["schema"], 5)
         self.assertIn("origin_branch", data)
 
 
@@ -512,7 +515,7 @@ class MigrationTests(RepoTest):
         self.run_state("init")
         state_path = self.repo / ".autopilot" / "state.json"
         state = json.loads(state_path.read_text(encoding="utf-8"))
-        self.assertEqual(state["schema"], 4)
+        self.assertEqual(state["schema"], 5)
         state.pop("estimated_tokens_used", None)
         state_path.write_text(json.dumps(state), encoding="utf-8")
         self.run_state("read")
@@ -826,6 +829,68 @@ class ImportUnitTests(unittest.TestCase):
         self.assertTrue(ap._is_autopilot_path(".autopilot\\state.json"))
         self.assertFalse(ap._is_autopilot_path(".autopilothack"))
         self.assertFalse(ap._is_autopilot_path("src/main.py"))
+
+    def test_candidate_adjusted_score_risk(self):
+        ap = self.ap
+        low, low_bd = ap.candidate_adjusted_score({"value": 5, "effort": 1, "risk": 1})
+        high, high_bd = ap.candidate_adjusted_score({"value": 5, "effort": 1, "risk": 5})
+        self.assertGreater(low, high)
+        self.assertEqual(low_bd["risk_factor"], 1.0)
+        self.assertAlmostEqual(high_bd["risk_factor"], 0.68, places=2)
+
+    def test_candidate_adjusted_score_saturation(self):
+        ap = self.ap
+        score, breakdown = ap.candidate_adjusted_score(
+            {"value": 5, "effort": 1, "type": "docs"},
+            {"docs": {"completed": 3, "blocked": 0}},
+            2,
+        )
+        self.assertAlmostEqual(score, 5.0 * 0.85, places=3)
+        self.assertAlmostEqual(breakdown["saturation_factor"], 0.85, places=3)
+
+    def test_candidate_adjusted_score_blocked_history(self):
+        ap = self.ap
+        score, _ = ap.candidate_adjusted_score(
+            {"value": 5, "effort": 1, "type": "perf"},
+            {"perf": {"completed": 1, "blocked": 2}},
+            2,
+        )
+        self.assertAlmostEqual(score, 5.0 * 0.9 * 0.9, places=3)
+
+    def test_compute_type_stats(self):
+        ap = self.ap
+        backlog = {
+            "candidates": [
+                {"type": "docs", "status": "completed", "effort": 2, "value": 4},
+                {"type": "docs", "status": "completed", "effort": 3, "value": 5},
+                {"type": "docs", "status": "blocked", "effort": 1, "value": 2},
+                {"type": "refactor", "status": "pending", "effort": 3, "value": 5},
+            ]
+        }
+        stats = ap.compute_type_stats(backlog)
+        self.assertEqual(stats["docs"]["completed"], 2)
+        self.assertEqual(stats["docs"]["blocked"], 1)
+        self.assertAlmostEqual(stats["docs"]["blocked_rate"], 1 / 3, places=3)
+        self.assertEqual(stats["docs"]["avg_effort"], 2.5)
+        self.assertEqual(stats["refactor"]["completed"], 0)
+
+    def test_candidate_deps_status(self):
+        ap = self.ap
+        backlog = {
+            "candidates": [
+                {"id": "candidate-001", "status": "completed"},
+                {"id": "candidate-002", "status": "pending"},
+            ]
+        }
+        missing, ready = ap.candidate_deps_status(backlog, {"depends_on": ["candidate-001"]})
+        self.assertTrue(ready)
+        self.assertEqual(missing, [])
+        missing, ready = ap.candidate_deps_status(backlog, {"depends_on": ["candidate-002"]})
+        self.assertFalse(ready)
+        self.assertIn("candidate-002", missing[0])
+        missing, ready = ap.candidate_deps_status(backlog, {"depends_on": ["candidate-999"]})
+        self.assertFalse(ready)
+        self.assertIn("missing", missing[0])
 
 
 class OptimizationTests(RepoTest):
@@ -1215,6 +1280,293 @@ class FeatureTests(RepoTest):
             self._complete_round()
         phase = list((self.repo / ".autopilot").glob("phase-report-round-*.md"))
         self.assertEqual(phase, [])
+
+
+class BacklogScoreTests(RepoTest):
+    def test_backlog_add_type_risk_deps_stored(self):
+        self.run_state("init")
+        self.run_state("backlog-add", "--title", "A", "--reason", "r", "--value", "4",
+                       "--effort", "2", "--type", "refactor", "--risk", "3",
+                       "--depends-on", "candidate-001")
+        c = self.read_json("backlog.json")["candidates"][0]
+        self.assertEqual(c["type"], "refactor")
+        self.assertEqual(c["risk"], 3)
+        self.assertEqual(c["depends_on"], ["candidate-001"])
+
+    def test_backlog_add_invalid_type_refused(self):
+        self.run_state("init")
+        result = self.run_state("backlog-add", "--title", "A", "--reason", "r", "--type", "nope")
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("--type", result.stderr)
+
+    def test_backlog_add_invalid_risk_refused(self):
+        self.run_state("init")
+        result = self.run_state("backlog-add", "--title", "A", "--reason", "r", "--risk", "9")
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("--risk", result.stderr)
+
+    def test_backlog_rank_respects_deps(self):
+        self.run_state("init")
+        self.run_state("backlog-add", "--title", "Prereq", "--reason", "r", "--value", "5", "--effort", "1")
+        self.run_state("backlog-add", "--title", "Dep", "--reason", "r", "--value", "5", "--effort", "1",
+                       "--depends-on", "candidate-001")
+        result = self.run_state("backlog-rank")
+        ranked = json.loads(result.stdout)
+        self.assertEqual(ranked[0]["title"], "Prereq")
+        self.assertTrue(ranked[0]["ready"])
+        self.assertFalse(ranked[1]["ready"])
+        self.assertIn("candidate-001", ranked[1]["blocked_by"][0])
+
+    def test_begin_round_refuses_unresolved_deps(self):
+        self.run_state("init")
+        self.run_state("backlog-add", "--title", "Dep", "--reason", "r", "--value", "5", "--effort", "1",
+                       "--depends-on", "candidate-999")
+        cid = self.read_json("backlog.json")["candidates"][0]["id"]
+        result = self.run_state("begin-round", "--title", "t", "--reason", "x", "--candidate-id", cid)
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("depends", result.stderr.lower())
+        self.assertIsNone(self.read_json("state.json")["current_round"])
+
+    def test_begin_round_allows_resolved_deps(self):
+        self.run_state("init")
+        self.run_state("backlog-add", "--title", "Prereq", "--reason", "r", "--value", "5", "--effort", "1")
+        prereq = self.read_json("backlog.json")["candidates"][0]["id"]
+        self.run_state("backlog-add", "--title", "Dep", "--reason", "r", "--value", "5", "--effort", "1",
+                       "--depends-on", prereq)
+        dep = self.read_json("backlog.json")["candidates"][1]["id"]
+        self.run_state("begin-round", "--title", "p", "--reason", "x", "--candidate-id", prereq)
+        self.add_file("prereq.py", "a = 1\n")
+        self.run_state("commit", "--summary", "prereq")
+        sha = self.git("rev-parse", "HEAD").stdout.strip()
+        self.run_state("complete-round", "--summary", "p", "--commit-sha", sha)
+        result = self.run_state("begin-round", "--title", "d", "--reason", "x", "--candidate-id", dep)
+        self.assertEqual(result.returncode, 0, result.stderr)
+
+    def test_backlog_rank_type_saturation(self):
+        self.run_state("init")
+        config_path = self.repo / ".autopilot" / "config.json"
+        config = json.loads(config_path.read_text(encoding="utf-8"))
+        config["type_saturation_threshold"] = 0
+        config_path.write_text(json.dumps(config), encoding="utf-8")
+        self.run_state("backlog-add", "--title", "DocA", "--reason", "r", "--value", "5", "--effort", "1", "--type", "docs")
+        self.run_state("backlog-add", "--title", "DocB", "--reason", "r", "--value", "4", "--effort", "1", "--type", "docs")
+        ids = [c["id"] for c in self.read_json("backlog.json")["candidates"]]
+        for cid in ids:
+            self.run_state("begin-round", "--title", "d", "--reason", "x", "--candidate-id", cid)
+            self.add_file("f.py", "x = 1\n")
+            sha = self.git("rev-parse", "HEAD").stdout.strip()
+            self.run_state("commit", "--summary", "doc")
+            self.run_state("complete-round", "--summary", "d", "--commit-sha", sha)
+        self.run_state("backlog-add", "--title", "DocC", "--reason", "r", "--value", "5", "--effort", "1", "--type", "docs")
+        self.run_state("backlog-add", "--title", "Feat", "--reason", "r", "--value", "5", "--effort", "1", "--type", "feature")
+        result = self.run_state("backlog-rank")
+        ranked = [r for r in json.loads(result.stdout) if r["status"] == "pending"]
+        titles = [r["title"] for r in ranked]
+        self.assertEqual(titles, ["Feat", "DocC"])
+        self.assertGreater(ranked[0]["score"], ranked[1]["score"])
+
+
+class SecretScanTests(RepoTest):
+    def test_commit_refuses_secret(self):
+        self.run_state("init")
+        self.run_state("begin-round", "--title", "r", "--reason", "x")
+        self.add_file("creds.py", 'KEY = "AKIAIOSFODNN7EXAMPLE"\n')
+        result = self.run_state("commit", "--summary", "oops")
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("secret", result.stderr.lower())
+
+    def test_commit_allow_secrets_bypass(self):
+        self.run_state("init")
+        self.run_state("begin-round", "--title", "r", "--reason", "x")
+        self.add_file("creds.py", 'KEY = "AKIAIOSFODNN7EXAMPLE"\n')
+        result = self.run_state("commit", "--summary", "force", "--allow-secrets")
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+
+    def test_commit_scan_secrets_disabled(self):
+        self.run_state("init")
+        config_path = self.repo / ".autopilot" / "config.json"
+        config = json.loads(config_path.read_text(encoding="utf-8"))
+        config["scan_secrets"] = False
+        config_path.write_text(json.dumps(config), encoding="utf-8")
+        self.run_state("begin-round", "--title", "r", "--reason", "x")
+        self.add_file("creds.py", 'KEY = "AKIAIOSFODNN7EXAMPLE"\n')
+        result = self.run_state("commit", "--summary", "ok")
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+
+    def test_commit_refuses_custom_pattern(self):
+        self.run_state("init")
+        config_path = self.repo / ".autopilot" / "config.json"
+        config = json.loads(config_path.read_text(encoding="utf-8"))
+        config["secret_patterns"] = [r"MYTOKEN[0-9]{6}"]
+        config_path.write_text(json.dumps(config), encoding="utf-8")
+        self.run_state("begin-round", "--title", "r", "--reason", "x")
+        self.add_file("t.py", "t = 'MYTOKEN123456'\n")
+        result = self.run_state("commit", "--summary", "oops")
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("secret", result.stderr.lower())
+
+    def test_secret_scan_command(self):
+        self.run_state("init")
+        self.run_state("begin-round", "--title", "r", "--reason", "x")
+        self.add_file("creds.py", 'KEY = "AKIAIOSFODNN7EXAMPLE"\n')
+        result = self.run_state("secret-scan", "--json")
+        self.assertNotEqual(result.returncode, 0)
+        data = json.loads(result.stdout)
+        self.assertFalse(data["clean"])
+        self.assertTrue(data["findings"])
+
+
+class AnalysisCacheTests(RepoTest):
+    def test_analysis_missing(self):
+        self.run_state("init")
+        result = self.run_state("analysis-load")
+        data = json.loads(result.stdout)
+        self.assertFalse(data["valid"])
+        self.assertEqual(data["status"], "missing")
+
+    def test_analysis_save_load_fresh(self):
+        self.run_state("init")
+        result = self.run_state("analysis-save", "--content", '{"tree": ["src/"], "lang": "py"}')
+        self.assertEqual(result.returncode, 0, result.stderr)
+        result = self.run_state("analysis-load")
+        data = json.loads(result.stdout)
+        self.assertTrue(data["valid"])
+        self.assertEqual(data["status"], "fresh")
+        self.assertEqual(data["analysis"]["tree"], ["src/"])
+
+    def test_analysis_invalid_content_refused(self):
+        self.run_state("init")
+        result = self.run_state("analysis-save", "--content", "not-json")
+        self.assertNotEqual(result.returncode, 0)
+
+    def test_analysis_stale_after_commit(self):
+        self.run_state("init")
+        self.run_state("analysis-save", "--content", "{}")
+        self.add_file("new.py")
+        self.git("commit", "-q", "-m", "new")
+        result = self.run_state("analysis-load")
+        data = json.loads(result.stdout)
+        self.assertFalse(data["valid"])
+        self.assertEqual(data["status"], "stale")
+
+    def test_analysis_stale_after_config_change(self):
+        self.run_state("init")
+        self.run_state("analysis-save", "--content", "{}")
+        config_path = self.repo / ".autopilot" / "config.json"
+        config = json.loads(config_path.read_text(encoding="utf-8"))
+        config["max_rounds"] = 3
+        config_path.write_text(json.dumps(config), encoding="utf-8")
+        result = self.run_state("analysis-load")
+        data = json.loads(result.stdout)
+        self.assertFalse(data["valid"])
+        self.assertIn("config", data["reason"])
+
+
+class BatchCommitTests(RepoTest):
+    def test_complete_round_without_sha(self):
+        self.run_state("init")
+        self.run_state("begin-round", "--title", "r", "--reason", "x")
+        self.add_file("a.py", "a = 1\n")
+        result = self.run_state("complete-round", "--summary", "no commit yet")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        state = self.read_json("state.json")
+        self.assertEqual(state["completed_rounds"], 1)
+        self.assertIsNone(state["history"][-1]["commit_sha"])
+
+    def test_token_no_double_count_batch(self):
+        self.run_state("init")
+        self.run_state("begin-round", "--title", "r1", "--reason", "x")
+        self.add_file("a.py", "1\n2\n")
+        self.run_state("complete-round", "--summary", "a")
+        after_r1 = self.read_json("state.json")["estimated_tokens_used"]
+
+        self.run_state("begin-round", "--title", "r2", "--reason", "x")
+        self.add_file("b.py", "3\n4\n5\n")
+        self.run_state("complete-round", "--summary", "b")
+        after_r2 = self.read_json("state.json")["estimated_tokens_used"]
+
+        round2 = after_r2 - after_r1
+        self.assertGreaterEqual(round2, 500)
+        self.assertLess(round2, 550)
+
+    def test_batch_commit_accumulates_changes(self):
+        self.run_state("init")
+        self.run_state("begin-round", "--title", "r1", "--reason", "x")
+        self.add_file("a.py", "a = 1\n")
+        self.run_state("complete-round", "--summary", "a")
+
+        self.run_state("begin-round", "--title", "r2", "--reason", "x")
+        self.add_file("b.py", "b = 2\n")
+        result = self.run_state("commit", "--summary", "batched")
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        sha = self.git("rev-parse", "HEAD").stdout.strip()
+        self.run_state("complete-round", "--summary", "b", "--commit-sha", sha)
+
+        files = self.git("show", "--stat", "--name-only", "--pretty=", "HEAD").stdout.strip().splitlines()
+        self.assertIn("a.py", files)
+        self.assertIn("b.py", files)
+
+
+class VerifyScheduleTests(RepoTest):
+    def test_check_reports_schedule(self):
+        self.run_state("init")
+        data = json.loads(self.run_state("check", "--brief").stdout)
+        self.assertEqual(data["next_verify_round"], 3)
+        self.assertEqual(data["next_commit_round"], 5)
+
+    def test_init_batching_flags(self):
+        self.run_state("init", "--commit-every-rounds", "2", "--verify-every-rounds", "1",
+                       "--type-saturation-threshold", "1", "--no-scan-secrets")
+        config = self.read_json("config.json")
+        self.assertEqual(config["commit_every_rounds"], 2)
+        self.assertEqual(config["verify_every_rounds"], 1)
+        self.assertEqual(config["type_saturation_threshold"], 1)
+        self.assertFalse(config["scan_secrets"])
+
+
+class RetrospectiveTests(RepoTest):
+    def test_retrospective_command(self):
+        self.run_state("init")
+        self.run_state("backlog-add", "--title", "A", "--reason", "r", "--value", "4",
+                       "--effort", "2", "--type", "feature")
+        cid = self.read_json("backlog.json")["candidates"][0]["id"]
+        self.run_state("begin-round", "--title", "A", "--reason", "r", "--candidate-id", cid)
+        self.add_file()
+        sha = self.git("rev-parse", "HEAD").stdout.strip()
+        self.run_state("commit", "--summary", "add feature")
+        self.run_state("complete-round", "--summary", "done", "--commit-sha", sha)
+        state = self.read_json("state.json")
+        self.assertEqual(state["type_stats"]["feature"]["completed"], 1)
+        result = self.run_state("retrospective", "--lang", "zh")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("复盘", result.stdout)
+        self.assertIn("| feature | 1 | 0 |", result.stdout)
+
+    def test_type_stats_refreshed_after_complete(self):
+        self.run_state("init")
+        self.run_state("backlog-add", "--title", "A", "--reason", "r", "--value", "4",
+                       "--effort", "2", "--type", "docs")
+        cid = self.read_json("backlog.json")["candidates"][0]["id"]
+        self.run_state("begin-round", "--title", "A", "--reason", "r", "--candidate-id", cid)
+        self.add_file()
+        sha = self.git("rev-parse", "HEAD").stdout.strip()
+        self.run_state("commit", "--summary", "add feature")
+        self.run_state("complete-round", "--summary", "done", "--commit-sha", sha)
+        stats = self.read_json("state.json")["type_stats"]
+        self.assertEqual(stats["docs"]["completed"], 1)
+        self.assertEqual(stats["docs"]["avg_effort"], 2.0)
+
+    def test_finish_writes_retrospective(self):
+        self.run_state("init")
+        self.run_state("begin-round", "--title", "r", "--reason", "x")
+        self.add_file()
+        sha = self.git("rev-parse", "HEAD").stdout.strip()
+        self.run_state("commit", "--summary", "add feature")
+        self.run_state("complete-round", "--summary", "done", "--commit-sha", sha)
+        result = self.run_state("finish", "--reason", "done", "--json")
+        data = json.loads(result.stdout)
+        self.assertTrue(data["ok"])
+        self.assertTrue((self.repo / ".autopilot" / "retrospective.md").exists())
 
 
 if __name__ == "__main__":

@@ -19,12 +19,13 @@ STATE_FILENAME = "state.json"
 BACKLOG_FILENAME = "backlog.json"
 LOCK_FILENAME = "lock"
 LOG_FILENAME = "log.jsonl"
+ANALYSIS_FILENAME = "analysis.json"
 PHASE_REPORT_PREFIX = "phase-report-round-"
 
 EMPTY_TREE = "4b825dc642cb6eb9a060e54bf8d69288fbee4904"
 
 DEFAULT_MAX_ROUNDS = 10
-SCHEMA_VERSION = 4
+SCHEMA_VERSION = 5
 
 
 def now_iso():
@@ -396,6 +397,22 @@ def estimate_tokens_for_round(repo, start_sha):
             text += t
             binary += b
     return 500 + text * 12 + binary * 100
+
+
+def worktree_change_lines(repo):
+    """Total changed units (text lines + binary files) in the working tree and the
+    index combined. Used to measure how much a batched round actually added on top
+    of the snapshot taken at begin-round, so deferred commits do not double count
+    earlier rounds' still-uncommitted lines in token accounting."""
+    text = 0
+    binary = 0
+    for diff_args in (("diff", "--numstat"), ("diff", "--cached", "--numstat")):
+        result = run_git(repo, *diff_args)
+        if result.returncode == 0:
+            t, b = _parse_numstat(result.stdout)
+            text += t
+            binary += b
+    return text + binary
 
 
 def git_push(repo):

@@ -7,12 +7,14 @@ Works with opencode, Claude Code, Codex, and other agent runtimes (auto-detected
 ## Features
 
 - **Self-owned loop**: deterministic state, backlog, branch, and budget management via `scripts/autopilot_state.py`; no host-specific tooling required.
-- **Small scoped commits**: every change is small, verified, and committed; `max_round_scope` enforces a size limit per commit.
-- **Batch support**: by default each round works on 1 backlog candidate; set `candidates_per_round: 3` (or `init --candidates-per-round 3`) to batch multiple independent changes per round while keeping each change a separate commit.
-- **Backlog ranking**: improvement candidates are scored by value-to-effort ratio and worked in order.
+- **Efficiency-first defaults**: one round works on `candidates_per_round` (default 3) candidates, full verification runs every `verify_every_rounds` (default 3) rounds, and commits are flushed once every `commit_every_rounds` (default 5) rounds instead of per candidate — far fewer commits and test runs per improvement.
+- **Smart backlog ranking**: candidates are ranked by an adjusted value/effort score that discounts high `risk`, downweights saturated types (`type_saturation_threshold`), downweights consistently-blocking types, and defers candidates with unfinished `depends_on` prereqs. Ranking adapts to the run's own history (per-type stats in `state.json`).
+- **Repo analysis cache**: `.autopilot/analysis.json` caches repository understanding across rounds and auto-invalidates when HEAD or config changes, so the loop does not re-read the whole repo every round.
+- **Secret guard**: `commit` scans the staged diff for secret-like content (AWS keys, private keys, GitHub/Slack/Google tokens, `sk-*`) and refuses on a match; `secret-scan` checks the staged diff on demand.
 - **Multiple stop conditions**: goals, `max_rounds`, `max_minutes`, `max_tokens`, `max_blocked_in_a_row`, and a `deadline` timer (e.g. "iterate until tomorrow morning") that stops at an absolute wall-clock moment.
 - **Safety rails**: refuses to commit user changes, never rewrites history, defaults to no pushing, optional `allow_paths`/`deny_paths` whitelist.
 - **Resumable**: unfinished runs resume from `.autopilot/state.json` instead of starting over.
+- **Retrospectives**: `finish` writes `.autopilot/retrospective.md` — per-type completion/blocked stats, blocked rounds, and the next likely improvement.
 
 ## Installation
 
@@ -51,16 +53,21 @@ All options live in `.autopilot/config.json` (created by `init`) and can be set 
 
 | Field | Default | Purpose |
 |---|---|---|
-| `candidates_per_round` | `1` | Backlog candidates worked per round; >1 batches changes into one round (each still a separate commit) |
+| `candidates_per_round` | `3` | Backlog candidates worked per round; batches several independent changes into one round |
+| `commit_every_rounds` | `5` | Commit accumulated changes once per this many rounds (fewer, larger commits) |
+| `verify_every_rounds` | `3` | Run full verification once per this many rounds; smoke-check in between |
 | `max_rounds` | `10` | Hard stop after this many completed/blocked rounds |
 | `max_minutes` | `null` | Countdown (倒计时): wall-clock budget since last round activity |
 | `deadline` | `null` | Timer (定时器): absolute stop time; `init --deadline "+8h"` / `"08:00"` / ISO timestamp |
 | `max_tokens` | `null` | Soft token budget |
 | `max_round_scope` | `null` | Max changed lines per commit |
 | `goals` | `[]` | Explicit goals; loop stops when all are met |
-| `check_commands` | `[]` | Exact verification commands to run each round |
+| `check_commands` | `[]` | Exact verification commands to run each verification round |
+| `scan_secrets` | `true` | Refuse commits whose staged diff matches a secret pattern |
+| `secret_patterns` | `[]` | Extra regex patterns for the commit-time secret scan |
+| `type_saturation_threshold` | `2` | Completed same-type candidates before ranking downweights the type |
 | `branch_mode` | `current` | `feature` isolates work on an `autopilot/<run-id>` branch |
-| `push` | `false` | Push after each completed round |
+| `push` | `false` | Push after each completed round with a commit |
 | `allow_paths` / `deny_paths` | `[]` | Commit path whitelist/blacklist (fnmatch globs) |
 | `allow_uncommitted_changes` | `false` | Allow starting from a dirty tree |
 | `report_lang` | `zh` | Language for reports (`zh` or `en`) |

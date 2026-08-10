@@ -25,6 +25,7 @@ def migrate_state(state):
         "cancelled_rounds": 0,
         "reverted_rounds": 0,
         "estimated_tokens_used": 0,
+        "type_stats": {},
         "repo": None,
         "created_at": io.now_iso(),
         "started_at": None,
@@ -273,6 +274,253 @@ def _candidate_score(candidate):
     return float(value) / float(effort)
 
 
+VALID_CANDIDATE_TYPES = ("bugfix", "feature", "refactor", "perf", "test", "docs")
+
+
+def compute_type_stats(backlog):
+    """Per-type completion/block statistics derived from the backlog. Feeds ranking
+    (saturation + blocked penalties) and the retrospective report. Types outside the
+    VALID_CANDIDATE_TYPES list are grouped under their own key."""
+    stats = {}
+    for candidate in backlog.get("candidates", []):
+        candidate_type = candidate.get("type") or "feature"
+        if candidate_type not in VALID_CANDIDATE_TYPES:
+            candidate_type = "other"
+        entry = stats.setdefault(
+            candidate_type,
+            {"completed": 0, "blocked": 0, "total": 0, "effort_sum": 0, "value_sum": 0},
+        )
+        status = candidate.get("status")
+        if status in ("completed", "blocked"):
+            entry["total"] += 1
+            if status == "completed":
+                entry["completed"] += 1
+                try:
+                    entry["effort_sum"] += int(candidate.get("effort") or 0)
+                    entry["value_sum"] += int(candidate.get("value") or 0)
+                except (TypeError, ValueError):
+                    pass
+            else:
+                entry["blocked"] += 1
+    for entry in stats.values():
+        done = entry["completed"] + entry["blocked"]
+        entry["blocked_rate"] = round(entry["blocked"] / done, 3) if done else 0.0
+        entry["avg_effort"] = round(entry["effort_sum"] / entry["completed"], 2) if entry["completed"] else 0.0
+        entry["avg_value"] = round(entry["value_sum"] / entry["completed"], 2) if entry["completed"] else 0.0
+        entry.pop("effort_sum", None)
+        entry.pop("value_sum", None)
+    return stats
+
+
+def candidate_deps_status(backlog, candidate):
+    """Return (missing_deps, ready). A candidate is ready when every candidate in its
+    depends_on list exists in the backlog and is completed."""
+    deps = candidate.get("depends_on") or []
+    if not deps:
+        return [], True
+    missing = []
+    for dep_id in deps:
+        dep = find_candidate(backlog, dep_id)
+        if dep is None:
+            missing.append("{} (missing)".format(dep_id))
+        elif dep.get("status") != "completed":
+            missing.append("{} ({})".format(dep_id, dep.get("status") or "pending"))
+    return missing, len(missing) == 0
+
+
+def candidate_adjusted_score(candidate, type_stats=None, saturation_threshold=2):
+    """Adjusted value/effort score. Risk discounts high-risk work, type saturation
+    downweights repeating an already-worked type, and a type's blocked history
+    discounts candidates in consistently-blocking areas. Returns (score, breakdown)."""
+    base = _candidate_score(candidate)
+    try:
+        risk = int(candidate.get("risk") or 1)
+    except (TypeError, ValueError):
+        risk = 1
+    risk = max(1, min(5, risk))
+    risk_factor = max(0.5, 1.0 - 0.08 * (risk - 1))
+
+    candidate_type = candidate.get("type") or "feature"
+    if candidate_type not in VALID_CANDIDATE_TYPES:
+        candidate_type = "other"
+    entry = (type_stats or {}).get(candidate_type, {})
+    completed_n = entry.get("completed") or 0
+    blocked_n = entry.get("blocked") or 0
+    try:
+        threshold = max(0, int(saturation_threshold or 0))
+    except (TypeError, ValueError):
+        threshold = 2
+    saturation_factor = 0.85 ** max(0, completed_n - threshold)
+    blocked_factor = 0.9 ** blocked_n
+
+    score = base * risk_factor * saturation_factor * blocked_factor
+    return score, {
+        "base": round(base, 3),
+        "risk": risk,
+        "risk_factor": round(risk_factor, 3),
+        "saturation_factor": round(saturation_factor, 3),
+        "blocked_factor": round(blocked_factor, 3),
+    }
+
+
+def rank_candidates(backlog, config):
+    """Rank backlog candidates by adjusted value/effort. Pending, dependency-ready
+    candidates come first (by score desc), then pending-but-blocked candidates (with
+    their blocked_by reasons), then picked/completed/blocked candidates."""
+    type_stats = compute_type_stats(backlog)
+    threshold = (config or {}).get("type_saturation_threshold", 2)
+    entries = []
+    for candidate in backlog.get("candidates", []):
+        entry = dict(candidate)
+        score, breakdown = candidate_adjusted_score(candidate, type_stats, threshold)
+        missing, ready = candidate_deps_status(backlog, candidate)
+        entry["score"] = round(score, 3)
+        entry["score_breakdown"] = breakdown
+        entry["ready"] = ready
+        entry["blocked_by"] = missing
+        entries.append(entry)
+    entries.sort(
+        key=lambda item: (
+            item.get("status") != "pending",
+            not item.get("ready"),
+            -item.get("score", 0.0),
+            item.get("id") or "",
+        )
+    )
+    return entries
+
+
+def analysis_path_for(repo):
+    return repo / io.AUTOPILOT_DIR / io.ANALYSIS_FILENAME
+
+
+def load_analysis(repo):
+    return io.load_json(analysis_path_for(repo), None)
+
+
+def save_analysis(repo, data):
+    io.save_json(analysis_path_for(repo), data)
+
+
+def config_mtime(repo):
+    path = config.config_path_for(repo)
+    try:
+        return int(path.stat().st_mtime_ns)
+    except OSError:
+        return None
+
+
+def analysis_validity(repo):
+    """Check whether the cached .autopilot/analysis.json can be reused. Returns
+    ('missing'|'fresh'|'stale', reason). A cache is stale when the repository HEAD
+    moved since it was saved (the code the analysis described changed) or the
+    autopilot config changed (commands/limits the analysis relied on changed)."""
+    analysis = load_analysis(repo)
+    if analysis is None:
+        return "missing", "no cached analysis"
+    if not isinstance(analysis, dict):
+        return "stale", "cached analysis is corrupt"
+    cached_head = analysis.get("git_head")
+    current_head = None
+    if io.has_commits(repo):
+        current_head = io.run_git(repo, "rev-parse", "HEAD").stdout.strip()
+    if cached_head != current_head:
+        return "stale", "HEAD changed since the analysis was saved"
+    cached_mtime = analysis.get("config_mtime")
+    current_mtime = config_mtime(repo)
+    if cached_mtime != current_mtime:
+        return "stale", "autopilot config changed since the analysis was saved"
+    return "fresh", "cached analysis is up to date"
+
+
+def build_retrospective(repo, state, config, lang="zh"):
+    """Run-level retrospective: per-type success stats, blocked rounds, and the
+    verification setup, in the configured language."""
+    zh = lang == "zh"
+    out = []
+    if zh:
+        out.append("# 迭代复盘（Retrospective）")
+        out.append("")
+        out.append("- 仓库: `{}`".format(state.get("repo")))
+        out.append("- run_id: `{}`".format(state.get("run_id")))
+        out.append("- 完成轮次: {}".format(state.get("completed_rounds", 0)))
+        out.append("- 受阻轮次: {}".format(state.get("blocked_rounds", 0)))
+        out.append("- 回滚轮次: {}".format(state.get("reverted_rounds", 0)))
+        out.append("- 估算 Token: {}".format(state.get("estimated_tokens_used", 0)))
+        out.append("")
+        out.append("## 按类型统计")
+        out.append("")
+    else:
+        out.append("# Run Retrospective")
+        out.append("")
+        out.append("- repo: `{}`".format(state.get("repo")))
+        out.append("- run_id: `{}`".format(state.get("run_id")))
+        out.append("- completed rounds: {}".format(state.get("completed_rounds", 0)))
+        out.append("- blocked rounds: {}".format(state.get("blocked_rounds", 0)))
+        out.append("- reverted rounds: {}".format(state.get("reverted_rounds", 0)))
+        out.append("- estimated tokens: {}".format(state.get("estimated_tokens_used", 0)))
+        out.append("")
+        out.append("## Stats by type")
+        out.append("")
+    stats = state.get("type_stats") or compute_type_stats(load_backlog(repo))
+    if not stats:
+        out.append("- {}: {}".format("无" if zh else "none", "—"))
+    else:
+        if zh:
+            out.append("| 类型 | 完成 | 受阻 | 受阻率 | 平均工作量 | 平均价值 |")
+            out.append("|---|---|---|---|---|---|")
+        else:
+            out.append("| type | completed | blocked | blocked rate | avg effort | avg value |")
+            out.append("|---|---|---|---|---|---|")
+        for candidate_type in sorted(stats):
+            s = stats[candidate_type]
+            out.append("| {} | {} | {} | {} | {} | {} |".format(
+                candidate_type,
+                s.get("completed", 0),
+                s.get("blocked", 0),
+                s.get("blocked_rate", 0.0),
+                s.get("avg_effort", 0.0),
+                s.get("avg_value", 0.0),
+            ))
+    out.append("")
+
+    blocked = [h for h in state.get("history", []) if h.get("status") == "blocked"]
+    out.append("## {}".format("受阻轮次" if zh else "Blocked rounds"))
+    out.append("")
+    if not blocked:
+        out.append("- {}".format("无" if zh else "none"))
+    else:
+        for entry in blocked:
+            out.append("- round {}: {} — {}".format(
+                entry.get("round", "?"), entry.get("title", ""), entry.get("reason", "")
+            ))
+    out.append("")
+
+    checks = config.get("check_commands") or []
+    out.append("## {}".format("验证命令" if zh else "Verification commands"))
+    out.append("")
+    if not checks:
+        out.append("- {}".format("未配置" if zh else "none configured"))
+    else:
+        for command in checks:
+            out.append("- `{}`".format(command))
+    out.append("")
+
+    ranked = rank_candidates(load_backlog(repo), config)
+    ready = [r for r in ranked if r.get("status") == "pending" and r.get("ready")]
+    out.append("## {}".format("下一步建议" if zh else "Next likely improvement"))
+    out.append("")
+    if not ready:
+        out.append("- {}".format("无" if zh else "none"))
+    else:
+        top = ready[0]
+        out.append("- {} `{}` (value={}, effort={}, type={})".format(
+            top.get("id"), top.get("title"), top.get("value"), top.get("effort"), top.get("type") or "feature"
+        ))
+    out.append("")
+    return "\n".join(out)
+
+
 _STATUS_LABELS = {
     "zh": {
         "completed": "已完成", "blocked": "受阻", "cancelled": "已取消",
@@ -362,12 +610,13 @@ def build_report(repo, state, config, lang="en"):
     if not backlog:
         out.append("- {}".format(L["none"]))
     else:
-        out.append("| id | title | value/effort | status |")
-        out.append("|---|---|---|---|")
+        out.append("| id | title | type | value/effort | status |")
+        out.append("|---|---|---|---|---|")
         for c in backlog:
             label = _STATUS_LABELS["zh" if zh else "en"].get(c.get("status", "pending"), c.get("status", "pending"))
-            out.append("| `{}` | {} | {}/{} | {} |".format(
-                c.get("id", ""), c.get("title", ""), c.get("value", ""), c.get("effort", ""), label
+            out.append("| `{}` | {} | {} | {}/{} | {} |".format(
+                c.get("id", ""), c.get("title", ""), c.get("type") or "feature",
+                c.get("value", ""), c.get("effort", ""), label,
             ))
     out.append("")
 
@@ -381,14 +630,15 @@ def build_report(repo, state, config, lang="en"):
             out.append("```")
             out.append("")
 
-    pending = [c for c in backlog if c.get("status") == "pending"]
-    if pending:
-        ranked = sorted(pending, key=_candidate_score, reverse=True)
-        top = ranked[0]
+    ranked = rank_candidates(load_backlog(repo), config)
+    ready = [r for r in ranked if r.get("status") == "pending" and r.get("ready")]
+    if ready:
+        top = ready[0]
         out.append("## {}".format(L["next"]))
         out.append("")
-        out.append("- {} `{}` (value={}, effort={})".format(
-            top.get("id"), top.get("title"), top.get("value"), top.get("effort")
+        out.append("- {} `{}` (value={}, effort={}, type={}, score={})".format(
+            top.get("id"), top.get("title"), top.get("value"), top.get("effort"),
+            top.get("type") or "feature", top.get("score"),
         ))
         out.append("")
 

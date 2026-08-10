@@ -35,6 +35,18 @@ def build_parser():
     init_parser.add_argument("--retries-per-round", type=int, default=None)
     init_parser.add_argument("--candidates-per-round", type=int, default=None, help="Backlog candidates to work per round (default 1)")
     init_parser.add_argument("--max-blocked-in-a-row", type=int, default=None)
+    init_parser.add_argument("--commit-every-rounds", type=int, default=None,
+                             help="Commit accumulated changes once per this many rounds (default 5)")
+    init_parser.add_argument("--verify-every-rounds", type=int, default=None,
+                             help="Run full verification once per this many rounds (default 3)")
+    scan_group = init_parser.add_mutually_exclusive_group()
+    scan_group.add_argument("--scan-secrets", dest="scan_secrets", action="store_true", default=None,
+                            help="Scan staged diffs for secret-like content before commit (default)")
+    scan_group.add_argument("--no-scan-secrets", dest="scan_secrets", action="store_false", default=None)
+    init_parser.add_argument("--secret-pattern", action="append", default=None,
+                             help="Extra regex patterns for the commit-time secret scan (repeatable)")
+    init_parser.add_argument("--type-saturation-threshold", type=int, default=None,
+                             help="Completed same-type candidates before ranking downweights the type (default 2)")
     init_parser.add_argument("--allow-path", action="append", default=None, help="Glob of paths allowed in commits (repeatable)")
     init_parser.add_argument("--deny-path", action="append", default=None, help="Glob of paths never allowed in commits (repeatable)")
     init_parser.add_argument("--report-lang", choices=["zh", "en"], default=None)
@@ -61,7 +73,8 @@ def build_parser():
     complete_parser.add_argument("--repo", default=".")
     complete_parser.add_argument("--title")
     complete_parser.add_argument("--summary", required=True)
-    complete_parser.add_argument("--commit-sha", required=True)
+    complete_parser.add_argument("--commit-sha", default=None,
+                                 help="Commit SHA recorded by the commit command (omit when deferring commits in batched mode)")
     complete_parser.add_argument("--tokens", type=int, default=None)
     add_json(complete_parser)
     add_dry_run(complete_parser)
@@ -86,6 +99,8 @@ def build_parser():
     commit_parser.add_argument("--repo", default=".")
     commit_parser.add_argument("--round", type=int, default=None)
     commit_parser.add_argument("--summary", required=True)
+    commit_parser.add_argument("--allow-secrets", action="store_true",
+                               help="Skip the built-in secret scan for this commit")
     add_json(commit_parser)
     add_dry_run(commit_parser)
 
@@ -116,6 +131,26 @@ def build_parser():
     report_parser.add_argument("--lang", choices=["zh", "en"], default=None, help="Report language (default: config report_lang)")
     add_json(report_parser)
 
+    retrospective_parser = subparsers.add_parser("retrospective", help="Print or write a run-level retrospective (type stats, blocked rounds)")
+    retrospective_parser.add_argument("--repo", default=".")
+    retrospective_parser.add_argument("--output", default=None, help="Write the retrospective to a file instead of stdout")
+    retrospective_parser.add_argument("--lang", choices=["zh", "en"], default=None)
+    add_json(retrospective_parser)
+
+    analysis_save_parser = subparsers.add_parser("analysis-save", help="Cache a repository analysis snapshot (invalidated on HEAD/config change)")
+    analysis_save_parser.add_argument("--repo", default=".")
+    analysis_save_parser.add_argument("--content", default=None, help="The analysis as a JSON value")
+    analysis_save_parser.add_argument("--name", default=None, help="Optional label for the cache entry")
+    add_json(analysis_save_parser)
+    add_dry_run(analysis_save_parser)
+
+    analysis_load_parser = subparsers.add_parser("analysis-load", help="Read the cached analysis and report whether it is still valid")
+    analysis_load_parser.add_argument("--repo", default=".")
+
+    secret_scan_parser = subparsers.add_parser("secret-scan", help="Scan the staged diff for secret-like content")
+    secret_scan_parser.add_argument("--repo", default=".")
+    add_json(secret_scan_parser)
+
     detect_verify_parser = subparsers.add_parser("detect-verify", help="Detect test/build commands from repo entry points")
     detect_verify_parser.add_argument("--repo", default=".")
     detect_verify_parser.add_argument("--apply", action="store_true", help="Write detected commands into config check_commands")
@@ -127,6 +162,11 @@ def build_parser():
     backlog_add_parser.add_argument("--reason")
     backlog_add_parser.add_argument("--value", type=int, default=None, help="Value 1-5 (preferred)")
     backlog_add_parser.add_argument("--effort", type=int, default=None, help="Effort 1-5 (preferred)")
+    backlog_add_parser.add_argument("--type", default=None,
+                                    help="bugfix|feature|refactor|perf|test|docs (default feature)")
+    backlog_add_parser.add_argument("--risk", type=int, default=None, help="Risk 1-5 (default 1)")
+    backlog_add_parser.add_argument("--depends-on", action="append", default=None,
+                                    help="Candidate id that must be completed first (repeatable)")
     backlog_add_parser.add_argument("--impact", choices=["high", "medium", "low"], default=None, help="Legacy")
     backlog_add_parser.add_argument("--effort-level", choices=["small", "medium", "large"], default=None, help="Legacy")
     add_json(backlog_add_parser)
@@ -138,6 +178,9 @@ def build_parser():
     backlog_update_parser.add_argument("--reason")
     backlog_update_parser.add_argument("--value", type=int, default=None, help="Value 1-5")
     backlog_update_parser.add_argument("--effort", type=int, default=None, help="Effort 1-5")
+    backlog_update_parser.add_argument("--type", default=None)
+    backlog_update_parser.add_argument("--risk", type=int, default=None, help="Risk 1-5")
+    backlog_update_parser.add_argument("--depends-on", action="append", default=None)
     backlog_update_parser.add_argument("--status", choices=["pending", "picked", "completed", "blocked"])
     add_json(backlog_update_parser)
 
@@ -194,6 +237,10 @@ def main():
         "goal-met": commands.cmd_goal_met,
         "finish": commands.cmd_finish,
         "report": commands.cmd_report,
+        "retrospective": commands.cmd_retrospective,
+        "analysis-save": commands.cmd_analysis_save,
+        "analysis-load": commands.cmd_analysis_load,
+        "secret-scan": commands.cmd_secret_scan,
         "detect-verify": commands.cmd_detect_verify,
         "backlog-add": commands.cmd_backlog_add,
         "backlog-update": commands.cmd_backlog_update,

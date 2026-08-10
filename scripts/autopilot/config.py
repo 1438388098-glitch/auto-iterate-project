@@ -22,12 +22,17 @@ def default_config(repo):
         "branch_mode": "current",
         "commit_message_prefix": "autopilot",
         "retries_per_round": 3,
-        "candidates_per_round": 1,
+        "candidates_per_round": 3,
+        "commit_every_rounds": 5,
+        "verify_every_rounds": 3,
         "max_blocked_in_a_row": 2,
         "check_commands": [],
         "track_state": False,
         "allow_paths": [],
         "deny_paths": [],
+        "scan_secrets": True,
+        "secret_patterns": [],
+        "type_saturation_threshold": 2,
         "report_lang": "zh",
     }
 
@@ -96,16 +101,23 @@ def load_config(repo):
     cpr = merged.get("candidates_per_round")
     if cpr is not None and (not isinstance(cpr, int) or isinstance(cpr, bool) or cpr < 1):
         _config_error(config_path_for(repo), "'candidates_per_round' must be a positive integer")
+    for key in ("commit_every_rounds", "verify_every_rounds"):
+        value = merged.get(key)
+        if value is not None and (not isinstance(value, int) or isinstance(value, bool) or value < 1):
+            _config_error(config_path_for(repo), "'{}' must be a positive integer".format(key))
+    threshold = merged.get("type_saturation_threshold")
+    if threshold is not None and (not isinstance(threshold, int) or isinstance(threshold, bool) or threshold < 0):
+        _config_error(config_path_for(repo), "'type_saturation_threshold' must be a non-negative integer")
     if not isinstance(merged["check_commands"], list) or not all(isinstance(c, str) for c in merged["check_commands"]):
         _config_error(config_path_for(repo), "'check_commands' must be an array of strings")
-    for key in ("allow_paths", "deny_paths"):
+    for key in ("allow_paths", "deny_paths", "secret_patterns"):
         if not isinstance(merged[key], list) or not all(isinstance(p, str) for p in merged[key]):
             _config_error(config_path_for(repo), "'{}' must be an array of strings".format(key))
     if merged.get("report_lang") not in ("zh", "en"):
         _config_error(config_path_for(repo), "'report_lang' must be 'zh' or 'en'")
     if merged.get("branch_mode") not in ("current", "feature"):
         _config_error(config_path_for(repo), "'branch_mode' must be 'current' or 'feature'")
-    for key in ("push", "allow_uncommitted_changes", "track_state"):
+    for key in ("push", "allow_uncommitted_changes", "track_state", "scan_secrets"):
         if not isinstance(merged[key], bool):
             _config_error(config_path_for(repo), "'{}' must be true or false".format(key))
     if not isinstance(merged["commit_message_prefix"], str):
