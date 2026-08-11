@@ -17,6 +17,7 @@ from autopilot.io import (
 from autopilot.state import (
     compute_stop_reason,
     _candidate_score,
+    all_goals_met,
     candidate_adjusted_score,
     candidate_deps_status,
     compute_type_stats,

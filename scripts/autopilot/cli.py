@@ -39,6 +39,12 @@ def build_parser():
                              help="Commit accumulated changes once per this many rounds (default 5)")
     init_parser.add_argument("--verify-every-rounds", type=int, default=None,
                              help="Run full verification once per this many rounds (default 3)")
+    init_parser.add_argument("--checkpoint-every", type=int, default=None,
+                             help="Pause and ask the user once per this many rounds (default off)")
+    init_parser.add_argument("--expand-after-goals", action="store_true", default=None,
+                             help="Keep iterating after all goals are met (scout new candidates instead of stopping)")
+    init_parser.add_argument("--review-threshold", type=int, default=None,
+                             help="complete-round requires --review-score >= this (1-5) to pass")
     scan_group = init_parser.add_mutually_exclusive_group()
     scan_group.add_argument("--scan-secrets", dest="scan_secrets", action="store_true", default=None,
                             help="Scan staged diffs for secret-like content before commit (default)")
@@ -76,6 +82,9 @@ def build_parser():
     complete_parser.add_argument("--commit-sha", default=None,
                                  help="Commit SHA recorded by the commit command (omit when deferring commits in batched mode)")
     complete_parser.add_argument("--tokens", type=int, default=None)
+    complete_parser.add_argument("--review-score", type=int, default=None,
+                                 help="Self-review score 1-5 (required when config review_threshold is set)")
+    complete_parser.add_argument("--review-notes", default=None, help="Optional self-review notes")
     add_json(complete_parser)
     add_dry_run(complete_parser)
 
@@ -146,6 +155,14 @@ def build_parser():
 
     analysis_load_parser = subparsers.add_parser("analysis-load", help="Read the cached analysis and report whether it is still valid")
     analysis_load_parser.add_argument("--repo", default=".")
+
+    directive_add_parser = subparsers.add_parser("directive-add", help="Add a standing directive the loop must honor in every future round")
+    directive_add_parser.add_argument("--repo", default=".")
+    directive_add_parser.add_argument("--text", required=True)
+    add_json(directive_add_parser)
+
+    directive_list_parser = subparsers.add_parser("directive-list", help="List standing directives")
+    directive_list_parser.add_argument("--repo", default=".")
 
     secret_scan_parser = subparsers.add_parser("secret-scan", help="Scan the staged diff for secret-like content")
     secret_scan_parser.add_argument("--repo", default=".")
@@ -240,6 +257,8 @@ def main():
         "retrospective": commands.cmd_retrospective,
         "analysis-save": commands.cmd_analysis_save,
         "analysis-load": commands.cmd_analysis_load,
+        "directive-add": commands.cmd_directive_add,
+        "directive-list": commands.cmd_directive_list,
         "secret-scan": commands.cmd_secret_scan,
         "detect-verify": commands.cmd_detect_verify,
         "backlog-add": commands.cmd_backlog_add,

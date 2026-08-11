@@ -804,6 +804,29 @@ class ImportUnitTests(unittest.TestCase):
         config["deadline"] = "2999-01-01T00:00:00+00:00"
         self.assertIsNone(ap.compute_stop_reason(state, config))
 
+    def test_all_goals_met_and_expand(self):
+        ap = self.ap
+        state = {"goals": [], "completed_goals": []}
+        config = {"goals": ["A", "B"], "expand_after_goals": False}
+        self.assertFalse(ap.all_goals_met(config, state))
+        state["completed_goals"] = ["A"]
+        self.assertFalse(ap.all_goals_met(config, state))
+        state["completed_goals"] = ["A", "B"]
+        self.assertTrue(ap.all_goals_met(config, state))
+        # expand_after_goals: goals met but the loop keeps running.
+        base = {
+            "finished_at": None, "stop_reason": None, "goals": ["A", "B"],
+            "completed_goals": ["A", "B"], "completed_rounds": 1, "blocked_rounds": 0,
+            "history": [], "estimated_tokens_used": 0, "last_activity_at": None,
+            "started_at": None,
+        }
+        cfg = {"goals": ["A", "B"], "max_rounds": None, "max_minutes": None,
+               "max_tokens": None, "max_blocked_in_a_row": None, "deadline": None,
+               "expand_after_goals": True}
+        self.assertIsNone(ap.compute_stop_reason(base, cfg))
+        cfg["expand_after_goals"] = False
+        self.assertEqual(ap.compute_stop_reason(base, cfg), "all goals met")
+
     def test_parse_deadline(self):
         ap = self.ap
         self.assertIsNone(ap.parse_deadline(None))
@@ -1567,6 +1590,120 @@ class RetrospectiveTests(RepoTest):
         data = json.loads(result.stdout)
         self.assertTrue(data["ok"])
         self.assertTrue((self.repo / ".autopilot" / "retrospective.md").exists())
+
+
+class CheckpointTests(RepoTest):
+    def test_checkpoint_round_off_by_default(self):
+        self.run_state("init")
+        data = json.loads(self.run_state("check", "--brief").stdout)
+        self.assertIsNone(data["next_checkpoint_round"])
+
+    def test_checkpoint_round_reported(self):
+        self.run_state("init", "--checkpoint-every", "2")
+        data = json.loads(self.run_state("check", "--brief").stdout)
+        self.assertEqual(data["next_checkpoint_round"], 2)
+        config = self.read_json("config.json")
+        self.assertEqual(config["checkpoint_every"], 2)
+
+
+class ExpandPhaseTests(RepoTest):
+    def _finish_goal(self):
+        self.run_state("begin-round", "--title", "r", "--reason", "x")
+        self.add_file()
+        self.run_state("commit", "--summary", "add feature")
+        sha = self.git("rev-parse", "HEAD").stdout.strip()
+        self.run_state("complete-round", "--summary", "done", "--commit-sha", sha)
+        self.run_state("goal-met", "--goal", "G")
+
+    def test_default_stops_after_goals_met(self):
+        self.run_state("init", "--goal", "G")
+        self._finish_goal()
+        data = json.loads(self.run_state("check", "--brief").stdout)
+        self.assertFalse(data["continue"])
+        self.assertIn("all goals met", data["stop_reason"])
+        result = self.run_state("begin-round", "--title", "r2", "--reason", "x")
+        self.assertNotEqual(result.returncode, 0)
+
+    def test_expand_after_goals_continues(self):
+        self.run_state("init", "--goal", "G", "--expand-after-goals")
+        self._finish_goal()
+        data = json.loads(self.run_state("check", "--brief").stdout)
+        self.assertTrue(data["continue"], data["stop_reason"])
+        self.assertTrue(data["goals_met"])
+        self.assertEqual(data["phase"], "expand")
+        result = self.run_state("begin-round", "--title", "r2", "--reason", "x")
+        self.assertEqual(result.returncode, 0, result.stderr)
+
+    def test_expand_warns_without_other_stop_condition(self):
+        self.run_state("init", "--goal", "G", "--expand-after-goals")
+        self._finish_goal()
+        config_path = self.repo / ".autopilot" / "config.json"
+        config = json.loads(config_path.read_text(encoding="utf-8"))
+        config["max_rounds"] = None
+        config["max_blocked_in_a_row"] = None
+        config_path.write_text(json.dumps(config), encoding="utf-8")
+        data = json.loads(self.run_state("check", "--brief").stdout)
+        self.assertTrue(any("expand_after_goals" in w for w in data["warnings"]))
+
+
+class ReviewGateTests(RepoTest):
+    def _begin_round(self):
+        self.run_state("init", "--review-threshold", "3")
+        self.run_state("begin-round", "--title", "r", "--reason", "x")
+
+    def test_review_score_required_when_threshold_set(self):
+        self._begin_round()
+        self.add_file()
+        sha = self.git("rev-parse", "HEAD").stdout.strip()
+        self.run_state("commit", "--summary", "add feature")
+        result = self.run_state("complete-round", "--summary", "done", "--commit-sha", sha)
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("review-score", result.stderr)
+
+    def test_review_score_below_threshold_refused(self):
+        self._begin_round()
+        self.add_file()
+        sha = self.git("rev-parse", "HEAD").stdout.strip()
+        self.run_state("commit", "--summary", "add feature")
+        result = self.run_state("complete-round", "--summary", "done", "--commit-sha", sha,
+                                "--review-score", "2", "--review-notes", "hacky")
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("below review_threshold", result.stderr)
+        self.assertIsNotNone(self.read_json("state.json")["current_round"])
+
+    def test_review_score_meets_threshold(self):
+        self._begin_round()
+        self.add_file()
+        sha = self.git("rev-parse", "HEAD").stdout.strip()
+        self.run_state("commit", "--summary", "add feature")
+        result = self.run_state("complete-round", "--summary", "done", "--commit-sha", sha,
+                                "--review-score", "4", "--review-notes", "solid")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        history = self.read_json("state.json")["history"][-1]
+        self.assertEqual(history["review_score"], 4)
+        self.assertEqual(history["review_notes"], "solid")
+
+
+class DirectiveTests(RepoTest):
+    def test_requires_init(self):
+        result = self.run_state("directive-add", "--text", "x")
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("not initialized", result.stderr.lower())
+
+    def test_add_and_list(self):
+        self.run_state("init")
+        result = self.run_state("directive-add", "--text", "优先保证向后兼容")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        result = self.run_state("directive-add", "--text", "改动公共 API 前先 grep 调用方")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        data = json.loads(self.run_state("directive-list").stdout)
+        self.assertEqual(len(data["directives"]), 2)
+        self.assertEqual(data["directives"][0]["text"], "优先保证向后兼容")
+
+    def test_directive_add_requires_text(self):
+        self.run_state("init")
+        result = self.run_state("directive-add", "--text", "")
+        self.assertNotEqual(result.returncode, 0)
 
 
 if __name__ == "__main__":

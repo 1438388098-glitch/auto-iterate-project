@@ -67,7 +67,7 @@ python <this-skill>/scripts/autopilot_state.py diagnose --repo <repo>
 6. Read `.autopilot/config.json` if it exists. If it does not exist, initialize with:
 
 ```powershell
-python <this-skill>/scripts/autopilot_state.py init --repo <repo> [--branch-mode feature] [--max-rounds N] [--max-minutes N] [--deadline "<expr>"] [--max-tokens N] [--max-round-scope N] [--goal "<goal>"] [--goals-from-prompt "<request>"] [--check-commands "<cmd>"] [--push] [--commit-message-prefix <prefix>] [--retries-per-round N] [--candidates-per-round N] [--commit-every-rounds N] [--verify-every-rounds N] [--max-blocked-in-a-row N] [--scan-secrets] [--no-scan-secrets] [--secret-pattern <regex>] [--type-saturation-threshold N] [--allow-path <glob>] [--deny-path <glob>] [--report-lang zh|en] [--track-state]
+python <this-skill>/scripts/autopilot_state.py init --repo <repo> [--branch-mode feature] [--max-rounds N] [--max-minutes N] [--deadline "<expr>"] [--max-tokens N] [--max-round-scope N] [--goal "<goal>"] [--goals-from-prompt "<request>"] [--check-commands "<cmd>"] [--push] [--commit-message-prefix <prefix>] [--retries-per-round N] [--candidates-per-round N] [--commit-every-rounds N] [--verify-every-rounds N] [--checkpoint-every N] [--expand-after-goals] [--review-threshold N] [--max-blocked-in-a-row N] [--scan-secrets] [--no-scan-secrets] [--secret-pattern <regex>] [--type-saturation-threshold N] [--allow-path <glob>] [--deny-path <glob>] [--report-lang zh|en] [--track-state]
 ```
 
 `--deadline` is the **timer (定时器)** stop: an absolute wall-clock moment when the run must stop, unlike the `--max-minutes` countdown (倒计时) which measures duration since the last round activity. Accepts an ISO timestamp (`2026-08-10T08:00:00`), a relative duration (`+8h`, `+30min`, `+1d`, `+2w`), or a local `HH:MM` (today, or tomorrow if already passed — e.g. `08:00` for "iterate until tomorrow morning"). It is resolved to an absolute UTC timestamp at init time. See `references/config.md` for details.
@@ -175,7 +175,7 @@ Do not push unless config sets `push: true`; when it does, `complete-round` push
 
 ### 8. Record the Round
 
-- On success: run `complete-round` with title and summary. On a commit round, pass `--commit-sha <sha>` from the commit helper; on a deferred round, omit it — the round is recorded and the changes stay in the working tree for the next batch. Token accounting is estimated automatically from the round's own diff (no double counting of earlier uncommitted batches) unless you pass `--tokens`.
+- On success: run `complete-round` with title and summary. On a commit round, pass `--commit-sha <sha>` from the commit helper; on a deferred round, omit it — the round is recorded and the changes stay in the working tree for the next batch. If `review_threshold` is configured (1-5), `complete-round` requires a `--review-score` at least as high — self-review the round against the quality gate first and pass `--review-notes` to record the rationale. Token accounting is estimated automatically from the round's own diff (no double counting of earlier uncommitted batches) unless you pass `--tokens`.
 - On blocked: run `block-round` with title and reason, and do not commit that round.
 - To abandon a round without counting it as blocked: run `cancel-round` (the round's candidates return to `pending`).
 - The helper automatically updates every backlog candidate attached to the round to `completed`, `blocked`, or back to `pending`, and refreshes the per-type stats (`state.type_stats`) that power ranking and the retrospective.
@@ -189,6 +189,28 @@ If the round satisfies one of the configured goals, run `goal-met --goal "<exact
 ### 10. Repeat
 
 Run `check` again after each round.
+
+## Human Checkpoints & Directives
+
+Set `checkpoint_every: N` to make the loop pause and consult the user every N rounds (`check` reports the next pause in `next_checkpoint_round`). At a checkpoint round, stop after `complete-round`/`block-round`, then:
+
+1. Summarize progress: completed/blocked rounds, `backlog-rank` top candidates, tokens used, recent commits.
+2. Read `directive-list` to surface standing directives.
+3. Ask the user: continue, change direction (add/edit goals), raise/lower budgets, or stop. Write down any new standing instructions with `directive-add` so every future round honors them.
+
+Directives are persistent — use `python <this-skill>/scripts/autopilot_state.py directive-add --repo <repo> --text "<standing rule>"` and `directive-list` to read them. At the start of **every** round's Implement step, read `directive-list` and honor the standing rules before writing any code. Directives are how you steer a long autonomous run without stopping it.
+
+## Expansion Phase
+
+When `expand_after_goals: true` and all configured goals are met, the loop does **not** stop: `check` reports `"phase": "expand"` and `begin-round` keeps working. This mirrors the "goal-met -> keep improving" pattern: once the core goal is real, the loop switches from chasing the goal to proposing genuinely valuable adjacent work instead of stopping or grinding.
+
+In the expansion phase:
+
+- **Scout with fresh eyes**: do not reuse the same analysis that got you here. Run `analysis-save` with a fresh scan, and propose 3-5 expansion candidates from a detached perspective (what would a user or a different engineer want next?).
+- **Value-gate before building**: add candidates with `type`/`value`/`effort`/`risk` and let `backlog-rank` score them. A candidate whose value cannot be stated in one concrete sentence is rejected — no random feature bloat. Prefer candidates in a `type` you have not saturated (`score_breakdown.saturation_factor` exposes this).
+- Keep honoring `review_threshold`, verification, and commit batching as usual.
+
+Expansion is still bounded by the normal stop conditions (`max_rounds`, budgets, `max_blocked_in_a_row`). Since goals no longer stop the loop in this mode, keep at least one budget configured, or `check` warns there is no automatic stopping point.
 
 ## Stop Conditions
 
@@ -212,6 +234,8 @@ Stop the loop and ask the user when any of these is true, instead of grinding on
 - The backlog has no pending candidates left, or the best candidate's value cannot be stated in one concrete sentence.
 - `max_round_scope` is exceeded in a way that cannot be split into smaller rounds.
 - The tree is dirty, `allow_uncommitted_changes` is false, and the dirty state cannot be resolved by committing or reverting.
+- A checkpoint round is reached (`checkpoint_every`) — pause and consult the user before continuing.
+- `expand_after_goals` is on, goals are met, and the expansion phase has no remaining budget to bound it.
 
 ## Finish
 
@@ -228,6 +252,7 @@ When the loop stops:
 - `retrospective` prints (or writes with `--output`) the run-level retrospective: per-type completed/blocked/blocked-rate/avg-effort/avg-value, blocked rounds, configured verification commands, and the next ready candidate. `finish` writes it automatically to `.autopilot/retrospective.md`.
 - `analysis-load` / `analysis-save` read and refresh the `.autopilot/analysis.json` repository-analysis cache (invalidated on HEAD or config change).
 - `secret-scan` scans the staged diff for secret-like content; `commit` runs the same scan automatically and refuses on a match (see Safety Rules).
+- `directive-add` / `directive-list` manage standing directives (`.autopilot/directives.json`) that every round must honor.
 - `detect-verify` scans the repo entry points and prints recommended `check_commands` (including `gitleaks`/`detect-secrets` when installed); `--apply` writes them into the config.
 - Every state-changing command accepts `--dry-run`: it prints what would happen and changes neither `.autopilot/` nor git. Use it to rehearse a step before committing to it.
 
@@ -260,6 +285,8 @@ When the loop stops:
 | `git log` fails during analysis | Repo has no commits yet | Skip log analysis; the first round creates the initial commit |
 | `begin-round` refuses with "Working tree is dirty" | Dirty tree on the first round with `allow_uncommitted_changes: false` | Commit/stash user changes, or set `allow_uncommitted_changes: true` (or run `init --force` to override) |
 | `begin-round` refuses with "depends on unfinished work" | The candidate's `depends_on` prereq is not completed | Complete and record the prereq first, or pick a dependency-ready candidate (`backlog-rank` marks `"ready": false`) |
+| `complete-round` refuses with "review score" | `review_threshold` is set and `--review-score` is missing or below it | Self-review the round on 1-5 and pass `--review-score` (>= threshold), or `block-round` and rework |
+| `goal-met` reports expansion instead of stopping | `expand_after_goals: true` | Expected; the loop keeps improving until a budget stops it. Disable the flag to stop at the goal |
 | `push` refuses with "push is disabled" | `push: false` in config | Only push when the config enables it; set `push: true` to allow pushing |
 | `complete-round` without a commit SHA | Deferred commit round (default `commit_every_rounds: 5`) | Expected; the round is recorded and changes stay in the working tree until the boundary round commits them. Flush pending changes before `finish` |
 | `complete-round` fails with "commit-sha does not resolve" | The SHA recorded by `commit` was not passed through | Use the exact SHA the `commit` helper printed |

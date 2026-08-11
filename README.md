@@ -11,6 +11,9 @@ Works with opencode, Claude Code, Codex, and other agent runtimes (auto-detected
 - **Smart backlog ranking**: candidates are ranked by an adjusted value/effort score that discounts high `risk`, downweights saturated types (`type_saturation_threshold`), downweights consistently-blocking types, and defers candidates with unfinished `depends_on` prereqs. Ranking adapts to the run's own history (per-type stats in `state.json`).
 - **Repo analysis cache**: `.autopilot/analysis.json` caches repository understanding across rounds and auto-invalidates when HEAD or config changes, so the loop does not re-read the whole repo every round.
 - **Secret guard**: `commit` scans the staged diff for secret-like content (AWS keys, private keys, GitHub/Slack/Google tokens, `sk-*`) and refuses on a match; `secret-scan` checks the staged diff on demand.
+- **Human checkpoints & directives**: `checkpoint_every: N` pauses the loop to consult you every N rounds; `directive-add` records standing rules that every round must honor (`.autopilot/directives.json`) — steer a long run without stopping it.
+- **Expansion phase**: `expand_after_goals: true` keeps the loop improving after all goals are met, scouting fresh candidates and value-gating them through the backlog rank instead of stopping or bloating.
+- **Quality red line**: `review_threshold` requires every completed round to self-score at or above a minimum before it is recorded.
 - **Multiple stop conditions**: goals, `max_rounds`, `max_minutes`, `max_tokens`, `max_blocked_in_a_row`, and a `deadline` timer (e.g. "iterate until tomorrow morning") that stops at an absolute wall-clock moment.
 - **Safety rails**: refuses to commit user changes, never rewrites history, defaults to no pushing, optional `allow_paths`/`deny_paths` whitelist.
 - **Resumable**: unfinished runs resume from `.autopilot/state.json` instead of starting over.
@@ -56,6 +59,9 @@ All options live in `.autopilot/config.json` (created by `init`) and can be set 
 | `candidates_per_round` | `3` | Backlog candidates worked per round; batches several independent changes into one round |
 | `commit_every_rounds` | `5` | Commit accumulated changes once per this many rounds (fewer, larger commits) |
 | `verify_every_rounds` | `3` | Run full verification once per this many rounds; smoke-check in between |
+| `checkpoint_every` | `null` | Pause and ask the user once per this many rounds |
+| `expand_after_goals` | `false` | Keep iterating after all goals are met (scout new candidates) |
+| `review_threshold` | `null` | `complete-round` requires `--review-score` >= this (1-5) |
 | `max_rounds` | `10` | Hard stop after this many completed/blocked rounds |
 | `max_minutes` | `null` | Countdown (倒计时): wall-clock budget since last round activity |
 | `deadline` | `null` | Timer (定时器): absolute stop time; `init --deadline "+8h"` / `"08:00"` / ISO timestamp |

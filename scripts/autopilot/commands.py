@@ -111,6 +111,18 @@ def cmd_init(args):
                 io.append_log(repo, "init", "error", reason="verify_every_rounds out of range")
                 return emit_result(args, False, "[ERROR] --verify-every-rounds must be a positive integer.")
             cfg["verify_every_rounds"] = args.verify_every_rounds
+        if args.checkpoint_every is not None:
+            if args.checkpoint_every < 1:
+                io.append_log(repo, "init", "error", reason="checkpoint_every out of range")
+                return emit_result(args, False, "[ERROR] --checkpoint-every must be a positive integer.")
+            cfg["checkpoint_every"] = args.checkpoint_every
+        if args.expand_after_goals:
+            cfg["expand_after_goals"] = True
+        if args.review_threshold is not None:
+            if args.review_threshold < 1 or args.review_threshold > 5:
+                io.append_log(repo, "init", "error", reason="review_threshold out of range")
+                return emit_result(args, False, "[ERROR] --review-threshold must be an integer 1-5.")
+            cfg["review_threshold"] = args.review_threshold
         if args.scan_secrets is not None:
             cfg["scan_secrets"] = args.scan_secrets
         if args.secret_pattern:
@@ -337,6 +349,29 @@ def cmd_complete_round(args):
             )
             return 0
 
+        cfg = config.load_config(repo)
+        review_threshold = cfg.get("review_threshold")
+        if review_threshold is not None:
+            if args.review_score is None:
+                io.append_log(repo, "complete-round", "error", reason="review score required")
+                return emit_result(
+                    args, False,
+                    "[ERROR] review_threshold is {} but no --review-score was provided. "
+                    "Self-review the round on a 1-5 scale and pass --review-score.".format(review_threshold),
+                )
+            if args.review_score < 1 or args.review_score > 5:
+                io.append_log(repo, "complete-round", "error", reason="review score out of range")
+                return emit_result(args, False, "[ERROR] --review-score must be between 1 and 5.")
+            if args.review_score < review_threshold:
+                io.append_log(repo, "complete-round", "error", reason="review score below threshold")
+                return emit_result(
+                    args, False,
+                    "[ERROR] Self-review score {} is below review_threshold {}. "
+                    "Rework the round and re-verify, or run block-round.".format(
+                        args.review_score, review_threshold
+                    ),
+                )
+
         st["completed_rounds"] += 1
         st["estimated_tokens_used"] += tokens
         st["last_activity_at"] = io.now_iso()
@@ -349,6 +384,8 @@ def cmd_complete_round(args):
                 "commit_sha": args.commit_sha,
                 "estimated_tokens": tokens,
                 "candidate_id": current.get("candidate_id"),
+                "review_score": getattr(args, "review_score", None),
+                "review_notes": getattr(args, "review_notes", None) or "",
                 "finished_at": io.now_iso(),
             }
         )
@@ -362,7 +399,6 @@ def cmd_complete_round(args):
             round=current["round"], commit_sha=args.commit_sha, estimated_tokens=tokens,
         )
 
-        cfg = config.load_config(repo)
         if st.get("completed_rounds", 0) % 10 == 0:
             state.write_phase_report(repo, st, cfg)
 
@@ -473,7 +509,12 @@ def cmd_goal_met(args):
             st["last_activity_at"] = io.now_iso()
         state.save_state(repo, st)
         io.append_log(repo, "goal-met", "success", goal=goal)
-        return emit_result(args, True, "[OK] Goal marked met.")
+        cfg = config.load_config(repo)
+        if state.all_goals_met(cfg, st) and cfg.get("expand_after_goals"):
+            message = "[OK] Goal marked met. All goals are met; entering the expansion phase (expand_after_goals)."
+        else:
+            message = "[OK] Goal marked met."
+        return emit_result(args, True, message)
 
 
 def cmd_finish(args):
@@ -1001,6 +1042,26 @@ def cmd_analysis_load(args):
     return 0
 
 
+def cmd_directive_add(args):
+    repo = Path(args.repo).resolve()
+    with io.run_lock(repo):
+        if not config.state_path_for(repo).exists():
+            return emit_result(args, False, "[ERROR] Autopilot not initialized. Run init first.")
+        if not args.text:
+            return emit_result(args, False, "[ERROR] --text is required.")
+        count = state.add_directive(repo, args.text)
+        io.append_log(repo, "directive-add", "success", text=args.text)
+        return emit_result(args, True, "[OK] Directive added ({} active).".format(count), data={"count": count})
+
+
+def cmd_directive_list(args):
+    repo = Path(args.repo).resolve()
+    if not config.state_path_for(repo).exists():
+        return emit_result(args, False, "[ERROR] Autopilot not initialized. Run init first.")
+    print(json.dumps(state.load_directives(repo), indent=2, ensure_ascii=False))
+    return 0
+
+
 def cmd_undo_round(args):
     repo = Path(args.repo).resolve()
     with io.run_lock(repo):
@@ -1162,6 +1223,16 @@ def cmd_check(args):
         and not goals
     ):
         warnings.append("No stop condition is configured (goals and all max_* and deadline are unset); the loop has no automatic stopping point.")
+    if goals and cfg.get("expand_after_goals") and (
+        cfg.get("max_rounds") is None
+        and cfg.get("max_minutes") is None
+        and cfg.get("deadline") is None
+        and cfg.get("max_tokens") is None
+        and cfg.get("max_blocked_in_a_row") is None
+    ):
+        warnings.append("expand_after_goals is true but no other stop condition is configured; the expansion phase has no automatic stopping point.")
+    if cfg.get("review_threshold") is not None:
+        warnings.append("review_threshold is set; complete-round will require --review-score >= {}.".format(cfg["review_threshold"]))
 
     if cfg.get("push"):
         remotes = io.run_git(repo, "remote")
@@ -1173,6 +1244,9 @@ def cmd_check(args):
         "stop_reason": stop_reason,
         "warnings": warnings,
     }
+    goals_met = state.all_goals_met(cfg, st)
+    payload["goals_met"] = goals_met
+    payload["phase"] = "expand" if (goals_met and cfg.get("expand_after_goals")) else "iterate"
     completed_total = (
         st.get("completed_rounds", 0)
         + st.get("blocked_rounds", 0)
@@ -1184,6 +1258,10 @@ def cmd_check(args):
     commit_every = cfg.get("commit_every_rounds") or 1
     payload["next_verify_round"] = ((current_number // verify_every) + 1) * verify_every
     payload["next_commit_round"] = ((current_number // commit_every) + 1) * commit_every
+    checkpoint_every = cfg.get("checkpoint_every")
+    payload["next_checkpoint_round"] = (
+        ((current_number // checkpoint_every) + 1) * checkpoint_every if checkpoint_every else None
+    )
     if not getattr(args, "brief", False):
         payload["state"] = st
         payload["config"] = cfg

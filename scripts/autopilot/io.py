@@ -20,6 +20,7 @@ BACKLOG_FILENAME = "backlog.json"
 LOCK_FILENAME = "lock"
 LOG_FILENAME = "log.jsonl"
 ANALYSIS_FILENAME = "analysis.json"
+DIRECTIVES_FILENAME = "directives.json"
 PHASE_REPORT_PREFIX = "phase-report-round-"
 
 EMPTY_TREE = "4b825dc642cb6eb9a060e54bf8d69288fbee4904"

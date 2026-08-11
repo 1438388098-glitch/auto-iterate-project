@@ -206,9 +206,7 @@ def compute_stop_reason(state, config):
         stop_reason = state["stop_reason"]
 
     if stop_reason is None:
-        goals = config.get("goals") or state.get("goals") or []
-        completed_goals = set(state.get("completed_goals") or [])
-        if goals and all(goal in completed_goals for goal in goals):
+        if all_goals_met(config, state) and not config.get("expand_after_goals"):
             stop_reason = "all goals met"
 
     if stop_reason is None:
@@ -255,6 +253,14 @@ def count_consecutive_blocked(state):
         else:
             break
     return count
+
+
+def all_goals_met(config, state):
+    goals = config.get("goals") or state.get("goals") or []
+    if not goals:
+        return False
+    completed_goals = set(state.get("completed_goals") or [])
+    return all(goal in completed_goals for goal in goals)
 
 
 def _candidate_score(candidate):
@@ -392,6 +398,26 @@ def rank_candidates(backlog, config):
 
 def analysis_path_for(repo):
     return repo / io.AUTOPILOT_DIR / io.ANALYSIS_FILENAME
+
+
+def directives_path_for(repo):
+    return repo / io.AUTOPILOT_DIR / io.DIRECTIVES_FILENAME
+
+
+def load_directives(repo):
+    return io.load_json(directives_path_for(repo), {"directives": []})
+
+
+def save_directives(repo, directives):
+    io.save_json(directives_path_for(repo), directives)
+
+
+def add_directive(repo, text):
+    directives = load_directives(repo)
+    entry = {"text": text, "added_at": io.now_iso()}
+    directives.setdefault("directives", []).append(entry)
+    save_directives(repo, directives)
+    return len(directives["directives"])
 
 
 def load_analysis(repo):

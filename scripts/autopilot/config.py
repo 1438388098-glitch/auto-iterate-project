@@ -25,6 +25,9 @@ def default_config(repo):
         "candidates_per_round": 3,
         "commit_every_rounds": 5,
         "verify_every_rounds": 3,
+        "checkpoint_every": None,
+        "expand_after_goals": False,
+        "review_threshold": None,
         "max_blocked_in_a_row": 2,
         "check_commands": [],
         "track_state": False,
@@ -105,6 +108,12 @@ def load_config(repo):
         value = merged.get(key)
         if value is not None and (not isinstance(value, int) or isinstance(value, bool) or value < 1):
             _config_error(config_path_for(repo), "'{}' must be a positive integer".format(key))
+    checkpoint = merged.get("checkpoint_every")
+    if checkpoint is not None and (not isinstance(checkpoint, int) or isinstance(checkpoint, bool) or checkpoint < 1):
+        _config_error(config_path_for(repo), "'checkpoint_every' must be a positive integer or null")
+    review = merged.get("review_threshold")
+    if review is not None and (not isinstance(review, int) or isinstance(review, bool) or review < 1 or review > 5):
+        _config_error(config_path_for(repo), "'review_threshold' must be an integer 1-5 or null")
     threshold = merged.get("type_saturation_threshold")
     if threshold is not None and (not isinstance(threshold, int) or isinstance(threshold, bool) or threshold < 0):
         _config_error(config_path_for(repo), "'type_saturation_threshold' must be a non-negative integer")
@@ -117,7 +126,7 @@ def load_config(repo):
         _config_error(config_path_for(repo), "'report_lang' must be 'zh' or 'en'")
     if merged.get("branch_mode") not in ("current", "feature"):
         _config_error(config_path_for(repo), "'branch_mode' must be 'current' or 'feature'")
-    for key in ("push", "allow_uncommitted_changes", "track_state", "scan_secrets"):
+    for key in ("push", "allow_uncommitted_changes", "track_state", "scan_secrets", "expand_after_goals"):
         if not isinstance(merged[key], bool):
             _config_error(config_path_for(repo), "'{}' must be true or false".format(key))
     if not isinstance(merged["commit_message_prefix"], str):

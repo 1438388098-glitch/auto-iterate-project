@@ -98,6 +98,18 @@ Integer, default `5`. How often accumulated changes are committed. Rounds before
 
 Integer, default `3`. How often the full verification set (`check_commands`, tests, build, lint) runs. Between verification rounds the agent runs only a cheap smoke check when one exists (`python -m py_compile`, `node --check`, `cargo check`) or states a lightweight verification method. A commit round is always a verification round, and a failing verification is never ignored to make a commit. Set to `1` to run full verification every round. `check` reports the next verification round in `next_verify_round`.
 
+### checkpoint_every
+
+Integer, default `null`. When set to `N`, the loop pauses after every Nth round and consults the user before continuing (progress summary, top ranked candidates, standing directives, budgets). This gives a human a steering wheel on long autonomous runs. `check` reports the next pause in `next_checkpoint_round`. `null` disables checkpoints.
+
+### expand_after_goals
+
+Boolean, default `false`. When `true`, reaching all configured goals does **not** stop the loop: `check` reports `"phase": "expand"` and `begin-round` keeps working on new, value-gated candidates instead of stopping. Modeled on the "goal-met -> expand" pattern: after the core goal is real, the agent scouts fresh candidates with a detached perspective and lets `backlog-rank` (value/effort, risk, type saturation) act as a value gate — no random feature bloat. Expansion remains bounded by the normal budgets (`max_rounds`, `max_minutes`, `deadline`, `max_tokens`, `max_blocked_in_a_row`); because goals no longer stop the loop in this mode, `check` warns when no other stop condition is configured.
+
+### review_threshold
+
+Integer 1-5, default `null`. When set, `complete-round` requires a `--review-score` (self-assessment on the same 1-5 scale) at least as high, and records the score plus optional `--review-notes` in the round history. A score below the threshold is refused with an error — the round must be reworked or blocked. This turns the pre-commit self-review into a hard quality red line. `null` disables the gate.
+
 ### scan_secrets
 
 Boolean, default `true`. When true, `commit` scans the **added lines** of the staged diff for secret-like content before committing and refuses on a match. Built-in patterns cover AWS access keys (`AKIA...`), private-key blocks, GitHub personal access tokens (`ghp_...`), Slack tokens (`xox...`), Google API keys (`AIza...`), OpenAI-style `sk-...` keys, and `api_key = ...` assignments. Bypass a false positive with `commit --allow-secrets`, or disable entirely by setting this to `false`. Run `secret-scan` at any time to check the staged diff without committing. Use `secret_patterns` to add repository-specific regexes.
@@ -148,6 +160,9 @@ String, default `"zh"`. Language for generated reports and the automatic 10-roun
   "candidates_per_round": 3,
   "commit_every_rounds": 5,
   "verify_every_rounds": 3,
+  "checkpoint_every": 6,
+  "expand_after_goals": true,
+  "review_threshold": 3,
   "max_blocked_in_a_row": 2,
   "check_commands": ["pytest", "npm run lint"],
   "track_state": false,
@@ -209,10 +224,10 @@ python <this-skill>/scripts/autopilot_state.py backlog-remove --repo <repo> --id
 
 ## State Helper Commands
 
-- `init` — create config + state (+ optional feature branch). Flags cover every config field: `--goal`, `--goals-from-prompt`, `--max-rounds`, `--max-minutes`, `--deadline`, `--max-tokens`, `--max-round-scope`, `--branch-mode`, `--allow-uncommitted-changes`, `--track-state`, `--check-commands`, `--push`, `--commit-message-prefix`, `--retries-per-round`, `--candidates-per-round`, `--commit-every-rounds`, `--verify-every-rounds`, `--scan-secrets`/`--no-scan-secrets`, `--secret-pattern`, `--type-saturation-threshold`, `--max-blocked-in-a-row`, `--allow-path`, `--deny-path`, `--report-lang`, `--force`.
-- `read`, `check`, `diagnose` — inspect state, stop conditions, and repository/git health. `check --brief` returns only `continue`/`stop_reason`/`warnings`/`next_verify_round`/`next_commit_round` (saves tokens in the loop).
+- `init` — create config + state (+ optional feature branch). Flags cover every config field: `--goal`, `--goals-from-prompt`, `--max-rounds`, `--max-minutes`, `--deadline`, `--max-tokens`, `--max-round-scope`, `--branch-mode`, `--allow-uncommitted-changes`, `--track-state`, `--check-commands`, `--push`, `--commit-message-prefix`, `--retries-per-round`, `--candidates-per-round`, `--commit-every-rounds`, `--verify-every-rounds`, `--checkpoint-every`, `--expand-after-goals`, `--review-threshold`, `--scan-secrets`/`--no-scan-secrets`, `--secret-pattern`, `--type-saturation-threshold`, `--max-blocked-in-a-row`, `--allow-path`, `--deny-path`, `--report-lang`, `--force`.
+- `read`, `check`, `diagnose` — inspect state, stop conditions, and repository/git health. `check --brief` returns only `continue`/`stop_reason`/`warnings`/`goals_met`/`phase`/`next_verify_round`/`next_commit_round`/`next_checkpoint_round` (saves tokens in the loop).
 - `detect-agent` — detect the runtime agent (opencode / claude-code / codex / generic) and print adaptation context. Honors a `SKILL_DIR` environment variable for the reported skill directory.
-- `begin-round`, `complete-round`, `block-round`, `cancel-round` — round lifecycle. `begin-round` enforces the clean-tree rule, refuses to pick candidates with unresolved `depends_on`, and refuses to reuse round numbers; `--candidate-id` is repeatable so one round can pick multiple backlog candidates (`candidates_per_round`). `complete-round` accepts an optional `--commit-sha` (omit it on deferred commit rounds when `commit_every_rounds > 1`), auto-writes a Chinese phase report (`.autopilot/phase-report-round-<N>.md`) every 10 completed rounds, and refreshes `state.type_stats`.
+- `begin-round`, `complete-round`, `block-round`, `cancel-round` — round lifecycle. `begin-round` enforces the clean-tree rule, refuses to pick candidates with unresolved `depends_on`, and refuses to reuse round numbers; `--candidate-id` is repeatable so one round can pick multiple backlog candidates (`candidates_per_round`). `complete-round` accepts an optional `--commit-sha` (omit it on deferred commit rounds when `commit_every_rounds > 1`), an optional `--review-score`/`--review-notes` (required when `review_threshold` is set), auto-writes a Chinese phase report (`.autopilot/phase-report-round-<N>.md`) every 10 completed rounds, and refreshes `state.type_stats`.
 - `commit` — staged-change check, git identity check, path whitelist check (`allow_paths`/`deny_paths`), secret scan (`scan_secrets`, bypassable with `--allow-secrets`), scope guard (including binary files), open-round requirement (skipped in batched mode), and prefix message building.
 - `undo-round` — `git revert` a bad commit (never rewriting history), record a `revert` history entry, and advance the round counter.
 - `goal-met`, `finish` — goals and run closure. `finish` auto-cancels any still-open round, writes `.autopilot/retrospective.md`, and returns to the origin branch in feature mode.
@@ -220,6 +235,7 @@ python <this-skill>/scripts/autopilot_state.py backlog-remove --repo <repo> --id
 - `retrospective` — print (or write with `--output`) the run-level retrospective: per-type stats, blocked rounds, verification commands, and the next ready candidate.
 - `detect-verify` — scan repo entry points and recommend `check_commands` (including `gitleaks`/`detect-secrets` when installed); `--apply` writes them into the config.
 - `analysis-save` / `analysis-load` — persist and read the repository-analysis cache in `.autopilot/analysis.json`; the cache auto-invalidates when HEAD or `.autopilot/config.json` changes.
+- `directive-add` / `directive-list` — manage standing directives in `.autopilot/directives.json`; the loop must honor them in every round.
 - `secret-scan` — scan the staged diff for secret-like content and report findings (exit non-zero on a match).
 - `backlog-add`, `backlog-update`, `backlog-remove`, `backlog-list`, `backlog-rank`, `backlog-pick` — backlog management (candidates now carry `type`, `risk`, and `depends_on`; ranking is the adjusted value/effort score).
 - `ensure-branch` — create or check out the autopilot feature branch
