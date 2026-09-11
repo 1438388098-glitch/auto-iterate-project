@@ -102,6 +102,9 @@ class InitTests(RepoTest):
         self.assertEqual(config["commit_every_rounds"], 5)
         self.assertEqual(config["verify_every_rounds"], 3)
         self.assertTrue(config["scan_secrets"])
+        self.assertEqual(config["ranking_mode"], "expected")
+        self.assertEqual(config["min_candidate_value"], 3)
+        self.assertEqual(config["max_same_type_per_round"], 2)
 
     def test_init_adds_exclude(self):
         self.run_state("init")
@@ -878,17 +881,104 @@ class ImportUnitTests(unittest.TestCase):
             {"docs": {"completed": 3, "blocked": 0}},
             2,
         )
-        self.assertAlmostEqual(score, 5.0 * 0.85, places=3)
-        self.assertAlmostEqual(breakdown["saturation_factor"], 0.85, places=3)
+        self.assertAlmostEqual(score, 5.0 * 0.7, places=3)
+        self.assertAlmostEqual(breakdown["saturation_factor"], 0.7, places=3)
 
     def test_candidate_adjusted_score_blocked_history(self):
         ap = self.ap
-        score, _ = ap.candidate_adjusted_score(
+        score, breakdown = ap.candidate_adjusted_score(
             {"value": 5, "effort": 1, "type": "perf"},
             {"perf": {"completed": 1, "blocked": 2}},
             2,
         )
-        self.assertAlmostEqual(score, 5.0 * 0.9 * 0.9, places=3)
+        # success rate 1/3 from the type's blocked history (2 of 3 attempts blocked)
+        self.assertAlmostEqual(breakdown["success_rate"], 1 / 3, places=3)
+        self.assertAlmostEqual(score, 5.0 * (1 / 3), places=3)
+
+    def test_expected_value_reverses_ratio_ranking(self):
+        """The core behavior fix: a cheap trivial candidate must no longer beat an
+        expensive valuable one — rounds are the scarce resource, not effort."""
+        ap = self.ap
+        backlog = {
+            "candidates": [
+                {"id": "candidate-001", "title": "Big feature", "status": "pending", "value": 5, "effort": 3},
+                {"id": "candidate-002", "title": "Tiny chore", "status": "pending", "value": 2, "effort": 1},
+            ]
+        }
+        ranked = ap.rank_candidates(backlog, {})
+        self.assertEqual(ranked[0]["title"], "Big feature")
+
+    def test_rank_candidates_classic_mode_keeps_ratio(self):
+        ap = self.ap
+        backlog = {
+            "candidates": [
+                {"id": "candidate-001", "title": "Big feature", "status": "pending", "value": 5, "effort": 3},
+                {"id": "candidate-002", "title": "Tiny chore", "status": "pending", "value": 2, "effort": 1},
+            ]
+        }
+        ranked = ap.rank_candidates(backlog, {"ranking_mode": "classic"})
+        self.assertEqual(ranked[0]["title"], "Tiny chore")
+        self.assertFalse(ranked[0]["below_floor"])
+        self.assertNotIn("selected", ranked[0])
+
+    def test_rank_candidates_unlock_bonus(self):
+        ap = self.ap
+        backlog = {
+            "candidates": [
+                {"id": "candidate-001", "title": "Standalone", "status": "pending", "value": 3, "effort": 1},
+                {"id": "candidate-002", "title": "Foundation", "status": "pending", "value": 3, "effort": 1},
+                {"id": "candidate-003", "title": "Dependent", "status": "pending", "value": 3, "effort": 1,
+                 "depends_on": ["candidate-002"]},
+            ]
+        }
+        ranked = ap.rank_candidates(backlog, {})
+        by_title = {r["title"]: r for r in ranked}
+        self.assertEqual(by_title["Foundation"]["unlocks"], 1)
+        self.assertGreater(by_title["Foundation"]["score"], by_title["Standalone"]["score"])
+
+    def test_rank_candidates_marks_selected_batch(self):
+        ap = self.ap
+        backlog = {
+            "candidates": [
+                {"id": "candidate-001", "title": "DocsA", "status": "pending", "value": 5, "effort": 1, "type": "docs"},
+                {"id": "candidate-002", "title": "DocsB", "status": "pending", "value": 5, "effort": 1, "type": "docs"},
+                {"id": "candidate-003", "title": "Feature", "status": "pending", "value": 4, "effort": 1, "type": "feature"},
+                {"id": "candidate-004", "title": "Quickwin", "status": "pending", "value": 2, "effort": 1, "type": "docs"},
+            ]
+        }
+        cfg = {"candidates_per_round": 3, "max_same_type_per_round": 2, "min_candidate_value": 3}
+        ranked = ap.rank_candidates(backlog, cfg)
+        by_title = {r["title"]: r for r in ranked}
+        self.assertTrue(by_title["DocsA"]["selected"])
+        self.assertTrue(by_title["DocsB"]["selected"])
+        self.assertTrue(by_title["Feature"]["selected"])
+        self.assertFalse(by_title["Quickwin"]["selected"])
+        self.assertTrue(by_title["Quickwin"]["below_floor"])
+        # tighter quota: only one docs candidate per round -> Feature is pulled in
+        # and the below-floor quick-win fills the last slot.
+        ranked2 = ap.rank_candidates(backlog, dict(cfg, max_same_type_per_round=1))
+        by_title2 = {r["title"]: r for r in ranked2}
+        self.assertTrue(by_title2["DocsA"]["selected"])
+        self.assertFalse(by_title2["DocsB"]["selected"])
+        self.assertTrue(by_title2["Feature"]["selected"])
+        self.assertTrue(by_title2["Quickwin"]["selected"])
+
+    def test_compute_type_stats_calibration(self):
+        ap = self.ap
+        backlog = {
+            "candidates": [
+                {"type": "docs", "status": "completed", "value": 4, "effort": 2, "review_score": 4},
+                {"type": "docs", "status": "completed", "value": 4, "effort": 2, "review_score": 4},
+                {"type": "docs", "status": "completed", "value": 4, "effort": 2, "review_score": 4},
+                {"type": "perf", "status": "completed", "value": 5, "effort": 3, "review_score": 2},
+                {"type": "perf", "status": "completed", "value": 5, "effort": 3, "review_score": 2},
+                {"type": "perf", "status": "completed", "value": 5, "effort": 3, "review_score": 2},
+            ]
+        }
+        stats = ap.compute_type_stats(backlog)
+        self.assertEqual(stats["docs"]["review_n"], 3)
+        self.assertEqual(stats["docs"]["calibration"], 1.0)
+        self.assertEqual(stats["perf"]["calibration"], 0.6)
 
     def test_compute_type_stats(self):
         ap = self.ap
@@ -1694,6 +1784,50 @@ class ReviewGateTests(RepoTest):
         self.assertEqual(history["review_notes"], "solid")
 
 
+class RankingModeTests(RepoTest):
+    def test_classic_mode_via_cli_restores_ratio(self):
+        self.run_state("init", "--ranking-mode", "classic")
+        config = self.read_json("config.json")
+        self.assertEqual(config["ranking_mode"], "classic")
+        self.run_state("backlog-add", "--title", "Big", "--reason", "r", "--value", "5", "--effort", "3")
+        self.run_state("backlog-add", "--title", "Tiny", "--reason", "r", "--value", "2", "--effort", "1")
+        ranked = json.loads(self.run_state("backlog-rank").stdout)
+        self.assertEqual(ranked[0]["title"], "Tiny")
+
+    def test_expected_mode_prefers_value(self):
+        self.run_state("init")
+        self.run_state("backlog-add", "--title", "Big", "--reason", "r", "--value", "5", "--effort", "3")
+        self.run_state("backlog-add", "--title", "Tiny", "--reason", "r", "--value", "2", "--effort", "1")
+        ranked = json.loads(self.run_state("backlog-rank").stdout)
+        self.assertEqual(ranked[0]["title"], "Big")
+        # With only two candidates and candidates_per_round=3, the below-floor
+        # quick-win legitimately fills the remaining recommended slot.
+        self.assertTrue(ranked[0]["selected"])
+        self.assertTrue(ranked[1]["below_floor"])
+        self.assertFalse(ranked[0]["below_floor"])
+
+    def test_begin_round_warns_on_multiple_below_floor(self):
+        self.run_state("init")
+        self.run_state("backlog-add", "--title", "Chore1", "--reason", "r", "--value", "2", "--effort", "1")
+        self.run_state("backlog-add", "--title", "Chore2", "--reason", "r", "--value", "2", "--effort", "1")
+        ids = [c["id"] for c in self.read_json("backlog.json")["candidates"]]
+        result = self.run_state("begin-round", "--title", "chores", "--reason", "x",
+                                "--candidate-id", ids[0], "--candidate-id", ids[1])
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("below min_candidate_value", result.stderr)
+
+    def test_invalid_ranking_config_clean_error(self):
+        self.run_state("init")
+        config_path = self.repo / ".autopilot" / "config.json"
+        config = json.loads(config_path.read_text(encoding="utf-8"))
+        config["ranking_mode"] = "bogus"
+        config_path.write_text(json.dumps(config), encoding="utf-8")
+        result = self.run_state("check")
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("ranking_mode", result.stderr)
+        self.assertNotIn("Traceback", result.stderr)
+
+
 class DirectiveTests(RepoTest):
     def test_requires_init(self):
         result = self.run_state("directive-add", "--text", "x")
@@ -2048,6 +2182,15 @@ class ContractTests(RepoTest):
                 "id", "title", "reason", "type", "risk", "depends_on", "impact",
                 "value", "effort", "status", "round", "created_at", "updated_at",
                 "score", "score_breakdown", "ready", "blocked_by",
+                "unlocks", "below_floor", "selected",
+            },
+        )
+        self.assertEqual(
+            set(ranked[0]["score_breakdown"]),
+            {
+                "base_value", "success_rate", "calibration", "expected_value",
+                "unlocks", "unlock_bonus", "risk", "risk_weight", "risk_factor",
+                "saturation_factor", "mix_penalty", "effort_cost",
             },
         )
 
@@ -2079,6 +2222,9 @@ class ConfigValidationMatrixTests(RepoTest):
         ("allow_paths_type", {"allow_paths": "src/"}, "'allow_paths' must be an array"),
         ("deadline_type", {"deadline": 12345}, "'deadline' must be"),
         ("secret_pattern_regex", {"secret_patterns": ["([unclosed"]}, "invalid regex"),
+        ("ranking_mode", {"ranking_mode": "bogus"}, "'ranking_mode' must be"),
+        ("min_candidate_value", {"min_candidate_value": 9}, "'min_candidate_value' must be"),
+        ("max_same_type_per_round", {"max_same_type_per_round": 0}, "'max_same_type_per_round' must be"),
     ]
 
     def test_validation_matrix(self):

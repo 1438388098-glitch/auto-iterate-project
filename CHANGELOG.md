@@ -2,6 +2,41 @@
 
 All notable changes to auto-iterate-project are documented here.
 
+## 1.1.0 (2026-09-11)
+
+Ranking overhaul: the backlog now ranks by **expected value per round** instead of
+a value/effort ratio, so cheap busywork no longer systematically outranks valuable
+work.
+
+### Added
+
+- `ranking_mode` config (`expected` default / `classic`): expected-value scoring is
+  `value × success rate (from the type's blocked history) × value calibration
+  (learned from past self-review scores) × dependency-unlock bonus × budget-aware
+  risk factor × saturation × prospective backlog-mix penalty ÷ log2(1+effort)`.
+  Rounds — not effort — are the scarce resource, so effort only breaks ties.
+- `min_candidate_value` (default 3): below-floor candidates are demoted
+  (`below_floor: true`) and at most one quick-win fills a remaining round slot;
+  `begin-round` warns when several below-floor candidates are picked together.
+- `max_same_type_per_round` (default 2): diversity quota applied when marking the
+  recommended round batch.
+- Batch cutoff: recommended-round selection stops once the score drops below 40%
+  of the best eligible candidate.
+- `backlog-rank` entries now carry `selected`, `below_floor`, and `unlocks`, and
+  `score_breakdown` exposes every factor (success_rate, calibration, unlock_bonus,
+  risk_weight, mix_penalty, effort_cost).
+- Value calibration: `complete-round --review-score` is written back to completed
+  candidates; per-type calibration (clamped 0.6-1.5, needs ≥3 samples) discounts
+  types the agent habitually over- or under-rates.
+- Risk weight grows with the consumed round budget (0.05 → 0.15): early rounds
+  take swings at risky work, late rounds play it safe.
+
+### Changed
+
+- Default ranking order for mixed backlogs: high-value/larger-effort candidates
+  now outrank trivial low-value ones (previously the opposite). Set
+  `ranking_mode: classic` to restore the old order.
+
 ## 1.0.0 (2026-09-11)
 
 Audit-driven hardening release. No workflow contract changes; all existing

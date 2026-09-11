@@ -41,6 +41,9 @@ def default_config(repo):
         "secret_patterns": [],
         "type_saturation_threshold": 2,
         "report_lang": "zh",
+        "ranking_mode": "expected",
+        "min_candidate_value": 3,
+        "max_same_type_per_round": 2,
     }
 
 
@@ -121,6 +124,14 @@ def load_config(repo):
     threshold = merged.get("type_saturation_threshold")
     if threshold is not None and (not isinstance(threshold, int) or isinstance(threshold, bool) or threshold < 0):
         _config_error(config_path_for(repo), "'type_saturation_threshold' must be a non-negative integer")
+    if merged.get("ranking_mode") not in ("expected", "classic"):
+        _config_error(config_path_for(repo), "'ranking_mode' must be 'expected' or 'classic'")
+    mcv = merged.get("min_candidate_value")
+    if mcv is not None and (not isinstance(mcv, int) or isinstance(mcv, bool) or mcv < 1 or mcv > 5):
+        _config_error(config_path_for(repo), "'min_candidate_value' must be an integer 1-5 or null")
+    mst = merged.get("max_same_type_per_round")
+    if mst is not None and (not isinstance(mst, int) or isinstance(mst, bool) or mst < 1):
+        _config_error(config_path_for(repo), "'max_same_type_per_round' must be a positive integer or null")
     if not isinstance(merged["check_commands"], list) or not all(isinstance(c, str) for c in merged["check_commands"]):
         _config_error(config_path_for(repo), "'check_commands' must be an array of strings")
     for key in ("allow_paths", "deny_paths", "secret_patterns"):

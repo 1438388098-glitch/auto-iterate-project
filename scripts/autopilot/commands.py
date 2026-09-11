@@ -125,6 +125,18 @@ def cmd_init(args):
                 io.append_log(repo, "init", "error", reason="type_saturation_threshold out of range")
                 return emit_result(args, False, "[ERROR] --type-saturation-threshold must be a non-negative integer.")
             cfg["type_saturation_threshold"] = args.type_saturation_threshold
+        if args.ranking_mode is not None:
+            cfg["ranking_mode"] = args.ranking_mode
+        if args.min_candidate_value is not None:
+            if args.min_candidate_value < 1 or args.min_candidate_value > 5:
+                io.append_log(repo, "init", "error", reason="min_candidate_value out of range")
+                return emit_result(args, False, "[ERROR] --min-candidate-value must be an integer 1-5.")
+            cfg["min_candidate_value"] = args.min_candidate_value
+        if args.max_same_type_per_round is not None:
+            if args.max_same_type_per_round < 1:
+                io.append_log(repo, "init", "error", reason="max_same_type_per_round out of range")
+                return emit_result(args, False, "[ERROR] --max-same-type-per-round must be a positive integer.")
+            cfg["max_same_type_per_round"] = args.max_same_type_per_round
         if args.allow_path:
             cfg["allow_paths"] = list(args.allow_path)
         if args.deny_path:
@@ -217,6 +229,20 @@ def cmd_begin_round(args):
                     )
             state.update_candidates_status(repo, candidate_ids, "picked", round_number, backlog=backlog)
 
+        floor = cfg.get("min_candidate_value")
+        if floor is not None:
+            low_value_ids = [
+                cid for cid in candidate_ids
+                if state._resolved_value(state.find_candidate(backlog, cid) or {}) < floor
+            ]
+            if len(low_value_ids) > 1:
+                print(
+                    "[WARN] {} picked candidates are below min_candidate_value ({}); "
+                    "at most one quick-win per round is recommended — the rest will compete "
+                    "with higher-value work for this round's budget.".format(len(low_value_ids), floor),
+                    file=sys.stderr,
+                )
+
         dirty = io.working_tree_dirty(repo)
         allow_dirty = cfg.get("allow_uncommitted_changes", False)
         first_round = (
@@ -284,7 +310,7 @@ def _refresh_type_stats(repo, st):
 
 
 def _close_round(repo, st, current, status, counter_key, tokens, history_entry,
-                 candidate_status, candidate_round=None):
+                 candidate_status, candidate_round=None, candidate_extra=None):
     """Shared round-closing bookkeeping: bump the round counter, append tokens,
     record bounded history, release the round, update candidates in one backlog
     pass, refresh type stats, and persist state."""
@@ -297,7 +323,8 @@ def _close_round(repo, st, current, status, counter_key, tokens, history_entry,
     state.append_history(st, history_entry)
     st["current_round"] = None
     state.update_candidates_status(
-        repo, state.round_candidate_ids(current), candidate_status, candidate_round
+        repo, state.round_candidate_ids(current), candidate_status, candidate_round,
+        extra_fields=candidate_extra,
     )
     _refresh_type_stats(repo, st)
     state.save_state(repo, st)
@@ -372,6 +399,9 @@ def cmd_complete_round(args):
             },
             candidate_status="completed",
             candidate_round=current["round"],
+            candidate_extra=(
+                {"review_score": args.review_score} if getattr(args, "review_score", None) is not None else None
+            ),
         )
         io.append_log(
             repo, "complete-round", "success",
@@ -717,7 +747,8 @@ def cmd_backlog_rank(args):
         return emit_result(args, False, "[ERROR] Autopilot not initialized. Run init first.")
     backlog = state.load_backlog(repo)
     cfg = config.load_config(repo)
-    ranked = state.rank_candidates(backlog, cfg)
+    st = state.load_state(repo)
+    ranked = state.rank_candidates(backlog, cfg, progress=state.progress_from_state(st, cfg))
     print(json.dumps(ranked, indent=2, ensure_ascii=False))
     return 0
 

@@ -56,6 +56,12 @@ def build_parser():
                              help="Extra regex patterns for the commit-time secret scan (repeatable)")
     init_parser.add_argument("--type-saturation-threshold", type=int, default=None,
                              help="Completed same-type candidates before ranking downweights the type (default 2)")
+    init_parser.add_argument("--ranking-mode", choices=["expected", "classic"], default=None,
+                             help="Backlog scoring: 'expected' ranks by value x success rate per round (default); 'classic' is the legacy value/effort ratio")
+    init_parser.add_argument("--min-candidate-value", type=int, default=None,
+                             help="Candidates below this value are demoted in ranking (1-5, default 3; null disables)")
+    init_parser.add_argument("--max-same-type-per-round", type=int, default=None,
+                             help="Diversity quota: at most this many same-type candidates per recommended round (default 2)")
     init_parser.add_argument("--allow-path", action="append", default=None, help="Glob of paths allowed in commits (repeatable)")
     init_parser.add_argument("--deny-path", action="append", default=None, help="Glob of paths never allowed in commits (repeatable)")
     init_parser.add_argument("--report-lang", choices=["zh", "en"], default=None)

@@ -1,6 +1,6 @@
 # Auto Iterate Project
 
-Version 1.0.0 — see [CHANGELOG.md](CHANGELOG.md) for release history.
+Version 1.1.0 — see [CHANGELOG.md](CHANGELOG.md) for release history.
 
 Automatically iterate any git project inside an agent session: analyze the repository, pick the next high-value improvement, implement small changes, verify, commit, and loop until a goal is met or configurable round/time/token limits are reached.
 
@@ -10,7 +10,7 @@ Works with opencode, Claude Code, Codex, and other agent runtimes (auto-detected
 
 - **Self-owned loop**: deterministic state, backlog, branch, and budget management via `scripts/autopilot_state.py`; no host-specific tooling required.
 - **Efficiency-first defaults**: one round works on `candidates_per_round` (default 3) candidates, full verification runs every `verify_every_rounds` (default 3) rounds, and commits are flushed once every `commit_every_rounds` (default 5) rounds instead of per candidate — far fewer commits and test runs per improvement.
-- **Smart backlog ranking**: candidates are ranked by an adjusted value/effort score that discounts high `risk`, downweights saturated types (`type_saturation_threshold`), downweights consistently-blocking types, and defers candidates with unfinished `depends_on` prereqs. Ranking adapts to the run's own history (per-type stats in `state.json`).
+- **Smart backlog ranking**: candidates are ranked by **expected value per round** (`ranking_mode: expected`, default): value × success rate learned from the type's blocked history × value calibration learned from past self-review scores, with a dependency-unlock bonus, a risk factor that grows stricter as the round budget is consumed, type saturation, a prospective backlog-mix penalty, and only a sublinear effort cost — cheap busywork can no longer outrank valuable work. A hard value floor (`min_candidate_value`), a per-round type quota (`max_same_type_per_round`), and a score cutoff shape each recommended batch (`selected` flags). `ranking_mode: classic` restores the legacy value/effort ratio.
 - **Repo analysis cache**: `.autopilot/analysis.json` caches repository understanding across rounds and auto-invalidates when HEAD or config changes, so the loop does not re-read the whole repo every round.
 - **Secret guard**: `commit` scans the staged diff for secret-like content (AWS keys, private keys, GitHub/Slack/Google tokens, `sk-*`) and refuses on a match; `secret-scan` checks the staged diff on demand.
 - **Human checkpoints & directives**: `checkpoint_every: N` pauses the loop to consult you every N rounds; `directive-add` records standing rules that every round must honor (`.autopilot/directives.json`) — steer a long run without stopping it.
@@ -74,6 +74,9 @@ All options live in `.autopilot/config.json` (created by `init`) and can be set 
 | `scan_secrets` | `true` | Refuse commits whose staged diff matches a secret pattern |
 | `secret_patterns` | `[]` | Extra regex patterns for the commit-time secret scan |
 | `type_saturation_threshold` | `2` | Completed same-type candidates before ranking downweights the type |
+| `ranking_mode` | `expected` | Backlog scoring: `expected` (value × success rate per round) or `classic` (legacy value/effort ratio) |
+| `min_candidate_value` | `3` | Candidates below this value are demoted (`below_floor`); at most one quick-win per round |
+| `max_same_type_per_round` | `2` | Diversity quota: max same-type candidates per recommended round |
 | `branch_mode` | `current` | `feature` isolates work on an `autopilot/<run-id>` branch |
 | `push` | `false` | Push after each completed round with a commit |
 | `allow_paths` / `deny_paths` | `[]` | Commit path whitelist/blacklist (fnmatch globs) |

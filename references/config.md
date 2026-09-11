@@ -128,7 +128,24 @@ Array of regex strings, default `[]`. Extra patterns appended to the built-in se
 
 ### type_saturation_threshold
 
-Integer, default `2`. After this many candidates of the same `type` have been completed, `backlog-rank` downweights further same-type pending candidates by `0.85` per additional completion (`0.85 ** (completed - threshold)`). This stops the loop from grinding out the same low-hanging-fruit category forever. A type with a blocked history is additionally discounted by `0.9` per blocked candidate. Set to a large number to disable.
+Integer, default `2`. After this many candidates of the same `type` have been completed, `backlog-rank` downweights further same-type pending candidates by `0.7` per additional completion (`0.7 ** (completed - threshold)` in the default `ranking_mode: expected`; `0.85` in `classic`). This stops the loop from grinding out the same low-hanging-fruit category forever. Set to a large number to disable.
+
+### ranking_mode
+
+String, default `"expected"`. How `backlog-rank` scores candidates:
+
+- `expected` (default): expected **value per round** — the scarce resource in a run is rounds, not effort. Score = `value × success_rate (1 − blocked_rate of the type) × calibration (learned from past self-review scores, clamped 0.6-1.5, needs ≥3 samples) × unlock_bonus (1 + 0.15 × pending candidates that depend on this one) × risk_factor × saturation × mix_penalty (1 − 0.3 × pending share of the type) ÷ log2(1 + effort)`. The risk factor tightens as the round budget is consumed (`risk_weight` 0.05 → 0.15), so early rounds take swings and late rounds play it safe.
+- `classic`: the legacy `value / effort` ratio with fixed risk/saturation/blocked discounts.
+
+Every `backlog-rank` entry carries a `score_breakdown` exposing each factor, plus `selected` (the recommended round batch), `below_floor`, `unlocks`, and `ready`/`blocked_by`.
+
+### min_candidate_value
+
+Integer 1-5, default `3`. Pending candidates whose (resolved) value is below this are demoted: `below_floor: true`, ranked after same-score above-floor candidates, and at most one such quick-win fills a remaining slot in the recommended batch. `begin-round` prints a warning when several below-floor candidates are picked in one round. Set to `null` to disable the floor.
+
+### max_same_type_per_round
+
+Positive integer, default `2`. Diversity quota used when marking the recommended round batch (`selected: true`): at most this many candidates of the same type are included per round. The recommended batch also stops once a candidate's score drops below 40% of the best eligible candidate (batch cutoff). Set to `null` to disable the quota.
 
 ### max_blocked_in_a_row
 
@@ -204,7 +221,7 @@ Each candidate tracks:
 - `status`: `pending`, `picked`, `completed`, or `blocked`
 - `round` and timestamps
 
-`backlog-rank` sorts pending, dependency-**ready** candidates by an **adjusted** score: base `value / effort`, discounted for `risk` (factor `max(0.5, 1.0 - 0.08 * (risk - 1))`), for type saturation (`0.85 ** max(0, completed_of_type - type_saturation_threshold)`), and for a blocked type history (`0.9 ** blocked_of_type`). Candidates whose `depends_on` is not yet satisfied are marked `"ready": false` with a `blocked_by` reason and ranked after ready candidates. Every entry carries a `score_breakdown` (base/risk/saturation/blocked factors) so the ranking is transparent. The per-type counts come from the backlog and are also persisted to `state.type_stats` for the retrospective. `begin-round` refuses to pick a candidate whose deps are unresolved.
+`backlog-rank` sorts pending, dependency-**ready** candidates by score and marks the recommended round batch (`selected`). In the default `ranking_mode: expected` the score is expected value per round (see the `ranking_mode` section above); `ranking_mode: classic` uses the legacy `value / effort` ratio discounted for `risk` (`max(0.5, 1.0 - 0.08 * (risk - 1))`), type saturation (`0.85 ** max(0, completed_of_type - type_saturation_threshold)`), and blocked history (`0.9 ** blocked_of_type`). Candidates whose `depends_on` is not yet satisfied are marked `"ready": false` with a `blocked_by` reason and ranked after ready candidates. Every entry carries a `score_breakdown` so the ranking is transparent. The per-type counts (including the learned value calibration) come from the backlog and are also persisted to `state.type_stats` for the retrospective. `begin-round` refuses to pick a candidate whose deps are unresolved.
 
 `begin-round` marks the chosen candidate(s) `picked` (`--candidate-id` is repeatable for multi-candidate rounds); the helper updates each one to `completed` or `blocked` when the round closes, and back to `pending` on `cancel-round`. Legacy string flags `--impact` and `--effort-level` are still accepted and mapped to numeric scores.
 

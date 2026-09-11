@@ -1,6 +1,6 @@
 ---
 name: auto-iterate-project
-version: 1.0.0
+version: 1.1.0
 description: Automatically iterate any git project inside the current agent session by analyzing the repository, choosing the next high-value improvement, implementing small changes, verifying, committing, and looping until a goal is met or configurable round/time/token limits are reached. Use when the user asks for autonomous project iteration, continuous self-improvement, auto-improve, keep improving this project, full-auto development, or wants the agent to keep making and committing improvements without per-step approval. Also use for Chinese requests like 全自动迭代这个项目, 自动改进并提交这个仓库, 连续自动开发, or 自动推进项目改进.
 ---
 
@@ -121,7 +121,8 @@ When nothing matches, run `python <this-skill>/scripts/autopilot_state.py detect
 ### 3. Maintain the Backlog
 
 - Use `backlog-add` to record 3-5 concrete improvement candidates with title, reason, a numeric `value` (1-5), `effort` (1-5), a `type` (`bugfix|feature|refactor|perf|test|docs`, default `feature`), an optional `risk` (1-5, default 1), and optional `depends-on <candidate-id>` prereqs.
-- Use `backlog-rank` to list pending candidates sorted by **adjusted** value/effort. The rank is not a raw ratio: it discounts high `risk`, downweights types you have already saturated (see `type_saturation_threshold`, default 2), downweights types that keep blocking, and pushes candidates with unfinished `depends_on` prereqs to the bottom (`"ready": false`, with `blocked_by` reasons and a `score_breakdown` showing every factor). Read the breakdown to pick deliberately instead of reflexively.
+- Use `backlog-rank` to list pending candidates sorted by expected value per round. The default `ranking_mode: expected` is NOT a value/effort ratio — the scarce resource in a run is rounds, not effort — so it scores `value × success rate (from the type's blocked history) × value calibration (learned from past review scores) × dependency-unlock bonus × budget-aware risk factor × saturation × backlog-mix penalty ÷ log2(1+effort)`. Entries carry `selected` (the recommended round batch), `below_floor` (below `min_candidate_value`, at most one such quick-win per round), `unlocks` (pending candidates that depend on this one), and `ready`/`blocked_by` for prereqs. Set `ranking_mode: classic` for the legacy value/effort ratio. Read the `score_breakdown` to pick deliberately instead of reflexively.
+- Pick the `selected` candidates (default `candidates_per_round` 3) for the round. The batch applies a diversity quota (`max_same_type_per_round`, default 2) and a value floor (`min_candidate_value`, default 3): picking several below-floor candidates in one round triggers a warning.
 - Choose the top `candidates_per_round` **ready** pending candidates (default `3`). Set `candidates_per_round: N` in `.autopilot/config.json` (or `init --candidates-per-round N`) to batch N independent changes per round and amortize the per-round overhead.
 - Do not combine unrelated candidates into a single change; within a round, each candidate is still implemented and reviewed as its own unit.
 - Quality gate: only open a round whose changes you can justify in one concrete sentence each ("why is this valuable to the user"). If the best available candidate has no clear value, stop and ask the user instead of producing trivial churn.

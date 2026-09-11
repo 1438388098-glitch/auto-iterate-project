@@ -1,5 +1,5 @@
 name: auto-iterate-project
-version: 1.0.0
+version: 1.1.0
 interface:
   display_name: "Auto Iterate Project"
   short_description: "Automatically analyze, improve, test, and commit git projects."

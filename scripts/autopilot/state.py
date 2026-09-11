@@ -1,6 +1,7 @@
 """State, backlog, branch, stop-condition, scoring, and report logic."""
 
 import json
+import math
 import re
 import sys
 import uuid
@@ -176,11 +177,12 @@ def update_candidate_status(repo, candidate_id, status, round_number=None):
     save_backlog(repo, backlog)
 
 
-def update_candidates_status(repo, candidate_ids, status, round_number=None, backlog=None):
+def update_candidates_status(repo, candidate_ids, status, round_number=None, backlog=None, extra_fields=None):
     """Update many candidates with a single backlog read/write cycle. When a
     preloaded backlog is passed it is mutated here; otherwise the backlog is
     loaded once for the whole batch. The backlog is saved once when anything
-    changed."""
+    changed. `extra_fields` is merged into every updated candidate (e.g. the
+    round's self-review score for value calibration)."""
     ids = [cid for cid in (candidate_ids or []) if cid]
     if not ids:
         return
@@ -196,6 +198,8 @@ def update_candidates_status(repo, candidate_ids, status, round_number=None, bac
         candidate["updated_at"] = io.now_iso()
         if round_number is not None:
             candidate["round"] = round_number
+        if extra_fields:
+            candidate.update(extra_fields)
         changed = True
     if changed:
         save_backlog(repo, backlog)
@@ -397,18 +401,50 @@ def _candidate_score(candidate):
 VALID_CANDIDATE_TYPES = ("bugfix", "feature", "refactor", "perf", "test", "docs")
 
 
+def _resolved_value(candidate):
+    """Numeric value 1-5 with legacy impact mapping and safe fallbacks."""
+    value = candidate.get("value")
+    if value is None:
+        value = config.LEGACY_IMPACT_SCORE.get(candidate.get("impact"), 3)
+    try:
+        return max(1, min(5, int(value)))
+    except (TypeError, ValueError):
+        return 3
+
+
+def _resolved_effort(candidate):
+    effort = candidate.get("effort")
+    if effort is None or isinstance(effort, str):
+        effort = config.LEGACY_EFFORT_SCORE.get(effort, 3)
+    try:
+        effort = int(effort)
+    except (TypeError, ValueError):
+        return 3
+    return max(1, min(5, effort))
+
+
+def _candidate_type(candidate):
+    candidate_type = candidate.get("type") or "feature"
+    if candidate_type not in VALID_CANDIDATE_TYPES:
+        return "other"
+    return candidate_type
+
+
 def compute_type_stats(backlog):
     """Per-type completion/block statistics derived from the backlog. Feeds ranking
-    (saturation + blocked penalties) and the retrospective report. Types outside the
+    (expected value, saturation, prospective mix) and the retrospective report.
+    Also learns a per-type value calibration from self-review scores: when at least
+    three completed candidates carry a review_score, calibration compares the
+    average review against the average predicted value (clamped 0.6-1.5) so the
+    agent's own optimism or pessimism self-corrects over a run. Types outside the
     VALID_CANDIDATE_TYPES list are grouped under their own key."""
     stats = {}
     for candidate in backlog.get("candidates", []):
-        candidate_type = candidate.get("type") or "feature"
-        if candidate_type not in VALID_CANDIDATE_TYPES:
-            candidate_type = "other"
+        candidate_type = _candidate_type(candidate)
         entry = stats.setdefault(
             candidate_type,
-            {"completed": 0, "blocked": 0, "total": 0, "effort_sum": 0, "value_sum": 0},
+            {"completed": 0, "blocked": 0, "total": 0, "effort_sum": 0, "value_sum": 0,
+             "review_sum": 0.0, "review_n": 0},
         )
         status = candidate.get("status")
         if status in ("completed", "blocked"):
@@ -420,15 +456,29 @@ def compute_type_stats(backlog):
                     entry["value_sum"] += int(candidate.get("value") or 0)
                 except (TypeError, ValueError):
                     pass
+                review = candidate.get("review_score")
+                if isinstance(review, (int, float)) and not isinstance(review, bool):
+                    entry["review_sum"] += review
+                    entry["review_n"] += 1
             else:
                 entry["blocked"] += 1
     for entry in stats.values():
         done = entry["completed"] + entry["blocked"]
         entry["blocked_rate"] = round(entry["blocked"] / done, 3) if done else 0.0
-        entry["avg_effort"] = round(entry["effort_sum"] / entry["completed"], 2) if entry["completed"] else 0.0
-        entry["avg_value"] = round(entry["value_sum"] / entry["completed"], 2) if entry["completed"] else 0.0
+        avg_effort = round(entry["effort_sum"] / entry["completed"], 2) if entry["completed"] else 0.0
+        avg_value = round(entry["value_sum"] / entry["completed"], 2) if entry["completed"] else 0.0
+        entry["avg_effort"] = avg_effort
+        entry["avg_value"] = avg_value
+        review_avg = round(entry["review_sum"] / entry["review_n"], 2) if entry["review_n"] else None
+        entry["review_n"] = entry["review_n"]
+        entry["review_avg"] = review_avg
+        if entry["review_n"] >= 3 and avg_value > 0 and review_avg is not None:
+            entry["calibration"] = round(max(0.6, min(1.5, review_avg / avg_value)), 2)
+        else:
+            entry["calibration"] = 1.0
         entry.pop("effort_sum", None)
         entry.pop("value_sum", None)
+        entry.pop("review_sum", None)
     return stats
 
 
@@ -448,10 +498,8 @@ def candidate_deps_status(backlog, candidate):
     return missing, len(missing) == 0
 
 
-def candidate_adjusted_score(candidate, type_stats=None, saturation_threshold=2):
-    """Adjusted value/effort score. Risk discounts high-risk work, type saturation
-    downweights repeating an already-worked type, and a type's blocked history
-    discounts candidates in consistently-blocking areas. Returns (score, breakdown)."""
+def _score_classic(candidate, type_stats=None, saturation_threshold=2):
+    """Legacy value/effort ratio scoring (ranking_mode: classic)."""
     base = _candidate_score(candidate)
     try:
         risk = int(candidate.get("risk") or 1)
@@ -460,9 +508,7 @@ def candidate_adjusted_score(candidate, type_stats=None, saturation_threshold=2)
     risk = max(1, min(5, risk))
     risk_factor = max(0.5, 1.0 - 0.08 * (risk - 1))
 
-    candidate_type = candidate.get("type") or "feature"
-    if candidate_type not in VALID_CANDIDATE_TYPES:
-        candidate_type = "other"
+    candidate_type = _candidate_type(candidate)
     entry = (type_stats or {}).get(candidate_type, {})
     completed_n = entry.get("completed") or 0
     blocked_n = entry.get("blocked") or 0
@@ -483,21 +529,183 @@ def candidate_adjusted_score(candidate, type_stats=None, saturation_threshold=2)
     }
 
 
-def rank_candidates(backlog, cfg):
-    """Rank backlog candidates by adjusted value/effort. Pending, dependency-ready
-    candidates come first (by score desc), then pending-but-blocked candidates (with
-    their blocked_by reasons), then picked/completed/blocked candidates."""
+def _score_expected(candidate, type_stats=None, saturation_threshold=2,
+                    unlocks=0, pending_mix=0.0, risk_weight=0.08):
+    """Expected-value-per-round scoring (ranking_mode: expected, default).
+
+    The scarce resource in an autopilot run is rounds, not effort — per-round
+    overhead (analysis, verify, commit) dominates and max_round_scope already
+    bounds effort. So the score is expected VALUE delivered per round:
+
+        value x P(round succeeds) x calibration     <- expected value
+        x dependency unlock bonus                   <- foundational work pays
+        x budget-aware risk factor                  <- take swings early, play safe late
+        x completed-type saturation                 <- stop grinding one area
+        x prospective backlog-mix penalty           <- diversify BEFORE over-grinding
+        / log2(1 + effort)                          <- sublinear effort cost, tie-break only
+    """
+    value = _resolved_value(candidate)
+    entry = (type_stats or {}).get(_candidate_type(candidate), {})
+    completed_n = entry.get("completed") or 0
+    blocked_n = entry.get("blocked") or 0
+    blocked_rate = entry.get("blocked_rate")
+    if blocked_rate is None:
+        blocked_rate = (blocked_n / (completed_n + blocked_n)) if (completed_n + blocked_n) else 0.0
+    success_rate = 1.0 - blocked_rate
+    calibration = entry.get("calibration") or 1.0
+    expected_value = value * success_rate * calibration
+
+    unlock_bonus = 1.0 + 0.15 * unlocks
+
+    try:
+        risk = int(candidate.get("risk") or 1)
+    except (TypeError, ValueError):
+        risk = 1
+    risk = max(1, min(5, risk))
+    risk_factor = max(0.3, 1.0 - risk_weight * (risk - 1))
+
+    try:
+        threshold = max(0, int(saturation_threshold or 0))
+    except (TypeError, ValueError):
+        threshold = 2
+    saturation_factor = 0.7 ** max(0, completed_n - threshold)
+
+    mix_penalty = 1.0 - 0.3 * max(0.0, min(1.0, pending_mix))
+
+    effort = _resolved_effort(candidate)
+    effort_cost = math.log2(1 + effort)
+
+    score = expected_value * unlock_bonus * risk_factor * saturation_factor * mix_penalty / effort_cost
+    return score, {
+        "base_value": value,
+        "success_rate": round(success_rate, 3),
+        "calibration": round(calibration, 3),
+        "expected_value": round(expected_value, 3),
+        "unlocks": unlocks,
+        "unlock_bonus": round(unlock_bonus, 3),
+        "risk": risk,
+        "risk_weight": round(risk_weight, 3),
+        "risk_factor": round(risk_factor, 3),
+        "saturation_factor": round(saturation_factor, 3),
+        "mix_penalty": round(mix_penalty, 3),
+        "effort_cost": round(effort_cost, 3),
+    }
+
+
+def candidate_adjusted_score(candidate, type_stats=None, saturation_threshold=2,
+                             cfg=None, unlocks=0, pending_mix=0.0, risk_weight=0.08):
+    """Adjusted score for one candidate. Dispatches on cfg ranking_mode:
+    'expected' (default) or 'classic'. Returns (score, breakdown)."""
+    if (cfg or {}).get("ranking_mode", "expected") == "classic":
+        return _score_classic(candidate, type_stats, saturation_threshold)
+    return _score_expected(candidate, type_stats, saturation_threshold,
+                           unlocks=unlocks, pending_mix=pending_mix, risk_weight=risk_weight)
+
+
+def _unlocks_map(backlog):
+    """candidate id -> number of pending candidates that depend on it."""
+    counts = {}
+    for candidate in backlog.get("candidates", []):
+        if candidate.get("status") != "pending":
+            continue
+        for dep_id in candidate.get("depends_on") or []:
+            counts[dep_id] = counts.get(dep_id, 0) + 1
+    return counts
+
+
+def _risk_weight_for(cfg, progress):
+    """Risk aversion grows as the run's round budget is consumed: early rounds
+    take swings at high-risk work, late rounds play it safe."""
+    if progress is None:
+        return 0.08
+    return 0.05 + 0.10 * max(0.0, min(1.0, progress))
+
+
+def _mark_selection(entries, cfg):
+    """Mark the recommended round batch (`selected: true`). Selection is a
+    constrained pick over the ranked list, separate from scoring:
+      - only pending + ready candidates are eligible
+      - value below min_candidate_value is demoted (below_floor) and at most one
+        such quick-win fills a remaining slot
+      - at most max_same_type_per_round candidates of the same type per round
+      - batch cutoff: stop once the score drops below 40% of the best eligible
+    """
+    n = cfg.get("candidates_per_round") or 3
+    max_per_type = cfg.get("max_same_type_per_round") or 2
+    for entry in entries:
+        entry["selected"] = False
+    pool = [e for e in entries if e.get("status") == "pending" and e.get("ready") and not e.get("below_floor")]
+    below = [e for e in entries if e.get("status") == "pending" and e.get("ready") and e.get("below_floor")]
+    selected = []
+    type_counts = {}
+    top_score = pool[0]["score"] if pool else None
+    for entry in pool:
+        if len(selected) >= n:
+            break
+        candidate_type = entry.get("type") or "feature"
+        if type_counts.get(candidate_type, 0) >= max_per_type:
+            continue
+        if top_score is not None and entry["score"] < 0.4 * top_score:
+            break
+        selected.append(entry)
+        type_counts[candidate_type] = type_counts.get(candidate_type, 0) + 1
+    if len(selected) < n and below:
+        selected.append(below[0])
+    for entry in selected:
+        entry["selected"] = True
+
+
+def progress_from_state(state, cfg):
+    """Fraction of the round budget consumed (0-1), or None when max_rounds is unset."""
+    max_rounds = (cfg or {}).get("max_rounds")
+    if not max_rounds:
+        return None
+    used = (
+        state.get("completed_rounds", 0)
+        + state.get("blocked_rounds", 0)
+        + state.get("cancelled_rounds", 0)
+        + state.get("reverted_rounds", 0)
+    )
+    return used / max_rounds
+
+
+def rank_candidates(backlog, cfg, progress=None):
+    """Rank backlog candidates and mark the recommended round batch. Pending,
+    dependency-ready candidates come first (by score desc), then pending-but-blocked
+    candidates (with their blocked_by reasons), then picked/completed/blocked
+    candidates. `progress` (0-1 fraction of max_rounds consumed, or None) shapes
+    the risk weight."""
+    cfg = cfg or {}
     type_stats = compute_type_stats(backlog)
-    threshold = (cfg or {}).get("type_saturation_threshold", 2)
+    threshold = cfg.get("type_saturation_threshold", 2)
+    floor = cfg.get("min_candidate_value")
+    risk_weight = _risk_weight_for(cfg, progress)
+
+    pending = [c for c in backlog.get("candidates", []) if c.get("status") == "pending"]
+    pending_total = len(pending)
+    pending_by_type = {}
+    for candidate in pending:
+        pending_by_type[_candidate_type(candidate)] = pending_by_type.get(_candidate_type(candidate), 0) + 1
+    unlocks = _unlocks_map(backlog)
+
     entries = []
     for candidate in backlog.get("candidates", []):
         entry = dict(candidate)
-        score, breakdown = candidate_adjusted_score(candidate, type_stats, threshold)
-        missing, ready = candidate_deps_status(backlog, candidate)
+        candidate_type = _candidate_type(candidate)
+        pending_mix = (pending_by_type.get(candidate_type, 0) / pending_total) if pending_total else 0.0
+        score, breakdown = candidate_adjusted_score(
+            candidate, type_stats, threshold, cfg,
+            unlocks=unlocks.get(candidate.get("id"), 0),
+            pending_mix=pending_mix,
+            risk_weight=risk_weight,
+        )
         entry["score"] = round(score, 3)
         entry["score_breakdown"] = breakdown
+        missing, ready = candidate_deps_status(backlog, candidate)
         entry["ready"] = ready
         entry["blocked_by"] = missing
+        entry["unlocks"] = unlocks.get(candidate.get("id"), 0)
+        entry["below_floor"] = bool(floor is not None and _resolved_value(candidate) < floor)
         entries.append(entry)
     entries.sort(
         key=lambda item: (
@@ -507,6 +715,8 @@ def rank_candidates(backlog, cfg):
             item.get("id") or "",
         )
     )
+    if cfg.get("ranking_mode", "expected") != "classic":
+        _mark_selection(entries, cfg)
     return entries
 
 
@@ -647,7 +857,7 @@ def build_retrospective(repo, state, cfg, lang="zh"):
             out.append("- `{}`".format(command))
     out.append("")
 
-    ranked = rank_candidates(backlog, cfg)
+    ranked = rank_candidates(backlog, cfg, progress=progress_from_state(state, cfg))
     ready = [r for r in ranked if r.get("status") == "pending" and r.get("ready")]
     out.append("## {}".format("下一步建议" if zh else "Next likely improvement"))
     out.append("")
@@ -772,7 +982,7 @@ def build_report(repo, state, cfg, lang="en"):
             out.append("```")
             out.append("")
 
-    ranked = rank_candidates(backlog_data, cfg)
+    ranked = rank_candidates(backlog_data, cfg, progress=progress_from_state(state, cfg))
     ready = [r for r in ranked if r.get("status") == "pending" and r.get("ready")]
     if ready:
         top = ready[0]
