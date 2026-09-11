@@ -6,9 +6,15 @@ Thin CLI entry point; the implementation lives in the ``autopilot`` package
 maintain. This module re-exports the names historically imported from it so
 external callers and the test suite keep working unchanged."""
 
+import sys
+from pathlib import Path
+
+# Explicit bootstrap so the entry keeps working under `python -P` /
+# PYTHONSAFEPATH, or when only this file is copied without the package layout.
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+
 from autopilot.cli import main
 from autopilot.io import (
-    EMPTY_TREE,
     parse_deadline,
     parse_time,
     _is_autopilot_path,

@@ -1,7 +1,8 @@
 """Low-level IO, git, time, and lock helpers. No imports from sibling modules."""
 
 import csv
-import io
+import hashlib
+import io as _stdlib_io
 import json
 import os
 import re
@@ -21,12 +22,27 @@ LOCK_FILENAME = "lock"
 LOG_FILENAME = "log.jsonl"
 ANALYSIS_FILENAME = "analysis.json"
 DIRECTIVES_FILENAME = "directives.json"
+RETROSPECTIVE_FILENAME = "retrospective.md"
 PHASE_REPORT_PREFIX = "phase-report-round-"
 
 EMPTY_TREE = "4b825dc642cb6eb9a060e54bf8d69288fbee4904"
 
 DEFAULT_MAX_ROUNDS = 10
 SCHEMA_VERSION = 5
+
+# Run/state sizing constants (single authority — do not hardcode these elsewhere).
+RUN_ID_LENGTH = 12
+HISTORY_LIMIT = 100
+HISTORY_TEXT_LIMIT = 2000
+PHASE_REPORT_INTERVAL = 10
+PHASE_REPORT_KEEP = 3
+LOG_ROTATE_BYTES = 5 * 1024 * 1024
+TASKLIST_TIMEOUT = 3
+
+# Token estimation (single authority; consumed by io.estimate_tokens_for_round).
+TOKEN_BASE = 500
+TOKENS_PER_TEXT_LINE = 12
+TOKENS_PER_BINARY_FILE = 100
 
 
 def now_iso():
@@ -193,25 +209,51 @@ def is_detached_head(repo):
 def _is_autopilot_path(path):
     if not path:
         return False
-    if path == ".autopilot":
+    if path == AUTOPILOT_DIR:
         return True
-    return path.startswith(".autopilot/") or path.startswith(".autopilot\\")
+    return path.startswith(AUTOPILOT_DIR + "/") or path.startswith(AUTOPILOT_DIR + "\\")
+
+
+_GIT_QUOTED_ESCAPE_RE = re.compile(r"\\([0-7]{3})|\\(.)")
+
+
+def _unquote_git_path(path):
+    """Undo git's C-style path quoting. Octal escapes encode raw UTF-8 bytes, so
+    decode byte-wise (latin-1 round-trip) and re-decode as UTF-8 — the old
+    ``unicode_escape`` approach produced mojibake for non-ASCII names."""
+    if not path.startswith('"'):
+        return path
+
+    def repl(match):
+        if match.group(1):
+            return chr(int(match.group(1), 8))
+        return {"n": "\n", "t": "\t", "r": "\r", '"': '"', "\\": "\\"}.get(
+            match.group(2), match.group(2)
+        )
+
+    unescaped = _GIT_QUOTED_ESCAPE_RE.sub(repl, path.strip('"'))
+    try:
+        return unescaped.encode("latin-1").decode("utf-8")
+    except (UnicodeEncodeError, UnicodeDecodeError):
+        return unescaped
 
 
 def _porcelain_entries(repo):
-    result = run_git(repo, "status", "--porcelain")
+    result = run_git(repo, "-c", "core.quotepath=false", "status", "--porcelain")
+    if result.returncode != 0:
+        print(
+            "[ERROR] git status failed (exit {}): {}".format(
+                result.returncode, result.stderr.strip() or "unknown error"
+            ),
+            file=sys.stderr,
+        )
+        raise SystemExit(2)
     entries = []
     for line in result.stdout.splitlines():
         if len(line) < 3:
             continue
         code = line[:2]
-        path = line[3:]
-        if path.startswith('"'):
-            try:
-                import codecs
-                path = codecs.decode(path, "unicode_escape").strip('"')
-            except Exception:
-                pass
+        path = _unquote_git_path(line[3:])
         entries.append((code, path))
     return entries
 
@@ -241,8 +283,15 @@ def tracked_changes(repo):
 
 
 def git_identity_ok(repo):
-    name = run_git(repo, "config", "user.name").stdout.strip()
-    email = run_git(repo, "config", "user.email").stdout.strip()
+    result = run_git(repo, "config", "--get-regexp", r"^user\.(name|email)$")
+    name = email = ""
+    if result.returncode == 0:
+        for line in result.stdout.splitlines():
+            key, _, value = line.partition(" ")
+            if key == "user.name":
+                name = value.strip()
+            elif key == "user.email":
+                email = value.strip()
     return bool(name and email), name, email
 
 
@@ -264,14 +313,16 @@ def _pid_alive(pid):
                 universal_newlines=True,
                 encoding="utf-8",
                 errors="replace",
-                timeout=15,
+                timeout=TASKLIST_TIMEOUT,
             )
         except (OSError, subprocess.SubprocessError):
             return True
         try:
-            rows = list(csv.reader(io.StringIO(result.stdout)))
+            rows = list(csv.reader(_stdlib_io.StringIO(result.stdout)))
         except Exception:
-            rows = []
+            # Unparseable output: treat the process as alive so a live lock is
+            # never deleted based on missing information.
+            return True
         for row in rows:
             if len(row) >= 2 and row[1].strip() == str(pid):
                 return True
@@ -294,39 +345,61 @@ def _read_lock_file(path):
         return None
 
 
+def _create_lock_exclusive(path):
+    """Atomically create the lock file (O_CREAT|O_EXCL). Returns False when the
+    file already exists — never overwrites another process's lock."""
+    payload = json.dumps(
+        {"pid": os.getpid(), "started_at": now_iso(), "hostname": socket.gethostname()}
+    )
+    try:
+        fd = os.open(str(path), os.O_CREAT | os.O_EXCL | os.O_WRONLY)
+    except FileExistsError:
+        return False
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as handle:
+            handle.write(payload)
+    except OSError:
+        try:
+            os.unlink(str(path))
+        except OSError:
+            pass
+        raise
+    return True
+
+
 def _acquire_lock(repo):
     path = lock_path_for(repo)
     path.parent.mkdir(parents=True, exist_ok=True)
-    holder = None
-    if path.exists():
+    for _ in range(2):
+        if _create_lock_exclusive(path):
+            return path
         holder = _read_lock_file(path)
-    if isinstance(holder, dict):
-        same_host = not holder.get("hostname") or holder.get("hostname") == socket.gethostname()
-        if _pid_alive(holder.get("pid")) and same_host:
+        if isinstance(holder, dict):
+            same_host = not holder.get("hostname") or holder.get("hostname") == socket.gethostname()
+            if _pid_alive(holder.get("pid")) and same_host:
+                print(
+                    "[ERROR] Another autopilot run appears active (pid {}). "
+                    "Refusing to modify state. If that process is dead, delete {}.".format(
+                        holder.get("pid"), path
+                    ),
+                    file=sys.stderr,
+                )
+                raise SystemExit(2)
             print(
-                "[ERROR] Another autopilot run appears active (pid {}). "
-                "Refusing to modify state. If that process is dead, delete {}.".format(
-                    holder.get("pid"), path
-                ),
+                "[WARN] Removing stale autopilot lock left by pid {}.".format(holder.get("pid")),
                 file=sys.stderr,
             )
-            raise SystemExit(2)
-        print(
-            "[WARN] Removing stale autopilot lock left by pid {}.".format(holder.get("pid")),
-            file=sys.stderr,
-        )
+        else:
+            print("[WARN] Removing corrupt autopilot lock file at {}.".format(path), file=sys.stderr)
         try:
             path.unlink()
         except OSError:
             pass
-    elif path.exists():
-        print("[WARN] Removing corrupt autopilot lock file at {}.".format(path), file=sys.stderr)
-        try:
-            path.unlink()
-        except OSError:
-            pass
-    save_json(path, {"pid": os.getpid(), "started_at": now_iso(), "hostname": socket.gethostname()})
-    return path
+    print(
+        "[ERROR] Could not acquire the autopilot lock at {} after retrying.".format(path),
+        file=sys.stderr,
+    )
+    raise SystemExit(2)
 
 
 def _release_lock(path):
@@ -351,10 +424,12 @@ def append_log(repo, event, status, **fields):
     path = repo / AUTOPILOT_DIR / LOG_FILENAME
     try:
         path.parent.mkdir(parents=True, exist_ok=True)
+        if path.exists() and path.stat().st_size > LOG_ROTATE_BYTES:
+            os.replace(str(path), str(path) + ".1")
         with path.open("a", encoding="utf-8") as handle:
             handle.write(json.dumps(entry, ensure_ascii=False) + "\n")
-    except OSError:
-        pass
+    except OSError as exc:
+        print("[WARN] Failed to append to {}: {}".format(path, exc), file=sys.stderr)
 
 
 def _parse_numstat(stdout):
@@ -372,16 +447,12 @@ def _parse_numstat(stdout):
     return text, binary
 
 
-def _numstat_total(stdout):
-    text, _ = _parse_numstat(stdout)
-    return text
-
-
-def estimate_tokens_for_round(repo, start_sha):
-    """Estimate tokens spent on a round: committed diff since round start, plus any
-    still-uncommitted working-tree/staged changes. Anchoring on the round start SHA
-    avoids double counting previously committed rounds. Binary files are charged a
-    flat cost because line counts are meaningless for them."""
+def estimate_tokens_for_round(repo, start_sha, worktree_baseline=None):
+    """Single authority for round token estimation: committed diff since the round's
+    start SHA, plus the working-tree/index delta measured against the snapshot taken
+    at begin-round (so deferred batched commits never double count earlier rounds'
+    uncommitted lines). Binary files are charged a flat cost because line counts are
+    meaningless for them."""
     text = 0
     binary = 0
     base = start_sha or EMPTY_TREE
@@ -391,13 +462,9 @@ def estimate_tokens_for_round(repo, start_sha):
             t, b = _parse_numstat(result.stdout)
             text += t
             binary += b
-    for diff_args in (("diff", "--numstat"), ("diff", "--cached", "--numstat")):
-        result = run_git(repo, *diff_args)
-        if result.returncode == 0:
-            t, b = _parse_numstat(result.stdout)
-            text += t
-            binary += b
-    return 500 + text * 12 + binary * 100
+    if worktree_baseline is not None:
+        text += max(0, worktree_change_lines(repo) - worktree_baseline)
+    return TOKEN_BASE + text * TOKENS_PER_TEXT_LINE + binary * TOKENS_PER_BINARY_FILE
 
 
 def worktree_change_lines(repo):
@@ -457,10 +524,22 @@ def ensure_git_exclude(git_dir, tracked, to_stderr=False):
     if ".autopilot/" not in lines:
         if lines and lines[-1].strip():
             lines.append("")
-        lines.append(".autopilot/")
+        lines.append(AUTOPILOT_DIR + "/")
         exclude_path.write_text("\n".join(lines) + "\n", encoding="utf-8")
         say("[OK] Added .autopilot/ to .git/info/exclude")
 
 
-def _home_dir():
+def autopilot_file_for(repo, filename):
+    return repo / AUTOPILOT_DIR / filename
+
+
+def file_sha256(path):
+    """SHA-256 hex digest of a file's bytes, or None when unreadable."""
+    try:
+        return hashlib.sha256(Path(path).read_bytes()).hexdigest()
+    except OSError:
+        return None
+
+
+def home_dir():
     return Path(os.environ.get("USERPROFILE") or os.environ.get("HOME") or str(Path.home()))

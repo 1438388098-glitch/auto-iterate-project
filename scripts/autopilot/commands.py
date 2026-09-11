@@ -1,25 +1,18 @@
-"""Command handlers: init, rounds, backlog, commit, check, report, push, undo."""
+"""Command handlers: init, rounds, backlog, commit, check, report, push, undo.
 
-import fnmatch
+Orchestration only: secret scanning lives in ``secrets``, path guarding in
+``guard``, verification discovery in ``verify``, and token estimation in
+``io.estimate_tokens_for_round``."""
+
 import json
-import os
-import re
-import shutil
 import sys
 import uuid
 from pathlib import Path
 
 from . import config, io, state
-
-SECRET_PATTERNS = [
-    r"AKIA[0-9A-Z]{16}",
-    r"-----BEGIN (?:RSA|EC|OPENSSH|PGP|DSA|PRIVATE) PRIVATE KEY-----",
-    r"ghp_[A-Za-z0-9]{36}",
-    r"xox[baprs]-[A-Za-z0-9-]{10,}",
-    r"AIza[0-9A-Za-z_-]{35}",
-    r"sk-[A-Za-z0-9]{20,}",
-    r"(?i)api[_-]?key\s*[:=]\s*[\"']?[A-Za-z0-9+/]{20,}[\"']?",
-]
+from .guard import path_allowed
+from .secrets import scan_staged_diff
+from .verify import detect_verify_commands
 
 
 def emit_result(args, ok, message, data=None):
@@ -151,7 +144,7 @@ def cmd_init(args):
         if getattr(args, "dry_run", False):
             print(
                 "[DRY-RUN] Would initialize autopilot state in {} with run_id {}, {} rounds, goals={}.".format(
-                    repo, uuid.uuid4().hex[:12], cfg.get("max_rounds"), cfg.get("goals")
+                    repo, uuid.uuid4().hex[:io.RUN_ID_LENGTH], cfg.get("max_rounds"), cfg.get("goals")
                 ),
                 file=sys.stderr,
             )
@@ -159,33 +152,15 @@ def cmd_init(args):
 
         config.save_config(repo, cfg)
         started_at = io.now_iso()
-        run_id = uuid.uuid4().hex[:12]
-        st = {
-            "schema": io.SCHEMA_VERSION,
-            "run_id": run_id,
-            "repo": str(repo),
-            "branch": None,
-            "origin_branch": None,
-            "created_at": started_at,
-            "started_at": started_at,
-            "last_activity_at": started_at,
-            "round": 0,
-            "completed_rounds": 0,
-            "blocked_rounds": 0,
-            "cancelled_rounds": 0,
-            "reverted_rounds": 0,
-            "estimated_tokens_used": 0,
-            "type_stats": {},
-            "goals": cfg["goals"],
-            "completed_goals": [],
-            "current_round": None,
-            "history": [],
-            "stop_reason": None,
-            "finished_at": None,
-        }
+        run_id = uuid.uuid4().hex[:io.RUN_ID_LENGTH]
+        st = state.default_state(repo, cfg["goals"], config_fingerprint=io.file_sha256(config.config_path_for(repo)))
+        st["run_id"] = run_id
+        st["created_at"] = started_at
+        st["started_at"] = started_at
+        st["last_activity_at"] = started_at
         state.save_state(repo, st)
         io.ensure_git_exclude(git_dir, cfg.get("track_state", False), to_stderr=getattr(args, "json", False))
-        state.ensure_branch_impl(repo, st, cfg, to_stderr=getattr(args, "json", False))
+        state.ensure_branch(repo, st, cfg, to_stderr=getattr(args, "json", False))
         io.append_log(repo, "init", "success", run_id=run_id, branch_mode=cfg.get("branch_mode"))
         return emit_result(args, True, "[OK] Initialized autopilot state.", data={"run_id": run_id})
 
@@ -240,7 +215,7 @@ def cmd_begin_round(args):
                             cid, "; ".join(missing)
                         ),
                     )
-                state.update_candidate_status(repo, cid, "picked", round_number)
+            state.update_candidates_status(repo, candidate_ids, "picked", round_number, backlog=backlog)
 
         dirty = io.working_tree_dirty(repo)
         allow_dirty = cfg.get("allow_uncommitted_changes", False)
@@ -297,28 +272,35 @@ def cmd_begin_round(args):
 
 
 def _resolve_tokens(args, repo, start_sha, worktree_baseline=None):
-    """Estimate round tokens. Committed diff since the round's start SHA plus the
-    working-tree/index delta measured against the snapshot taken at begin-round, so
-    deferred (batched) commits never double count earlier rounds' uncommitted lines."""
+    """Thin wrapper over the single token-estimation authority
+    (io.estimate_tokens_for_round); honors an explicit --tokens override."""
     if args.tokens is not None:
         return args.tokens
-    text = 0
-    binary = 0
-    base = start_sha or io.EMPTY_TREE
-    if io.has_commits(repo):
-        result = io.run_git(repo, "diff", "--numstat", base, "HEAD")
-        if result.returncode == 0:
-            t, b = io._parse_numstat(result.stdout)
-            text += t
-            binary += b
-    if worktree_baseline is not None:
-        delta = max(0, io.worktree_change_lines(repo) - worktree_baseline)
-        text += delta
-    return 500 + text * 12 + binary * 100
+    return io.estimate_tokens_for_round(repo, start_sha, worktree_baseline)
 
 
 def _refresh_type_stats(repo, st):
     st["type_stats"] = state.compute_type_stats(state.load_backlog(repo))
+
+
+def _close_round(repo, st, current, status, counter_key, tokens, history_entry,
+                 candidate_status, candidate_round=None):
+    """Shared round-closing bookkeeping: bump the round counter, append tokens,
+    record bounded history, release the round, update candidates in one backlog
+    pass, refresh type stats, and persist state."""
+    if counter_key:
+        st[counter_key] = st.get(counter_key, 0) + 1
+    if tokens:
+        st["estimated_tokens_used"] += tokens
+    st["last_activity_at"] = io.now_iso()
+    history_entry.setdefault("status", status)
+    state.append_history(st, history_entry)
+    st["current_round"] = None
+    state.update_candidates_status(
+        repo, state.round_candidate_ids(current), candidate_status, candidate_round
+    )
+    _refresh_type_stats(repo, st)
+    state.save_state(repo, st)
 
 
 def cmd_complete_round(args):
@@ -372,11 +354,12 @@ def cmd_complete_round(args):
                     ),
                 )
 
-        st["completed_rounds"] += 1
-        st["estimated_tokens_used"] += tokens
-        st["last_activity_at"] = io.now_iso()
-        st["history"].append(
-            {
+        _close_round(
+            repo, st, current,
+            status="completed",
+            counter_key="completed_rounds",
+            tokens=tokens,
+            history_entry={
                 "round": current["round"],
                 "status": "completed",
                 "title": args.title or current.get("title"),
@@ -386,20 +369,16 @@ def cmd_complete_round(args):
                 "candidate_id": current.get("candidate_id"),
                 "review_score": getattr(args, "review_score", None),
                 "review_notes": getattr(args, "review_notes", None) or "",
-                "finished_at": io.now_iso(),
-            }
+            },
+            candidate_status="completed",
+            candidate_round=current["round"],
         )
-        st["current_round"] = None
-        for cid in state.round_candidate_ids(current):
-            state.update_candidate_status(repo, cid, "completed", current["round"])
-        _refresh_type_stats(repo, st)
-        state.save_state(repo, st)
         io.append_log(
             repo, "complete-round", "success",
             round=current["round"], commit_sha=args.commit_sha, estimated_tokens=tokens,
         )
 
-        if st.get("completed_rounds", 0) % 10 == 0:
+        if st.get("completed_rounds", 0) % io.PHASE_REPORT_INTERVAL == 0:
             state.write_phase_report(repo, st, cfg)
 
         push_warning = None
@@ -433,24 +412,21 @@ def cmd_block_round(args):
                 file=sys.stderr,
             )
             return 0
-        st["blocked_rounds"] += 1
-        st["estimated_tokens_used"] += tokens
-        st["last_activity_at"] = io.now_iso()
-        st["history"].append(
-            {
+        _close_round(
+            repo, st, current,
+            status="blocked",
+            counter_key="blocked_rounds",
+            tokens=tokens,
+            history_entry={
                 "round": current["round"],
                 "status": "blocked",
                 "title": args.title or current.get("title"),
                 "reason": args.reason or "",
                 "candidate_id": current.get("candidate_id"),
-                "finished_at": io.now_iso(),
-            }
+            },
+            candidate_status="blocked",
+            candidate_round=current["round"],
         )
-        st["current_round"] = None
-        for cid in state.round_candidate_ids(current):
-            state.update_candidate_status(repo, cid, "blocked", current["round"])
-        _refresh_type_stats(repo, st)
-        state.save_state(repo, st)
         io.append_log(repo, "block-round", "success", round=current["round"], reason=args.reason)
         return emit_result(args, True, "[OK] Round blocked.")
 
@@ -471,24 +447,20 @@ def cmd_cancel_round(args):
                 file=sys.stderr,
             )
             return 0
-        st["estimated_tokens_used"] += tokens
-        st["cancelled_rounds"] = st.get("cancelled_rounds", 0) + 1
-        st["last_activity_at"] = io.now_iso()
-        st["history"].append(
-            {
+        _close_round(
+            repo, st, current,
+            status="cancelled",
+            counter_key="cancelled_rounds",
+            tokens=tokens,
+            history_entry={
                 "round": current["round"],
                 "status": "cancelled",
                 "title": args.title or current.get("title"),
                 "reason": args.reason or "",
                 "candidate_id": current.get("candidate_id"),
-                "finished_at": io.now_iso(),
-            }
+            },
+            candidate_status="pending",
         )
-        st["current_round"] = None
-        for cid in state.round_candidate_ids(current):
-            state.update_candidate_status(repo, cid, "pending")
-        _refresh_type_stats(repo, st)
-        state.save_state(repo, st)
         io.append_log(repo, "cancel-round", "success", round=current["round"], reason=args.reason)
         return emit_result(args, True, "[OK] Round cancelled.")
 
@@ -538,20 +510,20 @@ def cmd_finish(args):
                 "[WARN] finish called with round {} still open; auto-cancelling it.".format(open_round.get("round")),
                 file=sys.stderr,
             )
-            st["cancelled_rounds"] = st.get("cancelled_rounds", 0) + 1
-            st["current_round"] = None
-            st["history"].append(
-                {
+            _close_round(
+                repo, st, open_round,
+                status="cancelled",
+                counter_key="cancelled_rounds",
+                tokens=0,
+                history_entry={
                     "round": open_round["round"],
                     "status": "cancelled",
                     "title": open_round.get("title"),
                     "reason": "auto-cancelled at finish",
                     "candidate_id": open_round.get("candidate_id"),
-                    "finished_at": io.now_iso(),
-                }
+                },
+                candidate_status="pending",
             )
-            for cid in state.round_candidate_ids(open_round):
-                state.update_candidate_status(repo, cid, "pending")
             io.append_log(repo, "cancel-round", "success", round=open_round.get("round"), reason="auto-cancelled at finish")
 
         st["finished_at"] = io.now_iso()
@@ -582,7 +554,7 @@ def cmd_finish(args):
         retrospective_path = None
         try:
             markdown = state.build_retrospective(repo, st, cfg, cfg.get("report_lang", "zh"))
-            path = repo / io.AUTOPILOT_DIR / "retrospective.md"
+            path = io.autopilot_file_for(repo, io.RETROSPECTIVE_FILENAME)
             path.parent.mkdir(parents=True, exist_ok=True)
             path.write_text(markdown, encoding="utf-8")
             retrospective_path = str(path)
@@ -630,6 +602,14 @@ def cmd_backlog_add(args):
             "created_at": io.now_iso(),
             "updated_at": io.now_iso(),
         }
+        if getattr(args, "dry_run", False):
+            print(
+                "[DRY-RUN] Would add candidate {} ({}): {}.".format(
+                    candidate_id, args.type or "feature", args.title
+                ),
+                file=sys.stderr,
+            )
+            return 0
         backlog["candidates"].append(candidate)
         backlog["next_id"] += 1
         state.save_backlog(repo, backlog)
@@ -648,6 +628,9 @@ def cmd_backlog_update(args):
         if candidate is None:
             io.append_log(repo, "backlog-update", "error", reason="candidate not found")
             return emit_result(args, False, "[ERROR] Candidate not found in backlog: {}".format(args.id))
+        if getattr(args, "dry_run", False):
+            print("[DRY-RUN] Would update candidate {}.".format(args.id), file=sys.stderr)
+            return 0
         changed = []
         if args.title is not None:
             candidate["title"] = args.title
@@ -711,6 +694,9 @@ def cmd_backlog_remove(args):
         if len(updated) == len(candidates):
             io.append_log(repo, "backlog-remove", "error", reason="candidate not found")
             return emit_result(args, False, "[ERROR] Candidate not found in backlog: {}".format(args.id))
+        if getattr(args, "dry_run", False):
+            print("[DRY-RUN] Would remove candidate {}.".format(args.id), file=sys.stderr)
+            return 0
         backlog["candidates"] = updated
         state.save_backlog(repo, backlog)
         io.append_log(repo, "backlog-remove", "success", candidate_id=args.id)
@@ -744,6 +730,9 @@ def cmd_backlog_pick(args):
         if candidate is None:
             io.append_log(repo, "backlog-pick", "error", reason="candidate not found")
             return emit_result(args, False, "[ERROR] Candidate not found in backlog: {}".format(args.id))
+        if getattr(args, "dry_run", False):
+            print("[DRY-RUN] Would mark candidate {} as picked.".format(args.id), file=sys.stderr)
+            return 0
         candidate["status"] = "picked"
         candidate["updated_at"] = io.now_iso()
         state.save_backlog(repo, backlog)
@@ -756,7 +745,15 @@ def cmd_ensure_branch(args):
     with io.run_lock(repo):
         st = state.load_state(repo)
         cfg = config.load_config(repo)
-        branch = state.ensure_branch_impl(repo, st, cfg, to_stderr=getattr(args, "json", False))
+        if getattr(args, "dry_run", False):
+            print(
+                "[DRY-RUN] Would ensure the autopilot branch (branch_mode={}, current state branch={}).".format(
+                    cfg.get("branch_mode"), st.get("branch")
+                ),
+                file=sys.stderr,
+            )
+            return 0
+        branch = state.ensure_branch(repo, st, cfg, to_stderr=getattr(args, "json", False))
         io.append_log(repo, "ensure-branch", "success", branch=branch)
         return emit_result(args, True, "[OK] Autopilot branch ready: {}".format(branch or "current"), data={"branch": branch})
 
@@ -784,26 +781,6 @@ def cmd_push(args):
         return emit_result(args, True, "[OK] Pushed to remote.")
 
 
-def _path_allowed(path, allow_paths, deny_paths):
-    """A staged path is allowed unless deny_paths matches it, and unless allow_paths
-    is non-empty and does not match it. Patterns are fnmatch globs against the full
-    path and the basename."""
-    def matches(p, pattern):
-        if not pattern:
-            return False
-        if fnmatch.fnmatch(p, pattern):
-            return True
-        base = os.path.basename(p)
-        return bool(base and fnmatch.fnmatch(base, pattern))
-
-    if any(matches(path, pat) for pat in (deny_paths or [])):
-        return False
-    if allow_paths:
-        if not any(matches(path, pat) for pat in allow_paths):
-            return False
-    return True
-
-
 def cmd_commit(args):
     repo = Path(args.repo).resolve()
     with io.run_lock(repo):
@@ -824,11 +801,16 @@ def cmd_commit(args):
             io.append_log(repo, "commit", "error", reason="nothing staged")
             return emit_result(args, False, "[ERROR] Nothing is staged. Run 'git add <files>' for the current round first.")
 
+        bypassed_secrets = bool(cfg.get("scan_secrets", True) and getattr(args, "allow_secrets", False))
+
         if cfg.get("allow_paths") or cfg.get("deny_paths"):
-            names = io.run_git(repo, "diff", "--cached", "--name-only")
+            # -z + core.quotepath=false: literal NUL-separated paths, immune to
+            # quotePath escaping — deny_paths cannot be bypassed by odd file names.
+            names = io.run_git(repo, "-c", "core.quotepath=false", "diff", "--cached", "--name-only", "-z")
+            staged_paths = [p for p in names.stdout.split("\0") if p.strip()]
             blocked = [
-                line for line in names.stdout.splitlines()
-                if line.strip() and not _path_allowed(line, cfg.get("allow_paths"), cfg.get("deny_paths"))
+                path for path in staged_paths
+                if not path_allowed(path, cfg.get("allow_paths"), cfg.get("deny_paths"))
             ]
             if blocked:
                 io.append_log(repo, "commit", "error", reason="path whitelist violated", paths=blocked)
@@ -840,6 +822,8 @@ def cmd_commit(args):
         if cfg.get("scan_secrets", True) and not getattr(args, "allow_secrets", False):
             findings = scan_staged_diff(repo, cfg.get("secret_patterns"))
             if findings:
+                # Findings are masked (secrets.mask_secret_text) so the audit log
+                # never stores secret material.
                 io.append_log(repo, "commit", "error", reason="secrets detected", findings=findings)
                 detail = "; ".join(
                     "{}: {}".format(f.get("file") or "?", f.get("text")) for f in findings[:5]
@@ -902,42 +886,16 @@ def cmd_commit(args):
             io.append_log(repo, "commit", "error", reason="git commit failed")
             return emit_result(args, False, "[ERROR] git commit failed. Check pre-commit hooks or staged files.")
         sha = io.run_git(repo, "rev-parse", "HEAD").stdout.strip()
-        io.append_log(repo, "commit", "success", commit_sha=sha, message=message, round=round_no)
+        if bypassed_secrets:
+            # Audit trail for the --allow-secrets bypass (U: SEC-03).
+            io.append_log(repo, "commit", "success", commit_sha=sha, message=message, round=round_no, secrets_bypassed=True)
+        else:
+            io.append_log(repo, "commit", "success", commit_sha=sha, message=message, round=round_no)
         message = "[OK] Committed {}: {}".format(sha, message)
         if getattr(args, "json", False):
             return emit_result(args, True, message, data={"commit_sha": sha, "commit_message": message})
         print(message)
         return 0
-
-
-def scan_staged_diff(repo, extra_patterns=None):
-    """Scan the added lines of the staged diff for secret-like content. Returns a
-    list of findings (pattern, file, text), deduplicated per pattern+line."""
-    diff = io.run_git(repo, "diff", "--cached")
-    if diff.returncode != 0:
-        return []
-    patterns = list(SECRET_PATTERNS) + [p for p in (extra_patterns or []) if p]
-    findings = []
-    seen = set()
-    current_file = None
-    for line in diff.stdout.splitlines():
-        if line.startswith("+++ b/"):
-            current_file = line[6:]
-            continue
-        if line.startswith("+++"):
-            continue
-        if not line.startswith("+"):
-            continue
-        for pat in patterns:
-            if re.search(pat, line):
-                key = (pat, line[:80])
-                if key in seen:
-                    continue
-                seen.add(key)
-                findings.append(
-                    {"pattern": pat, "file": current_file, "text": line[1:].strip()[:120]}
-                )
-    return findings
 
 
 def cmd_secret_scan(args):
@@ -951,8 +909,10 @@ def cmd_secret_scan(args):
         print(json.dumps(payload, indent=2, ensure_ascii=False))
         return 0 if not findings else 2
     if findings:
+        # Machine-relevant findings go to stderr so stdout stays clean for
+        # text consumers; text is masked by the scanner.
         for f in findings:
-            print("{}: {} (matched {})".format(f.get("file"), f.get("text"), f.get("pattern")))
+            print("{}: {} (matched {})".format(f.get("file"), f.get("text"), f.get("pattern")), file=sys.stderr)
         return 2
     print("[OK] No secret-like content found in the staged diff.")
     return 0
@@ -966,17 +926,35 @@ def _staged_numstat_lines(repo):
     return text + binary
 
 
+def _write_report_output(args, repo, markdown, kind):
+    """Shared --output handling: refuse to write outside the target repository
+    unless --force is passed (guards against agent-directed arbitrary writes)."""
+    if not args.output:
+        return None
+    output = Path(args.output).resolve()
+    try:
+        output.relative_to(repo)
+    except ValueError:
+        if not getattr(args, "force", False):
+            return emit_result(
+                args, False,
+                "[ERROR] --output {} is outside the target repository. Pass --force "
+                "to write there anyway.".format(output),
+            )
+    output.parent.mkdir(parents=True, exist_ok=True)
+    output.write_text(markdown, encoding="utf-8")
+    return emit_result(args, True, "[OK] {} written to {}".format(kind, output), data={"path": str(output)})
+
+
 def cmd_report(args):
     repo = Path(args.repo).resolve()
     st = state.load_state(repo)
     cfg = config.load_config(repo)
     lang = args.lang or cfg.get("report_lang", "zh")
     markdown = state.build_report(repo, st, cfg, lang)
-    if args.output:
-        output = Path(args.output)
-        output.parent.mkdir(parents=True, exist_ok=True)
-        output.write_text(markdown, encoding="utf-8")
-        return emit_result(args, True, "[OK] Report written to {}".format(output), data={"path": str(output)})
+    result = _write_report_output(args, repo, markdown, "Report")
+    if result is not None:
+        return result
     print(markdown)
     return 0
 
@@ -989,11 +967,9 @@ def cmd_retrospective(args):
     cfg = config.load_config(repo)
     lang = args.lang or cfg.get("report_lang", "zh")
     markdown = state.build_retrospective(repo, st, cfg, lang)
-    if args.output:
-        output = Path(args.output)
-        output.parent.mkdir(parents=True, exist_ok=True)
-        output.write_text(markdown, encoding="utf-8")
-        return emit_result(args, True, "[OK] Retrospective written to {}".format(output), data={"path": str(output)})
+    result = _write_report_output(args, repo, markdown, "Retrospective")
+    if result is not None:
+        return result
     print(markdown)
     return 0
 
@@ -1009,6 +985,12 @@ def cmd_analysis_save(args):
             content = json.loads(args.content)
         except ValueError:
             return emit_result(args, False, "[ERROR] --content must be a JSON value.")
+        if getattr(args, "dry_run", False):
+            print(
+                "[DRY-RUN] Would cache the analysis snapshot (name={}).".format(args.name or "unnamed"),
+                file=sys.stderr,
+            )
+            return 0
         git_head = None
         if io.has_commits(repo):
             git_head = io.run_git(repo, "rev-parse", "HEAD").stdout.strip()
@@ -1049,6 +1031,9 @@ def cmd_directive_add(args):
             return emit_result(args, False, "[ERROR] Autopilot not initialized. Run init first.")
         if not args.text:
             return emit_result(args, False, "[ERROR] --text is required.")
+        if getattr(args, "dry_run", False):
+            print("[DRY-RUN] Would add directive: {}.".format(args.text), file=sys.stderr)
+            return 0
         count = state.add_directive(repo, args.text)
         io.append_log(repo, "directive-add", "success", text=args.text)
         return emit_result(args, True, "[OK] Directive added ({} active).".format(count), data={"count": count})
@@ -1103,7 +1088,8 @@ def cmd_undo_round(args):
         )
         st["reverted_rounds"] = st.get("reverted_rounds", 0) + 1
         st["last_activity_at"] = io.now_iso()
-        st["history"].append(
+        state.append_history(
+            st,
             {
                 "round": round_number,
                 "status": "revert",
@@ -1112,8 +1098,7 @@ def cmd_undo_round(args):
                 "commit_sha": revert_sha,
                 "reverted_sha": full_sha,
                 "candidate_id": None,
-                "finished_at": io.now_iso(),
-            }
+            },
         )
         state.save_state(repo, st)
         io.append_log(repo, "undo-round", "success", round=round_number, commit_sha=revert_sha, reverted_sha=full_sha)
@@ -1122,35 +1107,6 @@ def cmd_undo_round(args):
             "[OK] Reverted {} -> {}".format(full_sha[:12], revert_sha[:12]),
             data={"round": round_number, "revert_sha": revert_sha, "reverted_sha": full_sha},
         )
-
-
-def detect_verify_commands(repo):
-    """Return a list of (technology, command) pairs discovered from repo entry points."""
-    root = Path(repo)
-    signals = []
-    if (root / "pyproject.toml").exists() or (root / "setup.py").exists() or (root / "pytest.ini").exists() or (root / "setup.cfg").exists():
-        signals.append(("python", "pytest"))
-    if (root / "package.json").exists():
-        signals.append(("node", "npm test"))
-    if (root / "Cargo.toml").exists():
-        signals.append(("rust", "cargo test"))
-    if (root / "go.mod").exists():
-        signals.append(("go", "go test ./..."))
-    if (root / "CMakeLists.txt").exists():
-        signals.append(("cmake", "ctest"))
-    makefile = root / "Makefile"
-    if makefile.exists():
-        try:
-            content = makefile.read_text(encoding="utf-8", errors="replace")
-            if re.search(r"(?m)^\s*test\s*:", content):
-                signals.append(("make", "make test"))
-        except OSError:
-            pass
-    if shutil.which("gitleaks"):
-        signals.append(("secrets", "gitleaks git --no-banner ."))
-    if shutil.which("detect-secrets"):
-        signals.append(("secrets", "detect-secrets scan"))
-    return signals
 
 
 def cmd_detect_verify(args):
@@ -1162,6 +1118,12 @@ def cmd_detect_verify(args):
         if not commands:
             io.append_log(repo, "detect-verify", "error", reason="nothing detected")
             return emit_result(args, False, "[ERROR] No verification commands detected; nothing to apply.")
+        if getattr(args, "dry_run", False):
+            print(
+                "[DRY-RUN] Would set check_commands to {}.".format(commands),
+                file=sys.stderr,
+            )
+            return 0
         cfg = config.load_config(repo)
         cfg["check_commands"] = commands
         config.save_config(repo, cfg)
@@ -1189,15 +1151,17 @@ def cmd_check(args):
     if st.get("current_round") is not None:
         warnings.append("current_round is open; complete, block, or cancel it before starting a new round.")
 
-    if not io.has_commits(repo):
+    repo_has_commits = io.has_commits(repo)
+    if not repo_has_commits:
         warnings.append("Repository has no commits yet; git log is unavailable and the first round creates the initial commit.")
-
-    if io.is_detached_head(repo):
+    elif io.current_branch(repo) == "HEAD":
         warnings.append("Detached HEAD; consider checking out a branch before starting.")
 
-    identity_ok, _, _ = io.git_identity_ok(repo)
-    if not identity_ok:
-        warnings.append("Git user.name/user.email not configured; commits will fail until set.")
+    if st.get("config_fingerprint") and io.file_sha256(config.config_path_for(repo)) != st["config_fingerprint"]:
+        warnings.append(
+            "autopilot config.json changed since init; verify the change was intentional "
+            "(check_commands are executed and budgets are trusted by the loop)."
+        )
 
     if io.working_tree_dirty(repo):
         if not cfg.get("allow_uncommitted_changes"):

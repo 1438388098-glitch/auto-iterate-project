@@ -1,5 +1,6 @@
 ---
 name: auto-iterate-project
+version: 1.0.0
 description: Automatically iterate any git project inside the current agent session by analyzing the repository, choosing the next high-value improvement, implementing small changes, verifying, committing, and looping until a goal is met or configurable round/time/token limits are reached. Use when the user asks for autonomous project iteration, continuous self-improvement, auto-improve, keep improving this project, full-auto development, or wants the agent to keep making and committing improvements without per-step approval. Also use for Chinese requests like 全自动迭代这个项目, 自动改进并提交这个仓库, 连续自动开发, or 自动推进项目改进.
 ---
 
@@ -83,7 +84,7 @@ Repeat these steps until `check` reports `"continue": false`.
 
 ### 1. Check State
 
-Run `python <this-skill>/scripts/autopilot_state.py check --repo <repo>` (add `--brief` to return only `continue`/`stop_reason`/`warnings`, saving tokens on every loop). Stop if it says no. Read the `warnings` array and resolve anything actionable. Warnings now cover dirty trees (versus `allow_uncommitted_changes`), empty goals, missing remotes when `push` is enabled, and missing stop conditions.
+Run `python <this-skill>/scripts/autopilot_state.py check --repo <repo>` (add `--brief` to return only `continue`/`stop_reason`/`warnings`, saving tokens on every loop). Stop if it says no. Read the `warnings` array and resolve anything actionable. Warnings cover dirty trees (versus `allow_uncommitted_changes`), empty goals, missing remotes when `push` is enabled, missing stop conditions, detached HEAD, and `.autopilot/config.json` changes since `init` (a config fingerprint is stored in state; check_commands are executed and budgets trusted by the loop, so verify such a change was intentional before continuing).
 
 ### 2. Analyze
 

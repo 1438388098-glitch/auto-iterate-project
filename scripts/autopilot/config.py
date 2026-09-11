@@ -1,5 +1,9 @@
-"""Configuration schema, validation, and persistence for .autopilot/config.json."""
+"""Configuration schema, validation, and persistence for .autopilot/config.json.
 
+This module is the single source of truth for field defaults (default_config);
+references/config.md and README.md mirror it."""
+
+import re
 import sys
 
 from . import io
@@ -122,6 +126,14 @@ def load_config(repo):
     for key in ("allow_paths", "deny_paths", "secret_patterns"):
         if not isinstance(merged[key], list) or not all(isinstance(p, str) for p in merged[key]):
             _config_error(config_path_for(repo), "'{}' must be an array of strings".format(key))
+    for pattern in merged["secret_patterns"]:
+        try:
+            re.compile(pattern)
+        except re.error as exc:
+            _config_error(
+                config_path_for(repo),
+                "'secret_patterns' contains an invalid regex ({}): {}".format(pattern, exc),
+            )
     if merged.get("report_lang") not in ("zh", "en"):
         _config_error(config_path_for(repo), "'report_lang' must be 'zh' or 'en'")
     if merged.get("branch_mode") not in ("current", "feature"):

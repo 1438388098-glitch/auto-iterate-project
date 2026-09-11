@@ -1,5 +1,7 @@
 # Auto Iterate Project
 
+Version 1.0.0 — see [CHANGELOG.md](CHANGELOG.md) for release history.
+
 Automatically iterate any git project inside an agent session: analyze the repository, pick the next high-value improvement, implement small changes, verify, commit, and loop until a goal is met or configurable round/time/token limits are reached.
 
 Works with opencode, Claude Code, Codex, and other agent runtimes (auto-detected). Git is the only external dependency.

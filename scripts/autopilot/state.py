@@ -9,10 +9,40 @@ from datetime import datetime, timezone
 from . import config, io
 
 
+def default_state(repo, goals=None, config_fingerprint=None):
+    """Single authority for the state.json schema. cmd_init creates fresh state
+    from this; migrate_state backfills the same field set for older files."""
+    started_at = io.now_iso()
+    return {
+        "schema": io.SCHEMA_VERSION,
+        "run_id": uuid.uuid4().hex[:io.RUN_ID_LENGTH],
+        "repo": str(repo),
+        "branch": None,
+        "origin_branch": None,
+        "created_at": started_at,
+        "started_at": started_at,
+        "last_activity_at": started_at,
+        "round": 0,
+        "completed_rounds": 0,
+        "blocked_rounds": 0,
+        "cancelled_rounds": 0,
+        "reverted_rounds": 0,
+        "estimated_tokens_used": 0,
+        "type_stats": {},
+        "goals": list(goals or []),
+        "completed_goals": [],
+        "current_round": None,
+        "history": [],
+        "stop_reason": None,
+        "finished_at": None,
+        "config_fingerprint": config_fingerprint,
+    }
+
+
 def migrate_state(state):
     """Backfill missing state fields. Returns True if anything changed."""
     defaults = {
-        "run_id": uuid.uuid4().hex[:12],
+        "run_id": uuid.uuid4().hex[:io.RUN_ID_LENGTH],
         "branch": None,
         "origin_branch": None,
         "last_activity_at": None,
@@ -32,6 +62,7 @@ def migrate_state(state):
         "round": 0,
         "stop_reason": None,
         "finished_at": None,
+        "config_fingerprint": None,
     }
     changed = False
     for key, value in defaults.items():
@@ -47,6 +78,46 @@ def migrate_state(state):
     return changed
 
 
+_STATE_INT_KEYS = (
+    "schema",
+    "round",
+    "completed_rounds",
+    "blocked_rounds",
+    "cancelled_rounds",
+    "reverted_rounds",
+    "estimated_tokens_used",
+)
+
+
+def _state_type_error(path, message):
+    print(
+        "[ERROR] Invalid .autopilot/state.json: {}. Fix or delete it and run init again.".format(message),
+        file=sys.stderr,
+    )
+    raise SystemExit(2)
+
+
+def _validate_state_types(repo, state):
+    """Corrupted field types (e.g. a string counter) must fail cleanly instead of
+    raising a TypeError mid-command."""
+    path = config.state_path_for(repo)
+    for key in _STATE_INT_KEYS:
+        value = state.get(key)
+        if value is not None and not isinstance(value, int):
+            _state_type_error(path, "'{}' must be a number, got {}".format(key, type(value).__name__))
+    if not isinstance(state.get("history", []), list):
+        _state_type_error(path, "'history' must be an array")
+    if not isinstance(state.get("completed_goals", []), list):
+        _state_type_error(path, "'completed_goals' must be an array")
+    if not isinstance(state.get("goals", []), list):
+        _state_type_error(path, "'goals' must be an array")
+    if not isinstance(state.get("type_stats", {}), dict):
+        _state_type_error(path, "'type_stats' must be an object")
+    current = state.get("current_round")
+    if current is not None and not isinstance(current, dict):
+        _state_type_error(path, "'current_round' must be an object or null")
+
+
 def load_state(repo):
     state = io.load_json(config.state_path_for(repo))
     if state is None:
@@ -60,6 +131,7 @@ def load_state(repo):
         )
         raise SystemExit(2)
     changed = migrate_state(state)
+    _validate_state_types(repo, state)
     if state.get("schema", 1) < io.SCHEMA_VERSION:
         state["schema"] = io.SCHEMA_VERSION
         changed = True
@@ -89,6 +161,7 @@ def find_candidate(backlog, candidate_id):
 
 
 def update_candidate_status(repo, candidate_id, status, round_number=None):
+    """Update one candidate (loads and saves the backlog itself)."""
     if not candidate_id:
         return
     backlog = load_backlog(repo)
@@ -103,6 +176,47 @@ def update_candidate_status(repo, candidate_id, status, round_number=None):
     save_backlog(repo, backlog)
 
 
+def update_candidates_status(repo, candidate_ids, status, round_number=None, backlog=None):
+    """Update many candidates with a single backlog read/write cycle. When a
+    preloaded backlog is passed it is mutated here; otherwise the backlog is
+    loaded once for the whole batch. The backlog is saved once when anything
+    changed."""
+    ids = [cid for cid in (candidate_ids or []) if cid]
+    if not ids:
+        return
+    if backlog is None:
+        backlog = load_backlog(repo)
+    changed = False
+    for candidate_id in ids:
+        candidate = find_candidate(backlog, candidate_id)
+        if candidate is None:
+            print("[WARN] Candidate not found in backlog: {}".format(candidate_id), file=sys.stderr)
+            continue
+        candidate["status"] = status
+        candidate["updated_at"] = io.now_iso()
+        if round_number is not None:
+            candidate["round"] = round_number
+        changed = True
+    if changed:
+        save_backlog(repo, backlog)
+
+
+def append_history(st, entry):
+    """Append a round-history entry with bounded growth: text fields are capped
+    and only the most recent io.HISTORY_LIMIT entries are kept, so long-running
+    loops do not grow state.json without bound."""
+    for key in ("title", "summary", "reason", "review_notes"):
+        value = entry.get(key)
+        if isinstance(value, str) and len(value) > io.HISTORY_TEXT_LIMIT:
+            entry[key] = value[:io.HISTORY_TEXT_LIMIT]
+    entry.setdefault("finished_at", io.now_iso())
+    history = st.setdefault("history", [])
+    history.append(entry)
+    if len(history) > io.HISTORY_LIMIT:
+        del history[: len(history) - io.HISTORY_LIMIT]
+    return entry
+
+
 def round_candidate_ids(current):
     """All candidate ids attached to a round. Supports multi-candidate rounds
     (candidates_per_round > 1) while staying backward compatible with state
@@ -115,14 +229,14 @@ def round_candidate_ids(current):
     return ids
 
 
-def ensure_branch_impl(repo, state, config, to_stderr=False):
+def ensure_branch(repo, state, cfg, to_stderr=False):
     def say(msg):
         if to_stderr:
             print(msg, file=sys.stderr)
         else:
             print(msg)
 
-    if config.get("branch_mode") != "feature":
+    if cfg.get("branch_mode") != "feature":
         say("[SKIP] branch_mode is current; no autopilot branch created.")
         return None
 
@@ -142,7 +256,7 @@ def ensure_branch_impl(repo, state, config, to_stderr=False):
         )
         raise SystemExit(2)
 
-    if not config.get("allow_uncommitted_changes") and io.tracked_changes(repo):
+    if not cfg.get("allow_uncommitted_changes") and io.tracked_changes(repo):
         print(
             "[ERROR] Working tree has tracked changes and allow_uncommitted_changes is false; "
             "refusing to switch branches so user changes are not carried over.",
@@ -151,7 +265,7 @@ def ensure_branch_impl(repo, state, config, to_stderr=False):
         raise SystemExit(2)
 
     if not branch:
-        branch = "autopilot/" + state.get("run_id", uuid.uuid4().hex[:12])
+        branch = "autopilot/" + state.get("run_id", uuid.uuid4().hex[:io.RUN_ID_LENGTH])
         if io.branch_exists(repo, branch):
             result = io.run_git(repo, "checkout", branch)
         else:
@@ -196,7 +310,7 @@ def split_goals(text):
     return goals
 
 
-def compute_stop_reason(state, config):
+def compute_stop_reason(state, cfg):
     """Return the stop reason (or None) based on state and config. Shared by check and begin-round."""
     stop_reason = None
 
@@ -206,23 +320,23 @@ def compute_stop_reason(state, config):
         stop_reason = state["stop_reason"]
 
     if stop_reason is None:
-        if all_goals_met(config, state) and not config.get("expand_after_goals"):
+        if all_goals_met(cfg, state) and not cfg.get("expand_after_goals"):
             stop_reason = "all goals met"
 
     if stop_reason is None:
         total_rounds = state.get("completed_rounds", 0) + state.get("blocked_rounds", 0)
-        max_rounds = config.get("max_rounds")
+        max_rounds = cfg.get("max_rounds")
         if max_rounds is not None and total_rounds >= max_rounds:
             stop_reason = "max_rounds reached"
 
     if stop_reason is None:
         consecutive_blocked = count_consecutive_blocked(state)
-        max_blocked = config.get("max_blocked_in_a_row")
+        max_blocked = cfg.get("max_blocked_in_a_row")
         if max_blocked is not None and consecutive_blocked >= max_blocked:
             stop_reason = "max_blocked_in_a_row reached ({}/{})".format(consecutive_blocked, max_blocked)
 
     if stop_reason is None:
-        max_minutes = config.get("max_minutes")
+        max_minutes = cfg.get("max_minutes")
         reference = state.get("last_activity_at") or state.get("started_at")
         started_at = io.parse_time(reference)
         if max_minutes is not None and started_at is not None:
@@ -231,13 +345,13 @@ def compute_stop_reason(state, config):
                 stop_reason = "max_minutes reached ({:.1f}/{})".format(elapsed_minutes, max_minutes)
 
     if stop_reason is None:
-        deadline = config.get("deadline")
+        deadline = cfg.get("deadline")
         deadline_at = io.parse_time(deadline)
         if deadline_at is not None and datetime.now(timezone.utc) >= deadline_at:
             stop_reason = "deadline reached ({})".format(deadline)
 
     if stop_reason is None:
-        max_tokens = config.get("max_tokens")
+        max_tokens = cfg.get("max_tokens")
         used_tokens = state.get("estimated_tokens_used", 0)
         if max_tokens is not None and used_tokens >= max_tokens:
             stop_reason = "max_tokens soft budget reached ({}/{})".format(used_tokens, max_tokens)
@@ -255,8 +369,8 @@ def count_consecutive_blocked(state):
     return count
 
 
-def all_goals_met(config, state):
-    goals = config.get("goals") or state.get("goals") or []
+def all_goals_met(cfg, state):
+    goals = cfg.get("goals") or state.get("goals") or []
     if not goals:
         return False
     completed_goals = set(state.get("completed_goals") or [])
@@ -369,12 +483,12 @@ def candidate_adjusted_score(candidate, type_stats=None, saturation_threshold=2)
     }
 
 
-def rank_candidates(backlog, config):
+def rank_candidates(backlog, cfg):
     """Rank backlog candidates by adjusted value/effort. Pending, dependency-ready
     candidates come first (by score desc), then pending-but-blocked candidates (with
     their blocked_by reasons), then picked/completed/blocked candidates."""
     type_stats = compute_type_stats(backlog)
-    threshold = (config or {}).get("type_saturation_threshold", 2)
+    threshold = (cfg or {}).get("type_saturation_threshold", 2)
     entries = []
     for candidate in backlog.get("candidates", []):
         entry = dict(candidate)
@@ -459,10 +573,11 @@ def analysis_validity(repo):
     return "fresh", "cached analysis is up to date"
 
 
-def build_retrospective(repo, state, config, lang="zh"):
+def build_retrospective(repo, state, cfg, lang="zh"):
     """Run-level retrospective: per-type success stats, blocked rounds, and the
     verification setup, in the configured language."""
     zh = lang == "zh"
+    backlog = load_backlog(repo)
     out = []
     if zh:
         out.append("# 迭代复盘（Retrospective）")
@@ -488,7 +603,7 @@ def build_retrospective(repo, state, config, lang="zh"):
         out.append("")
         out.append("## Stats by type")
         out.append("")
-    stats = state.get("type_stats") or compute_type_stats(load_backlog(repo))
+    stats = state.get("type_stats") or compute_type_stats(backlog)
     if not stats:
         out.append("- {}: {}".format("无" if zh else "none", "—"))
     else:
@@ -522,7 +637,7 @@ def build_retrospective(repo, state, config, lang="zh"):
             ))
     out.append("")
 
-    checks = config.get("check_commands") or []
+    checks = cfg.get("check_commands") or []
     out.append("## {}".format("验证命令" if zh else "Verification commands"))
     out.append("")
     if not checks:
@@ -532,7 +647,7 @@ def build_retrospective(repo, state, config, lang="zh"):
             out.append("- `{}`".format(command))
     out.append("")
 
-    ranked = rank_candidates(load_backlog(repo), config)
+    ranked = rank_candidates(backlog, cfg)
     ready = [r for r in ranked if r.get("status") == "pending" and r.get("ready")]
     out.append("## {}".format("下一步建议" if zh else "Next likely improvement"))
     out.append("")
@@ -569,9 +684,10 @@ _STATUS_LABELS = {
 }
 
 
-def build_report(repo, state, config, lang="en"):
+def build_report(repo, state, cfg, lang="en"):
     """Build a deterministic markdown report from state, config, and backlog."""
     zh = lang == "zh"
+    backlog_data = load_backlog(repo)
     L = _STATUS_LABELS["zh" if zh else "en"]
     out = []
     out.append("# {}".format(L["run_report"]))
@@ -584,12 +700,12 @@ def build_report(repo, state, config, lang="en"):
     out.append("- {}: `{}`".format(L["active"], state.get("branch") or state.get("origin_branch") or L["none"]))
     out.append("- started_at: `{}`".format(state.get("started_at")))
     out.append("- last_activity_at: `{}`".format(state.get("last_activity_at")))
-    out.append("- {}: `{}`".format(L["deadline"], config.get("deadline") or L["none"]))
+    out.append("- {}: `{}`".format(L["deadline"], cfg.get("deadline") or L["none"]))
     out.append("- finished_at: `{}`".format(state.get("finished_at") or L["none"]))
     out.append("- stop_reason: `{}`".format(state.get("stop_reason") or L["none"]))
     out.append("")
 
-    goals = config.get("goals") or state.get("goals") or []
+    goals = cfg.get("goals") or state.get("goals") or []
     completed = set(state.get("completed_goals") or [])
     out.append("## {}".format(L["goals"]))
     out.append("")
@@ -630,7 +746,7 @@ def build_report(repo, state, config, lang="en"):
             ))
     out.append("")
 
-    backlog = load_backlog(repo).get("candidates") or []
+    backlog = backlog_data.get("candidates") or []
     out.append("## {}".format(L["backlog"]))
     out.append("")
     if not backlog:
@@ -656,7 +772,7 @@ def build_report(repo, state, config, lang="en"):
             out.append("```")
             out.append("")
 
-    ranked = rank_candidates(load_backlog(repo), config)
+    ranked = rank_candidates(backlog_data, cfg)
     ready = [r for r in ranked if r.get("status") == "pending" and r.get("ready")]
     if ready:
         top = ready[0]
@@ -671,15 +787,27 @@ def build_report(repo, state, config, lang="en"):
     return "\n".join(out)
 
 
-def write_phase_report(repo, state, config):
-    """Write a 10-round phase report in the configured language."""
-    lang = config.get("report_lang", "zh")
+def write_phase_report(repo, state, cfg):
+    """Write a phase report (every io.PHASE_REPORT_INTERVAL completed rounds) in the
+    configured language, keeping only the most recent io.PHASE_REPORT_KEEP files."""
+    lang = cfg.get("report_lang", "zh")
     completed = state.get("completed_rounds", 0)
-    markdown = build_report(repo, state, config, lang)
-    path = repo / io.AUTOPILOT_DIR / "{}{}.md".format(io.PHASE_REPORT_PREFIX, completed)
+    markdown = build_report(repo, state, cfg, lang)
+    path = io.autopilot_file_for(repo, "{}{}.md".format(io.PHASE_REPORT_PREFIX, completed))
     try:
         path.parent.mkdir(parents=True, exist_ok=True)
         path.write_text(markdown, encoding="utf-8")
+        reports = []
+        for old in path.parent.glob(io.PHASE_REPORT_PREFIX + "*.md"):
+            suffix = old.name[len(io.PHASE_REPORT_PREFIX):-3]
+            if suffix.isdigit():
+                reports.append((int(suffix), old))
+        reports.sort()
+        for _, old in reports[:-io.PHASE_REPORT_KEEP]:
+            try:
+                old.unlink()
+            except OSError:
+                pass
         print(
             "[PHASE] Completed {} rounds; phase report written to {} (lang={}).".format(completed, path, lang),
             file=sys.stderr,

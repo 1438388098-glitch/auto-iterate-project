@@ -1,0 +1,85 @@
+"""Secret scanning for the staged diff: pattern table, compiled matcher, and masking.
+
+Findings are masked at creation time so secret material never lands in
+log.jsonl or stdout (the scan exists to prevent leaks, not to become one)."""
+
+import re
+import sys
+
+from . import io
+
+SECRET_PATTERNS = [
+    r"AKIA[0-9A-Z]{16}",
+    r"-----BEGIN (?:RSA|EC|OPENSSH|PGP|DSA|PRIVATE) PRIVATE KEY-----",
+    r"ghp_[A-Za-z0-9]{36}",
+    r"github_pat_[A-Za-z0-9_]{36,}",
+    r"xox[baprs]-[A-Za-z0-9-]{10,}",
+    r"AIza[0-9A-Za-z_-]{35}",
+    r"sk-[A-Za-z0-9_-]{20,}",
+    r"(?i)api[_-]?key\s*[:=]\s*[\"']?[A-Za-z0-9+/]{20,}[\"']?",
+    r"\beyJ[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{5,}",
+]
+
+_COMPILED_DEFAULTS = [re.compile(pattern) for pattern in SECRET_PATTERNS]
+
+
+def compile_patterns(extra_patterns=None):
+    """Compile user-supplied patterns with a clean error instead of a traceback."""
+    compiled = []
+    for pattern in extra_patterns or []:
+        if not pattern:
+            continue
+        try:
+            compiled.append(re.compile(pattern))
+        except re.error as exc:
+            print(
+                "[ERROR] Invalid regex in secret_patterns ({}): {}. Fix the pattern in "
+                ".autopilot/config.json or on the init command line.".format(pattern, exc),
+                file=sys.stderr,
+            )
+            raise SystemExit(2)
+    return compiled
+
+
+def mask_secret_text(text):
+    """Keep enough context to locate the line without exposing the secret."""
+    text = (text or "").strip()
+    if len(text) <= 12:
+        return text[:2] + "..."
+    return text[:6] + "..." + text[-4:]
+
+
+def scan_staged_diff(repo, extra_patterns=None):
+    """Scan the added lines of the staged diff for secret-like content. Returns a
+    list of findings (pattern, file, masked text), deduplicated per pattern+line.
+    Uses -U0 so context lines are not read, and core.quotepath=false so non-ASCII
+    file names are reported literally."""
+    diff = io.run_git(repo, "-c", "core.quotepath=false", "diff", "--cached", "-U0")
+    if diff.returncode != 0:
+        return []
+    patterns = _COMPILED_DEFAULTS + compile_patterns(extra_patterns)
+    findings = []
+    seen = set()
+    current_file = None
+    for line in diff.stdout.splitlines():
+        if line.startswith("+++ b/"):
+            current_file = line[6:]
+            continue
+        if line.startswith("+++"):
+            continue
+        if not line.startswith("+"):
+            continue
+        for compiled in patterns:
+            if compiled.search(line):
+                key = (compiled.pattern, line[:80])
+                if key in seen:
+                    continue
+                seen.add(key)
+                findings.append(
+                    {
+                        "pattern": compiled.pattern,
+                        "file": current_file,
+                        "text": mask_secret_text(line[1:]),
+                    }
+                )
+    return findings

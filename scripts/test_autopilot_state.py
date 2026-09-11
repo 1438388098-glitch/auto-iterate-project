@@ -22,12 +22,22 @@ class AutopilotTestBase(unittest.TestCase):
         self.repo = Path(self.tmp) / "repo"
         self.repo.mkdir()
         self.env = dict(os.environ)
+        # Isolate from the developer's git environment: repo-local config only,
+        # no inherited GIT_* plumbing, no global gpgsign/hooks interference.
+        for var in ("GIT_DIR", "GIT_WORK_TREE", "GIT_INDEX_FILE", "GIT_NAMESPACE",
+                    "GIT_OBJECT_DIRECTORY", "GIT_COMMON_DIR"):
+            self.env.pop(var, None)
+        self.global_config = Path(self.tmp) / "global-gitconfig"
+        self.global_config.write_text("", encoding="utf-8")
+        self.env["GIT_CONFIG_GLOBAL"] = str(self.global_config)
+        self.env["GIT_CONFIG_SYSTEM"] = str(self.global_config)
         self.env["PYTHONIOENCODING"] = "utf-8"
         self.env["LC_ALL"] = "C"
         self.env["GIT_CEILING_DIRECTORIES"] = str(Path(self.tmp).parent).replace("\\", "/")
         self.git("init", "-q")
         self.git("config", "user.name", "Test User")
         self.git("config", "user.email", "test@example.com")
+        self.git("config", "commit.gpgsign", "false")
 
     def tearDown(self):
         shutil.rmtree(self.tmp, ignore_errors=True)
@@ -704,7 +714,7 @@ class DetectAgentTests(unittest.TestCase):
         env = self._clean_env()
         env["OPENCODE"] = "1"
         data = self._payload(self._run(env))
-        self.assertTrue(data["python_cmd"])
+        self.assertIn(data["python_cmd"], ("python", "python3", "py"))
 
     def test_skill_dir_env_override(self):
         env = self._clean_env()
@@ -1704,6 +1714,407 @@ class DirectiveTests(RepoTest):
         self.run_state("init")
         result = self.run_state("directive-add", "--text", "")
         self.assertNotEqual(result.returncode, 0)
+
+    def test_directive_add_dry_run(self):
+        self.run_state("init")
+        result = self.run_state("directive-add", "--text", "dry", "--dry-run")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("[DRY-RUN]", result.stderr)
+        data = json.loads(self.run_state("directive-list").stdout)
+        self.assertEqual(data["directives"], [])
+
+
+class BacklogPickTests(RepoTest):
+    def test_backlog_pick_marks_candidate(self):
+        self.run_state("init")
+        self.run_state("backlog-add", "--title", "T", "--reason", "r")
+        cid = self.read_json("backlog.json")["candidates"][0]["id"]
+        result = self.run_state("backlog-pick", "--id", cid)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(self.read_json("backlog.json")["candidates"][0]["status"], "picked")
+
+    def test_backlog_pick_unknown_id_refused(self):
+        self.run_state("init")
+        result = self.run_state("backlog-pick", "--id", "candidate-999")
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("not found", result.stderr.lower())
+
+    def test_backlog_pick_dry_run(self):
+        self.run_state("init")
+        self.run_state("backlog-add", "--title", "T", "--reason", "r")
+        cid = self.read_json("backlog.json")["candidates"][0]["id"]
+        result = self.run_state("backlog-pick", "--id", cid, "--dry-run")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("[DRY-RUN]", result.stderr)
+        self.assertEqual(self.read_json("backlog.json")["candidates"][0]["status"], "pending")
+
+    def test_backlog_add_dry_run(self):
+        self.run_state("init")
+        result = self.run_state("backlog-add", "--title", "T", "--reason", "r", "--dry-run")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("[DRY-RUN]", result.stderr)
+        # backlog.json is created lazily on first write; verify via backlog-list.
+        data = json.loads(self.run_state("backlog-list").stdout)
+        self.assertEqual(data["candidates"], [])
+
+    def test_backlog_remove_dry_run(self):
+        self.run_state("init")
+        self.run_state("backlog-add", "--title", "T", "--reason", "r")
+        cid = self.read_json("backlog.json")["candidates"][0]["id"]
+        result = self.run_state("backlog-remove", "--id", cid, "--dry-run")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(len(self.read_json("backlog.json")["candidates"]), 1)
+
+
+class SecretPatternCoverageTests(RepoTest):
+    """Every built-in secret pattern must catch a realistic sample (and stay quiet
+    on benign content). One staged file per subTest, verified via secret-scan."""
+
+    SAMPLES = [
+        ("aws_access_key", 'KEY = "AKIAIOSFODNN7EXAMPLE"\n'),
+        ("private_key", "-----BEGIN RSA PRIVATE KEY-----\nabc\n-----END RSA PRIVATE KEY-----\n"),
+        ("github_classic", 'TOKEN = "ghp_abcdefghijklmnopqrstuvwxyz0123456789"\n'),
+        ("github_fine_grained", 'TOKEN = "github_pat_abcdefghijklmnopqrstuvwxyz0123456789"\n'),
+        ("slack", 'TOKEN = "xoxb-abcdefghij"\n'),
+        ("google_api", 'KEY = "AIza' + "a" * 35 + '"\n'),
+        ("openai_sk", 'KEY = "sk-proj-' + "a" * 30 + '"\n'),
+        ("jwt", 'TOKEN = "eyJ' + "a" * 10 + "." + "b" * 10 + "." + "c" * 10 + '"\n'),
+    ]
+
+    def test_builtin_patterns_catch_samples(self):
+        self.run_state("init")
+        self.run_state("begin-round", "--title", "r", "--reason", "x")
+        for name, content in self.SAMPLES:
+            with self.subTest(pattern=name):
+                filename = "secret-sample-{}.py".format(name)
+                self.add_file(filename, content)
+                result = self.run_state("secret-scan", "--json")
+                self.assertNotEqual(result.returncode, 0, result.stdout)
+                data = json.loads(result.stdout)
+                self.assertFalse(data["clean"], name)
+                self.assertTrue(data["findings"], name)
+                # Findings must be masked: no full secret text in the output.
+                for finding in data["findings"]:
+                    self.assertNotIn("AKIAIOSFODNN7EXAMPLE", finding["text"])
+                self.git("reset", "-q", "HEAD", "--", filename)
+                (self.repo / filename).unlink()
+
+    def test_benign_content_not_flagged(self):
+        self.run_state("init")
+        self.run_state("begin-round", "--title", "r", "--reason", "x")
+        self.add_file("ok.py", 'key = "short"\nconfig = {"retries": 3}\n')
+        result = self.run_state("secret-scan", "--json")
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        data = json.loads(result.stdout)
+        self.assertTrue(data["clean"])
+
+    def test_allow_secrets_bypass_is_audited(self):
+        self.run_state("init")
+        self.run_state("begin-round", "--title", "r", "--reason", "x")
+        self.add_file("creds.py", 'KEY = "AKIAIOSFODNN7EXAMPLE"\n')
+        result = self.run_state("commit", "--summary", "force", "--allow-secrets")
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        log_path = self.repo / ".autopilot" / "log.jsonl"
+        events = [json.loads(line) for line in log_path.read_text(encoding="utf-8").splitlines() if line.strip()]
+        commit_events = [e for e in events if e["event"] == "commit" and e.get("status") == "success"]
+        self.assertTrue(commit_events)
+        self.assertTrue(commit_events[-1].get("secrets_bypassed"))
+
+    def test_invalid_secret_pattern_clean_error(self):
+        self.run_state("init")
+        self.run_state("begin-round", "--title", "r", "--reason", "x")
+        config_path = self.repo / ".autopilot" / "config.json"
+        config = json.loads(config_path.read_text(encoding="utf-8"))
+        config["secret_patterns"] = ["([unclosed"]
+        config_path.write_text(json.dumps(config), encoding="utf-8")
+        self.add_file("t.py", "x = 1\n")
+        result = self.run_state("commit", "--summary", "x")
+        self.assertNotEqual(result.returncode, 0)
+        self.assertNotIn("Traceback", result.stderr)
+
+
+class UndoRoundConflictTests(RepoTest):
+    def test_undo_round_conflict_refused(self):
+        self.run_state("init")
+        (self.repo / "f.txt").write_text("a\n", encoding="utf-8")
+        self.git("add", "f.txt")
+        self.git("commit", "-q", "-m", "change a")
+        a_sha = self.git("rev-parse", "HEAD").stdout.strip()
+        (self.repo / "f.txt").write_text("b\n", encoding="utf-8")
+        self.git("add", "f.txt")
+        self.git("commit", "-q", "-m", "change b")
+        result = self.run_state("undo-round", "--sha", a_sha)
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("revert failed", result.stderr)
+
+
+class FailurePathTests(RepoTest):
+    def test_corrupt_lock_is_removed(self):
+        self.run_state("init")
+        lock_path = self.repo / ".autopilot" / "lock"
+        lock_path.parent.mkdir(parents=True, exist_ok=True)
+        lock_path.write_text("not-json", encoding="utf-8")
+        result = self.run_state("begin-round", "--title", "r", "--reason", "x")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertFalse(lock_path.exists())
+
+    def test_state_non_object_clean_error(self):
+        self.run_state("init")
+        (self.repo / ".autopilot" / "state.json").write_text("[]", encoding="utf-8")
+        result = self.run_state("check")
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("state.json", result.stderr)
+        self.assertNotIn("Traceback", result.stderr)
+
+    def test_state_corrupt_field_type_clean_error(self):
+        self.run_state("init")
+        state_path = self.repo / ".autopilot" / "state.json"
+        state = json.loads(state_path.read_text(encoding="utf-8"))
+        state["completed_rounds"] = "many"
+        state_path.write_text(json.dumps(state), encoding="utf-8")
+        result = self.run_state("check")
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("completed_rounds", result.stderr)
+        self.assertNotIn("Traceback", result.stderr)
+
+    def test_corrupt_analysis_reports_stale(self):
+        self.run_state("init")
+        self.run_state("analysis-save", "--content", "{}")
+        (self.repo / ".autopilot" / "analysis.json").write_text("[]", encoding="utf-8")
+        result = self.run_state("analysis-load")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        data = json.loads(result.stdout)
+        self.assertEqual(data["status"], "stale")
+
+    def test_diagnose_reports_non_git_directory(self):
+        plain = Path(self.tmp) / "notgit"
+        plain.mkdir()
+        result = subprocess.run(
+            [sys.executable, str(self.script), "diagnose", "--repo", str(plain)],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            universal_newlines=True,
+            encoding="utf-8",
+            errors="replace",
+            env=self.env,
+        )
+        self.assertEqual(result.returncode, 0, result.stderr)
+        data = json.loads(result.stdout)
+        self.assertFalse(data["is_git_repo"])
+
+    def test_check_warns_on_detached_head(self):
+        self.run_state("init")
+        self.git("checkout", "--detach", "-q")
+        data = json.loads(self.run_state("check", "--brief").stdout)
+        self.assertTrue(any("Detached HEAD" in w for w in data["warnings"]))
+
+    def test_push_failure_reported(self):
+        missing_remote = Path(self.tmp) / "missing-remote.git"
+        self.git("remote", "add", "origin", str(missing_remote))
+        self.run_state("init", "--push")
+        result = self.run_state("push")
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("push failed", result.stderr)
+
+    def test_ensure_branch_refuses_tracked_changes(self):
+        self.run_state("init", "--branch-mode", "feature")
+        self.run_state("finish")
+        (self.repo / "README.md").write_text("# changed by user\n", encoding="utf-8")
+        result = self.run_state("ensure-branch")
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("tracked changes", result.stderr)
+
+
+class AllowPathsDirectoryPrefixTests(RepoTest):
+    """Regression: the documented directory-prefix form (`src/`, `src`) from
+    references/config.md must actually match files under the directory."""
+
+    def test_allow_paths_directory_form_passes(self):
+        self.run_state("init")
+        config_path = self.repo / ".autopilot" / "config.json"
+        config = json.loads(config_path.read_text(encoding="utf-8"))
+        config["allow_paths"] = ["src/"]
+        config_path.write_text(json.dumps(config), encoding="utf-8")
+        self.run_state("begin-round", "--title", "r", "--reason", "x")
+        (self.repo / "src").mkdir()
+        (self.repo / "src" / "ok.py").write_text("x = 1\n", encoding="utf-8")
+        self.git("add", "src/ok.py")
+        result = self.run_state("commit", "--summary", "ok")
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+
+    def test_allow_paths_bare_name_form_passes(self):
+        self.run_state("init")
+        config_path = self.repo / ".autopilot" / "config.json"
+        config = json.loads(config_path.read_text(encoding="utf-8"))
+        config["allow_paths"] = ["src"]
+        config_path.write_text(json.dumps(config), encoding="utf-8")
+        self.run_state("begin-round", "--title", "r", "--reason", "x")
+        (self.repo / "src").mkdir()
+        (self.repo / "src" / "ok.py").write_text("x = 1\n", encoding="utf-8")
+        self.git("add", "src/ok.py")
+        result = self.run_state("commit", "--summary", "ok")
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+
+    def test_deny_paths_non_ascii_filename_blocked(self):
+        self.run_state("init")
+        config_path = self.repo / ".autopilot" / "config.json"
+        config = json.loads(config_path.read_text(encoding="utf-8"))
+        config["deny_paths"] = ["*.pem"]
+        config_path.write_text(json.dumps(config), encoding="utf-8")
+        self.run_state("begin-round", "--title", "r", "--reason", "x")
+        (self.repo / "密钥.pem").write_text("k", encoding="utf-8")
+        self.git("add", "密钥.pem")
+        result = self.run_state("commit", "--summary", "oops")
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("deny_paths", result.stderr)
+
+
+class ConfigFingerprintTests(RepoTest):
+    def test_no_warning_right_after_init(self):
+        self.run_state("init")
+        data = json.loads(self.run_state("check", "--brief").stdout)
+        self.assertFalse(any("config.json changed" in w for w in data["warnings"]))
+
+    def test_warning_after_config_change(self):
+        self.run_state("init")
+        config_path = self.repo / ".autopilot" / "config.json"
+        config = json.loads(config_path.read_text(encoding="utf-8"))
+        config["max_rounds"] = 3
+        config_path.write_text(json.dumps(config), encoding="utf-8")
+        data = json.loads(self.run_state("check", "--brief").stdout)
+        self.assertTrue(any("config.json changed" in w for w in data["warnings"]))
+
+
+class OutputGuardTests(RepoTest):
+    def test_report_output_outside_repo_refused(self):
+        self.run_state("init")
+        outside = Path(self.tmp) / "outside" / "report.md"
+        result = self.run_state("report", "--output", str(outside))
+        self.assertNotEqual(result.returncode, 0)
+        self.assertFalse(outside.exists())
+
+    def test_report_output_outside_repo_with_force(self):
+        self.run_state("init")
+        outside_dir = Path(self.tmp) / "outside"
+        outside = outside_dir / "report.md"
+        result = self.run_state("report", "--output", str(outside), "--force")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertTrue(outside.exists())
+
+
+class ContractTests(RepoTest):
+    """JSON output is the machine interface agents consume: assert exact key sets
+    so accidental field removal fails loudly."""
+
+    def test_check_brief_contract(self):
+        self.run_state("init")
+        data = json.loads(self.run_state("check", "--brief").stdout)
+        self.assertEqual(
+            set(data),
+            {
+                "continue", "stop_reason", "warnings", "goals_met", "phase",
+                "next_verify_round", "next_commit_round", "next_checkpoint_round",
+            },
+        )
+
+    def test_detect_agent_contract(self):
+        env = dict(self.env)
+        for var in ("OPENCODE", "CLAUDE_CODE", "CODEX", "AUTOPILOT_AGENT", "SKILL_DIR"):
+            env.pop(var, None)
+        result = subprocess.run(
+            [sys.executable, str(self.script), "detect-agent", "--repo", str(self.repo), "--home", str(self.tmp)],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            universal_newlines=True,
+            encoding="utf-8",
+            errors="replace",
+            env=env,
+        )
+        self.assertEqual(result.returncode, 0, result.stderr)
+        data = json.loads(result.stdout)
+        self.assertEqual(
+            set(data),
+            {"agent", "label", "detected_by", "shell", "python_cmd", "skill_dir",
+             "project_marker", "agent_config", "adaptation"},
+        )
+
+    def test_backlog_rank_entry_contract(self):
+        self.run_state("init")
+        self.run_state("backlog-add", "--title", "A", "--reason", "r", "--value", "4", "--effort", "2")
+        ranked = json.loads(self.run_state("backlog-rank").stdout)
+        self.assertEqual(
+            set(ranked[0]),
+            {
+                "id", "title", "reason", "type", "risk", "depends_on", "impact",
+                "value", "effort", "status", "round", "created_at", "updated_at",
+                "score", "score_breakdown", "ready", "blocked_by",
+            },
+        )
+
+    def test_state_json_required_keys(self):
+        self.run_state("init")
+        state_data = self.read_json("state.json")
+        for key in (
+            "schema", "run_id", "repo", "branch", "origin_branch", "created_at",
+            "started_at", "last_activity_at", "round", "completed_rounds",
+            "blocked_rounds", "cancelled_rounds", "reverted_rounds",
+            "estimated_tokens_used", "type_stats", "goals", "completed_goals",
+            "current_round", "history", "stop_reason", "finished_at",
+            "config_fingerprint",
+        ):
+            self.assertIn(key, state_data)
+
+
+class ConfigValidationMatrixTests(RepoTest):
+    """load_config has ~20 validation branches; cover them with one table."""
+
+    CASES = [
+        ("goals_type", {"goals": "single"}, "'goals' must be an array"),
+        ("branch_mode", {"branch_mode": "nope"}, "'branch_mode' must be"),
+        ("report_lang", {"report_lang": "fr"}, "'report_lang' must be"),
+        ("review_threshold_range", {"review_threshold": 9}, "'review_threshold' must be"),
+        ("checkpoint_type", {"checkpoint_every": "2"}, "'checkpoint_every' must be"),
+        ("push_type", {"push": "yes"}, "'push' must be true or false"),
+        ("check_commands_type", {"check_commands": "pytest"}, "'check_commands' must be an array"),
+        ("allow_paths_type", {"allow_paths": "src/"}, "'allow_paths' must be an array"),
+        ("deadline_type", {"deadline": 12345}, "'deadline' must be"),
+        ("secret_pattern_regex", {"secret_patterns": ["([unclosed"]}, "invalid regex"),
+    ]
+
+    def test_validation_matrix(self):
+        for name, mutation, expected in self.CASES:
+            with self.subTest(case=name):
+                shutil.rmtree(self.repo / ".autopilot", ignore_errors=True)
+                self.run_state("init")
+                config_path = self.repo / ".autopilot" / "config.json"
+                config = json.loads(config_path.read_text(encoding="utf-8"))
+                config.update(mutation)
+                config_path.write_text(json.dumps(config), encoding="utf-8")
+                result = self.run_state("check")
+                self.assertNotEqual(result.returncode, 0, name)
+                self.assertIn(expected, result.stderr)
+                self.assertNotIn("Traceback", result.stderr)
+
+
+class HistoryBoundTests(unittest.TestCase):
+    """Unit test for the bounded history append (no git needed)."""
+
+    @classmethod
+    def setUpClass(cls):
+        import sys as _sys
+        if str(SCRIPT.parent) not in _sys.path:
+            _sys.path.insert(0, str(SCRIPT.parent))
+        import autopilot.state as apstate
+        cls.apstate = apstate
+
+    def test_append_history_trims_to_limit(self):
+        st = {"history": []}
+        for i in range(105):
+            self.apstate.append_history(st, {"round": i, "status": "completed", "title": "t" * 3000})
+        self.assertEqual(len(st["history"]), self.apstate.io.HISTORY_LIMIT)
+        self.assertEqual(st["history"][-1]["round"], 104)
+        self.assertEqual(st["history"][0]["round"], 105 - self.apstate.io.HISTORY_LIMIT)
+        self.assertEqual(len(st["history"][0]["title"]), self.apstate.io.HISTORY_TEXT_LIMIT)
 
 
 if __name__ == "__main__":

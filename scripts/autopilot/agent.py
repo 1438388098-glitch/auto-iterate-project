@@ -65,7 +65,7 @@ def detect_agent(cwd=None, home=None):
     """Detect the runtime agent from env vars, then cwd markers, then home markers.
     Returns (agent, detected_by) where agent is one of KNOWN_AGENTS."""
     cwd = Path(cwd) if cwd else Path.cwd()
-    home = Path(home) if home else io._home_dir()
+    home = Path(home) if home else io.home_dir()
 
     override = os.environ.get(AGENT_OVERRIDE_ENV, "")
     if override:
@@ -117,7 +117,7 @@ def cmd_detect_agent(args):
         "detected_by": detected_by,
         "shell": profile["default_shell"],
         "python_cmd": python_cmd,
-        "skill_dir": os.environ.get("SKILL_DIR") or (str(io._home_dir() / profile["skill_dir"]) if not args.home else str(Path(args.home) / profile["skill_dir"])),
+        "skill_dir": os.environ.get("SKILL_DIR") or (str(io.home_dir() / profile["skill_dir"]) if not args.home else str(Path(args.home) / profile["skill_dir"])),
         "project_marker": profile["project_marker"],
         "agent_config": profile["agent_config"],
         "adaptation": {

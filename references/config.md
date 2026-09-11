@@ -1,10 +1,18 @@
 # Configuration Reference
 
+> Single source of truth for field defaults: `scripts/autopilot/config.py::default_config`.
+> The tables below mirror it; when in doubt, the code wins. Update both together.
+
 ## Config File
 
 `.autopilot/config.json` lives at the target repository root. The state helper creates it during `init`; edit it before a run to set limits and goals. Every field has a default, so a minimal file works.
 
-The helper validates field types on every read: a non-object config, a string `max_rounds`, a bad `branch_mode`, or a non-list `check_commands` produces a clear error instead of a traceback. Delete the file and run `init` again to reset.
+The helper validates field types on every read: a non-object config, a string `max_rounds`, a bad `branch_mode`, or a non-list `check_commands` produces a clear error instead of a traceback. Invalid regex in `secret_patterns` is also rejected with a clean error. Delete the file and run `init` again to reset.
+
+> Security note: `check_commands` are executed by the loop as configured here, and `init`
+> records a fingerprint of this file in `state.json`. `check` warns when the config
+> changes after `init` — treat such a warning as a prompt to verify the change was
+> intentional before continuing an autonomous run.
 
 ## Fields
 
