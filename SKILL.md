@@ -285,6 +285,17 @@ When `check` returns `action_hint: "expand"`, the backlog is empty, or local ana
    - UX copy, naming consistency, surprising defaults
    - dependency graph: unused deps, outdated pins, duplicate abstractions
    - cross-cutting: rate limits, timeouts, retries, circuit breakers
+
+   Lens → helper-signal map (what to consult per lens family before proposing):
+
+   | Lens family | Helper signals to ground the proposals |
+   |---|---|
+   | tests / coverage gaps | `check` warnings, `state.type_stats` blocked rates, per-type test counts |
+   | architecture / dead code / API design | `analysis-load` cache, `git log -p`, public symbol audit |
+   | security / secrets / config surface | `secret-scan`, `config.py` validation branches, `references/config.md` |
+   | docs / UX copy / CLI ergonomics | diff between `SKILL.md`/`README.md`/`references/config.md` claims and `--help` output |
+   | observability / data integrity | `.autopilot/log.jsonl` event coverage, migration tests in `scripts/test_autopilot_state.py` |
+   | any origin tagging | `backlog-add --origin expansion` (shares the predicted quota; see `max_predicted_per_round`) |
 2. **Judge and ingest**: for each proposal, require one concrete user-facing sentence of value. Add winners with `backlog-add` (`type`/`value`/`effort`/`risk`; use `depends-on` when needed). Reject vague or cosmetic noise — but do not reject merely because effort is high; high-value large work is still work.
 3. **If still thin, escalate the search, not the conversation**:
    - Wave 2: lower `min_candidate_value` floor temporarily (accept 2s), look at adjacent modules, user-facing polish, test debt.

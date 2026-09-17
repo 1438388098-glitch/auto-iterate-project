@@ -2793,6 +2793,34 @@ class ContractTests(RepoTest):
         )
         self.assertIn(data["action_hint"], ("work", "expand", "stop"))
 
+    def test_detect_agent_contract_with_autopilot_state(self):
+        """Cross-contract (seed-001): detect-agent's key set must not drift when
+        the repo already carries .autopilot state (the common mid-run case)."""
+        self.run_state("init")
+        self.run_state("goal-met", "--goal", "G", "--next-step", "N")
+        env = dict(self.env)
+        for var in ("OPENCODE", "CLAUDE_CODE", "CODEX", "AUTOPILOT_AGENT", "SKILL_DIR"):
+            env.pop(var, None)
+        result = subprocess.run(
+            [sys.executable, str(self.script), "detect-agent", "--repo", str(self.repo), "--home", str(self.tmp)],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            universal_newlines=True,
+            encoding="utf-8",
+            errors="replace",
+            env=env,
+        )
+        self.assertEqual(result.returncode, 0, result.stderr)
+        data = json.loads(result.stdout)
+        self.assertEqual(
+            set(data),
+            {"agent", "label", "detected_by", "shell", "python_cmd", "skill_dir",
+             "project_marker", "agent_config", "adaptation"},
+        )
+        # Seed/expand context must not leak into the agent-detection payload.
+        self.assertNotIn("expansion", data)
+        self.assertNotIn("goal_seeds", data)
+
     def test_detect_agent_contract(self):
         env = dict(self.env)
         for var in ("OPENCODE", "CLAUDE_CODE", "CODEX", "AUTOPILOT_AGENT", "SKILL_DIR"):
