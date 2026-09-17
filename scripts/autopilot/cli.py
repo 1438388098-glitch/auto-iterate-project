@@ -160,6 +160,17 @@ def build_parser():
     add_dry_run(goal_parser)
     goal_parser.set_defaults(func=commands.cmd_goal_met)
 
+    seed_reject_parser = subparsers.add_parser(
+        "seed-reject",
+        help="Reject an open direction seed (value-gate / evidence check refused it)",
+    )
+    seed_reject_parser.add_argument("--repo", default=".")
+    seed_reject_parser.add_argument("--id", required=True, help="Direction seed id (e.g. seed-003)")
+    seed_reject_parser.add_argument("--reason", required=True, help="Why the hypothesis died (stored as the seed's outcome)")
+    add_json(seed_reject_parser)
+    add_dry_run(seed_reject_parser)
+    seed_reject_parser.set_defaults(func=commands.cmd_seed_reject)
+
     finish_parser = subparsers.add_parser("finish", help="Finish the run")
     finish_parser.add_argument("--repo", default=".")
     finish_parser.add_argument("--reason")

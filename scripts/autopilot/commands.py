@@ -341,38 +341,56 @@ def _refresh_type_stats(repo, st):
     st["type_stats"] = state.compute_type_stats(state.load_backlog(repo))
 
 
-def _resolve_round_seeds(repo, current, outcome, notes=None):
-    """Seed write-back after a round closes: candidates promoted from seeds
-    (`from_seed`) resolve their seed to verified (completed round), refuted
-    (blocked round, notes = the block reason — failed hypotheses keep their
-    evidence and never re-enter the pool to game the stats), or open again
-    (cancelled round, the candidate returns to pending)."""
+def _resolve_round_seeds_in_state(repo, st, current, outcome, notes=None):
+    """Seed write-back for one closing round, mutated into the caller's state so
+    the round close persists backlog + seed ledger without a crash window.
+    Only seeds PROMOTED BY THIS ROUND's candidates are touched: a stale
+    candidate from an earlier round completing must never verify/refute a seed
+    that was since re-promoted elsewhere. completed -> verified, blocked ->
+    refuted (+notes: failed hypotheses keep their evidence), cancelled -> open."""
     backlog = state.load_backlog(repo)
+    round_ids = set(state.round_candidate_ids(current))
     seed_ids = []
-    for candidate_id in state.round_candidate_ids(current):
+    for candidate_id in round_ids:
         candidate = state.find_candidate(backlog, candidate_id)
         from_seed = (candidate or {}).get("from_seed")
         if from_seed and from_seed not in seed_ids:
             seed_ids.append(from_seed)
-    if not seed_ids:
-        return
-    st = state.load_state(repo)
     for seed_id in seed_ids:
+        seed = state.find_seed(st, seed_id)
+        if seed is None:
+            print(
+                "[WARN] seed-writeback: seed {} no longer exists (truncated?); skipped.".format(seed_id),
+                file=sys.stderr,
+            )
+            io.append_log(repo, "seed-writeback", "warn", seed=seed_id, reason="missing")
+            continue
+        owner = seed.get("promoted_candidate_id")
+        if owner is not None and owner not in round_ids:
+            print(
+                "[WARN] seed-writeback: seed {} is owned by candidate {}, not this round; skipped.".format(
+                    seed_id, owner
+                ),
+                file=sys.stderr,
+            )
+            io.append_log(repo, "seed-writeback", "warn", seed=seed_id, reason="not owned by this round", owner=owner)
+            continue
         if outcome == "completed":
-            state.resolve_seed(st, seed_id, "verified", candidate_id=None)
+            state.resolve_seed(st, seed_id, "verified")
         elif outcome == "blocked":
             state.resolve_seed(st, seed_id, "refuted", notes=notes)
         else:
             state.resolve_seed(st, seed_id, "open")
-    state.save_state(repo, st)
-    io.append_log(repo, "seed-writeback", "success", seeds=seed_ids, outcome=outcome)
+        io.append_log(repo, "seed-writeback", "success", seed=seed_id, outcome=outcome)
 
 
 def _close_round(repo, st, current, status, counter_key, tokens, history_entry,
-                 candidate_status, candidate_round=None, candidate_extra=None):
+                 candidate_status, candidate_round=None, candidate_extra=None,
+                 seed_outcome=None, seed_notes=None):
     """Shared round-closing bookkeeping: bump the round counter, append tokens,
     record bounded history, release the round, update candidates in one backlog
-    pass, refresh type stats, and persist state."""
+    pass, resolve this round's seeds into the SAME state save, refresh type
+    stats, and persist state."""
     if counter_key:
         st[counter_key] = st.get(counter_key, 0) + 1
     if tokens:
@@ -385,6 +403,8 @@ def _close_round(repo, st, current, status, counter_key, tokens, history_entry,
         repo, state.round_candidate_ids(current), candidate_status, candidate_round,
         extra_fields=candidate_extra,
     )
+    if seed_outcome is not None:
+        _resolve_round_seeds_in_state(repo, st, current, seed_outcome, seed_notes)
     _refresh_type_stats(repo, st)
     state.save_state(repo, st)
 
@@ -461,12 +481,12 @@ def cmd_complete_round(args):
             candidate_extra=(
                 {"review_score": args.review_score} if getattr(args, "review_score", None) is not None else None
             ),
+            seed_outcome="completed",
         )
         io.append_log(
             repo, "complete-round", "success",
             round=current["round"], commit_sha=args.commit_sha, estimated_tokens=tokens,
         )
-        _resolve_round_seeds(repo, current, "completed")
 
         if st.get("completed_rounds", 0) % io.PHASE_REPORT_INTERVAL == 0:
             state.write_phase_report(repo, st, cfg)
@@ -516,9 +536,10 @@ def cmd_block_round(args):
             },
             candidate_status="blocked",
             candidate_round=current["round"],
+            seed_outcome="blocked",
+            seed_notes=args.reason,
         )
         io.append_log(repo, "block-round", "success", round=current["round"], reason=args.reason)
-        _resolve_round_seeds(repo, current, "blocked", notes=args.reason)
         return emit_result(args, True, "[OK] Round blocked.")
 
 
@@ -551,9 +572,9 @@ def cmd_cancel_round(args):
                 "candidate_id": current.get("candidate_id"),
             },
             candidate_status="pending",
+            seed_outcome="cancelled",
         )
         io.append_log(repo, "cancel-round", "success", round=current["round"], reason=args.reason)
-        _resolve_round_seeds(repo, current, "cancelled")
         return emit_result(args, True, "[OK] Round cancelled.")
 
 
@@ -675,6 +696,33 @@ def cmd_goal_met(args):
         return emit_result(args, True, message, data=data)
 
 
+def cmd_seed_reject(args):
+    repo = Path(args.repo).resolve()
+    with io.run_lock(repo):
+        st = state.load_state(repo)
+        seed = state.find_seed(st, args.id)
+        if seed is None:
+            io.append_log(repo, "seed-reject", "error", reason="seed not found")
+            return emit_result(args, False, "[ERROR] Direction seed not found in state: {}".format(args.id))
+        if seed.get("status") != "open":
+            io.append_log(repo, "seed-reject", "error", reason="seed not open")
+            return emit_result(
+                args, False,
+                "[ERROR] Seed {} is '{}' (only 'open' seeds can be rejected). "
+                "Promoted seeds resolve through complete-round/block-round.".format(
+                    args.id, seed.get("status")
+                ),
+            )
+        if getattr(args, "dry_run", False):
+            print("[DRY-RUN] Would reject seed {}: {}.".format(args.id, args.reason), file=sys.stderr)
+            return 0
+        state.resolve_seed(st, args.id, "rejected", notes=args.reason)
+        st["last_activity_at"] = io.now_iso()
+        state.save_state(repo, st)
+        io.append_log(repo, "seed-reject", "success", seed=args.id, reason=args.reason)
+        return emit_result(args, True, "[OK] Seed rejected: {}".format(args.id), data={"seed": args.id})
+
+
 def cmd_finish(args):
     repo = Path(args.repo).resolve()
     with io.run_lock(repo):
@@ -709,9 +757,9 @@ def cmd_finish(args):
                     "candidate_id": open_round.get("candidate_id"),
                 },
                 candidate_status="pending",
+                seed_outcome="cancelled",
             )
             io.append_log(repo, "cancel-round", "success", round=open_round.get("round"), reason="auto-cancelled at finish")
-            _resolve_round_seeds(repo, open_round, "cancelled")
 
         st["finished_at"] = io.now_iso()
         st["stop_reason"] = args.reason or st.get("stop_reason") or "finished"
@@ -801,7 +849,9 @@ def cmd_backlog_add(args):
         else:
             if confidence is None:
                 confidence = 0.75
-            if confidence < 0.5 or confidence > 1.0:
+            # Chained comparison: NaN fails it too (NaN < 0.5 is False, so a
+            # naive `confidence < 0.5 or confidence > 1.0` would let NaN through).
+            if not (0.5 <= confidence <= 1.0):
                 io.append_log(repo, "backlog-add", "error", reason="confidence out of range")
                 return emit_result(
                     args, False,

@@ -329,14 +329,18 @@ def resolve_seed(st, seed_id, status, notes=None, candidate_id=None):
     """Move a seed along its state machine. Returns the seed or None.
       open -> promoted (backlog-add --from-seed) -> verified (complete-round)
                                                  -> refuted  (block-round)
-      open -> rejected (value-gate refusal)
-    Cancelling a round returns its seeds to `open` (stale promotion markers are
-    cleared). Failed hypotheses never flow back silently: a refuted seed keeps
-    its notes so the hit-rate statistics stay honest."""
+      open -> rejected (seed-reject: value-gate / evidence check refused it)
+      promoted -> open (cancel-round write-back)
+    Terminal states (verified/refuted/rejected) are immutable — a cancelled
+    round can never resurrect a seed the statistics already counted. Failed
+    hypotheses never flow back silently: a refuted seed keeps its notes so the
+    hit-rate statistics stay honest."""
     seed = find_seed(st, seed_id)
     if seed is None:
         return None
     if status not in SEED_STATUSES:
+        return None
+    if seed.get("status") in ("verified", "refuted", "rejected"):
         return None
     now = io.now_iso()
     seed["status"] = status
@@ -616,7 +620,9 @@ def compute_type_stats(backlog):
                 except (TypeError, ValueError):
                     pass
                 review = candidate.get("review_score")
-                if isinstance(review, (int, float)) and not isinstance(review, bool):
+                # `review == review` rejects NaN, which would poison the average
+                # and the calibration factor.
+                if isinstance(review, (int, float)) and not isinstance(review, bool) and review == review:
                     entry["review_sum"] += review
                     entry["review_n"] += 1
             else:
@@ -676,7 +682,7 @@ def compute_predicted_account(backlog):
         if status == "completed":
             completed += 1
             review = candidate.get("review_score")
-            if isinstance(review, (int, float)) and not isinstance(review, bool):
+            if isinstance(review, (int, float)) and not isinstance(review, bool) and review == review:
                 review_sum += review
                 review_n += 1
         elif status == "blocked":
@@ -780,9 +786,15 @@ def _score_expected(candidate, type_stats=None, saturation_threshold=2,
         confidence = 1.0
     else:
         confidence = candidate.get("confidence")
-        if not isinstance(confidence, (int, float)) or isinstance(confidence, bool):
+        if (
+            not isinstance(confidence, (int, float))
+            or isinstance(confidence, bool)
+            # Chained range test: NaN and +-inf fail it and fall back to the
+            # default instead of poisoning the discount (NaN bypasses min/max).
+            or not (0.5 <= float(confidence) <= 1.0)
+        ):
             confidence = 0.75
-        confidence = max(0.5, min(1.0, float(confidence)))
+        confidence = float(confidence)
     confidence_factor = confidence
 
     based_on = candidate.get("based_on")
@@ -909,7 +921,15 @@ def _mark_selection(entries, cfg, progress=None):
         if (entry.get("origin") or "observed") != "observed":
             predicted_count += 1
     if len(selected) < n and below:
-        selected.append(below[0])
+        # The quick-win fallback obeys the same predicted quota / late-run cut as
+        # the main loop, or a below-floor predicted candidate would bypass both.
+        entry = below[0]
+        if (entry.get("origin") or "observed") != "observed":
+            if predicted_count < predicted_quota:
+                selected.append(entry)
+                predicted_count += 1
+        else:
+            selected.append(entry)
     for entry in selected:
         entry["selected"] = True
 
