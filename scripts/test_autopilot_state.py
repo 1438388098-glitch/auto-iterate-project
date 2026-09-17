@@ -18,6 +18,7 @@ SCRIPT = Path(__file__).resolve().parent / "autopilot_state.py"
 # selection): the package lives next to this file.
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 from autopilot import state as ap_state  # noqa: E402
+from autopilot import io as ap_io  # noqa: E402
 from autopilot.cli import build_parser  # noqa: E402
 from autopilot.guard import path_allowed  # noqa: E402
 from autopilot.secrets import SECRET_PATTERNS  # noqa: E402

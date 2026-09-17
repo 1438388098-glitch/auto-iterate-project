@@ -106,15 +106,15 @@ def parse_deadline(value):
             return None
         amount = float(match.group(1))
         unit = match.group(2).lower()
-        if unit in ("min", "mins", "minute", "minutes", "m"):
-            delta = timedelta(minutes=amount)
-        elif unit in ("h", "hour", "hours", "hr"):
-            delta = timedelta(hours=amount)
-        elif unit in ("d", "day", "days"):
-            delta = timedelta(days=amount)
-        else:
-            delta = timedelta(weeks=amount)
         try:
+            if unit in ("min", "mins", "minute", "minutes", "m"):
+                delta = timedelta(minutes=amount)
+            elif unit in ("h", "hour", "hours", "hr"):
+                delta = timedelta(hours=amount)
+            elif unit in ("d", "day", "days"):
+                delta = timedelta(days=amount)
+            else:
+                delta = timedelta(weeks=amount)
             return (datetime.now(timezone.utc) + delta).isoformat()
         except (OverflowError, OSError, ValueError):
             # An absurd duration (30-digit weeks) must reach the caller's
