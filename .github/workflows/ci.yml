@@ -4,20 +4,28 @@ on:
   push:
   pull_request:
 
+concurrency:
+  group: ci-\${{ github.ref }}
+  cancel-in-progress: true
+
 jobs:
   test:
     strategy:
       fail-fast: false
       matrix:
         os: [ubuntu-latest, windows-latest]
+        # The helper code targets Python 3.6+ (str.format conventions, no
+        # 3.7+ syntax), but hosted runners cannot install 3.6/3.7 — the
+        # documented support line is "3.6+ (CI-verified on 3.8-3.13)".
         python-version: ["3.8", "3.13"]
-    runs-on: ${{ matrix.os }}
+    runs-on: \${{ matrix.os }}
+    timeout-minutes: 15
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
         with:
-          python-version: ${{ matrix.python-version }}
+          python-version: \${{ matrix.python-version }}
       - name: Syntax check
-        run: python -m py_compile scripts/autopilot_state.py
+        run: python -m py_compile scripts/autopilot_state.py scripts/autopilot/*.py
       - name: Run test suite
         run: python scripts/test_autopilot_state.py
