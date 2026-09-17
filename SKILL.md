@@ -1,6 +1,6 @@
 ---
 name: auto-iterate-project
-version: 1.3.1
+version: 1.3.2
 description: Automatically iterate any git project inside the current agent session by analyzing the repository, choosing the next high-value improvement, implementing small changes, verifying, committing, and looping until a goal is met or configurable round/time/token limits are reached. Use when the user asks for autonomous project iteration, continuous self-improvement, auto-improve, keep improving this project, full-auto development, or wants the agent to keep making and committing improvements without per-step approval. Also use for Chinese requests like 全自动迭代这个项目, 自动改进并提交这个仓库, 连续自动开发, or 自动推进项目改进.
 ---
 
@@ -74,7 +74,7 @@ python <this-skill>/scripts/autopilot_state.py init --repo <repo> [--branch-mode
 
 `--deadline` is the **timer (定时器)** stop: an absolute wall-clock moment when the run must stop, unlike the `--max-minutes` countdown (倒计时) which measures duration since the last round activity. Accepts an ISO timestamp (`2026-08-10T08:00:00`), a relative duration (`+8h`, `+30min`, `+1d`, `+2w`), or a local `HH:MM` (today, or tomorrow if already passed — e.g. `08:00` for "iterate until tomorrow morning"). It is resolved to an absolute UTC timestamp at init time. See `references/config.md` for details.
 
-`--goals-from-prompt` splits a natural-language request (Chinese or English) into `goals` automatically. `--allow-path`/`--deny-path` seed the commit path whitelist (repeatable).
+`--goals-from-prompt` splits a natural-language request (Chinese or English) into `goals` automatically. `--allow-path`/`--deny-path` seed the commit path whitelist (repeatable). Ranking-related flags not shown above: `--ranking-mode`, `--min-candidate-value`, `--max-same-type-per-round`, `--max-predicted-per-round` (see `references/config.md`).
 
 7. If `branch_mode` is `feature`, run `ensure-branch`. On a fresh run `init` already created the branch, so this is only needed when resuming; calling it again is safe.
 8. If `.autopilot/state.json` already exists and is unfinished, run `read` and `check`, then continue from the current state instead of initializing again.
@@ -231,7 +231,7 @@ Deep Expansion answers "what else could be improved?"; this protocol answers "be
 | journey | with A in hand the user will do J next → make J not break | import works → handle first-sync failure |
 | debt | A bypassed D to hit the goal → remove D | hardcoded path → config option |
 
-**Hypothesis loop**: (1) predict, (2) verify the evidence at minimum cost — a hypothesis whose evidence is gone is rejected, (3) value-gate via `backlog-add --from-seed <id>` + `backlog-rank` (same red lines as Expansion), (4) work the most credible 1-2 via `begin-round`, (5) the seed resolves automatically from the round outcome: `complete-round` → `verified`, `block-round` → `refuted` (with the block reason as notes — failed hypotheses never flow back to game the stats), `cancel-round` → `open` again. A validated causal chain may spawn one more layer of hypotheses, at most two layers deep.
+**Hypothesis loop**: (1) predict, (2) verify the evidence at minimum cost — a hypothesis whose evidence is gone is rejected via `seed-reject --id <id> --reason "<why>"` (dead seeds leave the open list so the Wave 0 exception can fire), (3) value-gate via `backlog-add --from-seed <id>` + `backlog-rank` (same red lines as Expansion), (4) work the most credible 1-2 via `begin-round`, (5) the seed resolves automatically from the round outcome: `complete-round` → `verified`, `block-round` → `refuted` (with the block reason as notes — failed hypotheses never flow back to game the stats), `cancel-round` → `open` again. A validated causal chain may spawn one more layer of hypotheses, at most two layers deep.
 
 **Anti-noise guardrails (刀 B)**: promoted seeds carry `origin: "predicted"` and a `confidence` (default 0.75) that discounts their score — belief is not value. `max_predicted_per_round` (default 1) caps how many predicted candidates enter one recommended batch, observed work wins score ties, and in the late run (progress > 0.7) predicted work is cut entirely while observed candidates are still ready. Predictions keep their own blocked/review sub-account: consecutive failures sink future predictions without contaminating the observed work's stats, and the run report shows the hit rate (「方向假设」section). When tuning `max_predicted_per_round` or confidence defaults, justify the change from the sub-account's hit-rate samples — not from intuition.
 

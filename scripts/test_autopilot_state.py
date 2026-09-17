@@ -13,6 +13,11 @@ from pathlib import Path
 
 SCRIPT = Path(__file__).resolve().parent / "autopilot_state.py"
 
+# Direct import for pure-function adversarial tests (resolve_seed, scoring,
+# selection): the package lives next to this file.
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+from autopilot import state as ap_state  # noqa: E402
+
 
 class AutopilotTestBase(unittest.TestCase):
     script = SCRIPT
@@ -25,7 +30,10 @@ class AutopilotTestBase(unittest.TestCase):
         # Isolate from the developer's git environment: repo-local config only,
         # no inherited GIT_* plumbing, no global gpgsign/hooks interference.
         for var in ("GIT_DIR", "GIT_WORK_TREE", "GIT_INDEX_FILE", "GIT_NAMESPACE",
-                    "GIT_OBJECT_DIRECTORY", "GIT_COMMON_DIR"):
+                    "GIT_OBJECT_DIRECTORY", "GIT_COMMON_DIR",
+                    "GIT_AUTHOR_NAME", "GIT_AUTHOR_EMAIL", "GIT_AUTHOR_DATE",
+                    "GIT_COMMITTER_NAME", "GIT_COMMITTER_EMAIL", "GIT_COMMITTER_DATE",
+                    "GIT_CONFIG_COUNT"):
             self.env.pop(var, None)
         self.global_config = Path(self.tmp) / "global-gitconfig"
         self.global_config.write_text("", encoding="utf-8")
@@ -62,6 +70,7 @@ class AutopilotTestBase(unittest.TestCase):
             encoding="utf-8",
             errors="replace",
             env=self.env,
+            timeout=180,
         )
 
     def read_json(self, name):
@@ -704,6 +713,285 @@ class PredictedOriginTests(RepoTest):
         output = self.run_state("report").stdout
         self.assertIn("预测子账", output)
         self.assertIn("受阻 1", output)
+
+
+class ImportUnitTests(unittest.TestCase):
+    """Adversarial direct tests of pure helpers (no subprocess, no temp repo)."""
+
+    # -- resolve_seed state machine ------------------------------------------
+    def _seed(self, status="open", **extra):
+        state = {"goal_seeds": [dict({"id": "seed-001", "status": status}, **extra)]}
+        return state, state["goal_seeds"][0]
+
+    def test_resolve_seed_missing_and_invalid(self):
+        st = {"goal_seeds": []}
+        self.assertIsNone(ap_state.resolve_seed(st, "seed-999", "promoted"))
+        self.assertIsNone(ap_state.resolve_seed(st, "seed-001", "bogus"))
+        self.assertEqual(st, {"goal_seeds": []})
+
+    def test_resolve_seed_terminal_is_immutable(self):
+        for terminal in ("verified", "refuted", "rejected"):
+            st, seed = self._seed(status=terminal)
+            for target in ("open", "promoted", "verified", "refuted", "rejected"):
+                self.assertIsNone(ap_state.resolve_seed(st, "seed-001", target), (terminal, target))
+            self.assertEqual(seed["status"], terminal)
+
+    def test_resolve_seed_reopen_clears_promotion_keeps_outcome(self):
+        st, seed = self._seed(status="promoted", promoted_at="T", promoted_candidate_id="candidate-005",
+                              outcome="")
+        seed["outcome"] = "earlier attempt"
+        self.assertIsNotNone(ap_state.resolve_seed(st, "seed-001", "open"))
+        self.assertEqual(seed["status"], "open")
+        self.assertNotIn("promoted_at", seed)
+        self.assertNotIn("promoted_candidate_id", seed)
+        self.assertEqual(seed["outcome"], "earlier attempt")
+
+    def test_resolve_seed_refuted_keeps_ledger_honest(self):
+        st, seed = self._seed(status="promoted", promoted_at="T", promoted_candidate_id="candidate-005")
+        self.assertIsNotNone(ap_state.resolve_seed(st, "seed-001", "refuted", notes="evidence gone"))
+        self.assertEqual(seed["status"], "refuted")
+        self.assertEqual(seed["outcome"], "evidence gone")
+        self.assertIn("promoted_at", seed)
+        self.assertIn("refuted_at", seed)
+
+    # -- _score_expected confidence adversarial -------------------------------
+    def _score_confidence(self, confidence, origin="predicted"):
+        candidate = {"id": "c", "title": "t", "value": 4, "effort": 2,
+                     "origin": origin, "confidence": confidence}
+        score, breakdown = ap_state._score_expected(candidate, type_stats={})
+        return breakdown["confidence_factor"]
+
+    def test_confidence_adversarial_table(self):
+        fallback = 0.75
+        cases = [
+            (True, fallback), (False, fallback), ("high", fallback), (None, fallback),
+            (1.7, fallback), (-0.2, fallback), (0.5, 0.5), (1.0, 1.0),
+        ]
+        for confidence, expected in cases:
+            self.assertEqual(self._score_confidence(confidence), expected, confidence)
+
+    def test_confidence_nan_and_inf_fall_back(self):
+        # NaN fails the chained range test (min/max would return 1.0); inf too.
+        self.assertEqual(self._score_confidence(float("nan")), 0.75)
+        self.assertEqual(self._score_confidence(float("inf")), 0.75)
+
+    def test_observed_confidence_forced_to_one(self):
+        self.assertEqual(self._score_confidence(0.1, origin="observed"), 1.0)
+
+    def test_nan_review_score_never_poisons_calibration(self):
+        backlog = {"candidates": [
+            {"id": "a", "title": "t", "type": "bugfix", "status": "completed",
+             "value": 4, "effort": 2, "review_score": float("nan")},
+        ]}
+        stats = ap_state.compute_type_stats(backlog)
+        self.assertEqual(stats["bugfix"]["review_n"], 0)
+        self.assertEqual(stats["bugfix"]["calibration"], 1.0)
+        account = ap_state.compute_predicted_account({"candidates": [
+            {"id": "b", "title": "t", "status": "completed", "origin": "predicted",
+             "review_score": float("nan")},
+        ]})
+        self.assertEqual(account["review_n"], 0)
+
+    def test_overflow_values_do_not_crash_resolvers(self):
+        self.assertEqual(ap_state._resolved_value({"value": float("inf")}), 3)
+        self.assertEqual(ap_state._resolved_effort({"effort": float("inf")}), 3)
+
+    # -- _next_sequential_id monotonic after truncation -----------------------
+    def test_sequential_id_never_reuses_truncated_ids(self):
+        st = {"goal_seeds": [{"id": "seed-{:03d}".format(i), "title": str(i)} for i in range(1, 51)]}
+        self.assertEqual(ap_state._next_sequential_id(st, "goal_seeds", "seed-"), "seed-051")
+        st["goal_seeds"] = st["goal_seeds"][1:]  # seed-001 truncated away
+        self.assertEqual(ap_state._next_sequential_id(st, "goal_seeds", "seed-"), "seed-052")
+
+    # -- _mark_selection quota edges ------------------------------------------
+    @staticmethod
+    def _entry(entry_id, origin=None, below=False, score=5.0):
+        entry = {"id": entry_id, "title": entry_id, "type": "refactor", "status": "pending",
+                 "ready": True, "score": score, "below_floor": below}
+        if origin:
+            entry["origin"] = origin
+        return entry
+
+    def _cfg(self, quota=1):
+        return {"candidates_per_round": 3, "max_same_type_per_round": 2,
+                "max_predicted_per_round": quota}
+
+    def test_below_floor_predicted_respects_quota(self):
+        entries = [
+            self._entry("p1", origin="predicted", score=5.0),
+            self._entry("p2", origin="predicted", score=4.0),
+            self._entry("qp", origin="predicted", below=True, score=1.0),
+        ]
+        ap_state._mark_selection(entries, self._cfg(quota=0))
+        self.assertFalse(any(e.get("selected") for e in entries))
+
+        entries = [
+            self._entry("p1", origin="predicted", score=5.0),
+            self._entry("p2", origin="predicted", score=4.0),
+            self._entry("qp", origin="predicted", below=True, score=1.0),
+        ]
+        ap_state._mark_selection(entries, self._cfg(quota=1))
+        selected = [e["id"] for e in entries if e.get("selected")]
+        self.assertEqual(selected, ["p1"])  # main-loop slot consumed; below skipped
+
+    def test_below_floor_observed_still_fills_slot(self):
+        entries = [
+            self._entry("p1", origin="predicted", score=5.0),
+            self._entry("p2", origin="predicted", score=4.0),
+            self._entry("qo", below=True, score=1.0),
+        ]
+        ap_state._mark_selection(entries, self._cfg(quota=0))
+        selected = [e["id"] for e in entries if e.get("selected")]
+        self.assertEqual(selected, ["qo"])
+
+    def test_all_predicted_pool_selects_single_top(self):
+        entries = [
+            self._entry("p1", origin="predicted", score=5.0),
+            self._entry("p2", origin="predicted", score=4.0),
+            self._entry("p3", origin="predicted", score=3.0),
+        ]
+        ap_state._mark_selection(entries, self._cfg(quota=1))
+        selected = [e["id"] for e in entries if e.get("selected")]
+        self.assertEqual(selected, ["p1"])
+
+    def test_late_run_cuts_predicted_including_below(self):
+        entries = [
+            self._entry("p1", origin="predicted", score=5.0),
+            self._entry("qp", origin="predicted", below=True, score=1.0),
+            self._entry("obs", score=2.0),
+        ]
+        ap_state._mark_selection(entries, self._cfg(quota=1), progress=0.8)
+        selected = [e["id"] for e in entries if e.get("selected")]
+        self.assertEqual(selected, ["obs"])
+
+
+class PredictedHardeningTests(RepoTest):
+    """Subprocess regressions for the v1.3.2 hardening (audit-driven)."""
+
+    def test_seed_reject_command(self):
+        self.run_state("init", "--goal", "G", "--expand-after-goals", "--max-rounds", "50")
+        self.run_state("goal-met", "--goal", "G")
+        self.run_state("goal-met", "--goal", "G2", "--next-step", "N")
+        result = self.run_state("seed-reject", "--id", "seed-001", "--reason", "evidence gone")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        state = self.read_json("state.json")
+        seed = state["goal_seeds"][0]
+        self.assertEqual(seed["status"], "rejected")
+        self.assertEqual(seed["outcome"], "evidence gone")
+        # Rejected seeds leave the open-seeds list: the Wave 0 exception can fire.
+        brief = json.loads(self.run_state("check", "--brief").stdout)
+        self.assertEqual(brief["expansion"]["seeds"], [])
+        # promote / re-reject must fail
+        result = self.run_state("backlog-add", "--from-seed", "seed-001")
+        self.assertNotEqual(result.returncode, 0)
+        result = self.run_state("seed-reject", "--id", "seed-001", "--reason", "again")
+        self.assertNotEqual(result.returncode, 0)
+
+    def test_check_expansion_tolerates_corrupt_seed_entries(self):
+        self.run_state("init")
+        self.run_state("goal-met", "--goal", "G", "--next-step", "real seed")
+        state_path = self.repo / ".autopilot" / "state.json"
+        state = json.loads(state_path.read_text(encoding="utf-8"))
+        state["goal_seeds"] = ["oops", 42, None] + state["goal_seeds"]
+        state["goal_events"] = ["bad-event"] + state["goal_events"]
+        state_path.write_text(json.dumps(state), encoding="utf-8")
+        data = json.loads(self.run_state("check", "--brief").stdout)
+        self.assertEqual(data["phase"], "iterate")  # goals not met here; sanity
+
+    def test_corrupt_type_stats_clean_error(self):
+        self.run_state("init")
+        state_path = self.repo / ".autopilot" / "state.json"
+        state = json.loads(state_path.read_text(encoding="utf-8"))
+        state["type_stats"] = {"bugfix": "oops"}
+        state_path.write_text(json.dumps(state), encoding="utf-8")
+        result = self.run_state("check", "--brief")
+        self.assertNotEqual(result.returncode, 0)
+        self.assertNotIn("Traceback", result.stderr)
+        self.assertIn("type_stats", result.stderr)
+
+    def test_corrupt_backlog_clean_error(self):
+        self.run_state("init")
+        backlog_path = self.repo / ".autopilot" / "backlog.json"
+        backlog_path.write_text(json.dumps({"next_id": 2, "candidates": ["oops"]}), encoding="utf-8")
+        result = self.run_state("backlog-rank")
+        self.assertNotEqual(result.returncode, 0)
+        self.assertNotIn("Traceback", result.stderr)
+        self.assertIn("backlog.json", result.stderr)
+        result = self.run_state("check")
+        self.assertNotEqual(result.returncode, 0)
+        self.assertNotIn("Traceback", result.stderr)
+
+    def test_goal_met_dedupes_repeated_seeds(self):
+        self.run_state("init")
+        for _ in range(2):
+            result = self.run_state("goal-met", "--goal", "G", "--next-step", "same idea", "--json")
+            self.assertEqual(result.returncode, 0, result.stderr)
+        state = self.read_json("state.json")
+        self.assertEqual(len(state["goal_seeds"]), 1)
+
+    def test_goal_event_records_commit_sha_and_source_event_id(self):
+        self.run_state("init")
+        self.git("commit", "--allow-empty", "-q", "-m", "base")
+        self.run_state("begin-round", "--title", "t", "--reason", "r")
+        self.run_state("complete-round", "--commit-sha", "HEAD", "--summary", "s")
+        result = self.run_state("goal-met", "--goal", "G", "--next-step", "N", "--json")
+        payload = json.loads(result.stdout)
+        state = self.read_json("state.json")
+        event = state["goal_events"][0]
+        self.assertEqual(len(event["commit_shas"]), 1)
+        self.assertEqual(state["goal_seeds"][0]["source_event_id"], event["id"])
+
+    def test_multi_seed_multi_candidate_round_resolution(self):
+        self.run_state("init")
+        self.run_state("goal-met", "--goal", "G", "--next-step", "A", "--next-step", "B")
+        self.run_state("backlog-add", "--from-seed", "seed-001")
+        self.run_state("backlog-add", "--from-seed", "seed-002")
+        self.git("commit", "--allow-empty", "-q", "-m", "base")
+        self.run_state("begin-round", "--title", "t", "--reason", "r",
+                       "--candidate-id", "candidate-001", "--candidate-id", "candidate-002")
+        self.run_state("complete-round", "--summary", "both")
+        state = self.read_json("state.json")
+        self.assertEqual([s["status"] for s in state["goal_seeds"]], ["verified", "verified"])
+
+    def test_seed_writeback_warns_on_missing_seed(self):
+        self.run_state("init")
+        self.run_state("goal-met", "--goal", "G", "--next-step", "N")
+        self.run_state("backlog-add", "--from-seed", "seed-001")
+        state_path = self.repo / ".autopilot" / "state.json"
+        state = json.loads(state_path.read_text(encoding="utf-8"))
+        state["goal_seeds"] = []  # seed vanished (as if truncated)
+        state_path.write_text(json.dumps(state), encoding="utf-8")
+        self.git("commit", "--allow-empty", "-q", "-m", "base")
+        self.run_state("begin-round", "--title", "t", "--reason", "r", "--candidate-id", "candidate-001")
+        result = self.run_state("complete-round", "--summary", "s")
+        self.assertEqual(result.returncode, 0, result.stderr)  # no crash
+        log = (self.repo / ".autopilot" / "log.jsonl").read_text(encoding="utf-8")
+        self.assertIn("seed-writeback", log)
+        self.assertIn("missing", log)
+
+    def test_init_rejects_negative_max_predicted(self):
+        result = self.run_state("init", "--max-predicted-per-round", "-1")
+        self.assertNotEqual(result.returncode, 0)
+        self.assertNotIn("Traceback", result.stderr)
+        result = self.run_state("init", "--max-predicted-per-round", "0")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        cfg = json.loads((self.repo / ".autopilot" / "config.json").read_text(encoding="utf-8"))
+        self.assertEqual(cfg["max_predicted_per_round"], 0)
+
+    def test_seed_field_junk_falls_back(self):
+        self.run_state("init")
+        state_path = self.repo / ".autopilot" / "state.json"
+        state = json.loads(state_path.read_text(encoding="utf-8"))
+        state["goal_seeds"] = [{"id": "seed-001", "status": "open", "title": "junk",
+                                "type": "refactor", "value": "4", "effort": "oops", "risk": "2"}]
+        state_path.write_text(json.dumps(state), encoding="utf-8")
+        result = self.run_state("backlog-add", "--from-seed", "seed-001")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        backlog = self.read_json("backlog.json")
+        candidate = backlog["candidates"][0]
+        self.assertEqual(candidate["value"], 4)   # "4" coerced
+        self.assertEqual(candidate["effort"], 3)  # junk -> legacy default
+        self.assertEqual(candidate["risk"], 2)    # "2" coerced
 
 
 class DirectionSeedTests(RepoTest):
@@ -2616,6 +2904,8 @@ class ConfigValidationMatrixTests(RepoTest):
         ("min_candidate_value", {"min_candidate_value": 9}, "'min_candidate_value' must be"),
         ("max_same_type_per_round", {"max_same_type_per_round": 0}, "'max_same_type_per_round' must be"),
         ("min_pending_candidates", {"min_pending_candidates": -1}, "'min_pending_candidates' must be"),
+        ("max_predicted_per_round", {"max_predicted_per_round": -1}, "'max_predicted_per_round' must be"),
+        ("max_predicted_per_round_bool", {"max_predicted_per_round": True}, "'max_predicted_per_round' must be"),
     ]
 
     def test_validation_matrix(self):
