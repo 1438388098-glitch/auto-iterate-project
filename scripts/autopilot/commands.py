@@ -249,7 +249,13 @@ def cmd_begin_round(args):
                 candidate = state.find_candidate(backlog, cid)
                 if candidate is None:
                     io.append_log(repo, "begin-round", "error", reason="candidate not found")
-                    return emit_result(args, False, "[ERROR] Candidate not found in backlog: {}".format(cid))
+                    pending_ids = [c.get("id") for c in backlog.get("candidates") or []
+                                   if c.get("status") == "pending"]
+                    hint = ", ".join(str(p) for p in pending_ids[:5]) if pending_ids else "none (run backlog-rank)"
+                    return emit_result(
+                        args, False,
+                        "[ERROR] Candidate not found in backlog: {}. Pending: {}".format(cid, hint),
+                    )
                 missing, ready = state.candidate_deps_status(backlog, candidate)
                 if not ready:
                     io.append_log(repo, "begin-round", "error", reason="candidate deps unresolved", deps=missing)
@@ -710,6 +716,10 @@ def cmd_goal_met(args):
             message = "[OK] Goal marked met. All goals are met; entering the expansion phase (expand_after_goals). Wave 0: verify and value-gate the direction seeds first."
         else:
             message = "[OK] Goal marked met."
+        if seeds:
+            # Text-mode consumers need the ids: SKILL.md's Wave 0 next step is
+            # `backlog-add --from-seed <id>` / `seed-reject --id <id>`.
+            message += " Created direction seeds: {}.".format(", ".join(seed["id"] for seed in seeds))
         data = None
         if getattr(args, "json", False):
             data = {"goal_event": goal_event, "seeds": seeds}
@@ -723,7 +733,12 @@ def cmd_seed_reject(args):
         seed = state.find_seed(st, args.id)
         if seed is None:
             io.append_log(repo, "seed-reject", "error", reason="seed not found")
-            return emit_result(args, False, "[ERROR] Direction seed not found in state: {}".format(args.id))
+            open_ids = [s.get("id") for s in state.open_seeds(st) if s.get("id")]
+            hint = ", ".join(open_ids[:5]) if open_ids else "none (see read / check --brief expansion)"
+            return emit_result(
+                args, False,
+                "[ERROR] Direction seed not found in state: {}. Open seeds: {}".format(args.id, hint),
+            )
         if seed.get("status") != "open":
             io.append_log(repo, "seed-reject", "error", reason="seed not open")
             return emit_result(
@@ -843,6 +858,9 @@ def _seed_num(seed, name, default=None):
 def cmd_backlog_add(args):
     repo = Path(args.repo).resolve()
     with io.run_lock(repo):
+        if not config.state_path_for(repo).exists():
+            io.append_log(repo, "backlog-add", "error", reason="not initialized")
+            return emit_result(args, False, "[ERROR] Autopilot not initialized. Run init first.")
         backlog = state.load_backlog(repo)
         seed = None
         if getattr(args, "from_seed", None):
@@ -850,7 +868,14 @@ def cmd_backlog_add(args):
             seed = state.find_seed(st, args.from_seed)
             if seed is None:
                 io.append_log(repo, "backlog-add", "error", reason="seed not found")
-                return emit_result(args, False, "[ERROR] Direction seed not found in state: {}".format(args.from_seed))
+                open_ids = [s.get("id") for s in state.open_seeds(st) if s.get("id")]
+                hint = ", ".join(open_ids[:5]) if open_ids else "none (see read / check --brief expansion)"
+                return emit_result(
+                    args, False,
+                    "[ERROR] Direction seed not found in state: {}. Open seeds: {}".format(
+                        args.from_seed, hint
+                    ),
+                )
             if seed.get("status") != "open":
                 io.append_log(
                     repo, "backlog-add", "error", reason="seed not open",
@@ -960,12 +985,11 @@ def cmd_backlog_add(args):
             state.save_state(repo, st)
         # Expansion/backlog work counts as activity so max_minutes does not burn
         # out while the agent is scouting instead of sitting in begin-round.
-        try:
-            st = state.load_state(repo)
-            st["last_activity_at"] = io.now_iso()
-            state.save_state(repo, st)
-        except SystemExit:
-            pass
+        # state.json is verified to exist above; a corrupt state must fail
+        # cleanly here (fail-closed), never be swallowed into a fake success.
+        st = state.load_state(repo)
+        st["last_activity_at"] = io.now_iso()
+        state.save_state(repo, st)
         io.append_log(repo, "backlog-add", "success", candidate_id=candidate_id, title=title)
         if getattr(args, "json", False):
             return emit_result(args, True, "backlog candidate added", data={"id": candidate_id})
@@ -1554,6 +1578,7 @@ def cmd_check(args):
         warnings.append("Detached HEAD; consider checking out a branch before starting.")
 
     if st.get("config_fingerprint") and io.file_sha256(config.config_path_for(repo)) != st["config_fingerprint"]:
+        io.append_log(repo, "config-drift", "warn")
         warnings.append(
             "autopilot config.json changed since init; verify the change was intentional "
             "(check_commands are executed and budgets are trusted by the loop)."

@@ -969,6 +969,27 @@ class PredictedHardeningTests(RepoTest):
         self.assertIn("seed-writeback", log)
         self.assertIn("missing", log)
 
+    def test_goal_met_text_mode_echoes_seed_ids(self):
+        self.run_state("init")
+        result = self.run_state("goal-met", "--goal", "G", "--next-step", "A", "--next-step", "B")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("Created direction seeds: seed-001, seed-002", result.stdout)
+
+    def test_backlog_add_requires_init(self):
+        result = self.run_state("backlog-add", "--title", "t", "--value", "3", "--effort", "1")
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("not initialized", result.stderr)
+        self.assertFalse((self.repo / ".autopilot" / "backlog.json").exists())
+        self.assertNotIn("candidate-", result.stdout)
+
+    def test_backlog_add_fails_closed_on_corrupt_state(self):
+        self.run_state("init")
+        (self.repo / ".autopilot" / "state.json").write_text("{ not json", encoding="utf-8")
+        result = self.run_state("backlog-add", "--title", "t", "--value", "3", "--effort", "1")
+        self.assertNotEqual(result.returncode, 0)
+        self.assertNotIn("Traceback", result.stderr)
+        self.assertNotIn("candidate-", result.stdout)
+
     def test_init_rejects_negative_max_predicted(self):
         result = self.run_state("init", "--max-predicted-per-round", "-1")
         self.assertNotEqual(result.returncode, 0)
