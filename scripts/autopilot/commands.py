@@ -142,6 +142,11 @@ def cmd_init(args):
                 io.append_log(repo, "init", "error", reason="min_pending_candidates out of range")
                 return emit_result(args, False, "[ERROR] --min-pending-candidates must be a non-negative integer.")
             cfg["min_pending_candidates"] = args.min_pending_candidates
+        if getattr(args, "max_predicted_per_round", None) is not None:
+            if args.max_predicted_per_round < 0:
+                io.append_log(repo, "init", "error", reason="max_predicted_per_round out of range")
+                return emit_result(args, False, "[ERROR] --max-predicted-per-round must be a non-negative integer.")
+            cfg["max_predicted_per_round"] = args.max_predicted_per_round
         if args.allow_path:
             cfg["allow_paths"] = list(args.allow_path)
         if args.deny_path:
@@ -782,6 +787,27 @@ def cmd_backlog_add(args):
         title = args.title or (seed or {}).get("title")
         if not title:
             return emit_result(args, False, "[ERROR] --title is required (unless --from-seed supplies it).")
+        origin = getattr(args, "origin", None)
+        if origin is not None and origin not in ("observed", "predicted", "expansion"):
+            return emit_result(args, False, "[ERROR] --origin must be one of observed|predicted|expansion.")
+        if seed is not None and origin is None:
+            origin = "predicted"
+        if origin is None:
+            origin = "observed"
+        confidence = getattr(args, "confidence", None)
+        if origin == "observed":
+            # Observed work is trusted by definition; an explicit confidence is ignored.
+            confidence = 1.0
+        else:
+            if confidence is None:
+                confidence = 0.75
+            if confidence < 0.5 or confidence > 1.0:
+                io.append_log(repo, "backlog-add", "error", reason="confidence out of range")
+                return emit_result(
+                    args, False,
+                    "[ERROR] --confidence for predicted/expansion work must be between 0.5 and 1.0 "
+                    "(it discounts the score; observed work is always 1.0).",
+                )
         candidate_id = "candidate-{:03d}".format(backlog["next_id"])
         value = args.value
         if value is None:
@@ -828,6 +854,14 @@ def cmd_backlog_add(args):
             candidate["risk"] = args.risk if args.risk is not None else (seed.get("risk") or 1)
             candidate["from_seed"] = seed["id"]
             candidate["hypothesis"] = seed.get("hypothesis") or ""
+        if origin != "observed" or seed is not None:
+            candidate["origin"] = origin
+            candidate["confidence"] = confidence
+            based_on = getattr(args, "based_on", None)
+            if based_on is None and seed is not None:
+                based_on = seed.get("source_goal") or ""
+            candidate["based_on"] = based_on or ""
+            candidate["evidence"] = getattr(args, "evidence", None) or ""
         if getattr(args, "dry_run", False):
             print(
                 "[DRY-RUN] Would add candidate {} ({}): {}.".format(
@@ -956,7 +990,10 @@ def cmd_backlog_rank(args):
     backlog = state.load_backlog(repo)
     cfg = config.load_config(repo)
     st = state.load_state(repo)
-    ranked = state.rank_candidates(backlog, cfg, progress=state.progress_from_state(st, cfg))
+    ranked = state.rank_candidates(
+        backlog, cfg, progress=state.progress_from_state(st, cfg),
+        completed_goals=list(st.get("completed_goals") or []),
+    )
     print(json.dumps(ranked, indent=2, ensure_ascii=False))
     return 0
 

@@ -2,6 +2,39 @@
 
 All notable changes to auto-iterate-project are documented here.
 
+## 1.3.1 (2026-09-17)
+
+刀 B — anti-noise guardrails for direction-seed predictions (proposal §6).
+Predictions now carry belief, a quota, and their own ledger, so a run of wrong
+hypotheses cannot crowd out real observed work.
+
+### Added
+
+- Candidates accept `origin` (`observed` | `predicted` | `expansion`, default
+  `observed`; `--from-seed` defaults `predicted`), `confidence` (0.5-1.0,
+  default 0.75 for predicted/expansion, observed always 1.0), `based_on` (the
+  goal the prediction came from; from-seed defaults to the seed's source goal),
+  and `evidence` (audit-only).
+- Expected-mode scoring multipliers: `confidence_factor` (the candidate's
+  confidence) and `goal_chain_factor` (`based_on` matches a met goal → 1.08,
+  deliberately below the dependency-unlock 0.15). Both land in
+  `score_breakdown` and are neutral (1.0) for observed work — legacy ranking
+  order is unchanged.
+- Predicted sub-account (`compute_predicted_account`): predicted-origin
+  candidates keep their own completed/blocked/review ledger and are excluded
+  from `type_stats`. With fewer than 3 resolved predictions, scoring uses a
+  conservative prior (type success rate × 0.75); with enough samples the
+  sub-account's own success rate and calibration take over, so consecutive
+  failures sink future predictions without contaminating observed work.
+- `max_predicted_per_round` (default 1): at most one predicted-origin candidate
+  per recommended batch; `null` disables. Observed wins score ties. In the
+  late run (progress > 0.7) predicted work is cut entirely while observed
+  candidates remain ready.
+- `report` gains a 「方向假设 / Direction seeds」 section: the seed table plus
+  the predicted sub-account hit rate; predicted backlog rows are marked `[P]`.
+- `init --max-predicted-per-round N`; `ranking_mode: classic` deliberately
+  ignores every prediction factor (legacy ratio stays pure).
+
 ## 1.3.0 (2026-09-17)
 
 Post-Goal Direction Prediction (Wave 0): completed goals become predicted

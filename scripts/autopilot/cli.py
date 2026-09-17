@@ -64,6 +64,8 @@ def build_parser():
                              help="Diversity quota: at most this many same-type candidates per recommended round (default 2)")
     init_parser.add_argument("--min-pending-candidates", type=int, default=None,
                              help="check action_hint=expand when pending backlog falls below this (default 3)")
+    init_parser.add_argument("--max-predicted-per-round", type=int, default=None,
+                             help="Anti-noise quota: at most this many predicted-origin candidates per recommended round (default 1; null disables)")
     init_parser.add_argument("--allow-path", action="append", default=None, help="Glob of paths allowed in commits (repeatable)")
     init_parser.add_argument("--deny-path", action="append", default=None, help="Glob of paths never allowed in commits (repeatable)")
     init_parser.add_argument("--report-lang", choices=["zh", "en"], default=None)
@@ -233,6 +235,14 @@ def build_parser():
     backlog_add_parser.add_argument("--risk", type=int, default=None, help="Risk 1-5 (default 1)")
     backlog_add_parser.add_argument("--depends-on", action="append", default=None,
                                     help="Candidate id that must be completed first (repeatable)")
+    backlog_add_parser.add_argument("--origin", default=None,
+                                    help="observed|predicted|expansion (predicted work is score-discounted and quota-limited; default observed, from-seed defaults predicted)")
+    backlog_add_parser.add_argument("--confidence", type=float, default=None,
+                                    help="Belief 0.5-1.0 for predicted/expansion work (default 0.75); observed is always 1.0")
+    backlog_add_parser.add_argument("--based-on", default=None,
+                                    help="Goal text this candidate was predicted from (goal-chain bonus <=1.08; from-seed defaults to the seed's source goal)")
+    backlog_add_parser.add_argument("--evidence", default=None,
+                                    help="Audit-only note on the supporting evidence (not scored)")
     backlog_add_parser.add_argument("--impact", choices=["high", "medium", "low"], default=None, help="Legacy")
     backlog_add_parser.add_argument("--effort-level", choices=["small", "medium", "large"], default=None, help="Legacy")
     add_json(backlog_add_parser)

@@ -523,6 +523,189 @@ class GoalBudgetTests(RepoTest):
         self.assertTrue(data["continue"], data["stop_reason"])
 
 
+class PredictedOriginTests(RepoTest):
+    """刀 B anti-noise: predicted-origin candidates are confidence-discounted,
+    quota-limited per batch, accounted separately, and cut in the late run.
+    Acceptance matrix from docs/post-goal-prediction-proposal.md §8."""
+
+    def _add(self, *args):
+        result = self.run_state("backlog-add", *args)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        return result.stdout.strip().splitlines()[-1]
+
+    def test_old_backlog_scores_unchanged(self):
+        """No origin field -> observed defaults; confidence/goal-chain factors neutral."""
+        self.run_state("init")
+        self._add("--title", "A", "--reason", "r", "--value", "4", "--effort", "2")
+        ranked = json.loads(self.run_state("backlog-rank").stdout)
+        breakdown = ranked[0]["score_breakdown"]
+        self.assertEqual(breakdown["origin"], "observed")
+        self.assertEqual(breakdown["confidence_factor"], 1.0)
+        self.assertEqual(breakdown["goal_chain_factor"], 1.0)
+        self.assertTrue(ranked[0]["selected"])
+
+    def test_confidence_discounts_score(self):
+        """Same value/effort/type: predicted confidence 0.6 scores ~0.6x observed
+        (with >=3 predicted samples so the 0.75 prior is inactive)."""
+        self.run_state("init")
+        # Three resolved predicted candidates activate the predicted sub-account
+        # (success_rate 1.0 -> prior x0.75 no longer applies).
+        for _ in range(3):
+            cid = self._add("--title", "hist", "--value", "3", "--effort", "3",
+                            "--origin", "predicted", "--confidence", "0.8")
+            backlog_path = self.repo / ".autopilot" / "backlog.json"
+            backlog = json.loads(backlog_path.read_text(encoding="utf-8"))
+            for c in backlog["candidates"]:
+                if c["id"] == cid:
+                    c["status"] = "completed"
+            backlog_path.write_text(json.dumps(backlog), encoding="utf-8")
+        obs = self._add("--title", "observed", "--value", "4", "--effort", "2")
+        pred = self._add("--title", "predicted", "--value", "4", "--effort", "2",
+                         "--origin", "predicted", "--confidence", "0.6",
+                         "--based-on", "some goal", "--evidence", "e")
+        self.run_state("goal-met", "--goal", "some goal")  # activates the goal-chain bonus
+        ranked = json.loads(self.run_state("backlog-rank").stdout)
+        by_id = {entry["id"]: entry for entry in ranked}
+        ratio = by_id[pred]["score"] / by_id[obs]["score"]
+        self.assertAlmostEqual(ratio, 0.6 * 1.08, places=2)  # confidence x goal-chain
+        self.assertEqual(by_id[pred]["score_breakdown"]["confidence"], 0.6)
+        self.assertEqual(by_id[pred]["score_breakdown"]["goal_chain_factor"], 1.08)
+
+    def test_confidence_validation(self):
+        self.run_state("init")
+        result = self.run_state("backlog-add", "--title", "p", "--origin", "predicted",
+                                "--confidence", "0.3")
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("0.5 and 1.0", result.stderr)
+        result = self.run_state("backlog-add", "--title", "p", "--origin", "bogus")
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("observed|predicted|expansion", result.stderr)
+
+    def test_predicted_quota_one_per_batch(self):
+        """Three high-value ready predicted candidates, quota default 1: only one
+        predicted enters the selected batch."""
+        self.run_state("init", "--max-rounds", "10")
+        for i in range(3):
+            self._add("--title", "pred{}".format(i), "--value", "5", "--effort", "1",
+                      "--origin", "predicted", "--confidence", "0.9",
+                      "--type", "refactor")
+        self._add("--title", "obs", "--value", "5", "--effort", "1", "--type", "bugfix")
+        ranked = json.loads(self.run_state("backlog-rank").stdout)
+        selected = [e for e in ranked if e.get("selected")]
+        predicted_selected = [e for e in selected if e.get("origin") == "predicted"]
+        self.assertEqual(len(predicted_selected), 1)
+        self.assertTrue(any(e.get("origin") is None for e in selected))
+
+    def test_quota_zero_disables_predicted_selection(self):
+        self.run_state("init", "--max-rounds", "10")
+        cfg_path = self.repo / ".autopilot" / "config.json"
+        cfg = json.loads(cfg_path.read_text(encoding="utf-8"))
+        cfg["max_predicted_per_round"] = 0
+        cfg_path.write_text(json.dumps(cfg), encoding="utf-8")
+        for i in range(2):
+            self._add("--title", "pred{}".format(i), "--value", "5", "--effort", "1",
+                      "--origin", "predicted", "--type", "refactor")
+        self._add("--title", "obs", "--value", "3", "--effort", "3", "--type", "bugfix")
+        ranked = json.loads(self.run_state("backlog-rank").stdout)
+        selected = [e for e in ranked if e.get("selected")]
+        self.assertFalse(any(e.get("origin") == "predicted" for e in selected))
+
+    def test_consecutive_blocked_predictions_sink_without_contaminating_observed(self):
+        """Three blocked predictions: the next predicted sinks via its sub-account;
+        the observed candidate of the same type keeps a clean success rate."""
+        self.run_state("init")
+        for i in range(3):
+            self._add("--title", "p{}".format(i), "--value", "5", "--effort", "1",
+                      "--origin", "predicted", "--confidence", "0.9", "--type", "refactor")
+        pred4 = self._add("--title", "p4", "--value", "5", "--effort", "1",
+                          "--origin", "predicted", "--confidence", "0.9", "--type", "refactor")
+        obs = self._add("--title", "obs", "--value", "5", "--effort", "1", "--type", "refactor")
+        backlog_path = self.repo / ".autopilot" / "backlog.json"
+        backlog = json.loads(backlog_path.read_text(encoding="utf-8"))
+        for c in backlog["candidates"]:
+            if c["id"] in ("candidate-001", "candidate-002", "candidate-003"):
+                c["status"] = "blocked"
+        backlog_path.write_text(json.dumps(backlog), encoding="utf-8")
+        ranked = json.loads(self.run_state("backlog-rank").stdout)
+        by_id = {entry["id"]: entry for entry in ranked}
+        self.assertEqual(by_id[pred4]["score_breakdown"]["success_rate"], 0.0)
+        self.assertEqual(by_id[obs]["score_breakdown"]["success_rate"], 1.0)
+        self.assertFalse(by_id[pred4].get("selected"))
+        self.assertTrue(by_id[obs].get("selected"))
+
+    def test_late_run_cuts_predicted_when_observed_ready(self):
+        self.run_state("init", "--max-rounds", "10")
+        # 8 rounds consumed -> progress 0.8 > 0.7.
+        state_path = self.repo / ".autopilot" / "state.json"
+        st = json.loads(state_path.read_text(encoding="utf-8"))
+        st["completed_rounds"] = 8
+        state_path.write_text(json.dumps(st), encoding="utf-8")
+        self._add("--title", "pred", "--value", "5", "--effort", "1",
+                  "--origin", "predicted", "--confidence", "0.95", "--type", "refactor")
+        self._add("--title", "obs", "--value", "3", "--effort", "3", "--type", "bugfix")
+        ranked = json.loads(self.run_state("backlog-rank").stdout)
+        selected = [e for e in ranked if e.get("selected")]
+        self.assertFalse(any(e.get("origin") == "predicted" for e in selected))
+        self.assertTrue(any(e.get("origin") is None for e in selected))
+
+    def test_late_run_allows_predicted_when_no_observed_ready(self):
+        self.run_state("init", "--max-rounds", "10")
+        state_path = self.repo / ".autopilot" / "state.json"
+        st = json.loads(state_path.read_text(encoding="utf-8"))
+        st["completed_rounds"] = 8
+        state_path.write_text(json.dumps(st), encoding="utf-8")
+        self._add("--title", "pred", "--value", "4", "--effort", "2",
+                  "--origin", "predicted", "--confidence", "0.9", "--type", "refactor")
+        ranked = json.loads(self.run_state("backlog-rank").stdout)
+        selected = [e for e in ranked if e.get("selected")]
+        self.assertTrue(any(e.get("origin") == "predicted" for e in selected))
+
+    def test_classic_mode_ignores_prediction_factors(self):
+        self.run_state("init", "--max-rounds", "10")
+        cfg_path = self.repo / ".autopilot" / "config.json"
+        cfg = json.loads(cfg_path.read_text(encoding="utf-8"))
+        cfg["ranking_mode"] = "classic"
+        cfg_path.write_text(json.dumps(cfg), encoding="utf-8")
+        obs = self._add("--title", "obs", "--value", "4", "--effort", "2")
+        pred = self._add("--title", "pred", "--value", "4", "--effort", "2",
+                         "--origin", "predicted", "--confidence", "0.5")
+        ranked = json.loads(self.run_state("backlog-rank").stdout)
+        by_id = {entry["id"]: entry for entry in ranked}
+        self.assertAlmostEqual(by_id[pred]["score"], by_id[obs]["score"], places=3)
+        self.assertNotIn("confidence_factor", by_id[pred]["score_breakdown"])
+
+    def test_from_seed_defaults_predicted_origin(self):
+        self.run_state("init")
+        self.run_state("goal-met", "--goal", "G1", "--next-step", "follow up")
+        seed_id = self.read_json("state.json")["goal_seeds"][0]["id"]
+        cid = self._add("--from-seed", seed_id)
+        ranked = json.loads(self.run_state("backlog-rank").stdout)
+        entry = [e for e in ranked if e["id"] == cid][0]
+        self.assertEqual(entry["origin"], "predicted")
+        self.assertEqual(entry["based_on"], "G1")
+        self.assertEqual(entry["confidence"], 0.75)
+        self.assertEqual(entry["evidence"], "")
+
+    def test_report_lists_seeds_and_predicted_account(self):
+        self.run_state("init")
+        self.run_state("goal-met", "--goal", "G1", "--next-step", "follow up A",
+                       "--next-step", "follow up B")
+        result = self.run_state("report")
+        output = result.stdout
+        self.assertIn("方向假设", output)
+        self.assertIn("follow up A", output)
+        cid = self._add("--from-seed", "seed-001")
+        backlog_path = self.repo / ".autopilot" / "backlog.json"
+        backlog = json.loads(backlog_path.read_text(encoding="utf-8"))
+        for c in backlog["candidates"]:
+            if c["id"] == cid:
+                c["status"] = "blocked"
+        backlog_path.write_text(json.dumps(backlog), encoding="utf-8")
+        output = self.run_state("report").stdout
+        self.assertIn("预测子账", output)
+        self.assertIn("受阻 1", output)
+
+
 class DirectionSeedTests(RepoTest):
     """Post-goal direction prediction: goal events + direction seeds live in
     state.json; completed_goals stays a plain string array (schema v6)."""
@@ -2359,11 +2542,17 @@ class ContractTests(RepoTest):
         self.assertEqual(
             set(ranked[0]["score_breakdown"]),
             {
-                "base_value", "success_rate", "calibration", "expected_value",
+                "base_value", "origin", "confidence", "confidence_factor",
+                "goal_chain_factor", "success_rate", "calibration", "expected_value",
                 "unlocks", "unlock_bonus", "risk", "risk_weight", "risk_factor",
                 "saturation_factor", "mix_penalty", "effort_cost",
             },
         )
+        # Neutral prediction factors for a plain (observed) candidate — 刀 B
+        # must not move legacy scores.
+        self.assertEqual(ranked[0]["score_breakdown"]["origin"], "observed")
+        self.assertEqual(ranked[0]["score_breakdown"]["confidence_factor"], 1.0)
+        self.assertEqual(ranked[0]["score_breakdown"]["goal_chain_factor"], 1.0)
 
     def test_state_json_required_keys(self):
         self.run_state("init")

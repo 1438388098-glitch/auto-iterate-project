@@ -591,9 +591,14 @@ def compute_type_stats(backlog):
     three completed candidates carry a review_score, calibration compares the
     average review against the average predicted value (clamped 0.6-1.5) so the
     agent's own optimism or pessimism self-corrects over a run. Types outside the
-    VALID_CANDIDATE_TYPES list are grouped under their own key."""
+    VALID_CANDIDATE_TYPES list are grouped under their own key.
+    Predicted-origin candidates (`origin: "predicted"`) are excluded here — they
+    are accounted in compute_predicted_account, so a failed prediction never
+    drags down the success rate of observed work in the same type."""
     stats = {}
     for candidate in backlog.get("candidates", []):
+        if candidate.get("origin") == "predicted":
+            continue
         candidate_type = _candidate_type(candidate)
         entry = stats.setdefault(
             candidate_type,
@@ -652,6 +657,47 @@ def candidate_deps_status(backlog, candidate):
     return missing, len(missing) == 0
 
 
+PREDICTED_SAMPLE_FLOOR = 3
+
+
+def compute_predicted_account(backlog):
+    """Blocked/review sub-account for predicted-origin candidates only (刀 B).
+    Predictions keep their own ledger so consecutive failures sink future
+    predictions without touching the observed work's statistics. Until
+    PREDICTED_SAMPLE_FLOOR resolved predictions exist, scoring falls back to a
+    conservative prior (type success_rate x 0.75)."""
+    completed = blocked = 0
+    review_sum = 0.0
+    review_n = 0
+    for candidate in backlog.get("candidates", []):
+        if candidate.get("origin") != "predicted":
+            continue
+        status = candidate.get("status")
+        if status == "completed":
+            completed += 1
+            review = candidate.get("review_score")
+            if isinstance(review, (int, float)) and not isinstance(review, bool):
+                review_sum += review
+                review_n += 1
+        elif status == "blocked":
+            blocked += 1
+    done = completed + blocked
+    blocked_rate = round(blocked / done, 3) if done else 0.0
+    return {
+        "completed": completed,
+        "blocked": blocked,
+        "done": done,
+        "blocked_rate": blocked_rate,
+        "success_rate": round(1.0 - blocked_rate, 3),
+        "review_n": review_n,
+        "review_avg": round(review_sum / review_n, 2) if review_n else None,
+        "calibration": (
+            round(max(0.6, min(1.5, (review_sum / review_n) / max(1, completed))), 2)
+            if review_n >= 3 and completed else 1.0
+        ),
+    }
+
+
 def _score_classic(candidate, type_stats=None, saturation_threshold=2):
     """Legacy value/effort ratio scoring (ranking_mode: classic)."""
     base = _candidate_score(candidate)
@@ -684,7 +730,8 @@ def _score_classic(candidate, type_stats=None, saturation_threshold=2):
 
 
 def _score_expected(candidate, type_stats=None, saturation_threshold=2,
-                    unlocks=0, pending_mix=0.0, risk_weight=0.08):
+                    unlocks=0, pending_mix=0.0, risk_weight=0.08,
+                    completed_goals=None, predicted_account=None):
     """Expected-value-per-round scoring (ranking_mode: expected, default).
 
     The scarce resource in an autopilot run is rounds, not effort — per-round
@@ -692,13 +739,25 @@ def _score_expected(candidate, type_stats=None, saturation_threshold=2,
     bounds effort. So the score is expected VALUE delivered per round:
 
         value x P(round succeeds) x calibration     <- expected value
+        x confidence                                <- predicted-origin work is
+                                                       discounted by belief (刀 B)
+        x goal-chain bonus (<=1.08)                 <- "based on a met goal" is a
+                                                       tie-breaker, never more
+                                                       than half a real unlock
         x dependency unlock bonus                   <- foundational work pays
         x budget-aware risk factor                  <- take swings early, play safe late
         x completed-type saturation                 <- stop grinding one area
         x prospective backlog-mix penalty           <- diversify BEFORE over-grinding
         / log2(1 + effort)                          <- sublinear effort cost, tie-break only
-    """
+
+    Predicted-origin candidates draw their success rate from the predicted
+    sub-account once it has PREDICTED_SAMPLE_FLOOR resolved samples; before that
+    they pay a conservative prior (type success_rate x 0.75). Classic mode never
+    sees any of these factors."""
     value = _resolved_value(candidate)
+    origin = candidate.get("origin")
+    if origin not in ("observed", "predicted", "expansion"):
+        origin = "observed"
     entry = (type_stats or {}).get(_candidate_type(candidate), {})
     completed_n = entry.get("completed") or 0
     blocked_n = entry.get("blocked") or 0
@@ -707,7 +766,27 @@ def _score_expected(candidate, type_stats=None, saturation_threshold=2,
         blocked_rate = (blocked_n / (completed_n + blocked_n)) if (completed_n + blocked_n) else 0.0
     success_rate = 1.0 - blocked_rate
     calibration = entry.get("calibration") or 1.0
-    expected_value = value * success_rate * calibration
+
+    predicted_account = predicted_account or {}
+    if origin == "predicted":
+        if predicted_account.get("done", 0) >= PREDICTED_SAMPLE_FLOOR:
+            success_rate = predicted_account.get("success_rate", success_rate)
+            if predicted_account.get("calibration") is not None:
+                calibration = predicted_account["calibration"]
+        else:
+            success_rate = success_rate * 0.75
+
+    if origin == "observed":
+        confidence = 1.0
+    else:
+        confidence = candidate.get("confidence")
+        if not isinstance(confidence, (int, float)) or isinstance(confidence, bool):
+            confidence = 0.75
+        confidence = max(0.5, min(1.0, float(confidence)))
+    confidence_factor = confidence
+
+    based_on = candidate.get("based_on")
+    goal_chain_factor = 1.08 if (based_on and based_on in (completed_goals or [])) else 1.0
 
     unlock_bonus = 1.0 + 0.15 * unlocks
 
@@ -729,9 +808,15 @@ def _score_expected(candidate, type_stats=None, saturation_threshold=2,
     effort = _resolved_effort(candidate)
     effort_cost = math.log2(1 + effort)
 
-    score = expected_value * unlock_bonus * risk_factor * saturation_factor * mix_penalty / effort_cost
+    expected_value = value * success_rate * calibration
+    score = (expected_value * unlock_bonus * risk_factor * saturation_factor * mix_penalty
+             / effort_cost * confidence_factor * goal_chain_factor)
     return score, {
         "base_value": value,
+        "origin": origin,
+        "confidence": round(confidence, 3),
+        "confidence_factor": round(confidence_factor, 3),
+        "goal_chain_factor": round(goal_chain_factor, 3),
         "success_rate": round(success_rate, 3),
         "calibration": round(calibration, 3),
         "expected_value": round(expected_value, 3),
@@ -747,13 +832,17 @@ def _score_expected(candidate, type_stats=None, saturation_threshold=2,
 
 
 def candidate_adjusted_score(candidate, type_stats=None, saturation_threshold=2,
-                             cfg=None, unlocks=0, pending_mix=0.0, risk_weight=0.08):
+                             cfg=None, unlocks=0, pending_mix=0.0, risk_weight=0.08,
+                             completed_goals=None, predicted_account=None):
     """Adjusted score for one candidate. Dispatches on cfg ranking_mode:
-    'expected' (default) or 'classic'. Returns (score, breakdown)."""
+    'expected' (default) or 'classic'. Returns (score, breakdown). The
+    prediction factors (completed_goals / predicted_account) only apply in
+    expected mode — classic stays the legacy value/effort ratio."""
     if (cfg or {}).get("ranking_mode", "expected") == "classic":
         return _score_classic(candidate, type_stats, saturation_threshold)
     return _score_expected(candidate, type_stats, saturation_threshold,
-                           unlocks=unlocks, pending_mix=pending_mix, risk_weight=risk_weight)
+                           unlocks=unlocks, pending_mix=pending_mix, risk_weight=risk_weight,
+                           completed_goals=completed_goals, predicted_account=predicted_account)
 
 
 def _unlocks_map(backlog):
@@ -775,34 +864,50 @@ def _risk_weight_for(cfg, progress):
     return 0.05 + 0.10 * max(0.0, min(1.0, progress))
 
 
-def _mark_selection(entries, cfg):
+def _mark_selection(entries, cfg, progress=None):
     """Mark the recommended round batch (`selected: true`). Selection is a
     constrained pick over the ranked list, separate from scoring:
       - only pending + ready candidates are eligible
       - value below min_candidate_value is demoted (below_floor) and at most one
         such quick-win fills a remaining slot
       - at most max_same_type_per_round candidates of the same type per round
+      - at most max_predicted_per_round (default 1) predicted/expansion-origin
+        candidates per batch (刀 B anti-noise quota); observed wins score ties
+      - late run (progress > 0.7): predicted work is cut entirely while observed
+        candidates are still ready
       - batch cutoff: stop once the score drops below 40% of the best eligible
     """
     n = cfg.get("candidates_per_round") or 3
     max_per_type = cfg.get("max_same_type_per_round") or 2
+    max_predicted = cfg.get("max_predicted_per_round")
+    if max_predicted is None:
+        max_predicted = len(entries)
+    late_run = progress is not None and progress > 0.7
     for entry in entries:
         entry["selected"] = False
     pool = [e for e in entries if e.get("status") == "pending" and e.get("ready") and not e.get("below_floor")]
     below = [e for e in entries if e.get("status") == "pending" and e.get("ready") and e.get("below_floor")]
+    observed_ready = any((e.get("origin") or "observed") == "observed" for e in pool)
+    predicted_quota = 0 if (late_run and observed_ready) else max_predicted
     selected = []
     type_counts = {}
+    predicted_count = 0
     top_score = pool[0]["score"] if pool else None
     for entry in pool:
         if len(selected) >= n:
             break
         candidate_type = entry.get("type") or "feature"
+        if (entry.get("origin") or "observed") != "observed":
+            if predicted_count >= predicted_quota:
+                continue
         if type_counts.get(candidate_type, 0) >= max_per_type:
             continue
         if top_score is not None and entry["score"] < 0.4 * top_score:
             break
         selected.append(entry)
         type_counts[candidate_type] = type_counts.get(candidate_type, 0) + 1
+        if (entry.get("origin") or "observed") != "observed":
+            predicted_count += 1
     if len(selected) < n and below:
         selected.append(below[0])
     for entry in selected:
@@ -823,14 +928,16 @@ def progress_from_state(state, cfg):
     return used / max_rounds
 
 
-def rank_candidates(backlog, cfg, progress=None):
+def rank_candidates(backlog, cfg, progress=None, completed_goals=None):
     """Rank backlog candidates and mark the recommended round batch. Pending,
     dependency-ready candidates come first (by score desc), then pending-but-blocked
     candidates (with their blocked_by reasons), then picked/completed/blocked
     candidates. `progress` (0-1 fraction of max_rounds consumed, or None) shapes
-    the risk weight."""
+    the risk weight and the late-run predicted quota. `completed_goals` enables
+    the goal-chain bonus for candidates whose based_on matches a met goal."""
     cfg = cfg or {}
     type_stats = compute_type_stats(backlog)
+    predicted_account = compute_predicted_account(backlog)
     threshold = cfg.get("type_saturation_threshold", 2)
     floor = cfg.get("min_candidate_value")
     risk_weight = _risk_weight_for(cfg, progress)
@@ -852,6 +959,8 @@ def rank_candidates(backlog, cfg, progress=None):
             unlocks=unlocks.get(candidate.get("id"), 0),
             pending_mix=pending_mix,
             risk_weight=risk_weight,
+            completed_goals=completed_goals,
+            predicted_account=predicted_account,
         )
         entry["score"] = round(score, 3)
         entry["score_breakdown"] = breakdown
@@ -866,11 +975,12 @@ def rank_candidates(backlog, cfg, progress=None):
             item.get("status") != "pending",
             not item.get("ready"),
             -item.get("score", 0.0),
+            (item.get("origin") or "observed") != "observed",
             item.get("id") or "",
         )
     )
     if cfg.get("ranking_mode", "expected") != "classic":
-        _mark_selection(entries, cfg)
+        _mark_selection(entries, cfg, progress=progress)
     return entries
 
 
@@ -1034,7 +1144,10 @@ _STATUS_LABELS = {
         "counts": "轮次统计", "history": "轮次历史", "backlog": "改进清单",
         "gitlog": "最近提交", "next": "下一步建议", "active": "活动分支",
         "tokens": "估算 Token", "repo": "仓库", "none": "无",
-        "deadline": "定时截止",
+        "deadline": "定时截止", "seeds": "方向假设（种子）",
+        "seed_status": {"open": "待处理", "promoted": "已立项", "verified": "已验证",
+                        "refuted": "已证伪", "rejected": "已否决", "pending": "待处理",
+                        "picked": "进行中", "completed": "已完成", "blocked": "受阻"},
     },
     "en": {
         "completed": "completed", "blocked": "blocked", "cancelled": "cancelled",
@@ -1043,7 +1156,10 @@ _STATUS_LABELS = {
         "counts": "Round counts", "history": "Round history", "backlog": "Backlog",
         "gitlog": "Recent commits", "next": "Next likely improvement", "active": "Active branch",
         "tokens": "Estimated tokens", "repo": "Repo", "none": "none",
-        "deadline": "Deadline timer",
+        "deadline": "Deadline timer", "seeds": "Direction seeds (predictions)",
+        "seed_status": {"open": "open", "promoted": "promoted", "verified": "verified",
+                        "refuted": "refuted", "rejected": "rejected", "pending": "pending",
+                        "picked": "picked", "completed": "completed", "blocked": "blocked"},
     },
 }
 
@@ -1120,10 +1236,45 @@ def build_report(repo, state, cfg, lang="en"):
         out.append("|---|---|---|---|---|")
         for c in backlog:
             label = _STATUS_LABELS["zh" if zh else "en"].get(c.get("status", "pending"), c.get("status", "pending"))
+            title = c.get("title", "")
+            if c.get("origin") == "predicted":
+                title = "[P] " + title
             out.append("| `{}` | {} | {} | {}/{} | {} |".format(
-                c.get("id", ""), c.get("title", ""), c.get("type") or "feature",
+                c.get("id", ""), title, c.get("type") or "feature",
                 c.get("value", ""), c.get("effort", ""), label,
             ))
+    out.append("")
+
+    # Direction seeds + predicted sub-account (刀 B): predictions carry their own
+    # ledger so their hit rate is visible instead of melting into the type stats.
+    seeds = [s for s in (state.get("goal_seeds") or []) if isinstance(s, dict)]
+    predicted_account = compute_predicted_account(backlog_data)
+    out.append("## {}".format(L["seeds"]))
+    out.append("")
+    if not seeds and not predicted_account.get("done"):
+        out.append("- {}".format(L["none"]))
+    else:
+        if seeds:
+            out.append("| id | status | type | title | source goal |")
+            out.append("|---|---|---|---|---|")
+            for seed in seeds:
+                status_label = L["seed_status"].get(seed.get("status", "open"), seed.get("status", "open"))
+                out.append("| `{}` | {} | {} | {} | {} |".format(
+                    seed.get("id", ""), status_label, seed.get("type") or "feature",
+                    seed.get("title", ""), seed.get("source_goal", ""),
+                ))
+        if predicted_account.get("done"):
+            out.append("")
+            if zh:
+                out.append("- 预测子账：已完成 {} / 受阻 {}（受阻率 {}%）".format(
+                    predicted_account["completed"], predicted_account["blocked"],
+                    round(predicted_account["blocked_rate"] * 100),
+                ))
+            else:
+                out.append("- Predicted sub-account: {} completed / {} blocked (blocked rate {}%)".format(
+                    predicted_account["completed"], predicted_account["blocked"],
+                    round(predicted_account["blocked_rate"] * 100),
+                ))
     out.append("")
 
     if io.has_commits(repo):

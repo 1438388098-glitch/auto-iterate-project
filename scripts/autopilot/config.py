@@ -45,6 +45,7 @@ def default_config(repo):
         "min_candidate_value": 3,
         "max_same_type_per_round": 2,
         "min_pending_candidates": 3,
+        "max_predicted_per_round": 1,
     }
 
 
@@ -136,6 +137,9 @@ def load_config(repo):
     mpc = merged.get("min_pending_candidates")
     if mpc is not None and (not isinstance(mpc, int) or isinstance(mpc, bool) or mpc < 0):
         _config_error(config_path_for(repo), "'min_pending_candidates' must be a non-negative integer or null")
+    mpp = merged.get("max_predicted_per_round")
+    if mpp is not None and (not isinstance(mpp, int) or isinstance(mpp, bool) or mpp < 0):
+        _config_error(config_path_for(repo), "'max_predicted_per_round' must be a non-negative integer or null")
     if not isinstance(merged["check_commands"], list) or not all(isinstance(c, str) for c in merged["check_commands"]):
         _config_error(config_path_for(repo), "'check_commands' must be an array of strings")
     for key in ("allow_paths", "deny_paths", "secret_patterns"):

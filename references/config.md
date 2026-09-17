@@ -153,6 +153,10 @@ Positive integer, default `2`. Diversity quota used when marking the recommended
 
 Non-negative integer, default `3`. When the backlog has fewer than this many `pending` candidates, `check` sets `action_hint: "expand"` and warns the agent to run Deep Expansion (spawn explore subagents, `backlog-add`) instead of idling or treating the thin backlog as a stop. Pending count of `0` always triggers the expansion warning while the run continues. Set to `0` to disable the thin-backlog trigger (empty backlog still warns). Init flag: `--min-pending-candidates N`.
 
+### max_predicted_per_round
+
+Non-negative integer or `null`, default `1`. Anti-noise quota for direction-seed predictions (刀 B): at most this many predicted-origin candidates may enter one recommended round batch (`selected`). Predicted candidates also carry a `confidence` (0.5-1.0, default 0.75) that discounts their score, observed work wins score ties, and in the late run (progress > 0.7) predicted work is cut entirely while observed candidates remain ready. Predicted candidates keep their own blocked/review sub-account, so consecutive failures sink future predictions without contaminating the observed work's per-type statistics; with fewer than 3 resolved predictions the score uses a conservative prior (type success rate × 0.75). `ranking_mode: classic` ignores every prediction factor. Set to `null` to disable the quota. Init flag: `--max-predicted-per-round N`. Tune this (or the confidence defaults) only from the predicted sub-account's hit-rate samples in `report` — not from intuition.
+
 ### max_blocked_in_a_row
 
 Integer. Default `2`. Hard stop after this many consecutive blocked rounds, checked by the state helper rather than only by agent judgment.
@@ -261,6 +265,8 @@ A seed moves through `open → promoted → verified` or `open → promoted → 
 - `complete-round` on the promoted candidate's round marks the seed `verified`; `block-round` marks it `refuted` with the block reason stored as `outcome` notes (failed hypotheses never re-enter the pool to game the statistics); `cancel-round` returns it to `open`.
 
 In the expand phase (`check` reports `"phase": "expand"`), the `--brief` payload carries an `expansion` object with a stable key set — `seeds` (open seeds with `id`/`title`/`type`/`from_capability`/`source_goal`/`status`; `[]` when none), `completed_goals`, `recent_types`, `saturated_types`, `underused_types`, `suggested_themes`, `min_pending_candidates`. In the iterate phase the key is absent and the `check --brief` output shape is unchanged. See the Post-Goal Direction Prediction chapter in `SKILL.md` for the Wave 0 protocol.
+
+Anti-noise scoring (刀 B): a promoted candidate carries `origin: "predicted"`, `confidence` (default 0.75, clamp 0.5-1.0 — explicit `--confidence` overrides), `based_on` (the seed's source goal; a met goal gives a ≤1.08 goal-chain bonus), and `evidence` (audit only, not scored). `backlog-add --origin predicted --confidence 0.8 --based-on "<goal>" --evidence "<note>"` tags any candidate manually; `expansion` origin marks lens-scouted work. The run `report` lists the seeds and the predicted sub-account hit rate (「方向假设」section).
 
 ## State File
 
