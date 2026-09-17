@@ -137,6 +137,11 @@ def cmd_init(args):
                 io.append_log(repo, "init", "error", reason="max_same_type_per_round out of range")
                 return emit_result(args, False, "[ERROR] --max-same-type-per-round must be a positive integer.")
             cfg["max_same_type_per_round"] = args.max_same_type_per_round
+        if getattr(args, "min_pending_candidates", None) is not None:
+            if args.min_pending_candidates < 0:
+                io.append_log(repo, "init", "error", reason="min_pending_candidates out of range")
+                return emit_result(args, False, "[ERROR] --min-pending-candidates must be a non-negative integer.")
+            cfg["min_pending_candidates"] = args.min_pending_candidates
         if args.allow_path:
             cfg["allow_paths"] = list(args.allow_path)
         if args.deny_path:
@@ -211,8 +216,30 @@ def cmd_begin_round(args):
             )
             return 0
         candidate_ids = list(args.candidate_id) if args.candidate_id else []
+        backlog = state.load_backlog(repo)
+        ready_pending = []
+        for candidate in backlog.get("candidates") or []:
+            if candidate.get("status") != "pending":
+                continue
+            missing, is_ready = state.candidate_deps_status(backlog, candidate)
+            if is_ready:
+                ready_pending.append(candidate)
+        if not candidate_ids:
+            if ready_pending:
+                io.append_log(repo, "begin-round", "error", reason="no candidate ids while ready backlog exists")
+                return emit_result(
+                    args, False,
+                    "[ERROR] begin-round requires at least one --candidate-id when the backlog "
+                    "has ready pending candidates (found {}). Pick with backlog-rank, or clear/"
+                    "complete those candidates first. Empty rounds on a stocked backlog are refused "
+                    "to prevent churn.".format(len(ready_pending)),
+                )
+            print(
+                "[WARN] begin-round without --candidate-id and no ready pending backlog items; "
+                "this is an exploratory round. Prefer picking candidates via backlog-rank.",
+                file=sys.stderr,
+            )
         if candidate_ids:
-            backlog = state.load_backlog(repo)
             for cid in candidate_ids:
                 candidate = state.find_candidate(backlog, cid)
                 if candidate is None:
@@ -564,22 +591,27 @@ def cmd_finish(args):
         if not args.stay and cfg.get("branch_mode") == "feature":
             origin = st.get("origin_branch")
             if origin and origin != "HEAD" and io.branch_exists(repo, origin):
-                current = io.current_branch(repo)
-                if current != origin:
-                    result = io.run_git(repo, "checkout", origin)
-                    if result.returncode == 0:
-                        returned_to = origin
-                        if getattr(args, "json", False):
-                            print("[OK] Returned to branch: {}".format(origin), file=sys.stderr)
+                try:
+                    state._assert_safe_ref_name(origin, what="origin branch")
+                except SystemExit:
+                    origin = None
+                if origin:
+                    current = io.current_branch(repo)
+                    if current != origin:
+                        result = io.run_git(repo, "checkout", origin)
+                        if result.returncode == 0:
+                            returned_to = origin
+                            if getattr(args, "json", False):
+                                print("[OK] Returned to branch: {}".format(origin), file=sys.stderr)
+                            else:
+                                print("[OK] Returned to branch: {}".format(origin))
                         else:
-                            print("[OK] Returned to branch: {}".format(origin))
-                    else:
-                        print(
-                            "[WARN] Could not return to branch {}: {}".format(
-                                origin, result.stderr.strip()
-                            ),
-                            file=sys.stderr,
-                        )
+                            print(
+                                "[WARN] Could not return to branch {}: {}".format(
+                                    origin, result.stderr.strip()
+                                ),
+                                file=sys.stderr,
+                            )
         io.append_log(repo, "finish", "success", reason=args.reason, returned_to=returned_to)
         retrospective_path = None
         try:
@@ -588,8 +620,13 @@ def cmd_finish(args):
             path.parent.mkdir(parents=True, exist_ok=True)
             path.write_text(markdown, encoding="utf-8")
             retrospective_path = str(path)
-        except OSError:
-            pass
+        except OSError as exc:
+            print(
+                "[WARN] Could not write retrospective to {}: {}".format(
+                    io.RETROSPECTIVE_FILENAME, exc
+                ),
+                file=sys.stderr,
+            )
         message = "[OK] Autopilot run finished."
         data = {"returned_to": returned_to, "retrospective": retrospective_path}
         return emit_result(args, True, message, data=data)
@@ -643,6 +680,14 @@ def cmd_backlog_add(args):
         backlog["candidates"].append(candidate)
         backlog["next_id"] += 1
         state.save_backlog(repo, backlog)
+        # Expansion/backlog work counts as activity so max_minutes does not burn
+        # out while the agent is scouting instead of sitting in begin-round.
+        try:
+            st = state.load_state(repo)
+            st["last_activity_at"] = io.now_iso()
+            state.save_state(repo, st)
+        except SystemExit:
+            pass
         io.append_log(repo, "backlog-add", "success", candidate_id=candidate_id, title=args.title)
         if getattr(args, "json", False):
             return emit_result(args, True, "backlog candidate added", data={"id": candidate_id})
@@ -952,7 +997,15 @@ def cmd_secret_scan(args):
 def _staged_numstat_lines(repo):
     result = io.run_git(repo, "diff", "--cached", "--numstat")
     if result.returncode != 0:
-        return 0
+        # Fail-closed: a failed numstat must not look like a zero-line diff,
+        # or max_round_scope would silently stop applying.
+        print(
+            "[ERROR] Could not read staged numstat ({}); refusing to treat the diff as empty.".format(
+                (result.stderr or result.stdout or "git diff --numstat failed").strip()
+            ),
+            file=sys.stderr,
+        )
+        raise SystemExit(2)
     text, binary = io._parse_numstat(result.stdout)
     return text + binary
 
@@ -986,6 +1039,9 @@ def cmd_report(args):
     result = _write_report_output(args, repo, markdown, "Report")
     if result is not None:
         return result
+    if getattr(args, "json", False):
+        print(json.dumps({"ok": True, "message": "report", "markdown": markdown}, indent=2, ensure_ascii=False))
+        return 0
     print(markdown)
     return 0
 
@@ -1001,6 +1057,9 @@ def cmd_retrospective(args):
     result = _write_report_output(args, repo, markdown, "Retrospective")
     if result is not None:
         return result
+    if getattr(args, "json", False):
+        print(json.dumps({"ok": True, "message": "retrospective", "markdown": markdown}, indent=2, ensure_ascii=False))
+        return 0
     print(markdown)
     return 0
 
@@ -1172,6 +1231,31 @@ def cmd_detect_verify(args):
     return 0
 
 
+def _backlog_watch(backlog, cfg):
+    """Summarize pending backlog health for check. Empty/thin/unready backlog is an
+    expansion trigger, never an automatic stop."""
+    candidates = backlog.get("candidates") or []
+    pending = [c for c in candidates if c.get("status") == "pending"]
+    ready = []
+    for candidate in pending:
+        missing, is_ready = state.candidate_deps_status(backlog, candidate)
+        if is_ready:
+            ready.append(candidate)
+    min_pending = cfg.get("min_pending_candidates")
+    if min_pending is None:
+        min_pending = 3
+    # Expand when there is nothing actionable (ready==0), even if pending is
+    # "full" of dependency-blocked items — otherwise check says work while
+    # begin-round rejects every candidate.
+    needs_expansion = len(ready) == 0 or len(pending) < min_pending
+    return {
+        "pending": len(pending),
+        "ready": len(ready),
+        "min_pending_candidates": min_pending,
+        "needs_expansion": needs_expansion,
+    }
+
+
 def cmd_check(args):
     repo = Path(args.repo).resolve()
     st = state.load_state(repo)
@@ -1234,10 +1318,41 @@ def cmd_check(args):
         if remotes.returncode == 0 and not remotes.stdout.strip():
             warnings.append("push is true but no git remote is configured; complete-round will warn on every push attempt.")
 
+    backlog = state.load_backlog(repo)
+    backlog_watch = _backlog_watch(backlog, cfg)
+    if stop_reason is None and backlog_watch["needs_expansion"]:
+        if backlog_watch["pending"] == 0:
+            warnings.append(
+                "Backlog has no pending candidates. Do NOT idle or wait for the deadline: "
+                "run Deep Expansion now (spawn explore subagents, add 3-5 candidates with "
+                "backlog-add). Empty backlog is an expansion trigger, not a reason to stop."
+            )
+        elif backlog_watch["ready"] == 0:
+            warnings.append(
+                "Backlog has {} pending candidates but 0 are dependency-ready. "
+                "Unblock depends-on chains or Deep Expansion for independent work; "
+                "do not idle.".format(backlog_watch["pending"])
+            )
+        else:
+            warnings.append(
+                "Backlog pending candidates ({}) is below min_pending_candidates ({}). "
+                "Top up via Deep Expansion (subagent scout) before the next begin-round; "
+                "do not grind the last thin candidates or idle. You may still begin-round "
+                "with existing ready candidates while expanding in parallel.".format(
+                    backlog_watch["pending"], backlog_watch["min_pending_candidates"]
+                )
+            )
+
+    action_hint = "expand" if (stop_reason is None and backlog_watch["needs_expansion"]) else (
+        "stop" if stop_reason is not None else "work"
+    )
+
     payload = {
         "continue": stop_reason is None,
         "stop_reason": stop_reason,
         "warnings": warnings,
+        "backlog": backlog_watch,
+        "action_hint": action_hint,
     }
     goals_met = state.all_goals_met(cfg, st)
     payload["goals_met"] = goals_met

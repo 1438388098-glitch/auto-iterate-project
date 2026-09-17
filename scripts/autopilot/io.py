@@ -375,12 +375,25 @@ def _acquire_lock(repo):
             return path
         holder = _read_lock_file(path)
         if isinstance(holder, dict):
-            same_host = not holder.get("hostname") or holder.get("hostname") == socket.gethostname()
-            if _pid_alive(holder.get("pid")) and same_host:
+            hostname = holder.get("hostname")
+            same_host = not hostname or hostname == socket.gethostname()
+            if same_host and _pid_alive(holder.get("pid")):
                 print(
                     "[ERROR] Another autopilot run appears active (pid {}). "
                     "Refusing to modify state. If that process is dead, delete {}.".format(
                         holder.get("pid"), path
+                    ),
+                    file=sys.stderr,
+                )
+                raise SystemExit(2)
+            if not same_host:
+                # Shared/network disk: a live lock from another host must not be
+                # deleted. Only a clearly dead local pid or corrupt lock is stale.
+                print(
+                    "[ERROR] Autopilot lock at {} is held by host {} (pid {}). "
+                    "Refusing to delete a lock from another host. If that run is dead, "
+                    "remove the lock file manually.".format(
+                        path, hostname, holder.get("pid")
                     ),
                     file=sys.stderr,
                 )

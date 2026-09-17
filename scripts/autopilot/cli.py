@@ -62,6 +62,8 @@ def build_parser():
                              help="Candidates below this value are demoted in ranking (1-5, default 3; null disables)")
     init_parser.add_argument("--max-same-type-per-round", type=int, default=None,
                              help="Diversity quota: at most this many same-type candidates per recommended round (default 2)")
+    init_parser.add_argument("--min-pending-candidates", type=int, default=None,
+                             help="check action_hint=expand when pending backlog falls below this (default 3)")
     init_parser.add_argument("--allow-path", action="append", default=None, help="Glob of paths allowed in commits (repeatable)")
     init_parser.add_argument("--deny-path", action="append", default=None, help="Glob of paths never allowed in commits (repeatable)")
     init_parser.add_argument("--report-lang", choices=["zh", "en"], default=None)
@@ -250,7 +252,10 @@ def build_parser():
     backlog_list_parser.add_argument("--repo", default=".")
     backlog_list_parser.set_defaults(func=commands.cmd_backlog_list)
 
-    backlog_rank_parser = subparsers.add_parser("backlog-rank", help="List candidates sorted by value-to-effort ratio")
+    backlog_rank_parser = subparsers.add_parser(
+        "backlog-rank",
+        help="List candidates sorted by expected value per round (ranking_mode; classic is value/effort)",
+    )
     backlog_rank_parser.add_argument("--repo", default=".")
     backlog_rank_parser.set_defaults(func=commands.cmd_backlog_rank)
 
@@ -275,7 +280,7 @@ def build_parser():
 
     check_parser = subparsers.add_parser("check", help="Check stop conditions")
     check_parser.add_argument("--repo", default=".")
-    check_parser.add_argument("--brief", action="store_true", help="Return only continue/stop_reason/warnings without state and config")
+    check_parser.add_argument("--brief", action="store_true", help="Return loop-driving fields only (continue/stop_reason/warnings/backlog/action_hint/schedule) without full state and config")
     check_parser.set_defaults(func=commands.cmd_check)
 
     detect_parser = subparsers.add_parser("detect-agent", help="Detect the runtime agent and print adaptation context")

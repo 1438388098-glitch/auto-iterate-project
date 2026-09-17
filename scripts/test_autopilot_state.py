@@ -2148,8 +2148,14 @@ class ContractTests(RepoTest):
             {
                 "continue", "stop_reason", "warnings", "goals_met", "phase",
                 "next_verify_round", "next_commit_round", "next_checkpoint_round",
+                "backlog", "action_hint",
             },
         )
+        self.assertEqual(
+            set(data["backlog"]),
+            {"pending", "ready", "min_pending_candidates", "needs_expansion"},
+        )
+        self.assertIn(data["action_hint"], ("work", "expand", "stop"))
 
     def test_detect_agent_contract(self):
         env = dict(self.env)
@@ -2225,6 +2231,7 @@ class ConfigValidationMatrixTests(RepoTest):
         ("ranking_mode", {"ranking_mode": "bogus"}, "'ranking_mode' must be"),
         ("min_candidate_value", {"min_candidate_value": 9}, "'min_candidate_value' must be"),
         ("max_same_type_per_round", {"max_same_type_per_round": 0}, "'max_same_type_per_round' must be"),
+        ("min_pending_candidates", {"min_pending_candidates": -1}, "'min_pending_candidates' must be"),
     ]
 
     def test_validation_matrix(self):
@@ -2240,6 +2247,148 @@ class ConfigValidationMatrixTests(RepoTest):
                 self.assertNotEqual(result.returncode, 0, name)
                 self.assertIn(expected, result.stderr)
                 self.assertNotIn("Traceback", result.stderr)
+
+
+class ExpansionWatchTests(RepoTest):
+    """Empty/thin backlog must push the agent to Deep Expansion, never idle or stop."""
+
+    def test_empty_backlog_expands_not_stops(self):
+        self.run_state("init")
+        data = json.loads(self.run_state("check", "--brief").stdout)
+        self.assertTrue(data["continue"])
+        self.assertIsNone(data["stop_reason"])
+        self.assertEqual(data["action_hint"], "expand")
+        self.assertTrue(data["backlog"]["needs_expansion"])
+        self.assertEqual(data["backlog"]["pending"], 0)
+        joined = " ".join(data["warnings"]).lower()
+        self.assertIn("deep expansion", joined)
+        self.assertIn("do not idle", joined)
+
+    def test_thin_backlog_warns_below_min_pending(self):
+        self.run_state("init", "--min-pending-candidates", "3")
+        self.run_state("backlog-add", "--title", "A", "--reason", "r", "--value", "4", "--effort", "2")
+        data = json.loads(self.run_state("check", "--brief").stdout)
+        self.assertTrue(data["continue"])
+        self.assertEqual(data["action_hint"], "expand")
+        self.assertEqual(data["backlog"]["pending"], 1)
+        self.assertTrue(any("min_pending_candidates" in w for w in data["warnings"]))
+
+    def test_healthy_backlog_action_hint_work(self):
+        self.run_state("init", "--min-pending-candidates", "2")
+        self.run_state("backlog-add", "--title", "A", "--reason", "r", "--value", "4", "--effort", "2")
+        self.run_state("backlog-add", "--title", "B", "--reason", "r", "--value", "4", "--effort", "2")
+        data = json.loads(self.run_state("check", "--brief").stdout)
+        self.assertTrue(data["continue"])
+        self.assertEqual(data["action_hint"], "work")
+        self.assertFalse(data["backlog"]["needs_expansion"])
+        expansion_warnings = [w for w in data["warnings"] if "Deep Expansion" in w or "min_pending_candidates" in w]
+        self.assertEqual(expansion_warnings, [])
+
+    def test_stopped_run_action_hint_stop(self):
+        self.run_state("init", "--max-rounds", "0")
+        data = json.loads(self.run_state("check", "--brief").stdout)
+        self.assertFalse(data["continue"])
+        self.assertEqual(data["action_hint"], "stop")
+
+    def test_init_min_pending_flag(self):
+        self.run_state("init", "--min-pending-candidates", "5")
+        cfg = json.loads((self.repo / ".autopilot" / "config.json").read_text(encoding="utf-8"))
+        self.assertEqual(cfg["min_pending_candidates"], 5)
+
+    def test_ready_zero_forces_expand_even_when_pending_full(self):
+        """pending>=min but all dependency-blocked must still action_hint=expand."""
+        self.run_state("init", "--min-pending-candidates", "2")
+        self.run_state("backlog-add", "--title", "Base", "--reason", "r", "--value", "4", "--effort", "2")
+        base = json.loads((self.repo / ".autopilot" / "backlog.json").read_text(encoding="utf-8"))["candidates"][0]["id"]
+        self.run_state(
+            "backlog-add", "--title", "Dep1", "--reason", "r", "--value", "4", "--effort", "2",
+            "--depends-on", "candidate-999",
+        )
+        self.run_state(
+            "backlog-add", "--title", "Dep2", "--reason", "r", "--value", "4", "--effort", "2",
+            "--depends-on", "candidate-999",
+        )
+        # Remove the ready base so only dependency-blocked pending items remain.
+        self.run_state("backlog-remove", "--id", base)
+        data = json.loads(self.run_state("check", "--brief").stdout)
+        self.assertEqual(data["backlog"]["pending"], 2)
+        self.assertEqual(data["backlog"]["ready"], 0)
+        self.assertEqual(data["action_hint"], "expand")
+        self.assertTrue(any("dependency-ready" in w or "Deep Expansion" in w for w in data["warnings"]))
+
+    def test_begin_round_refuses_empty_when_ready_backlog_exists(self):
+        self.run_state("init")
+        self.run_state("backlog-add", "--title", "A", "--reason", "r", "--value", "4", "--effort", "2")
+        result = self.run_state("begin-round", "--title", "r", "--reason", "x")
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("candidate-id", result.stderr.lower())
+
+    def test_begin_round_allows_empty_when_no_ready_backlog(self):
+        self.run_state("init")
+        result = self.run_state("begin-round", "--title", "r", "--reason", "x")
+        self.assertEqual(result.returncode, 0, result.stderr)
+
+    def test_backlog_add_refreshes_last_activity(self):
+        self.run_state("init", "--max-minutes", "1")
+        state_path = self.repo / ".autopilot" / "state.json"
+        st = json.loads(state_path.read_text(encoding="utf-8"))
+        st["last_activity_at"] = "2020-01-01T00:00:00+00:00"
+        state_path.write_text(json.dumps(st), encoding="utf-8")
+        self.run_state("backlog-add", "--title", "A", "--reason", "r", "--value", "4", "--effort", "2")
+        st = json.loads(state_path.read_text(encoding="utf-8"))
+        self.assertNotEqual(st["last_activity_at"], "2020-01-01T00:00:00+00:00")
+
+    def test_report_json_wraps_markdown(self):
+        self.run_state("init")
+        data = json.loads(self.run_state("report", "--json").stdout)
+        self.assertTrue(data["ok"])
+        self.assertIn("markdown", data)
+        self.assertTrue(data["markdown"])
+
+    def test_retrospective_json_wraps_markdown(self):
+        self.run_state("init")
+        data = json.loads(self.run_state("retrospective", "--json").stdout)
+        self.assertTrue(data["ok"])
+        self.assertIn("markdown", data)
+
+
+class MaxRoundsCountingTests(RepoTest):
+    def test_cancelled_rounds_count_toward_max_rounds(self):
+        self.run_state("init", "--max-rounds", "1")
+        self.run_state("begin-round", "--title", "r", "--reason", "x")
+        self.run_state("cancel-round", "--reason", "nope")
+        result = self.run_state("begin-round", "--title", "r2", "--reason", "y")
+        self.assertNotEqual(result.returncode, 0)
+        data = json.loads(self.run_state("check", "--brief").stdout)
+        self.assertFalse(data["continue"])
+        self.assertIn("max_rounds", data["stop_reason"])
+
+
+class RefNameGuardTests(RepoTest):
+    def test_assert_safe_ref_name_rejects_dash_prefix(self):
+        import sys as _sys
+        if str(SCRIPT.parent) not in _sys.path:
+            _sys.path.insert(0, str(SCRIPT.parent))
+        import autopilot.state as apstate
+        with self.assertRaises(SystemExit):
+            apstate._assert_safe_ref_name("-f")
+        with self.assertRaises(SystemExit):
+            apstate._assert_safe_ref_name("../evil")
+        self.assertEqual(apstate._assert_safe_ref_name("autopilot/abc"), "autopilot/abc")
+
+
+class LockHostTests(RepoTest):
+    def test_other_host_lock_is_not_deleted(self):
+        self.run_state("init")
+        lock = self.repo / ".autopilot" / "lock"
+        lock.write_text(
+            json.dumps({"pid": os.getpid(), "hostname": "other-host-not-this-machine"}),
+            encoding="utf-8",
+        )
+        result = self.run_state("backlog-add", "--title", "A", "--reason", "r", "--value", "4", "--effort", "2")
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("another host", result.stderr.lower())
+        self.assertTrue(lock.exists())
 
 
 class HistoryBoundTests(unittest.TestCase):

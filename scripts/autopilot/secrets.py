@@ -53,10 +53,23 @@ def scan_staged_diff(repo, extra_patterns=None):
     """Scan the added lines of the staged diff for secret-like content. Returns a
     list of findings (pattern, file, masked text), deduplicated per pattern+line.
     Uses -U0 so context lines are not read, and core.quotepath=false so non-ASCII
-    file names are reported literally."""
+    file names are reported literally. Fail-closed: if git diff fails, the scan
+    reports a synthetic finding instead of pretending the tree is clean."""
     diff = io.run_git(repo, "-c", "core.quotepath=false", "diff", "--cached", "-U0")
     if diff.returncode != 0:
-        return []
+        detail = (diff.stderr or diff.stdout or "git diff failed").strip()
+        print(
+            "[ERROR] Secret scan could not read the staged diff ({}). "
+            "Refusing to treat the tree as clean.".format(detail),
+            file=sys.stderr,
+        )
+        return [
+            {
+                "pattern": "git-diff-failure",
+                "file": "(staged diff)",
+                "text": mask_secret_text(detail[:200]),
+            }
+        ]
     patterns = _COMPILED_DEFAULTS + compile_patterns(extra_patterns)
     findings = []
     seen = set()

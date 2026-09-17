@@ -233,6 +233,21 @@ def round_candidate_ids(current):
     return ids
 
 
+def _assert_safe_ref_name(name, what="branch"):
+    """Reject ref names git would parse as options or path traversal."""
+    if not name or not isinstance(name, str):
+        print("[ERROR] Invalid {} name: empty.".format(what), file=sys.stderr)
+        raise SystemExit(2)
+    if name.startswith("-") or name.startswith("/") or ".." in name or name != name.strip():
+        print(
+            "[ERROR] Invalid {} name {!r}: must not start with '-', '/', contain '..', "
+            "or have edge whitespace.".format(what, name),
+            file=sys.stderr,
+        )
+        raise SystemExit(2)
+    return name
+
+
 def ensure_branch(repo, state, cfg, to_stderr=False):
     def say(msg):
         if to_stderr:
@@ -252,7 +267,7 @@ def ensure_branch(repo, state, cfg, to_stderr=False):
         save_state(repo, state)
 
     branch = state.get("branch")
-    if branch and not branch.startswith("autopilot/"):
+    if branch and not str(branch).startswith("autopilot/"):
         print(
             "[ERROR] state.json branch {!r} is not an autopilot branch; refusing to check it out. "
             "Reset .autopilot/state.json or run init --force to recover.".format(branch),
@@ -270,6 +285,7 @@ def ensure_branch(repo, state, cfg, to_stderr=False):
 
     if not branch:
         branch = "autopilot/" + state.get("run_id", uuid.uuid4().hex[:io.RUN_ID_LENGTH])
+        _assert_safe_ref_name(branch)
         if io.branch_exists(repo, branch):
             result = io.run_git(repo, "checkout", branch)
         else:
@@ -280,6 +296,7 @@ def ensure_branch(repo, state, cfg, to_stderr=False):
         state["branch"] = branch
         save_state(repo, state)
     else:
+        _assert_safe_ref_name(branch)
         current = io.current_branch(repo)
         if current != branch:
             result = io.run_git(repo, "checkout", branch)
@@ -328,7 +345,14 @@ def compute_stop_reason(state, cfg):
             stop_reason = "all goals met"
 
     if stop_reason is None:
-        total_rounds = state.get("completed_rounds", 0) + state.get("blocked_rounds", 0)
+        # Count every round that consumed a slot in the run (matches round numbers):
+        # completed, blocked, cancelled, and reverted all advance the counter.
+        total_rounds = (
+            state.get("completed_rounds", 0)
+            + state.get("blocked_rounds", 0)
+            + state.get("cancelled_rounds", 0)
+            + state.get("reverted_rounds", 0)
+        )
         max_rounds = cfg.get("max_rounds")
         if max_rounds is not None and total_rounds >= max_rounds:
             stop_reason = "max_rounds reached"

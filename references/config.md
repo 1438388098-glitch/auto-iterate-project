@@ -112,7 +112,9 @@ Integer, default `null`. When set to `N`, the loop pauses after every Nth round 
 
 ### expand_after_goals
 
-Boolean, default `false`. When `true`, reaching all configured goals does **not** stop the loop: `check` reports `"phase": "expand"` and `begin-round` keeps working on new, value-gated candidates instead of stopping. Modeled on the "goal-met -> expand" pattern: after the core goal is real, the agent scouts fresh candidates with a detached perspective and lets `backlog-rank` (value/effort, risk, type saturation) act as a value gate — no random feature bloat. Expansion remains bounded by the normal budgets (`max_rounds`, `max_minutes`, `deadline`, `max_tokens`, `max_blocked_in_a_row`); because goals no longer stop the loop in this mode, `check` warns when no other stop condition is configured.
+Boolean, default `false`. When `true`, reaching all configured goals does **not** stop the loop: `check` reports `"phase": "expand"` and `begin-round` keeps working on new, value-gated candidates instead of stopping. Modeled on the "goal-met -> expand" pattern: after the core goal is real, the agent scouts fresh candidates with a detached perspective and lets `backlog-rank` (expected value per round, risk, type saturation) act as a value gate — no random feature bloat. Expansion remains bounded by the normal budgets (`max_rounds`, `max_minutes`, `deadline`, `max_tokens`, `max_blocked_in_a_row`); because goals no longer stop the loop in this mode, `check` warns when no other stop condition is configured.
+
+Independent of this flag, a thin backlog (`pending` < `min_pending_candidates`) is always an expansion trigger while the run continues — see Deep Expansion Protocol in `SKILL.md`.
 
 ### review_threshold
 
@@ -120,7 +122,7 @@ Integer 1-5, default `null`. When set, `complete-round` requires a `--review-sco
 
 ### scan_secrets
 
-Boolean, default `true`. When true, `commit` scans the **added lines** of the staged diff for secret-like content before committing and refuses on a match. Built-in patterns cover AWS access keys (`AKIA...`), private-key blocks, GitHub personal access tokens (`ghp_...`), Slack tokens (`xox...`), Google API keys (`AIza...`), OpenAI-style `sk-...` keys, and `api_key = ...` assignments. Bypass a false positive with `commit --allow-secrets`, or disable entirely by setting this to `false`. Run `secret-scan` at any time to check the staged diff without committing. Use `secret_patterns` to add repository-specific regexes.
+Boolean, default `true`. When true, `commit` scans the **added lines** of the staged diff for secret-like content before committing and refuses on a match. Built-in patterns cover AWS access keys (`AKIA...`), private-key blocks, GitHub personal access tokens (`ghp_...` and `github_pat_...`), Slack tokens (`xox...`), Google API keys (`AIza...`), OpenAI-style `sk-...` keys (including `sk-proj-`/`sk-ant-`), JWTs (`eyJ...`), and `api_key = ...` assignments. If `git diff` fails during the scan, the helper **fails closed** (treats the scan as dirty) instead of allowing the commit. Bypass a false positive with `commit --allow-secrets`, or disable entirely by setting this to `false`. Run `secret-scan` at any time to check the staged diff without committing. Use `secret_patterns` to add repository-specific regexes.
 
 ### secret_patterns
 
@@ -146,6 +148,10 @@ Integer 1-5, default `3`. Pending candidates whose (resolved) value is below thi
 ### max_same_type_per_round
 
 Positive integer, default `2`. Diversity quota used when marking the recommended round batch (`selected: true`): at most this many candidates of the same type are included per round. The recommended batch also stops once a candidate's score drops below 40% of the best eligible candidate (batch cutoff). Set to `null` to disable the quota.
+
+### min_pending_candidates
+
+Non-negative integer, default `3`. When the backlog has fewer than this many `pending` candidates, `check` sets `action_hint: "expand"` and warns the agent to run Deep Expansion (spawn explore subagents, `backlog-add`) instead of idling or treating the thin backlog as a stop. Pending count of `0` always triggers the expansion warning while the run continues. Set to `0` to disable the thin-backlog trigger (empty backlog still warns). Init flag: `--min-pending-candidates N`.
 
 ### max_blocked_in_a_row
 
@@ -196,7 +202,11 @@ String, default `"zh"`. Language for generated reports and the automatic 10-roun
   "scan_secrets": true,
   "secret_patterns": [],
   "type_saturation_threshold": 2,
-  "report_lang": "zh"
+  "report_lang": "zh",
+  "ranking_mode": "expected",
+  "min_candidate_value": 3,
+  "max_same_type_per_round": 2,
+  "min_pending_candidates": 3
 }
 ```
 
@@ -249,8 +259,8 @@ python <this-skill>/scripts/autopilot_state.py backlog-remove --repo <repo> --id
 
 ## State Helper Commands
 
-- `init` — create config + state (+ optional feature branch). Flags cover every config field: `--goal`, `--goals-from-prompt`, `--max-rounds`, `--max-minutes`, `--deadline`, `--max-tokens`, `--max-round-scope`, `--branch-mode`, `--allow-uncommitted-changes`, `--track-state`, `--check-commands`, `--push`, `--commit-message-prefix`, `--retries-per-round`, `--candidates-per-round`, `--commit-every-rounds`, `--verify-every-rounds`, `--checkpoint-every`, `--expand-after-goals`, `--review-threshold`, `--scan-secrets`/`--no-scan-secrets`, `--secret-pattern`, `--type-saturation-threshold`, `--max-blocked-in-a-row`, `--allow-path`, `--deny-path`, `--report-lang`, `--force`.
-- `read`, `check`, `diagnose` — inspect state, stop conditions, and repository/git health. `check --brief` returns only `continue`/`stop_reason`/`warnings`/`goals_met`/`phase`/`next_verify_round`/`next_commit_round`/`next_checkpoint_round` (saves tokens in the loop).
+- `init` — create config + state (+ optional feature branch). Flags cover every config field: `--goal`, `--goals-from-prompt`, `--max-rounds`, `--max-minutes`, `--deadline`, `--max-tokens`, `--max-round-scope`, `--branch-mode`, `--allow-uncommitted-changes`, `--track-state`, `--check-commands`, `--push`, `--commit-message-prefix`, `--retries-per-round`, `--candidates-per-round`, `--commit-every-rounds`, `--verify-every-rounds`, `--checkpoint-every`, `--expand-after-goals`, `--review-threshold`, `--scan-secrets`/`--no-scan-secrets`, `--secret-pattern`, `--type-saturation-threshold`, `--ranking-mode`, `--min-candidate-value`, `--max-same-type-per-round`, `--min-pending-candidates`, `--max-blocked-in-a-row`, `--allow-path`, `--deny-path`, `--report-lang`, `--force`.
+- `read`, `check`, `diagnose` — inspect state, stop conditions, and repository/git health. `check --brief` returns loop-driving fields only: `continue`/`stop_reason`/`warnings`/`goals_met`/`phase`/`backlog` (`pending`/`ready`/`min_pending_candidates`/`needs_expansion`)/`action_hint` (`work`|`expand`|`stop`)/`next_verify_round`/`next_commit_round`/`next_checkpoint_round` (saves tokens in the loop).
 - `detect-agent` — detect the runtime agent (opencode / claude-code / codex / generic) and print adaptation context. Honors a `SKILL_DIR` environment variable for the reported skill directory.
 - `begin-round`, `complete-round`, `block-round`, `cancel-round` — round lifecycle. `begin-round` enforces the clean-tree rule, refuses to pick candidates with unresolved `depends_on`, and refuses to reuse round numbers; `--candidate-id` is repeatable so one round can pick multiple backlog candidates (`candidates_per_round`). `complete-round` accepts an optional `--commit-sha` (omit it on deferred commit rounds when `commit_every_rounds > 1`), an optional `--review-score`/`--review-notes` (required when `review_threshold` is set), auto-writes a Chinese phase report (`.autopilot/phase-report-round-<N>.md`) every 10 completed rounds, and refreshes `state.type_stats`.
 - `commit` — staged-change check, git identity check, path whitelist check (`allow_paths`/`deny_paths`), secret scan (`scan_secrets`, bypassable with `--allow-secrets`), scope guard (including binary files), open-round requirement (skipped in batched mode), and prefix message building.
@@ -262,7 +272,7 @@ python <this-skill>/scripts/autopilot_state.py backlog-remove --repo <repo> --id
 - `analysis-save` / `analysis-load` — persist and read the repository-analysis cache in `.autopilot/analysis.json`; the cache auto-invalidates when HEAD or `.autopilot/config.json` changes.
 - `directive-add` / `directive-list` — manage standing directives in `.autopilot/directives.json`; the loop must honor them in every round.
 - `secret-scan` — scan the staged diff for secret-like content and report findings (exit non-zero on a match).
-- `backlog-add`, `backlog-update`, `backlog-remove`, `backlog-list`, `backlog-rank`, `backlog-pick` — backlog management (candidates now carry `type`, `risk`, and `depends_on`; ranking is the adjusted value/effort score).
+- `backlog-add`, `backlog-update`, `backlog-remove`, `backlog-list`, `backlog-rank`, `backlog-pick` — backlog management (candidates carry `type`, `risk`, and `depends_on`; ranking defaults to expected value per round — see `ranking_mode`). `backlog-add` also refreshes `last_activity_at` so expansion scouting does not burn `max_minutes` without progress.
 - `ensure-branch` — create or check out the autopilot feature branch
 - `push` — push the current branch to its remote using an explicit non-force refspec; refuses to run when `push: false`
 
@@ -288,13 +298,13 @@ Output includes `agent`, `detected_by`, `shell`/`command_style` (`powershell` or
 
 ## Stop-Condition Enforcement
 
-`begin-round` refuses to open a new round when any stop condition is already reached (all goals met, `max_rounds`, `max_minutes`, `deadline`, `max_tokens`, `max_blocked_in_a_row`, or a finished run), so the loop cannot overrun its own limits.
+`begin-round` refuses to open a new round when any stop condition is already reached (all goals met without `expand_after_goals`, `max_rounds` counting completed+blocked+cancelled+reverted, `max_minutes`, `deadline`, `max_tokens`, `max_blocked_in_a_row`, or a finished run), so the loop cannot overrun its own limits. When the backlog has ready pending candidates, `begin-round` requires at least one `--candidate-id`.
 
 `commit` requires an open round. It refuses to commit when no round is open unless `--round <n>` is passed explicitly, which prevents orphan commits after `cancel-round` or `block-round` from being committed with a misleading round number.
 
 ## JSON Output
 
-State-changing commands accept `--json` and emit a single machine-readable result object `{ "ok": true, "message": "...", ... }` on stdout instead of human text. This now includes `init`, `commit`, `ensure-branch`, `finish`, `retrospective`, `analysis-save`, and `secret-scan` (informational lines are routed to stderr in JSON mode). Error cases emit `"ok": false` and exit with a non-zero code, so automation can branch on the code and the payload. `check`/`analysis-load`/`backlog-rank` always emit JSON.
+State-changing commands accept `--json` and emit a single machine-readable result object `{ "ok": true, "message": "...", ...data }` on stdout instead of human text. This includes `init`, `commit`, `ensure-branch`, `finish`, `analysis-save`, `secret-scan`, and `report`/`retrospective` (JSON wraps the markdown as `markdown`). Informational lines are routed to stderr in JSON mode. Error cases emit `"ok": false` and exit with a non-zero code, so automation can branch on the code and the payload. `check`/`analysis-load`/`backlog-rank`/`backlog-list`/`read`/`diagnose`/`directive-list` always emit JSON.
 
 ## Audit Log
 

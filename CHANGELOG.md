@@ -2,6 +2,74 @@
 
 All notable changes to auto-iterate-project are documented here.
 
+## 1.2.1 (2026-09-11)
+
+Audit hardening from multi-lens Deep Expansion: fail-closed guards, ready-aware
+check signals, protocol fixes that remove remaining early-stop / idle paths.
+
+### Fixed
+
+- Secret scan and `max_round_scope` no longer **fail open** when `git diff` /
+  `--numstat` fails — both refuse instead of treating the tree as clean/empty.
+- `report` / `retrospective` honor `--json` (wrap markdown in a JSON object)
+  instead of printing raw Markdown.
+- `max_rounds` now counts cancelled + reverted rounds, matching the round-number
+  counter (previously cancel churn could never hit the budget stop).
+- Lock from **another hostname** is no longer deleted as stale (shared-disk
+  safety); the run refuses until the lock is removed manually.
+- `git checkout` of state-controlled branch names is validated
+  (`_assert_safe_ref_name`) so a corrupted `state.json` cannot inject git options.
+- `finish` retrospective write failures warn instead of being silently swallowed.
+- `check` `needs_expansion` / `action_hint` treat **ready==0** (dependency-blocked
+  pending pool) as expand, not work — no more check↔begin-round deadlock.
+- `begin-round` refuses an empty round when the backlog has ready pending
+  candidates (exploratory empty rounds still allowed when nothing is ready).
+- `backlog-add` refreshes `last_activity_at` so expansion scouting does not burn
+  `max_minutes` without any recorded activity.
+
+### Docs / protocol
+
+- Stop Conditions: goals stop only when `expand_after_goals` is false.
+- Deep Expansion: expand **in parallel with** ready work (no expand-only deadlock);
+  serial in-process lens fallback when the host has no subagent tool.
+- Undo guidance unified on `undo-round` (no competing `git revert` advice).
+- Config example, init flags, check --brief fields, ranking/secret-pattern docs
+  brought in line with 1.1.0/1.2.0 behavior.
+
+## 1.2.0 (2026-09-11)
+
+Anti-early-stop and anti-idle protocol. Empty or thin backlog is no longer an
+escalation/stop; it is a mandatory Deep Expansion trigger. The agent must keep
+working (or spawn explore subagents) until a real budget stop, never wait out
+the deadline.
+
+### Added
+
+- `min_pending_candidates` config (default 3) and `init --min-pending-candidates N`.
+- `check` now reports `backlog` (`pending`, `ready`, `min_pending_candidates`,
+  `needs_expansion`) and `action_hint` (`work` | `expand` | `stop`).
+- When pending backlog is below the threshold (or empty), `check` warns to run
+  Deep Expansion — spawn explore subagents, `backlog-add` value-gated
+  candidates — instead of idling.
+- SKILL.md: **Deep Expansion Protocol** (3-6 parallel explore subagents across a
+  rotating 16-lens set: architecture, tests, security, perf, docs/DX, debt,
+  API, concurrency, i18n/encoding, config, observability, packaging, data
+  integrity, UX copy, deps, cross-cutting resilience) and **Anti-Idle
+  Discipline** (every continue=true check must begin-round or expand; waiting
+  out the deadline is a protocol violation).
+- Failed expansion waves never escalate the conversation — they escalate
+  effort (new lenses → lower value floor → deeper end-to-end reads → wider
+  scope). Escalation is reserved for true external blockers and budget stops.
+
+### Changed
+
+- Quality gate: "no clear value" no longer means stop-and-ask on the first
+  miss; it means Deep Expansion first. Empty/thin backlog never escalates —
+  keep expanding while budgets remain.
+- Expansion Phase is continuous (thin backlog / empty backlog / goals met),
+  not only after `expand_after_goals`.
+- Safety Rules: never idle until the deadline while `continue` is true.
+
 ## 1.1.0 (2026-09-11)
 
 Ranking overhaul: the backlog now ranks by **expected value per round** instead of
