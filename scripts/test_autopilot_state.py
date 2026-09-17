@@ -1020,6 +1020,31 @@ class PredictedHardeningTests(RepoTest):
         self.assertNotIn("Traceback", result.stderr)
         self.assertNotIn("candidate-", result.stdout)
 
+    def test_goal_invisible_chars_cannot_fake_success(self):
+        self.run_state("init", "--goal", "提升测试质量", "--max-rounds", "5")
+        result = self.run_state("goal-met", "--goal", "提升测试质量\u200b")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        # The near-duplicate must not leave the run unable to stop.
+        data = json.loads(self.run_state("check", "--brief").stdout)
+        self.assertTrue(data["goals_met"])
+        self.assertFalse(data["continue"])
+
+    def test_goal_mismatch_warns(self):
+        self.run_state("init", "--goal", "real goal")
+        result = self.run_state("goal-met", "--goal", "totally different")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("does not match any configured goal", result.stderr)
+
+    def test_report_tables_survive_hostile_titles(self):
+        self.run_state("init")
+        self.run_state("backlog-add", "--title", "line1\nline2|PIPE\tTAB", "--value", "3", "--effort", "1")
+        self.run_state("goal-met", "--goal", "G", "--next-step", "stepA\nstepB|X")
+        output = self.run_state("report").stdout
+        self.assertNotIn("line1\nline2", output)
+        self.assertNotIn("stepA\nstepB", output)
+        self.assertIn("line1 line2\\|PIPE TAB", output)
+        self.assertIn("stepA stepB\\|X", output)
+
     def test_directive_remove_by_index(self):
         self.run_state("init")
         self.run_state("directive-add", "--text", "rule one")

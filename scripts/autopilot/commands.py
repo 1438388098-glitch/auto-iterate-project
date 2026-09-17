@@ -643,6 +643,25 @@ def cmd_goal_met(args):
 
         next_steps = list(args.next_step or [])
         unlocked = list(args.unlocked_capability or [])
+        # Canonicalize the goal text: a zero-width character or trailing space
+        # used to record a "met" goal that all_goals_met could never match,
+        # so a goals-only run could never stop.
+        normalized = state.normalize_goal_text(goal)
+        cfg_goal_list = cfg.get("goals") or st.get("goals") or []
+        for configured in cfg_goal_list:
+            if state.normalize_goal_text(configured) == normalized:
+                goal = configured  # record the configured spelling
+                break
+        else:
+            if cfg_goal_list:
+                print(
+                    "[WARN] --goal {!r} does not match any configured goal "
+                    "(compared normalized); recording as-is. Configured: {}".format(
+                        goal, "; ".join(cfg_goal_list)
+                    ),
+                    file=sys.stderr,
+                )
+                io.append_log(repo, "goal-met", "warn", reason="goal not in configured goals", goal=goal)
         seed_type = getattr(args, "seed_type", None)
         if seed_type is not None and seed_type not in state.VALID_CANDIDATE_TYPES:
             io.append_log(repo, "goal-met", "error", reason="unknown seed type")
@@ -693,7 +712,8 @@ def cmd_goal_met(args):
                 })
                 seeds.append(seed)
 
-        if goal not in st["completed_goals"]:
+        if not any(state.normalize_goal_text(existing) == state.normalize_goal_text(goal)
+                   for existing in st["completed_goals"]):
             st["completed_goals"].append(goal)
         st["last_activity_at"] = io.now_iso()
         goal_event = None

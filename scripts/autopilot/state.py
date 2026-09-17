@@ -4,10 +4,36 @@ import json
 import math
 import re
 import sys
+import unicodedata
 import uuid
 from datetime import datetime, timezone
 
 from . import config, io
+
+_ZERO_WIDTH_CHARS = ("\u200b", "\u200c", "\u200d", "\ufeff")
+
+
+def normalize_goal_text(text):
+    """Canonical comparison form for goal strings: NFC + zero-width/BOM
+    removal + whitespace strip. Guards the goal-met -> stop-condition chain:
+    a zero-width space used to make `goal-met` report success while
+    all_goals_met stayed False forever (the loop could never stop)."""
+    if not isinstance(text, str):
+        return text
+    cleaned = unicodedata.normalize("NFC", text)
+    for char in _ZERO_WIDTH_CHARS:
+        cleaned = cleaned.replace(char, "")
+    return cleaned.strip()
+
+
+def table_cell(text):
+    """Make arbitrary text safe inside a markdown table cell: physical
+    newlines/tabs become spaces (they break the row into phantom rows) and
+    pipes are escaped (they create phantom columns)."""
+    if not isinstance(text, str):
+        return text
+    cleaned = text.replace("|", "\\|")
+    return re.sub(r"[\r\n\t]+", " ", cleaned).strip()
 
 
 def default_state(repo, goals=None, config_fingerprint=None):
@@ -598,8 +624,8 @@ def all_goals_met(cfg, state):
     goals = cfg.get("goals") or state.get("goals") or []
     if not goals:
         return False
-    completed_goals = set(state.get("completed_goals") or [])
-    return all(goal in completed_goals for goal in goals)
+    completed = {normalize_goal_text(goal) for goal in state.get("completed_goals") or []}
+    return all(normalize_goal_text(goal) in completed for goal in goals)
 
 
 def _candidate_score(candidate):
@@ -1190,7 +1216,7 @@ def build_retrospective(repo, state, cfg, lang="zh"):
     else:
         for entry in blocked:
             out.append("- round {}: {} — {}".format(
-                entry.get("round", "?"), entry.get("title", ""), entry.get("reason", "")
+                entry.get("round", "?"), table_cell(entry.get("title", "")), table_cell(entry.get("reason", ""))
             ))
     out.append("")
 
@@ -1216,7 +1242,7 @@ def build_retrospective(repo, state, cfg, lang="zh"):
     else:
         top = ready[0]
         out.append("- {} `{}` (value={}, effort={}, type={})".format(
-            top.get("id"), top.get("title"), top.get("value"), top.get("effort"), top.get("type") or "feature"
+            top.get("id"), table_cell(top.get("title")), top.get("value"), top.get("effort"), top.get("type") or "feature"
         ))
     out.append("")
     return "\n".join(out)
@@ -1308,7 +1334,7 @@ def build_report(repo, state, cfg, lang="en"):
                 sha = "`{}`".format(sha[:12])
             tokens = entry.get("estimated_tokens", "")
             out.append("| {} | {} | {} | {} | {} |".format(
-                entry.get("round", ""), label, entry.get("title", ""), sha, tokens
+                entry.get("round", ""), label, table_cell(entry.get("title", "")), sha, tokens
             ))
     out.append("")
 
@@ -1326,7 +1352,7 @@ def build_report(repo, state, cfg, lang="en"):
             if c.get("origin") == "predicted":
                 title = "[P] " + title
             out.append("| `{}` | {} | {} | {}/{} | {} |".format(
-                c.get("id", ""), title, c.get("type") or "feature",
+                c.get("id", ""), table_cell(title), c.get("type") or "feature",
                 c.get("value", ""), c.get("effort", ""), label,
             ))
     out.append("")
@@ -1347,7 +1373,7 @@ def build_report(repo, state, cfg, lang="en"):
                 status_label = L["seed_status"].get(seed.get("status", "open"), seed.get("status", "open"))
                 out.append("| `{}` | {} | {} | {} | {} |".format(
                     seed.get("id", ""), status_label, seed.get("type") or "feature",
-                    seed.get("title", ""), seed.get("source_goal", ""),
+                    table_cell(seed.get("title", "")), table_cell(seed.get("source_goal", "")),
                 ))
         if predicted_account.get("done"):
             out.append("")
@@ -1383,7 +1409,7 @@ def build_report(repo, state, cfg, lang="en"):
         out.append("## {}".format(L["next"]))
         out.append("")
         out.append("- {} `{}` (value={}, effort={}, type={}, score={})".format(
-            top.get("id"), top.get("title"), top.get("value"), top.get("effort"),
+            top.get("id"), table_cell(top.get("title")), top.get("value"), top.get("effort"),
             top.get("type") or "feature", top.get("score"),
         ))
         out.append("")
