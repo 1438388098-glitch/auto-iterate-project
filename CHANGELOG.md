@@ -2,6 +2,96 @@
 
 All notable changes to auto-iterate-project are documented here.
 
+## 1.3.2 (2026-09-17)
+
+Hardening release from a three-agent audit (robustness deep-review, functional
+completeness, test quality). No protocol changes — the v1.3.0/v1.3.1 semantics
+are unchanged; the edges stop biting.
+
+### Fixed
+
+- `--confidence nan` no longer bypasses the discount: the CLI uses a chained
+  range check, the scorer falls back to the default for NaN/±inf/bool/strings,
+  and NaN `review_score`s are dropped from both calibration ledgers (NaN used
+  to clamp to the 1.0/1.5 ceilings).
+- `_mark_selection`: the below-floor quick-win fallback now obeys the predicted
+  quota and the late-run cut (a value-2 predicted quick-win used to sneak into
+  every batch, even with `max_predicted_per_round: 0`).
+- Seed state machine: terminal states (`verified`/`refuted`/`rejected`) are
+  immutable — a cancelled round can no longer resurrect a verified seed; seed
+  write-back checks ownership (`promoted_candidate_id` must belong to the
+  closing round) and warns (instead of logging success) when the seed no longer
+  exists; write-back is folded into the round-close state save (no crash window
+  between backlog and seed ledger).
+- Seed ids are monotonic after truncation — a truncated `seed-001` is never
+  reused, so stale `from_seed` references can't point at a newer seed.
+- Junk in hand-edited state degrades cleanly: seed `value`/`effort`/`risk`
+  strings coerce or fall back; `±inf` values raise no OverflowError; corrupt
+  `type_stats` values and a malformed `backlog.json` fail with a clear message
+  and exit 2 (no traceback); `check`'s expansion payload skips non-dict entries.
+- Windows console/pipe encoding: the CLI forces UTF-8 (errors replaced) on
+  stdout/stderr — zh reports no longer crash on non-GBK characters.
+
+### Added
+
+- `seed-reject --id <id> --reason "<why>"`: the missing write path for the
+  `rejected` state (evidence check refused the hypothesis). Rejected seeds
+  leave the open-seeds list, making SKILL.md's Wave 0 exception reachable.
+- `goal-met` dedupes repeated `--next-step` seeds per goal; goal events record
+  the last completed round's commit SHA(s); seeds carry `source_event_id`.
+- `report` / `retrospective` ranking now honors `completed_goals` (goal-chain
+  bonus consistent with `backlog-rank`).
+- Test suite: adversarial direct unit tests (state machine, confidence table,
+  id monotonicity, selection quota edges), 10 subprocess regressions (corrupt
+  data fail-clean, dedupe, write-back warn, field coercion), config validation
+  matrix entries, wider `GIT_*` isolation, subprocess timeouts.
+
+### Expansion waves (same release; two scout waves + hardening rounds)
+
+- `goal-met` text mode now echoes the created seed ids (Wave 0's next step
+  needs `--from-seed <id>`; agents used to guess `seed-00N`).
+- Goal text is normalized (NFC + zero-width/BOM stripped + trimmed) before
+  recording and inside `all_goals_met`: an invisible character could mark a
+  goal "met" while the stop condition stayed false forever. A `--goal` that
+  matches no configured goal records a warning.
+- Report/retrospective hardening: markdown table cells (backlog, history,
+  seeds) and suggestion lines sanitize newlines/tabs/pipes; `--output`
+  relative paths resolve against `--repo`, not the process CWD.
+- Audit trail: `state-migrate`, `config-drift`, `analysis-load`, and
+  `integrity` (state/backlog validation failures) events in `log.jsonl`.
+- `directive-remove --index N` (directives.json was add-only); malformed
+  `directives.json` now fails cleanly like state/backlog.
+- Fail-clean completeness: corrupt `current_round` (missing `round`) and
+  junk `history` entries exit 2 with a message instead of KeyError/AttributeError
+  (the old failure bricked the run — begin-round refused while every closer
+  crashed); malformed `--repo` paths surface as `[ERROR]` + exit 2 via an
+  OSError net in the entry point.
+- Guidance: unknown seed/candidate ids list the open/pending ids; `undo-round`
+  on a merge commit points at `git revert -m 1` instead of a phantom conflict.
+- Consistency: `backlog-update`/`backlog-pick`/`backlog-remove` require init
+  like their siblings; empty commit subjects no longer leak bare SHAs into
+  `suggested_themes`.
+- Performance: the test harness dispatches in-process (589 interpreter startups
+  eliminated), setup writes repo-local git config directly, and hot commands
+  merge redundant git calls — suite runtime 358s → ~193s.
+- SKILL.md: init flag list completed (`--allow-uncommitted-changes`/`--force`),
+  lens→helper-signal map for Deep Expansion subagents.
+- Guards and scanners: `deny_paths`/`allow_paths` patterns are normalized to
+  forward slashes (a Windows-style `secrets\\` deny rule silently never
+  matched — fail-open) and `**/` collapses to zero directories
+  (`src/**/*.py` now also matches `src/a.py`); the secret scanner catches
+  PKCS#8 `ENCRYPTED PRIVATE KEY` blocks and `gho_/ghs_/ghu_/ghr_` GitHub
+  tokens, and `sk-` requires a word boundary (long hyphenated words ending in
+  "-sk-" no longer block commits); `--deadline` overflow durations fall to the
+  friendly parse error; `git push` prefers `origin`/`upstream` over the
+  alphabetically-first remote.
+- Release hygiene: `scripts/autopilot/__init__.py` gains `__version__` (single
+  authority) with a `--version` flag and a consistency test across SKILL.md /
+  openai.yaml / README / CHANGELOG; CI adds a concurrency group, job timeouts,
+  and package-wide syntax check; README documents the shipped-file surface and
+  junction/symlink installs; `agents/openai.yaml` gains a description with the
+  trigger phrases.
+
 ## 1.3.1 (2026-09-17)
 
 刀 B — anti-noise guardrails for direction-seed predictions (proposal §6).

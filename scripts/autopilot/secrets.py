@@ -10,12 +10,18 @@ from . import io
 
 SECRET_PATTERNS = [
     r"AKIA[0-9A-Z]{16}",
-    r"-----BEGIN (?:RSA|EC|OPENSSH|PGP|DSA|PRIVATE) PRIVATE KEY-----",
-    r"ghp_[A-Za-z0-9]{36}",
+    # PKCS#8 writes "ENCRYPTED PRIVATE KEY" — the explicit-alternatives form
+    # missed it; accept any words before PRIVATE KEY.
+    r"-----BEGIN [A-Z ]*PRIVATE KEY-----",
+    # gho_/ghs_/ghu_/ghr_ are live GitHub App/OAuth/Actions/user-to-server/
+    # refresh tokens, same 36-char shape as ghp_.
+    r"gh[pousr]_[A-Za-z0-9]{36}",
     r"github_pat_[A-Za-z0-9_]{36,}",
     r"xox[baprs]-[A-Za-z0-9-]{10,}",
     r"AIza[0-9A-Za-z_-]{35}",
-    r"sk-[A-Za-z0-9_-]{20,}",
+    # \b: without it every long hyphenated word ending in "sk-" (task-, risk-,
+    # disk-) blocked commits, training users to reach for --allow-secrets.
+    r"\bsk-[A-Za-z0-9_-]{20,}",
     r"(?i)api[_-]?key\s*[:=]\s*[\"']?[A-Za-z0-9+/]{20,}[\"']?",
     r"\beyJ[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{5,}",
 ]

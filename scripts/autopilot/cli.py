@@ -4,13 +4,29 @@ Each subparser registers its handler via ``set_defaults(func=...)`` — a single
 registration point per command, no second name->handler table to keep in sync."""
 
 import argparse
+import io
 import sys
 
 from . import agent, commands
 
 
+def _force_utf8_stdio():
+    """Windows pipes inherit the ANSI code page on py3.6: a zh report or a
+    seed title with non-GBK characters would crash the loop mid-print with
+    UnicodeEncodeError. Force UTF-8 with replacement on both streams."""
+    for name in ("stdout", "stderr"):
+        stream = getattr(sys, name)
+        buffer = getattr(stream, "buffer", None)
+        if buffer is not None:
+            setattr(sys, name, io.TextIOWrapper(buffer, encoding="utf-8", errors="replace"))
+
+
 def build_parser():
+    from . import __version__
+
     parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--version", action="version",
+                        version="auto-iterate-project {}".format(__version__))
     subparsers = parser.add_subparsers(dest="command")
 
     def add_json(sub):
@@ -160,6 +176,17 @@ def build_parser():
     add_dry_run(goal_parser)
     goal_parser.set_defaults(func=commands.cmd_goal_met)
 
+    seed_reject_parser = subparsers.add_parser(
+        "seed-reject",
+        help="Reject an open direction seed (value-gate / evidence check refused it)",
+    )
+    seed_reject_parser.add_argument("--repo", default=".")
+    seed_reject_parser.add_argument("--id", required=True, help="Direction seed id (e.g. seed-003)")
+    seed_reject_parser.add_argument("--reason", required=True, help="Why the hypothesis died (stored as the seed's outcome)")
+    add_json(seed_reject_parser)
+    add_dry_run(seed_reject_parser)
+    seed_reject_parser.set_defaults(func=commands.cmd_seed_reject)
+
     finish_parser = subparsers.add_parser("finish", help="Finish the run")
     finish_parser.add_argument("--repo", default=".")
     finish_parser.add_argument("--reason")
@@ -208,6 +235,17 @@ def build_parser():
     directive_list_parser = subparsers.add_parser("directive-list", help="List standing directives")
     directive_list_parser.add_argument("--repo", default=".")
     directive_list_parser.set_defaults(func=commands.cmd_directive_list)
+
+    directive_remove_parser = subparsers.add_parser(
+        "directive-remove",
+        help="Remove a standing directive by its 1-based index in directive-list",
+    )
+    directive_remove_parser.add_argument("--repo", default=".")
+    directive_remove_parser.add_argument("--index", type=int, required=True,
+                                         help="1-based position from directive-list output")
+    add_json(directive_remove_parser)
+    add_dry_run(directive_remove_parser)
+    directive_remove_parser.set_defaults(func=commands.cmd_directive_remove)
 
     secret_scan_parser = subparsers.add_parser("secret-scan", help="Scan the staged diff for secret-like content")
     secret_scan_parser.add_argument("--repo", default=".")
@@ -315,8 +353,16 @@ def build_parser():
 
 
 def main():
+    _force_utf8_stdio()
     parser = build_parser()
     args = parser.parse_args()
     if args.command is None:
         parser.error("a command is required")
-    sys.exit(args.func(args))
+    try:
+        code = args.func(args)
+    except OSError as exc:
+        # Malformed paths (e.g. shell-mangled \\?\ device paths) used to escape
+        # as raw tracebacks from ~30 entry points; the contract is [ERROR]+2.
+        print("[ERROR] OS-level failure: {}".format(exc), file=sys.stderr)
+        code = 2
+    sys.exit(code)

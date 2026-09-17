@@ -9,9 +9,35 @@ import subprocess
 import sys
 import tempfile
 import unittest
+from io import StringIO
 from pathlib import Path
 
 SCRIPT = Path(__file__).resolve().parent / "autopilot_state.py"
+
+# Direct import for pure-function adversarial tests (resolve_seed, scoring,
+# selection): the package lives next to this file.
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+from autopilot import state as ap_state  # noqa: E402
+from autopilot import io as ap_io  # noqa: E402
+from autopilot.cli import build_parser  # noqa: E402
+from autopilot.guard import path_allowed  # noqa: E402
+from autopilot.secrets import SECRET_PATTERNS  # noqa: E402
+
+import re  # noqa: E402
+
+
+def _secret_hit(text):
+    return any(re.search(pattern, text) for pattern in SECRET_PATTERNS)
+
+
+class RunResult(object):
+    """Minimal subprocess.CompletedProcess stand-in for in-process runs."""
+
+    def __init__(self, returncode, stdout, stderr):
+        self.returncode = returncode
+        self.stdout = stdout
+        self.stderr = stderr
+        self.args = []
 
 
 class AutopilotTestBase(unittest.TestCase):
@@ -25,7 +51,10 @@ class AutopilotTestBase(unittest.TestCase):
         # Isolate from the developer's git environment: repo-local config only,
         # no inherited GIT_* plumbing, no global gpgsign/hooks interference.
         for var in ("GIT_DIR", "GIT_WORK_TREE", "GIT_INDEX_FILE", "GIT_NAMESPACE",
-                    "GIT_OBJECT_DIRECTORY", "GIT_COMMON_DIR"):
+                    "GIT_OBJECT_DIRECTORY", "GIT_COMMON_DIR",
+                    "GIT_AUTHOR_NAME", "GIT_AUTHOR_EMAIL", "GIT_AUTHOR_DATE",
+                    "GIT_COMMITTER_NAME", "GIT_COMMITTER_EMAIL", "GIT_COMMITTER_DATE",
+                    "GIT_CONFIG_COUNT"):
             self.env.pop(var, None)
         self.global_config = Path(self.tmp) / "global-gitconfig"
         self.global_config.write_text("", encoding="utf-8")
@@ -35,9 +64,13 @@ class AutopilotTestBase(unittest.TestCase):
         self.env["LC_ALL"] = "C"
         self.env["GIT_CEILING_DIRECTORIES"] = str(Path(self.tmp).parent).replace("\\", "/")
         self.git("init", "-q")
-        self.git("config", "user.name", "Test User")
-        self.git("config", "user.email", "test@example.com")
-        self.git("config", "commit.gpgsign", "false")
+        # Repo-local identity written straight into .git/config: 3 fewer git
+        # subprocesses per test (~250 tests) without changing behavior.
+        (self.repo / ".git" / "config").write_text(
+            "[user]\n\tname = Test User\n\temail = test@example.com\n"
+            "[commit]\n\tgpgsign = false\n",
+            encoding="utf-8",
+        )
 
     def tearDown(self):
         shutil.rmtree(self.tmp, ignore_errors=True)
@@ -54,15 +87,27 @@ class AutopilotTestBase(unittest.TestCase):
         )
 
     def run_state(self, command, *args):
-        return subprocess.run(
-            [sys.executable, str(self.script), command, "--repo", str(self.repo)] + list(args),
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
-            universal_newlines=True,
-            encoding="utf-8",
-            errors="replace",
-            env=self.env,
-        )
+        """In-process invocation of the CLI. ~589 subprocess calls at ~0.33s
+        interpreter startup each dominated the suite runtime; dispatching
+        through build_parser keeps every call site unchanged. Real-subprocess
+        behavior (exit codes through the entry point, UTF-8 stdio) stays
+        covered by the explicit subprocess contract tests."""
+        parser = build_parser()
+        old_out, old_err = sys.stdout, sys.stderr
+        sys.stdout = StringIO()
+        sys.stderr = StringIO()
+        try:
+            try:
+                ns = parser.parse_args([command, "--repo", str(self.repo)] + list(args))
+                code = ns.func(ns)
+            except SystemExit as exc:
+                code = exc.code
+        finally:
+            out, err = sys.stdout.getvalue(), sys.stderr.getvalue()
+            sys.stdout, sys.stderr = old_out, old_err
+        if not isinstance(code, int):
+            code = 0
+        return RunResult(code, out, err)
 
     def read_json(self, name):
         return json.loads((self.repo / ".autopilot" / name).read_text(encoding="utf-8"))
@@ -76,7 +121,10 @@ class RepoTest(AutopilotTestBase):
         (self.repo / "README.md").write_text("# Test\n", encoding="utf-8")
         self.git("add", "README.md")
         self.git("commit", "-q", "-m", "initial")
-        self.initial_branch = self.git("rev-parse", "--abbrev-ref", "HEAD").stdout.strip()
+        # Read HEAD directly (ref: refs/heads/<name>) — no subprocess, and
+        # independent of the git version's default-branch name.
+        head = (self.repo / ".git" / "HEAD").read_text(encoding="utf-8").strip()
+        self.initial_branch = head.split("/")[-1] if "/" in head else head
 
     def add_file(self, name="feature.py", content="x = 1\n"):
         (self.repo / name).write_text(content, encoding="utf-8")
@@ -704,6 +752,486 @@ class PredictedOriginTests(RepoTest):
         output = self.run_state("report").stdout
         self.assertIn("预测子账", output)
         self.assertIn("受阻 1", output)
+
+
+class ImportUnitTests(unittest.TestCase):
+    """Adversarial direct tests of pure helpers (no subprocess, no temp repo)."""
+
+    # -- resolve_seed state machine ------------------------------------------
+    def _seed(self, status="open", **extra):
+        state = {"goal_seeds": [dict({"id": "seed-001", "status": status}, **extra)]}
+        return state, state["goal_seeds"][0]
+
+    def test_resolve_seed_missing_and_invalid(self):
+        st = {"goal_seeds": []}
+        self.assertIsNone(ap_state.resolve_seed(st, "seed-999", "promoted"))
+        self.assertIsNone(ap_state.resolve_seed(st, "seed-001", "bogus"))
+        self.assertEqual(st, {"goal_seeds": []})
+
+    def test_resolve_seed_terminal_is_immutable(self):
+        for terminal in ("verified", "refuted", "rejected"):
+            st, seed = self._seed(status=terminal)
+            for target in ("open", "promoted", "verified", "refuted", "rejected"):
+                self.assertIsNone(ap_state.resolve_seed(st, "seed-001", target), (terminal, target))
+            self.assertEqual(seed["status"], terminal)
+
+    def test_resolve_seed_reopen_clears_promotion_keeps_outcome(self):
+        st, seed = self._seed(status="promoted", promoted_at="T", promoted_candidate_id="candidate-005",
+                              outcome="")
+        seed["outcome"] = "earlier attempt"
+        self.assertIsNotNone(ap_state.resolve_seed(st, "seed-001", "open"))
+        self.assertEqual(seed["status"], "open")
+        self.assertNotIn("promoted_at", seed)
+        self.assertNotIn("promoted_candidate_id", seed)
+        self.assertEqual(seed["outcome"], "earlier attempt")
+
+    def test_resolve_seed_refuted_keeps_ledger_honest(self):
+        st, seed = self._seed(status="promoted", promoted_at="T", promoted_candidate_id="candidate-005")
+        self.assertIsNotNone(ap_state.resolve_seed(st, "seed-001", "refuted", notes="evidence gone"))
+        self.assertEqual(seed["status"], "refuted")
+        self.assertEqual(seed["outcome"], "evidence gone")
+        self.assertIn("promoted_at", seed)
+        self.assertIn("refuted_at", seed)
+
+    # -- _score_expected confidence adversarial -------------------------------
+    def _score_confidence(self, confidence, origin="predicted"):
+        candidate = {"id": "c", "title": "t", "value": 4, "effort": 2,
+                     "origin": origin, "confidence": confidence}
+        score, breakdown = ap_state._score_expected(candidate, type_stats={})
+        return breakdown["confidence_factor"]
+
+    def test_confidence_adversarial_table(self):
+        fallback = 0.75
+        cases = [
+            (True, fallback), (False, fallback), ("high", fallback), (None, fallback),
+            (1.7, fallback), (-0.2, fallback), (0.5, 0.5), (1.0, 1.0),
+        ]
+        for confidence, expected in cases:
+            self.assertEqual(self._score_confidence(confidence), expected, confidence)
+
+    def test_confidence_nan_and_inf_fall_back(self):
+        # NaN fails the chained range test (min/max would return 1.0); inf too.
+        self.assertEqual(self._score_confidence(float("nan")), 0.75)
+        self.assertEqual(self._score_confidence(float("inf")), 0.75)
+
+    def test_observed_confidence_forced_to_one(self):
+        self.assertEqual(self._score_confidence(0.1, origin="observed"), 1.0)
+
+    def test_nan_review_score_never_poisons_calibration(self):
+        backlog = {"candidates": [
+            {"id": "a", "title": "t", "type": "bugfix", "status": "completed",
+             "value": 4, "effort": 2, "review_score": float("nan")},
+        ]}
+        stats = ap_state.compute_type_stats(backlog)
+        self.assertEqual(stats["bugfix"]["review_n"], 0)
+        self.assertEqual(stats["bugfix"]["calibration"], 1.0)
+        account = ap_state.compute_predicted_account({"candidates": [
+            {"id": "b", "title": "t", "status": "completed", "origin": "predicted",
+             "review_score": float("nan")},
+        ]})
+        self.assertEqual(account["review_n"], 0)
+
+    def test_overflow_values_do_not_crash_resolvers(self):
+        self.assertEqual(ap_state._resolved_value({"value": float("inf")}), 3)
+        self.assertEqual(ap_state._resolved_effort({"effort": float("inf")}), 3)
+
+    # -- _next_sequential_id monotonic after truncation -----------------------
+    def test_sequential_id_never_reuses_truncated_ids(self):
+        st = {"goal_seeds": [{"id": "seed-{:03d}".format(i), "title": str(i)} for i in range(1, 51)]}
+        self.assertEqual(ap_state._next_sequential_id(st, "goal_seeds", "seed-"), "seed-051")
+        st["goal_seeds"] = st["goal_seeds"][1:]  # seed-001 truncated away
+        self.assertEqual(ap_state._next_sequential_id(st, "goal_seeds", "seed-"), "seed-052")
+
+    # -- _mark_selection quota edges ------------------------------------------
+    @staticmethod
+    def _entry(entry_id, origin=None, below=False, score=5.0):
+        entry = {"id": entry_id, "title": entry_id, "type": "refactor", "status": "pending",
+                 "ready": True, "score": score, "below_floor": below}
+        if origin:
+            entry["origin"] = origin
+        return entry
+
+    def _cfg(self, quota=1):
+        return {"candidates_per_round": 3, "max_same_type_per_round": 2,
+                "max_predicted_per_round": quota}
+
+    def test_below_floor_predicted_respects_quota(self):
+        entries = [
+            self._entry("p1", origin="predicted", score=5.0),
+            self._entry("p2", origin="predicted", score=4.0),
+            self._entry("qp", origin="predicted", below=True, score=1.0),
+        ]
+        ap_state._mark_selection(entries, self._cfg(quota=0))
+        self.assertFalse(any(e.get("selected") for e in entries))
+
+        entries = [
+            self._entry("p1", origin="predicted", score=5.0),
+            self._entry("p2", origin="predicted", score=4.0),
+            self._entry("qp", origin="predicted", below=True, score=1.0),
+        ]
+        ap_state._mark_selection(entries, self._cfg(quota=1))
+        selected = [e["id"] for e in entries if e.get("selected")]
+        self.assertEqual(selected, ["p1"])  # main-loop slot consumed; below skipped
+
+    def test_below_floor_observed_still_fills_slot(self):
+        entries = [
+            self._entry("p1", origin="predicted", score=5.0),
+            self._entry("p2", origin="predicted", score=4.0),
+            self._entry("qo", below=True, score=1.0),
+        ]
+        ap_state._mark_selection(entries, self._cfg(quota=0))
+        selected = [e["id"] for e in entries if e.get("selected")]
+        self.assertEqual(selected, ["qo"])
+
+    def test_all_predicted_pool_selects_single_top(self):
+        entries = [
+            self._entry("p1", origin="predicted", score=5.0),
+            self._entry("p2", origin="predicted", score=4.0),
+            self._entry("p3", origin="predicted", score=3.0),
+        ]
+        ap_state._mark_selection(entries, self._cfg(quota=1))
+        selected = [e["id"] for e in entries if e.get("selected")]
+        self.assertEqual(selected, ["p1"])
+
+    def test_late_run_cuts_predicted_including_below(self):
+        entries = [
+            self._entry("p1", origin="predicted", score=5.0),
+            self._entry("qp", origin="predicted", below=True, score=1.0),
+            self._entry("obs", score=2.0),
+        ]
+        ap_state._mark_selection(entries, self._cfg(quota=1), progress=0.8)
+        selected = [e["id"] for e in entries if e.get("selected")]
+        self.assertEqual(selected, ["obs"])
+
+
+class PredictedHardeningTests(RepoTest):
+    """Subprocess regressions for the v1.3.2 hardening (audit-driven)."""
+
+    def test_seed_reject_command(self):
+        self.run_state("init", "--goal", "G", "--expand-after-goals", "--max-rounds", "50")
+        self.run_state("goal-met", "--goal", "G")
+        self.run_state("goal-met", "--goal", "G2", "--next-step", "N")
+        result = self.run_state("seed-reject", "--id", "seed-001", "--reason", "evidence gone")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        state = self.read_json("state.json")
+        seed = state["goal_seeds"][0]
+        self.assertEqual(seed["status"], "rejected")
+        self.assertEqual(seed["outcome"], "evidence gone")
+        # Rejected seeds leave the open-seeds list: the Wave 0 exception can fire.
+        brief = json.loads(self.run_state("check", "--brief").stdout)
+        self.assertEqual(brief["expansion"]["seeds"], [])
+        # promote / re-reject must fail
+        result = self.run_state("backlog-add", "--from-seed", "seed-001")
+        self.assertNotEqual(result.returncode, 0)
+        result = self.run_state("seed-reject", "--id", "seed-001", "--reason", "again")
+        self.assertNotEqual(result.returncode, 0)
+
+    def test_check_expansion_tolerates_corrupt_seed_entries(self):
+        self.run_state("init")
+        self.run_state("goal-met", "--goal", "G", "--next-step", "real seed")
+        state_path = self.repo / ".autopilot" / "state.json"
+        state = json.loads(state_path.read_text(encoding="utf-8"))
+        state["goal_seeds"] = ["oops", 42, None] + state["goal_seeds"]
+        state["goal_events"] = ["bad-event"] + state["goal_events"]
+        state_path.write_text(json.dumps(state), encoding="utf-8")
+        data = json.loads(self.run_state("check", "--brief").stdout)
+        self.assertEqual(data["phase"], "iterate")  # goals not met here; sanity
+
+    def test_corrupt_type_stats_clean_error(self):
+        self.run_state("init")
+        state_path = self.repo / ".autopilot" / "state.json"
+        state = json.loads(state_path.read_text(encoding="utf-8"))
+        state["type_stats"] = {"bugfix": "oops"}
+        state_path.write_text(json.dumps(state), encoding="utf-8")
+        result = self.run_state("check", "--brief")
+        self.assertNotEqual(result.returncode, 0)
+        self.assertNotIn("Traceback", result.stderr)
+        self.assertIn("type_stats", result.stderr)
+
+    def test_corrupt_backlog_clean_error(self):
+        self.run_state("init")
+        backlog_path = self.repo / ".autopilot" / "backlog.json"
+        backlog_path.write_text(json.dumps({"next_id": 2, "candidates": ["oops"]}), encoding="utf-8")
+        result = self.run_state("backlog-rank")
+        self.assertNotEqual(result.returncode, 0)
+        self.assertNotIn("Traceback", result.stderr)
+        self.assertIn("backlog.json", result.stderr)
+        result = self.run_state("check")
+        self.assertNotEqual(result.returncode, 0)
+        self.assertNotIn("Traceback", result.stderr)
+
+    def test_goal_met_dedupes_repeated_seeds(self):
+        self.run_state("init")
+        for _ in range(2):
+            result = self.run_state("goal-met", "--goal", "G", "--next-step", "same idea", "--json")
+            self.assertEqual(result.returncode, 0, result.stderr)
+        state = self.read_json("state.json")
+        self.assertEqual(len(state["goal_seeds"]), 1)
+
+    def test_goal_event_records_commit_sha_and_source_event_id(self):
+        self.run_state("init")
+        self.git("commit", "--allow-empty", "-q", "-m", "base")
+        self.run_state("begin-round", "--title", "t", "--reason", "r")
+        self.run_state("complete-round", "--commit-sha", "HEAD", "--summary", "s")
+        result = self.run_state("goal-met", "--goal", "G", "--next-step", "N", "--json")
+        payload = json.loads(result.stdout)
+        state = self.read_json("state.json")
+        event = state["goal_events"][0]
+        self.assertEqual(len(event["commit_shas"]), 1)
+        self.assertEqual(state["goal_seeds"][0]["source_event_id"], event["id"])
+
+    def test_multi_seed_multi_candidate_round_resolution(self):
+        self.run_state("init")
+        self.run_state("goal-met", "--goal", "G", "--next-step", "A", "--next-step", "B")
+        self.run_state("backlog-add", "--from-seed", "seed-001")
+        self.run_state("backlog-add", "--from-seed", "seed-002")
+        self.git("commit", "--allow-empty", "-q", "-m", "base")
+        self.run_state("begin-round", "--title", "t", "--reason", "r",
+                       "--candidate-id", "candidate-001", "--candidate-id", "candidate-002")
+        self.run_state("complete-round", "--summary", "both")
+        state = self.read_json("state.json")
+        self.assertEqual([s["status"] for s in state["goal_seeds"]], ["verified", "verified"])
+
+    def test_seed_writeback_warns_on_missing_seed(self):
+        self.run_state("init")
+        self.run_state("goal-met", "--goal", "G", "--next-step", "N")
+        self.run_state("backlog-add", "--from-seed", "seed-001")
+        state_path = self.repo / ".autopilot" / "state.json"
+        state = json.loads(state_path.read_text(encoding="utf-8"))
+        state["goal_seeds"] = []  # seed vanished (as if truncated)
+        state_path.write_text(json.dumps(state), encoding="utf-8")
+        self.git("commit", "--allow-empty", "-q", "-m", "base")
+        self.run_state("begin-round", "--title", "t", "--reason", "r", "--candidate-id", "candidate-001")
+        result = self.run_state("complete-round", "--summary", "s")
+        self.assertEqual(result.returncode, 0, result.stderr)  # no crash
+        log = (self.repo / ".autopilot" / "log.jsonl").read_text(encoding="utf-8")
+        self.assertIn("seed-writeback", log)
+        self.assertIn("missing", log)
+
+    def test_goal_met_text_mode_echoes_seed_ids(self):
+        self.run_state("init")
+        result = self.run_state("goal-met", "--goal", "G", "--next-step", "A", "--next-step", "B")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("Created direction seeds: seed-001, seed-002", result.stdout)
+
+    def test_backlog_add_requires_init(self):
+        result = self.run_state("backlog-add", "--title", "t", "--value", "3", "--effort", "1")
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("not initialized", result.stderr)
+        self.assertFalse((self.repo / ".autopilot" / "backlog.json").exists())
+        self.assertNotIn("candidate-", result.stdout)
+
+    def test_backlog_add_fails_closed_on_corrupt_state(self):
+        self.run_state("init")
+        (self.repo / ".autopilot" / "state.json").write_text("{ not json", encoding="utf-8")
+        result = self.run_state("backlog-add", "--title", "t", "--value", "3", "--effort", "1")
+        self.assertNotEqual(result.returncode, 0)
+        self.assertNotIn("Traceback", result.stderr)
+        self.assertNotIn("candidate-", result.stdout)
+
+    def test_goal_invisible_chars_cannot_fake_success(self):
+        self.run_state("init", "--goal", "提升测试质量", "--max-rounds", "5")
+        result = self.run_state("goal-met", "--goal", "提升测试质量\u200b")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        # The near-duplicate must not leave the run unable to stop.
+        data = json.loads(self.run_state("check", "--brief").stdout)
+        self.assertTrue(data["goals_met"])
+        self.assertFalse(data["continue"])
+
+    def test_goal_mismatch_warns(self):
+        self.run_state("init", "--goal", "real goal")
+        result = self.run_state("goal-met", "--goal", "totally different")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("does not match any configured goal", result.stderr)
+
+    def test_report_tables_survive_hostile_titles(self):
+        self.run_state("init")
+        self.run_state("backlog-add", "--title", "line1\nline2|PIPE\tTAB", "--value", "3", "--effort", "1")
+        self.run_state("goal-met", "--goal", "G", "--next-step", "stepA\nstepB|X")
+        output = self.run_state("report").stdout
+        self.assertNotIn("line1\nline2", output)
+        self.assertNotIn("stepA\nstepB", output)
+        self.assertIn("line1 line2\\|PIPE TAB", output)
+        self.assertIn("stepA stepB\\|X", output)
+
+    def test_guard_backslash_deny_matches(self):
+        # A Windows-style deny rule used to silently never match (fail-open).
+        self.assertFalse(path_allowed("secrets/prod/keys.txt", [], ["secrets\\"]))
+        self.assertFalse(path_allowed("secrets/prod/keys.txt", [], ["secrets/"]))
+
+    def test_guard_globstar_matches_zero_directories(self):
+        self.assertFalse(path_allowed("src/a.py", [], ["src/**/*.py"]))
+        self.assertFalse(path_allowed("src/deep/b.py", [], ["src/**/*.py"]))
+        self.assertTrue(path_allowed("src/a.py", ["src/**/*.py"], []))
+        # Bare "*.log" matches by basename under subdirectories.
+        self.assertFalse(path_allowed("notes/a.log", [], ["*.log"]))
+        self.assertTrue(path_allowed("notes/a.log", ["*.log"], []))
+
+    def test_secret_patterns_pkcs8_and_github_variants(self):
+        self.assertTrue(_secret_hit("-----BEGIN ENCRYPTED PRIVATE KEY-----"))
+        self.assertTrue(_secret_hit("-----BEGIN OPENSSH PRIVATE KEY-----"))
+        self.assertTrue(_secret_hit("token: gho_" + "a" * 36))
+        self.assertTrue(_secret_hit("token: ghs_" + "b" * 36))
+        self.assertTrue(_secret_hit("key = " + "sk-proj-" + "c" * 30))
+
+    def test_secret_sk_pattern_word_boundary(self):
+        self.assertFalse(_secret_hit("the task-runner-configuration-for-nightly job"))
+        self.assertFalse(_secret_hit("disk-utility-backup-script-v2 archive"))
+        self.assertTrue(_secret_hit('"sk-live-abcdefghijklmnopqrst"'))
+
+    def test_version_consistency_across_files(self):
+        """Single version authority (scripts/autopilot/__init__.py __version__)
+        must match SKILL.md frontmatter, agents/openai.yaml, README.md, and the
+        newest CHANGELOG section — drift fails here instead of at release time."""
+        import autopilot
+
+        repo_root = Path(__file__).resolve().parent.parent
+        version = autopilot.__version__
+        skill = (repo_root / "SKILL.md").read_text(encoding="utf-8")
+        self.assertIn("version: {}".format(version), skill)
+        yaml_text = (repo_root / "agents" / "openai.yaml").read_text(encoding="utf-8")
+        self.assertIn("version: {}".format(version), yaml_text)
+        readme = (repo_root / "README.md").read_text(encoding="utf-8")
+        self.assertIn("Version {}".format(version), readme)
+        changelog = (repo_root / "CHANGELOG.md").read_text(encoding="utf-8")
+        self.assertIn("## {} (".format(version), changelog)
+
+    def test_parse_deadline_overflow_returns_none(self):
+        from autopilot import io as ap_io
+        self.assertIsNone(ap_io.parse_deadline("+" + "9" * 30 + "w"))
+        self.assertIsNone(ap_io.parse_deadline("+not-a-duration"))
+        self.assertIsNotNone(ap_io.parse_deadline("+1h"))
+
+    def test_git_push_prefers_origin_over_alphabetical_first(self):
+        """Multi-remote repos (fork + origin, standard contribution setup) must
+        not push to the alphabetically-first remote when no upstream is set."""
+        origin = Path(self.tmp) / "origin.git"
+        fork = Path(self.tmp) / "a-fork.git"  # sorts before "origin"
+        for remote in (origin, fork):
+            self.git("init", "-q", "--bare", str(remote))
+        self.git("remote", "add", "fork", str(fork))
+        self.git("remote", "add", "origin", str(origin))
+        self.add_file("f.py")
+        self.git("commit", "-q", "-m", "x")
+        branch = (self.repo / ".git" / "HEAD").read_text(encoding="utf-8").strip().split("/")[-1]
+        output, err = ap_io.git_push(self.repo)
+        self.assertIsNone(err, err)
+        fork_heads = self.git("ls-remote", str(fork), "refs/heads/" + branch).stdout.strip()
+        origin_heads = self.git("ls-remote", str(origin), "refs/heads/" + branch).stdout.strip()
+        self.assertNotEqual(origin_heads, "", "origin (preferred) must receive the push")
+        self.assertEqual(fork_heads, "", "the alphabetically-first fork must be skipped")
+
+    def test_directive_remove_by_index(self):
+        self.run_state("init")
+        self.run_state("directive-add", "--text", "rule one")
+        self.run_state("directive-add", "--text", "rule two")
+        result = self.run_state("directive-remove", "--index", "1")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("rule one", result.stdout)
+        directives = json.loads(self.run_state("directive-list").stdout)
+        self.assertEqual([d["text"] for d in directives["directives"]], ["rule two"])
+        result = self.run_state("directive-remove", "--index", "5")
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("between 1 and 1", result.stderr)
+
+    def test_state_migration_is_logged(self):
+        self.run_state("init")
+        state_path = self.repo / ".autopilot" / "state.json"
+        state = json.loads(state_path.read_text(encoding="utf-8"))
+        state["schema"] = 5
+        state.pop("goal_seeds", None)
+        state_path.write_text(json.dumps(state), encoding="utf-8")
+        self.run_state("read")
+        disk = json.loads(state_path.read_text(encoding="utf-8"))
+        self.assertEqual(disk["schema"], 6)
+        log = (self.repo / ".autopilot" / "log.jsonl").read_text(encoding="utf-8")
+        self.assertIn("state-migrate", log)
+
+    def test_real_subprocess_exit_code_and_utf8(self):
+        """Contract for the real entry point that in-process runs can't cover:
+        process exit code, and UTF-8 stdio without PYTHONIOENCODING (the CLI
+        wraps its own streams)."""
+        self.run_state("init")
+        self.run_state("goal-met", "--goal", "G", "--next-step", "seed \U0001f680 title")
+        env = dict(self.env)
+        env.pop("PYTHONIOENCODING", None)
+        result = subprocess.run(
+            [sys.executable, str(self.script), "check", "--brief", "--repo", str(self.repo)],
+            stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+            universal_newlines=True, encoding="utf-8", errors="replace",
+            env=env, timeout=60,
+        )
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertNotIn("Traceback", result.stderr)
+        result = subprocess.run(
+            [sys.executable, str(self.script), "check", "--repo", str(self.repo.parent)],
+            stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+            universal_newlines=True, encoding="utf-8", errors="replace",
+            env=env, timeout=60,
+        )
+        self.assertNotEqual(result.returncode, 0)
+        self.assertNotIn("Traceback", result.stderr)
+
+    def test_corrupt_directives_clean_error(self):
+        self.run_state("init")
+        path = self.repo / ".autopilot" / "directives.json"
+        path.write_text("[]", encoding="utf-8")
+        for command, args in (("directive-add", ("--text", "t")),
+                              ("directive-list", ()),
+                              ("directive-remove", ("--index", "1"))):
+            result = self.run_state(command, *args)
+            self.assertNotEqual(result.returncode, 0, command)
+            self.assertNotIn("Traceback", result.stderr)
+            self.assertIn("directives.json", result.stderr)
+
+    def test_current_round_missing_round_key_clean_error(self):
+        self.run_state("init")
+        state_path = self.repo / ".autopilot" / "state.json"
+        state = json.loads(state_path.read_text(encoding="utf-8"))
+        state["current_round"] = {"title": "broken"}
+        state_path.write_text(json.dumps(state), encoding="utf-8")
+        for command, args in (("complete-round", ("--summary", "s")),
+                              ("block-round", ("--reason", "r")),
+                              ("cancel-round", ("--reason", "r"))):
+            result = self.run_state(command, *args)
+            self.assertNotEqual(result.returncode, 0, command)
+            self.assertNotIn("Traceback", result.stderr)
+            self.assertIn("current_round.round", result.stderr)
+
+    def test_history_junk_clean_error(self):
+        self.run_state("init")
+        state_path = self.repo / ".autopilot" / "state.json"
+        state = json.loads(state_path.read_text(encoding="utf-8"))
+        state["history"] = ["junk"]
+        state_path.write_text(json.dumps(state), encoding="utf-8")
+        result = self.run_state("check", "--brief")
+        self.assertNotEqual(result.returncode, 0)
+        self.assertNotIn("Traceback", result.stderr)
+        self.assertIn("history", result.stderr)
+
+    def test_init_rejects_negative_max_predicted(self):
+        result = self.run_state("init", "--max-predicted-per-round", "-1")
+        self.assertNotEqual(result.returncode, 0)
+        self.assertNotIn("Traceback", result.stderr)
+        result = self.run_state("init", "--max-predicted-per-round", "0")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        cfg = json.loads((self.repo / ".autopilot" / "config.json").read_text(encoding="utf-8"))
+        self.assertEqual(cfg["max_predicted_per_round"], 0)
+
+    def test_seed_field_junk_falls_back(self):
+        self.run_state("init")
+        state_path = self.repo / ".autopilot" / "state.json"
+        state = json.loads(state_path.read_text(encoding="utf-8"))
+        state["goal_seeds"] = [{"id": "seed-001", "status": "open", "title": "junk",
+                                "type": "refactor", "value": "4", "effort": "oops", "risk": "2"}]
+        state_path.write_text(json.dumps(state), encoding="utf-8")
+        result = self.run_state("backlog-add", "--from-seed", "seed-001")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        backlog = self.read_json("backlog.json")
+        candidate = backlog["candidates"][0]
+        self.assertEqual(candidate["value"], 4)   # "4" coerced
+        self.assertEqual(candidate["effort"], 3)  # junk -> legacy default
+        self.assertEqual(candidate["risk"], 2)    # "2" coerced
 
 
 class DirectionSeedTests(RepoTest):
@@ -2505,6 +3033,34 @@ class ContractTests(RepoTest):
         )
         self.assertIn(data["action_hint"], ("work", "expand", "stop"))
 
+    def test_detect_agent_contract_with_autopilot_state(self):
+        """Cross-contract (seed-001): detect-agent's key set must not drift when
+        the repo already carries .autopilot state (the common mid-run case)."""
+        self.run_state("init")
+        self.run_state("goal-met", "--goal", "G", "--next-step", "N")
+        env = dict(self.env)
+        for var in ("OPENCODE", "CLAUDE_CODE", "CODEX", "AUTOPILOT_AGENT", "SKILL_DIR"):
+            env.pop(var, None)
+        result = subprocess.run(
+            [sys.executable, str(self.script), "detect-agent", "--repo", str(self.repo), "--home", str(self.tmp)],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            universal_newlines=True,
+            encoding="utf-8",
+            errors="replace",
+            env=env,
+        )
+        self.assertEqual(result.returncode, 0, result.stderr)
+        data = json.loads(result.stdout)
+        self.assertEqual(
+            set(data),
+            {"agent", "label", "detected_by", "shell", "python_cmd", "skill_dir",
+             "project_marker", "agent_config", "adaptation"},
+        )
+        # Seed/expand context must not leak into the agent-detection payload.
+        self.assertNotIn("expansion", data)
+        self.assertNotIn("goal_seeds", data)
+
     def test_detect_agent_contract(self):
         env = dict(self.env)
         for var in ("OPENCODE", "CLAUDE_CODE", "CODEX", "AUTOPILOT_AGENT", "SKILL_DIR"):
@@ -2616,6 +3172,8 @@ class ConfigValidationMatrixTests(RepoTest):
         ("min_candidate_value", {"min_candidate_value": 9}, "'min_candidate_value' must be"),
         ("max_same_type_per_round", {"max_same_type_per_round": 0}, "'max_same_type_per_round' must be"),
         ("min_pending_candidates", {"min_pending_candidates": -1}, "'min_pending_candidates' must be"),
+        ("max_predicted_per_round", {"max_predicted_per_round": -1}, "'max_predicted_per_round' must be"),
+        ("max_predicted_per_round_bool", {"max_predicted_per_round": True}, "'max_predicted_per_round' must be"),
     ]
 
     def test_validation_matrix(self):

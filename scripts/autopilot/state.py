@@ -4,10 +4,36 @@ import json
 import math
 import re
 import sys
+import unicodedata
 import uuid
 from datetime import datetime, timezone
 
 from . import config, io
+
+_ZERO_WIDTH_CHARS = ("\u200b", "\u200c", "\u200d", "\ufeff")
+
+
+def normalize_goal_text(text):
+    """Canonical comparison form for goal strings: NFC + zero-width/BOM
+    removal + whitespace strip. Guards the goal-met -> stop-condition chain:
+    a zero-width space used to make `goal-met` report success while
+    all_goals_met stayed False forever (the loop could never stop)."""
+    if not isinstance(text, str):
+        return text
+    cleaned = unicodedata.normalize("NFC", text)
+    for char in _ZERO_WIDTH_CHARS:
+        cleaned = cleaned.replace(char, "")
+    return cleaned.strip()
+
+
+def table_cell(text):
+    """Make arbitrary text safe inside a markdown table cell: physical
+    newlines/tabs become spaces (they break the row into phantom rows) and
+    pipes are escaped (they create phantom columns)."""
+    if not isinstance(text, str):
+        return text
+    cleaned = text.replace("|", "\\|")
+    return re.sub(r"[\r\n\t]+", " ", cleaned).strip()
 
 
 def default_state(repo, goals=None, config_fingerprint=None):
@@ -95,6 +121,13 @@ _STATE_INT_KEYS = (
 
 
 def _state_type_error(path, message):
+    # The integrity trail outlives this process's stderr: log before dying so
+    # the first detection of corrupted state is findable after the fact.
+    try:
+        io.append_log(path.parent.parent, "integrity", "error",
+                      file=str(path), message=message)
+    except Exception:
+        pass
     print(
         "[ERROR] Invalid .autopilot/state.json: {}. Fix or delete it and run init again.".format(message),
         file=sys.stderr,
@@ -112,12 +145,21 @@ def _validate_state_types(repo, state):
             _state_type_error(path, "'{}' must be a number, got {}".format(key, type(value).__name__))
     if not isinstance(state.get("history", []), list):
         _state_type_error(path, "'history' must be an array")
+    for entry in state.get("history", []):
+        if not isinstance(entry, dict):
+            _state_type_error(path, "'history' items must be objects")
     if not isinstance(state.get("completed_goals", []), list):
         _state_type_error(path, "'completed_goals' must be an array")
     if not isinstance(state.get("goals", []), list):
         _state_type_error(path, "'goals' must be an array")
     if not isinstance(state.get("type_stats", {}), dict):
         _state_type_error(path, "'type_stats' must be an object")
+    for key, value in (state.get("type_stats") or {}).items():
+        if not isinstance(value, dict):
+            _state_type_error(
+                path,
+                "'type_stats.{}' must be an object, got {}".format(key, type(value).__name__),
+            )
     if not isinstance(state.get("goal_events", []), list):
         _state_type_error(path, "'goal_events' must be an array")
     if not isinstance(state.get("goal_seeds", []), list):
@@ -125,6 +167,11 @@ def _validate_state_types(repo, state):
     current = state.get("current_round")
     if current is not None and not isinstance(current, dict):
         _state_type_error(path, "'current_round' must be an object or null")
+    if isinstance(current, dict) and not isinstance(current.get("round"), int):
+        # Without a valid round number every round-closing command would die in
+        # a KeyError while begin-round refuses (round already open) — a bricked
+        # run. Fail cleanly instead.
+        _state_type_error(path, "'current_round.round' must be a number")
 
 
 def load_state(repo):
@@ -141,12 +188,18 @@ def load_state(repo):
         raise SystemExit(2)
     changed = migrate_state(state)
     _validate_state_types(repo, state)
-    if state.get("schema", 1) < io.SCHEMA_VERSION:
+    old_schema = state.get("schema", 1)
+    if old_schema < io.SCHEMA_VERSION:
         state["schema"] = io.SCHEMA_VERSION
         changed = True
     state["repo"] = str(repo)
     if changed:
         save_state(repo, state)
+        # Schema upgrades and field backfills mutate the user's state file: an
+        # audit event makes "who changed state.json" answerable (migration, not
+        # corruption).
+        io.append_log(repo, "state-migrate", "success",
+                      from_schema=old_schema, to_schema=io.SCHEMA_VERSION)
     return state
 
 
@@ -155,7 +208,40 @@ def save_state(repo, state):
 
 
 def load_backlog(repo):
-    return io.load_json(config.backlog_path_for(repo), config.default_backlog())
+    backlog = io.load_json(config.backlog_path_for(repo), config.default_backlog())
+    _validate_backlog(repo, backlog)
+    return backlog
+
+
+def _validate_backlog(repo, backlog):
+    """Same fail-clean policy as state.json: a hand-corrupted backlog must die
+    with a clear message, not with a TypeError somewhere inside ranking."""
+    path = config.backlog_path_for(repo)
+
+    def fail(message):
+        try:
+            io.append_log(repo, "integrity", "error", file=str(path), message=message)
+        except Exception:
+            pass
+        print(
+            "[ERROR] Invalid .autopilot/backlog.json: {}. Fix or delete it and run init again.".format(message),
+            file=sys.stderr,
+        )
+        raise SystemExit(2)
+
+    if not isinstance(backlog, dict):
+        fail("must be a JSON object, got {}".format(type(backlog).__name__))
+    candidates = backlog.get("candidates")
+    if not isinstance(candidates, list):
+        fail("'candidates' must be an array")
+    for candidate in candidates:
+        if not isinstance(candidate, dict):
+            fail("every candidate must be an object")
+        if not isinstance(candidate.get("id"), str) or not candidate.get("id"):
+            fail("every candidate needs a non-empty string 'id'")
+    next_id = backlog.get("next_id")
+    if not isinstance(next_id, int) or isinstance(next_id, bool):
+        fail("'next_id' must be a number")
 
 
 def save_backlog(repo, backlog):
@@ -258,10 +344,12 @@ def saturated_types(state, threshold=2):
         threshold = 2
     result = []
     for candidate_type in sorted(state.get("type_stats") or {}):
-        entry = (state.get("type_stats") or {}).get(candidate_type) or {}
+        entry = (state.get("type_stats") or {}).get(candidate_type)
+        if not isinstance(entry, dict):
+            entry = {}
         try:
             completed = int(entry.get("completed") or 0)
-        except (TypeError, ValueError):
+        except (TypeError, ValueError, OverflowError):
             completed = 0
         if completed >= threshold:
             result.append(candidate_type)
@@ -269,13 +357,22 @@ def saturated_types(state, threshold=2):
 
 
 def _next_sequential_id(state, key, prefix):
-    """Next zero-padded id (`ge-003` / `seed-011`) that does not collide with
-    existing entries, even after truncation dropped the oldest ones."""
+    """Next zero-padded id (`ge-003` / `seed-011`). The counter is MONOTONIC:
+    it starts past the highest suffix ever issued (not just past existing
+    entries), so ids truncated away by the bounded lists are never reused —
+    a stale candidate.from_seed can never come to point at a newer, unrelated
+    seed."""
     existing = set()
+    max_counter = 0
     for item in state.get(key) or []:
-        if isinstance(item, dict) and str(item.get("id") or "").startswith(prefix):
-            existing.add(str(item.get("id")))
-    counter = 1
+        if isinstance(item, dict):
+            item_id = str(item.get("id") or "")
+            if item_id.startswith(prefix):
+                existing.add(item_id)
+                suffix = item_id[len(prefix):]
+                if suffix.isdigit():
+                    max_counter = max(max_counter, int(suffix))
+    counter = max_counter + 1
     while "{}{:03d}".format(prefix, counter) in existing:
         counter += 1
     return "{}{:03d}".format(prefix, counter)
@@ -329,14 +426,18 @@ def resolve_seed(st, seed_id, status, notes=None, candidate_id=None):
     """Move a seed along its state machine. Returns the seed or None.
       open -> promoted (backlog-add --from-seed) -> verified (complete-round)
                                                  -> refuted  (block-round)
-      open -> rejected (value-gate refusal)
-    Cancelling a round returns its seeds to `open` (stale promotion markers are
-    cleared). Failed hypotheses never flow back silently: a refuted seed keeps
-    its notes so the hit-rate statistics stay honest."""
+      open -> rejected (seed-reject: value-gate / evidence check refused it)
+      promoted -> open (cancel-round write-back)
+    Terminal states (verified/refuted/rejected) are immutable — a cancelled
+    round can never resurrect a seed the statistics already counted. Failed
+    hypotheses never flow back silently: a refuted seed keeps its notes so the
+    hit-rate statistics stay honest."""
     seed = find_seed(st, seed_id)
     if seed is None:
         return None
     if status not in SEED_STATUSES:
+        return None
+    if seed.get("status") in ("verified", "refuted", "rejected"):
         return None
     now = io.now_iso()
     seed["status"] = status
@@ -531,8 +632,8 @@ def all_goals_met(cfg, state):
     goals = cfg.get("goals") or state.get("goals") or []
     if not goals:
         return False
-    completed_goals = set(state.get("completed_goals") or [])
-    return all(goal in completed_goals for goal in goals)
+    completed = {normalize_goal_text(goal) for goal in state.get("completed_goals") or []}
+    return all(normalize_goal_text(goal) in completed for goal in goals)
 
 
 def _candidate_score(candidate):
@@ -545,7 +646,7 @@ def _candidate_score(candidate):
     try:
         value = int(value)
         effort = int(effort)
-    except (TypeError, ValueError):
+    except (TypeError, ValueError, OverflowError):
         value, effort = 3, 3
     if effort <= 0:
         effort = 1
@@ -562,7 +663,7 @@ def _resolved_value(candidate):
         value = config.LEGACY_IMPACT_SCORE.get(candidate.get("impact"), 3)
     try:
         return max(1, min(5, int(value)))
-    except (TypeError, ValueError):
+    except (TypeError, ValueError, OverflowError):
         return 3
 
 
@@ -572,7 +673,7 @@ def _resolved_effort(candidate):
         effort = config.LEGACY_EFFORT_SCORE.get(effort, 3)
     try:
         effort = int(effort)
-    except (TypeError, ValueError):
+    except (TypeError, ValueError, OverflowError):
         return 3
     return max(1, min(5, effort))
 
@@ -616,7 +717,9 @@ def compute_type_stats(backlog):
                 except (TypeError, ValueError):
                     pass
                 review = candidate.get("review_score")
-                if isinstance(review, (int, float)) and not isinstance(review, bool):
+                # `review == review` rejects NaN, which would poison the average
+                # and the calibration factor.
+                if isinstance(review, (int, float)) and not isinstance(review, bool) and review == review:
                     entry["review_sum"] += review
                     entry["review_n"] += 1
             else:
@@ -676,7 +779,7 @@ def compute_predicted_account(backlog):
         if status == "completed":
             completed += 1
             review = candidate.get("review_score")
-            if isinstance(review, (int, float)) and not isinstance(review, bool):
+            if isinstance(review, (int, float)) and not isinstance(review, bool) and review == review:
                 review_sum += review
                 review_n += 1
         elif status == "blocked":
@@ -703,7 +806,7 @@ def _score_classic(candidate, type_stats=None, saturation_threshold=2):
     base = _candidate_score(candidate)
     try:
         risk = int(candidate.get("risk") or 1)
-    except (TypeError, ValueError):
+    except (TypeError, ValueError, OverflowError):
         risk = 1
     risk = max(1, min(5, risk))
     risk_factor = max(0.5, 1.0 - 0.08 * (risk - 1))
@@ -780,9 +883,15 @@ def _score_expected(candidate, type_stats=None, saturation_threshold=2,
         confidence = 1.0
     else:
         confidence = candidate.get("confidence")
-        if not isinstance(confidence, (int, float)) or isinstance(confidence, bool):
+        if (
+            not isinstance(confidence, (int, float))
+            or isinstance(confidence, bool)
+            # Chained range test: NaN and +-inf fail it and fall back to the
+            # default instead of poisoning the discount (NaN bypasses min/max).
+            or not (0.5 <= float(confidence) <= 1.0)
+        ):
             confidence = 0.75
-        confidence = max(0.5, min(1.0, float(confidence)))
+        confidence = float(confidence)
     confidence_factor = confidence
 
     based_on = candidate.get("based_on")
@@ -792,7 +901,7 @@ def _score_expected(candidate, type_stats=None, saturation_threshold=2,
 
     try:
         risk = int(candidate.get("risk") or 1)
-    except (TypeError, ValueError):
+    except (TypeError, ValueError, OverflowError):
         risk = 1
     risk = max(1, min(5, risk))
     risk_factor = max(0.3, 1.0 - risk_weight * (risk - 1))
@@ -909,7 +1018,15 @@ def _mark_selection(entries, cfg, progress=None):
         if (entry.get("origin") or "observed") != "observed":
             predicted_count += 1
     if len(selected) < n and below:
-        selected.append(below[0])
+        # The quick-win fallback obeys the same predicted quota / late-run cut as
+        # the main loop, or a below-floor predicted candidate would bypass both.
+        entry = below[0]
+        if (entry.get("origin") or "observed") != "observed":
+            if predicted_count < predicted_quota:
+                selected.append(entry)
+                predicted_count += 1
+        else:
+            selected.append(entry)
     for entry in selected:
         entry["selected"] = True
 
@@ -993,7 +1110,24 @@ def directives_path_for(repo):
 
 
 def load_directives(repo):
-    return io.load_json(directives_path_for(repo), {"directives": []})
+    directives = io.load_json(directives_path_for(repo), {"directives": []})
+    path = directives_path_for(repo)
+    if not isinstance(directives, dict) or not isinstance(directives.get("directives"), list):
+        print(
+            "[ERROR] Invalid .autopilot/directives.json: must be an object with a "
+            "'directives' array. Fix or delete it and run init again.",
+            file=sys.stderr,
+        )
+        raise SystemExit(2)
+    for entry in directives["directives"]:
+        if not isinstance(entry, dict):
+            print(
+                "[ERROR] Invalid .autopilot/directives.json: every directive must be an object. "
+                "Fix or delete it and run init again.",
+                file=sys.stderr,
+            )
+            raise SystemExit(2)
+    return directives
 
 
 def save_directives(repo, directives):
@@ -1107,7 +1241,7 @@ def build_retrospective(repo, state, cfg, lang="zh"):
     else:
         for entry in blocked:
             out.append("- round {}: {} — {}".format(
-                entry.get("round", "?"), entry.get("title", ""), entry.get("reason", "")
+                entry.get("round", "?"), table_cell(entry.get("title", "")), table_cell(entry.get("reason", ""))
             ))
     out.append("")
 
@@ -1121,7 +1255,10 @@ def build_retrospective(repo, state, cfg, lang="zh"):
             out.append("- `{}`".format(command))
     out.append("")
 
-    ranked = rank_candidates(backlog, cfg, progress=progress_from_state(state, cfg))
+    ranked = rank_candidates(
+        backlog, cfg, progress=progress_from_state(state, cfg),
+        completed_goals=list(state.get("completed_goals") or []),
+    )
     ready = [r for r in ranked if r.get("status") == "pending" and r.get("ready")]
     out.append("## {}".format("下一步建议" if zh else "Next likely improvement"))
     out.append("")
@@ -1130,7 +1267,7 @@ def build_retrospective(repo, state, cfg, lang="zh"):
     else:
         top = ready[0]
         out.append("- {} `{}` (value={}, effort={}, type={})".format(
-            top.get("id"), top.get("title"), top.get("value"), top.get("effort"), top.get("type") or "feature"
+            top.get("id"), table_cell(top.get("title")), top.get("value"), top.get("effort"), top.get("type") or "feature"
         ))
     out.append("")
     return "\n".join(out)
@@ -1222,7 +1359,7 @@ def build_report(repo, state, cfg, lang="en"):
                 sha = "`{}`".format(sha[:12])
             tokens = entry.get("estimated_tokens", "")
             out.append("| {} | {} | {} | {} | {} |".format(
-                entry.get("round", ""), label, entry.get("title", ""), sha, tokens
+                entry.get("round", ""), label, table_cell(entry.get("title", "")), sha, tokens
             ))
     out.append("")
 
@@ -1240,7 +1377,7 @@ def build_report(repo, state, cfg, lang="en"):
             if c.get("origin") == "predicted":
                 title = "[P] " + title
             out.append("| `{}` | {} | {} | {}/{} | {} |".format(
-                c.get("id", ""), title, c.get("type") or "feature",
+                c.get("id", ""), table_cell(title), c.get("type") or "feature",
                 c.get("value", ""), c.get("effort", ""), label,
             ))
     out.append("")
@@ -1261,7 +1398,7 @@ def build_report(repo, state, cfg, lang="en"):
                 status_label = L["seed_status"].get(seed.get("status", "open"), seed.get("status", "open"))
                 out.append("| `{}` | {} | {} | {} | {} |".format(
                     seed.get("id", ""), status_label, seed.get("type") or "feature",
-                    seed.get("title", ""), seed.get("source_goal", ""),
+                    table_cell(seed.get("title", "")), table_cell(seed.get("source_goal", "")),
                 ))
         if predicted_account.get("done"):
             out.append("")
@@ -1287,14 +1424,17 @@ def build_report(repo, state, cfg, lang="en"):
             out.append("```")
             out.append("")
 
-    ranked = rank_candidates(backlog_data, cfg, progress=progress_from_state(state, cfg))
+    ranked = rank_candidates(
+        backlog_data, cfg, progress=progress_from_state(state, cfg),
+        completed_goals=list(state.get("completed_goals") or []),
+    )
     ready = [r for r in ranked if r.get("status") == "pending" and r.get("ready")]
     if ready:
         top = ready[0]
         out.append("## {}".format(L["next"]))
         out.append("")
         out.append("- {} `{}` (value={}, effort={}, type={}, score={})".format(
-            top.get("id"), top.get("title"), top.get("value"), top.get("effort"),
+            top.get("id"), table_cell(top.get("title")), top.get("value"), top.get("effort"),
             top.get("type") or "feature", top.get("score"),
         ))
         out.append("")

@@ -249,7 +249,13 @@ def cmd_begin_round(args):
                 candidate = state.find_candidate(backlog, cid)
                 if candidate is None:
                     io.append_log(repo, "begin-round", "error", reason="candidate not found")
-                    return emit_result(args, False, "[ERROR] Candidate not found in backlog: {}".format(cid))
+                    pending_ids = [c.get("id") for c in backlog.get("candidates") or []
+                                   if c.get("status") == "pending"]
+                    hint = ", ".join(str(p) for p in pending_ids[:5]) if pending_ids else "none (run backlog-rank)"
+                    return emit_result(
+                        args, False,
+                        "[ERROR] Candidate not found in backlog: {}. Pending: {}".format(cid, hint),
+                    )
                 missing, ready = state.candidate_deps_status(backlog, candidate)
                 if not ready:
                     io.append_log(repo, "begin-round", "error", reason="candidate deps unresolved", deps=missing)
@@ -303,9 +309,10 @@ def cmd_begin_round(args):
                 file=sys.stderr,
             )
 
-        start_sha = None
-        if io.has_commits(repo):
-            start_sha = io.run_git(repo, "rev-parse", "HEAD").stdout.strip()
+        # One rev-parse answers "has commits?" and yields the SHA together
+        # (has_commits + rev-parse would be two identical-cost calls).
+        head = io.run_git(repo, "rev-parse", "--verify", "-q", "HEAD")
+        start_sha = head.stdout.strip() if head.returncode == 0 else None
 
         current = {
             "round": round_number,
@@ -341,38 +348,56 @@ def _refresh_type_stats(repo, st):
     st["type_stats"] = state.compute_type_stats(state.load_backlog(repo))
 
 
-def _resolve_round_seeds(repo, current, outcome, notes=None):
-    """Seed write-back after a round closes: candidates promoted from seeds
-    (`from_seed`) resolve their seed to verified (completed round), refuted
-    (blocked round, notes = the block reason — failed hypotheses keep their
-    evidence and never re-enter the pool to game the stats), or open again
-    (cancelled round, the candidate returns to pending)."""
+def _resolve_round_seeds_in_state(repo, st, current, outcome, notes=None):
+    """Seed write-back for one closing round, mutated into the caller's state so
+    the round close persists backlog + seed ledger without a crash window.
+    Only seeds PROMOTED BY THIS ROUND's candidates are touched: a stale
+    candidate from an earlier round completing must never verify/refute a seed
+    that was since re-promoted elsewhere. completed -> verified, blocked ->
+    refuted (+notes: failed hypotheses keep their evidence), cancelled -> open."""
     backlog = state.load_backlog(repo)
+    round_ids = set(state.round_candidate_ids(current))
     seed_ids = []
-    for candidate_id in state.round_candidate_ids(current):
+    for candidate_id in round_ids:
         candidate = state.find_candidate(backlog, candidate_id)
         from_seed = (candidate or {}).get("from_seed")
         if from_seed and from_seed not in seed_ids:
             seed_ids.append(from_seed)
-    if not seed_ids:
-        return
-    st = state.load_state(repo)
     for seed_id in seed_ids:
+        seed = state.find_seed(st, seed_id)
+        if seed is None:
+            print(
+                "[WARN] seed-writeback: seed {} no longer exists (truncated?); skipped.".format(seed_id),
+                file=sys.stderr,
+            )
+            io.append_log(repo, "seed-writeback", "warn", seed=seed_id, reason="missing")
+            continue
+        owner = seed.get("promoted_candidate_id")
+        if owner is not None and owner not in round_ids:
+            print(
+                "[WARN] seed-writeback: seed {} is owned by candidate {}, not this round; skipped.".format(
+                    seed_id, owner
+                ),
+                file=sys.stderr,
+            )
+            io.append_log(repo, "seed-writeback", "warn", seed=seed_id, reason="not owned by this round", owner=owner)
+            continue
         if outcome == "completed":
-            state.resolve_seed(st, seed_id, "verified", candidate_id=None)
+            state.resolve_seed(st, seed_id, "verified")
         elif outcome == "blocked":
             state.resolve_seed(st, seed_id, "refuted", notes=notes)
         else:
             state.resolve_seed(st, seed_id, "open")
-    state.save_state(repo, st)
-    io.append_log(repo, "seed-writeback", "success", seeds=seed_ids, outcome=outcome)
+        io.append_log(repo, "seed-writeback", "success", seed=seed_id, outcome=outcome)
 
 
 def _close_round(repo, st, current, status, counter_key, tokens, history_entry,
-                 candidate_status, candidate_round=None, candidate_extra=None):
+                 candidate_status, candidate_round=None, candidate_extra=None,
+                 seed_outcome=None, seed_notes=None):
     """Shared round-closing bookkeeping: bump the round counter, append tokens,
     record bounded history, release the round, update candidates in one backlog
-    pass, refresh type stats, and persist state."""
+    pass, resolve this round's seeds into the SAME state save, refresh type
+    stats, and persist state."""
     if counter_key:
         st[counter_key] = st.get(counter_key, 0) + 1
     if tokens:
@@ -385,6 +410,8 @@ def _close_round(repo, st, current, status, counter_key, tokens, history_entry,
         repo, state.round_candidate_ids(current), candidate_status, candidate_round,
         extra_fields=candidate_extra,
     )
+    if seed_outcome is not None:
+        _resolve_round_seeds_in_state(repo, st, current, seed_outcome, seed_notes)
     _refresh_type_stats(repo, st)
     state.save_state(repo, st)
 
@@ -461,12 +488,12 @@ def cmd_complete_round(args):
             candidate_extra=(
                 {"review_score": args.review_score} if getattr(args, "review_score", None) is not None else None
             ),
+            seed_outcome="completed",
         )
         io.append_log(
             repo, "complete-round", "success",
             round=current["round"], commit_sha=args.commit_sha, estimated_tokens=tokens,
         )
-        _resolve_round_seeds(repo, current, "completed")
 
         if st.get("completed_rounds", 0) % io.PHASE_REPORT_INTERVAL == 0:
             state.write_phase_report(repo, st, cfg)
@@ -516,9 +543,10 @@ def cmd_block_round(args):
             },
             candidate_status="blocked",
             candidate_round=current["round"],
+            seed_outcome="blocked",
+            seed_notes=args.reason,
         )
         io.append_log(repo, "block-round", "success", round=current["round"], reason=args.reason)
-        _resolve_round_seeds(repo, current, "blocked", notes=args.reason)
         return emit_result(args, True, "[OK] Round blocked.")
 
 
@@ -551,9 +579,9 @@ def cmd_cancel_round(args):
                 "candidate_id": current.get("candidate_id"),
             },
             candidate_status="pending",
+            seed_outcome="cancelled",
         )
         io.append_log(repo, "cancel-round", "success", round=current["round"], reason=args.reason)
-        _resolve_round_seeds(repo, current, "cancelled")
         return emit_result(args, True, "[OK] Round cancelled.")
 
 
@@ -569,10 +597,22 @@ def _recent_commit_topics(repo, limit=5):
         subject = line.strip()
         if " " in subject:
             subject = subject.split(" ", 1)[1]
+        else:
+            # No separator: a bare sha (empty commit subject) — not a topic.
+            continue
         if subject:
             topics.append(subject)
     topics.reverse()
     return topics
+
+
+def _last_completed_round_shas(st):
+    """Commit SHA recorded by the most recent completed round that has one
+    (deferred-commit rounds carry None and are skipped)."""
+    for entry in reversed(st.get("history") or []):
+        if entry.get("status") == "completed" and entry.get("commit_sha"):
+            return [entry["commit_sha"]]
+    return []
 
 
 def _last_completed_candidate_ids(st):
@@ -606,6 +646,25 @@ def cmd_goal_met(args):
 
         next_steps = list(args.next_step or [])
         unlocked = list(args.unlocked_capability or [])
+        # Canonicalize the goal text: a zero-width character or trailing space
+        # used to record a "met" goal that all_goals_met could never match,
+        # so a goals-only run could never stop.
+        normalized = state.normalize_goal_text(goal)
+        cfg_goal_list = cfg.get("goals") or st.get("goals") or []
+        for configured in cfg_goal_list:
+            if state.normalize_goal_text(configured) == normalized:
+                goal = configured  # record the configured spelling
+                break
+        else:
+            if cfg_goal_list:
+                print(
+                    "[WARN] --goal {!r} does not match any configured goal "
+                    "(compared normalized); recording as-is. Configured: {}".format(
+                        goal, "; ".join(cfg_goal_list)
+                    ),
+                    file=sys.stderr,
+                )
+                io.append_log(repo, "goal-met", "warn", reason="goal not in configured goals", goal=goal)
         seed_type = getattr(args, "seed_type", None)
         if seed_type is not None and seed_type not in state.VALID_CANDIDATE_TYPES:
             io.append_log(repo, "goal-met", "error", reason="unknown seed type")
@@ -633,7 +692,16 @@ def cmd_goal_met(args):
         seeds = []
         if next_steps:
             default_type = seed_type or _default_seed_type(saturated)
+            # Replaying the same goal-met must not duplicate the same hypothesis:
+            # every open/promoted seed with an identical (goal, title) is kept.
+            existing_hypotheses = {
+                (s.get("source_goal"), s.get("title"))
+                for s in st.get("goal_seeds") or []
+                if isinstance(s, dict) and s.get("status") in ("open", "promoted")
+            }
             for title in next_steps:
+                if (goal, title) in existing_hypotheses:
+                    continue
                 seed = state.append_seed(st, {
                     "source_goal": goal,
                     "title": title,
@@ -647,7 +715,8 @@ def cmd_goal_met(args):
                 })
                 seeds.append(seed)
 
-        if goal not in st["completed_goals"]:
+        if not any(state.normalize_goal_text(existing) == state.normalize_goal_text(goal)
+                   for existing in st["completed_goals"]):
             st["completed_goals"].append(goal)
         st["last_activity_at"] = io.now_iso()
         goal_event = None
@@ -656,23 +725,61 @@ def cmd_goal_met(args):
                 "goal": goal,
                 "met_at": io.now_iso(),
                 "round": st.get("round") or 0,
-                "commit_shas": [],
+                "commit_shas": _last_completed_round_shas(st) if not args.no_auto_context else [],
                 "candidate_ids": round_candidate_ids,
                 "unlocked_capabilities": unlocked,
                 "recent_commit_topics": recent_topics,
                 "saturated_types": saturated,
                 "seed_ids": [seed["id"] for seed in seeds],
             })
+            for seed in seeds:
+                seed["source_event_id"] = goal_event["id"]
         state.save_state(repo, st)
         io.append_log(repo, "goal-met", "success", goal=goal, seeds=[seed["id"] for seed in seeds])
         if state.all_goals_met(cfg, st) and cfg.get("expand_after_goals"):
             message = "[OK] Goal marked met. All goals are met; entering the expansion phase (expand_after_goals). Wave 0: verify and value-gate the direction seeds first."
         else:
             message = "[OK] Goal marked met."
+        if seeds:
+            # Text-mode consumers need the ids: SKILL.md's Wave 0 next step is
+            # `backlog-add --from-seed <id>` / `seed-reject --id <id>`.
+            message += " Created direction seeds: {}.".format(", ".join(seed["id"] for seed in seeds))
         data = None
         if getattr(args, "json", False):
             data = {"goal_event": goal_event, "seeds": seeds}
         return emit_result(args, True, message, data=data)
+
+
+def cmd_seed_reject(args):
+    repo = Path(args.repo).resolve()
+    with io.run_lock(repo):
+        st = state.load_state(repo)
+        seed = state.find_seed(st, args.id)
+        if seed is None:
+            io.append_log(repo, "seed-reject", "error", reason="seed not found")
+            open_ids = [s.get("id") for s in state.open_seeds(st) if s.get("id")]
+            hint = ", ".join(open_ids[:5]) if open_ids else "none (see read / check --brief expansion)"
+            return emit_result(
+                args, False,
+                "[ERROR] Direction seed not found in state: {}. Open seeds: {}".format(args.id, hint),
+            )
+        if seed.get("status") != "open":
+            io.append_log(repo, "seed-reject", "error", reason="seed not open")
+            return emit_result(
+                args, False,
+                "[ERROR] Seed {} is '{}' (only 'open' seeds can be rejected). "
+                "Promoted seeds resolve through complete-round/block-round.".format(
+                    args.id, seed.get("status")
+                ),
+            )
+        if getattr(args, "dry_run", False):
+            print("[DRY-RUN] Would reject seed {}: {}.".format(args.id, args.reason), file=sys.stderr)
+            return 0
+        state.resolve_seed(st, args.id, "rejected", notes=args.reason)
+        st["last_activity_at"] = io.now_iso()
+        state.save_state(repo, st)
+        io.append_log(repo, "seed-reject", "success", seed=args.id, reason=args.reason)
+        return emit_result(args, True, "[OK] Seed rejected: {}".format(args.id), data={"seed": args.id})
 
 
 def cmd_finish(args):
@@ -709,9 +816,9 @@ def cmd_finish(args):
                     "candidate_id": open_round.get("candidate_id"),
                 },
                 candidate_status="pending",
+                seed_outcome="cancelled",
             )
             io.append_log(repo, "cancel-round", "success", round=open_round.get("round"), reason="auto-cancelled at finish")
-            _resolve_round_seeds(repo, open_round, "cancelled")
 
         st["finished_at"] = io.now_iso()
         st["stop_reason"] = args.reason or st.get("stop_reason") or "finished"
@@ -762,9 +869,22 @@ def cmd_finish(args):
         return emit_result(args, True, message, data=data)
 
 
+def _seed_num(seed, name, default=None):
+    """Coerce a seed's numeric field (value/effort/risk) to int; hand-edited
+    state files may hold strings or junk — fall back instead of raising."""
+    raw = (seed or {}).get(name)
+    try:
+        return int(raw)
+    except (TypeError, ValueError, OverflowError):
+        return default
+
+
 def cmd_backlog_add(args):
     repo = Path(args.repo).resolve()
     with io.run_lock(repo):
+        if not config.state_path_for(repo).exists():
+            io.append_log(repo, "backlog-add", "error", reason="not initialized")
+            return emit_result(args, False, "[ERROR] Autopilot not initialized. Run init first.")
         backlog = state.load_backlog(repo)
         seed = None
         if getattr(args, "from_seed", None):
@@ -772,7 +892,14 @@ def cmd_backlog_add(args):
             seed = state.find_seed(st, args.from_seed)
             if seed is None:
                 io.append_log(repo, "backlog-add", "error", reason="seed not found")
-                return emit_result(args, False, "[ERROR] Direction seed not found in state: {}".format(args.from_seed))
+                open_ids = [s.get("id") for s in state.open_seeds(st) if s.get("id")]
+                hint = ", ".join(open_ids[:5]) if open_ids else "none (see read / check --brief expansion)"
+                return emit_result(
+                    args, False,
+                    "[ERROR] Direction seed not found in state: {}. Open seeds: {}".format(
+                        args.from_seed, hint
+                    ),
+                )
             if seed.get("status") != "open":
                 io.append_log(
                     repo, "backlog-add", "error", reason="seed not open",
@@ -801,7 +928,9 @@ def cmd_backlog_add(args):
         else:
             if confidence is None:
                 confidence = 0.75
-            if confidence < 0.5 or confidence > 1.0:
+            # Chained comparison: NaN fails it too (NaN < 0.5 is False, so a
+            # naive `confidence < 0.5 or confidence > 1.0` would let NaN through).
+            if not (0.5 <= confidence <= 1.0):
                 io.append_log(repo, "backlog-add", "error", reason="confidence out of range")
                 return emit_result(
                     args, False,
@@ -810,13 +939,13 @@ def cmd_backlog_add(args):
                 )
         candidate_id = "candidate-{:03d}".format(backlog["next_id"])
         value = args.value
-        if value is None:
-            value = (seed or {}).get("value") if seed is not None else None
+        if value is None and seed is not None:
+            value = _seed_num(seed, "value")
         if value is None:
             value = config.LEGACY_IMPACT_SCORE.get(args.impact, 3)
         effort = args.effort
-        if effort is None:
-            effort = (seed or {}).get("effort") if seed is not None else None
+        if effort is None and seed is not None:
+            effort = _seed_num(seed, "effort")
         if effort is None:
             effort = config.LEGACY_EFFORT_SCORE.get(args.effort_level, 3)
         if value < 1 or value > 5:
@@ -851,7 +980,8 @@ def cmd_backlog_add(args):
         }
         if seed is not None:
             candidate["type"] = args.type or seed.get("type") or "feature"
-            candidate["risk"] = args.risk if args.risk is not None else (seed.get("risk") or 1)
+            seed_risk = _seed_num(seed, "risk", default=1)
+            candidate["risk"] = args.risk if args.risk is not None else (seed_risk or 1)
             candidate["from_seed"] = seed["id"]
             candidate["hypothesis"] = seed.get("hypothesis") or ""
         if origin != "observed" or seed is not None:
@@ -879,12 +1009,11 @@ def cmd_backlog_add(args):
             state.save_state(repo, st)
         # Expansion/backlog work counts as activity so max_minutes does not burn
         # out while the agent is scouting instead of sitting in begin-round.
-        try:
-            st = state.load_state(repo)
-            st["last_activity_at"] = io.now_iso()
-            state.save_state(repo, st)
-        except SystemExit:
-            pass
+        # state.json is verified to exist above; a corrupt state must fail
+        # cleanly here (fail-closed), never be swallowed into a fake success.
+        st = state.load_state(repo)
+        st["last_activity_at"] = io.now_iso()
+        state.save_state(repo, st)
         io.append_log(repo, "backlog-add", "success", candidate_id=candidate_id, title=title)
         if getattr(args, "json", False):
             return emit_result(args, True, "backlog candidate added", data={"id": candidate_id})
@@ -895,6 +1024,8 @@ def cmd_backlog_add(args):
 def cmd_backlog_update(args):
     repo = Path(args.repo).resolve()
     with io.run_lock(repo):
+        if not config.state_path_for(repo).exists():
+            return emit_result(args, False, "[ERROR] Autopilot not initialized. Run init first.")
         backlog = state.load_backlog(repo)
         candidate = state.find_candidate(backlog, args.id)
         if candidate is None:
@@ -960,6 +1091,8 @@ def cmd_backlog_update(args):
 def cmd_backlog_remove(args):
     repo = Path(args.repo).resolve()
     with io.run_lock(repo):
+        if not config.state_path_for(repo).exists():
+            return emit_result(args, False, "[ERROR] Autopilot not initialized. Run init first.")
         backlog = state.load_backlog(repo)
         candidates = backlog.get("candidates", [])
         updated = [c for c in candidates if c.get("id") != args.id]
@@ -1001,6 +1134,8 @@ def cmd_backlog_rank(args):
 def cmd_backlog_pick(args):
     repo = Path(args.repo).resolve()
     with io.run_lock(repo):
+        if not config.state_path_for(repo).exists():
+            return emit_result(args, False, "[ERROR] Autopilot not initialized. Run init first.")
         backlog = state.load_backlog(repo)
         candidate = state.find_candidate(backlog, args.id)
         if candidate is None:
@@ -1212,10 +1347,15 @@ def _staged_numstat_lines(repo):
 
 def _write_report_output(args, repo, markdown, kind):
     """Shared --output handling: refuse to write outside the target repository
-    unless --force is passed (guards against agent-directed arbitrary writes)."""
+    unless --force is passed (guards against agent-directed arbitrary writes).
+    Relative paths resolve against --repo, not the process CWD — agents invoke
+    the helper from arbitrary working directories."""
     if not args.output:
         return None
-    output = Path(args.output).resolve()
+    candidate = Path(args.output)
+    if not candidate.is_absolute():
+        candidate = repo / candidate
+    output = candidate.resolve()
     try:
         output.relative_to(repo)
     except ValueError:
@@ -1304,6 +1444,7 @@ def cmd_analysis_load(args):
         return emit_result(args, False, "[ERROR] Autopilot not initialized. Run init first.")
     validity, reason = state.analysis_validity(repo)
     data = state.load_analysis(repo)
+    io.append_log(repo, "analysis-load", "success" if validity == "fresh" else "warn", validity=validity)
     payload = {
         "valid": validity == "fresh",
         "status": validity,
@@ -1337,6 +1478,29 @@ def cmd_directive_list(args):
     return 0
 
 
+def cmd_directive_remove(args):
+    repo = Path(args.repo).resolve()
+    with io.run_lock(repo):
+        if not config.state_path_for(repo).exists():
+            return emit_result(args, False, "[ERROR] Autopilot not initialized. Run init first.")
+        directives = state.load_directives(repo)
+        entries = directives.get("directives") or []
+        index = args.index
+        if index < 1 or index > len(entries):
+            return emit_result(
+                args, False,
+                "[ERROR] --index must be between 1 and {} (as shown by directive-list).".format(len(entries)),
+            )
+        removed = entries.pop(index - 1)
+        state.save_directives(repo, directives)
+        io.append_log(repo, "directive-remove", "success", text=removed.get("text"), index=index)
+        return emit_result(
+            args, True,
+            "[OK] Directive removed: {}".format((removed.get("text") or "")[:80]),
+            data={"count": len(entries)},
+        )
+
+
 def cmd_undo_round(args):
     repo = Path(args.repo).resolve()
     with io.run_lock(repo):
@@ -1353,6 +1517,8 @@ def cmd_undo_round(args):
             io.append_log(repo, "undo-round", "error", reason="invalid sha")
             return emit_result(args, False, "[ERROR] --sha does not resolve to a commit: {}".format(args.sha))
         full_sha = verify.stdout.strip()
+        parents = io.run_git(repo, "rev-list", "--parents", "-n", "1", full_sha)
+        is_merge = len(parents.stdout.split()) > 2
         if getattr(args, "dry_run", False):
             print(
                 "[DRY-RUN] Would git revert commit {} into a new commit.".format(full_sha),
@@ -1363,6 +1529,15 @@ def cmd_undo_round(args):
         if result.returncode != 0:
             print(result.stderr.strip(), file=sys.stderr)
             io.append_log(repo, "undo-round", "error", reason="revert failed", sha=full_sha)
+            if is_merge:
+                return emit_result(
+                    args, False,
+                    "[ERROR] git revert failed: {} is a merge commit (revert needs a "
+                    "mainline decision). Resolve manually — e.g. `git revert -m 1 {}` — "
+                    "commit, then record the round with commit/complete-round.".format(
+                        full_sha[:12], full_sha[:12]
+                    ),
+                )
             return emit_result(
                 args, False,
                 "[ERROR] git revert failed (likely a conflict). Resolve the conflict and commit "
@@ -1473,6 +1648,7 @@ def cmd_check(args):
         warnings.append("Detached HEAD; consider checking out a branch before starting.")
 
     if st.get("config_fingerprint") and io.file_sha256(config.config_path_for(repo)) != st["config_fingerprint"]:
+        io.append_log(repo, "config-drift", "warn")
         warnings.append(
             "autopilot config.json changed since init; verify the change was intentional "
             "(check_commands are executed and budgets are trusted by the loop)."
@@ -1574,9 +1750,12 @@ def cmd_check(args):
         type_stats = st.get("type_stats") or {}
         recent_types = {}
         for candidate_type in sorted(type_stats):
+            entry = type_stats.get(candidate_type)
+            if not isinstance(entry, dict):
+                continue
             try:
-                recent_types[candidate_type] = int((type_stats.get(candidate_type) or {}).get("completed") or 0)
-            except (TypeError, ValueError):
+                recent_types[candidate_type] = int(entry.get("completed") or 0)
+            except (TypeError, ValueError, OverflowError):
                 recent_types[candidate_type] = 0
         saturated = state.saturated_types(st, cfg.get("type_saturation_threshold", 2))
         underused = [t for t in state.VALID_CANDIDATE_TYPES if t not in saturated]
@@ -1639,12 +1818,14 @@ def cmd_diagnose(args):
         return 0
 
     identity_ok, name, email = io.git_identity_ok(repo)
+    has_commits = io.has_commits(repo)
+    branch = io.current_branch(repo)
     info = {
         "is_git_repo": True,
         "repo": str(repo),
-        "has_commits": io.has_commits(repo),
-        "current_branch": io.current_branch(repo),
-        "detached_head": io.is_detached_head(repo),
+        "has_commits": has_commits,
+        "current_branch": branch,
+        "detached_head": bool(has_commits and branch == "HEAD"),
         "dirty": io.working_tree_dirty(repo),
         "user_name": name,
         "user_email": email,

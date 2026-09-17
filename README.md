@@ -1,6 +1,6 @@
 # Auto Iterate Project
 
-Version 1.3.1 — see [CHANGELOG.md](CHANGELOG.md) for release history.
+Version 1.3.2 — see [CHANGELOG.md](CHANGELOG.md) for release history.
 
 Automatically iterate any git project inside an agent session: analyze the repository, pick the next high-value improvement, implement small changes, verify, commit, and loop until a goal is met or configurable round/time/token limits are reached.
 
@@ -26,11 +26,22 @@ Works with opencode, Claude Code, Codex, and other agent runtimes (auto-detected
 
 ## Installation
 
-Copy this folder into your agent's skills directory:
+The shipped surface is `SKILL.md`, `scripts/`, `references/`, and `agents/` — everything else in the repository is working material (proposal archive in `docs/`, audit records at the root, CI in `.github/`). Copy (or link) the folder into your agent's skills directory:
 
 - opencode: `~/.config/opencode/skills/auto-iterate-project/`
 - Claude Code: `~/.claude/skills/auto-iterate-project/`
 - Codex / generic: `~/.codex/skills/` or `~/.agents/skills/auto-iterate-project/`
+
+If you keep a git clone of this repository, prefer a directory junction (Windows) or symlink (macOS/Linux) instead of a copy, so `git pull` upgrades the installed skill in place:
+
+```powershell
+# Windows (no admin needed): remove the copy first, then
+cmd /c mklink /J "%USERPROFILE%\.agents\skillsuto-iterate-project" "D:\path	outo-iterate-project"
+# macOS / Linux
+ln -s /path/to/auto-iterate-project ~/.agents/skills/auto-iterate-project
+```
+
+Caveat: with a link, the installed skill follows the clone's checked-out branch and uncommitted changes — keep the clone on a stable branch.
 
 The skill's `SKILL.md` entry point documents the full workflow. The helper script is standalone and works on Windows, macOS, and Linux (Python 3.6+).
 

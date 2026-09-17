@@ -106,15 +106,20 @@ def parse_deadline(value):
             return None
         amount = float(match.group(1))
         unit = match.group(2).lower()
-        if unit in ("min", "mins", "minute", "minutes", "m"):
-            delta = timedelta(minutes=amount)
-        elif unit in ("h", "hour", "hours", "hr"):
-            delta = timedelta(hours=amount)
-        elif unit in ("d", "day", "days"):
-            delta = timedelta(days=amount)
-        else:
-            delta = timedelta(weeks=amount)
-        return (datetime.now(timezone.utc) + delta).isoformat()
+        try:
+            if unit in ("min", "mins", "minute", "minutes", "m"):
+                delta = timedelta(minutes=amount)
+            elif unit in ("h", "hour", "hours", "hr"):
+                delta = timedelta(hours=amount)
+            elif unit in ("d", "day", "days"):
+                delta = timedelta(days=amount)
+            else:
+                delta = timedelta(weeks=amount)
+            return (datetime.now(timezone.utc) + delta).isoformat()
+        except (OverflowError, OSError, ValueError):
+            # An absurd duration (30-digit weeks) must reach the caller's
+            # "unparseable deadline" path, not crash init with a traceback.
+            return None
     parsed = parse_time(expr)
     if parsed is not None:
         return parsed.isoformat()
@@ -516,7 +521,15 @@ def git_push(repo):
     else:
         remotes = run_git(repo, "remote")
         if remotes.returncode == 0 and remotes.stdout.strip():
-            remote = remotes.stdout.strip().splitlines()[0]
+            names = remotes.stdout.strip().splitlines()
+            # Alphabetical order alone can select a fork over origin (the
+            # standard contribution setup) and push somewhere the user never
+            # intended. Prefer the conventional names first.
+            remote = names[0]
+            for preferred in ("origin", "upstream"):
+                if preferred in names:
+                    remote = preferred
+                    break
     if not remote:
         return None, "No git remote is configured."
     result = run_git(repo, "push", remote, "{}:{}".format(branch, branch))
