@@ -118,6 +118,12 @@ def _validate_state_types(repo, state):
         _state_type_error(path, "'goals' must be an array")
     if not isinstance(state.get("type_stats", {}), dict):
         _state_type_error(path, "'type_stats' must be an object")
+    for key, value in (state.get("type_stats") or {}).items():
+        if not isinstance(value, dict):
+            _state_type_error(
+                path,
+                "'type_stats.{}' must be an object, got {}".format(key, type(value).__name__),
+            )
     if not isinstance(state.get("goal_events", []), list):
         _state_type_error(path, "'goal_events' must be an array")
     if not isinstance(state.get("goal_seeds", []), list):
@@ -155,7 +161,36 @@ def save_state(repo, state):
 
 
 def load_backlog(repo):
-    return io.load_json(config.backlog_path_for(repo), config.default_backlog())
+    backlog = io.load_json(config.backlog_path_for(repo), config.default_backlog())
+    _validate_backlog(repo, backlog)
+    return backlog
+
+
+def _validate_backlog(repo, backlog):
+    """Same fail-clean policy as state.json: a hand-corrupted backlog must die
+    with a clear message, not with a TypeError somewhere inside ranking."""
+    path = config.backlog_path_for(repo)
+
+    def fail(message):
+        print(
+            "[ERROR] Invalid .autopilot/backlog.json: {}. Fix or delete it and run init again.".format(message),
+            file=sys.stderr,
+        )
+        raise SystemExit(2)
+
+    if not isinstance(backlog, dict):
+        fail("must be a JSON object, got {}".format(type(backlog).__name__))
+    candidates = backlog.get("candidates")
+    if not isinstance(candidates, list):
+        fail("'candidates' must be an array")
+    for candidate in candidates:
+        if not isinstance(candidate, dict):
+            fail("every candidate must be an object")
+        if not isinstance(candidate.get("id"), str) or not candidate.get("id"):
+            fail("every candidate needs a non-empty string 'id'")
+    next_id = backlog.get("next_id")
+    if not isinstance(next_id, int) or isinstance(next_id, bool):
+        fail("'next_id' must be a number")
 
 
 def save_backlog(repo, backlog):
@@ -258,10 +293,12 @@ def saturated_types(state, threshold=2):
         threshold = 2
     result = []
     for candidate_type in sorted(state.get("type_stats") or {}):
-        entry = (state.get("type_stats") or {}).get(candidate_type) or {}
+        entry = (state.get("type_stats") or {}).get(candidate_type)
+        if not isinstance(entry, dict):
+            entry = {}
         try:
             completed = int(entry.get("completed") or 0)
-        except (TypeError, ValueError):
+        except (TypeError, ValueError, OverflowError):
             completed = 0
         if completed >= threshold:
             result.append(candidate_type)
@@ -269,13 +306,22 @@ def saturated_types(state, threshold=2):
 
 
 def _next_sequential_id(state, key, prefix):
-    """Next zero-padded id (`ge-003` / `seed-011`) that does not collide with
-    existing entries, even after truncation dropped the oldest ones."""
+    """Next zero-padded id (`ge-003` / `seed-011`). The counter is MONOTONIC:
+    it starts past the highest suffix ever issued (not just past existing
+    entries), so ids truncated away by the bounded lists are never reused —
+    a stale candidate.from_seed can never come to point at a newer, unrelated
+    seed."""
     existing = set()
+    max_counter = 0
     for item in state.get(key) or []:
-        if isinstance(item, dict) and str(item.get("id") or "").startswith(prefix):
-            existing.add(str(item.get("id")))
-    counter = 1
+        if isinstance(item, dict):
+            item_id = str(item.get("id") or "")
+            if item_id.startswith(prefix):
+                existing.add(item_id)
+                suffix = item_id[len(prefix):]
+                if suffix.isdigit():
+                    max_counter = max(max_counter, int(suffix))
+    counter = max_counter + 1
     while "{}{:03d}".format(prefix, counter) in existing:
         counter += 1
     return "{}{:03d}".format(prefix, counter)
@@ -549,7 +595,7 @@ def _candidate_score(candidate):
     try:
         value = int(value)
         effort = int(effort)
-    except (TypeError, ValueError):
+    except (TypeError, ValueError, OverflowError):
         value, effort = 3, 3
     if effort <= 0:
         effort = 1
@@ -566,7 +612,7 @@ def _resolved_value(candidate):
         value = config.LEGACY_IMPACT_SCORE.get(candidate.get("impact"), 3)
     try:
         return max(1, min(5, int(value)))
-    except (TypeError, ValueError):
+    except (TypeError, ValueError, OverflowError):
         return 3
 
 
@@ -576,7 +622,7 @@ def _resolved_effort(candidate):
         effort = config.LEGACY_EFFORT_SCORE.get(effort, 3)
     try:
         effort = int(effort)
-    except (TypeError, ValueError):
+    except (TypeError, ValueError, OverflowError):
         return 3
     return max(1, min(5, effort))
 
@@ -709,7 +755,7 @@ def _score_classic(candidate, type_stats=None, saturation_threshold=2):
     base = _candidate_score(candidate)
     try:
         risk = int(candidate.get("risk") or 1)
-    except (TypeError, ValueError):
+    except (TypeError, ValueError, OverflowError):
         risk = 1
     risk = max(1, min(5, risk))
     risk_factor = max(0.5, 1.0 - 0.08 * (risk - 1))
@@ -804,7 +850,7 @@ def _score_expected(candidate, type_stats=None, saturation_threshold=2,
 
     try:
         risk = int(candidate.get("risk") or 1)
-    except (TypeError, ValueError):
+    except (TypeError, ValueError, OverflowError):
         risk = 1
     risk = max(1, min(5, risk))
     risk_factor = max(0.3, 1.0 - risk_weight * (risk - 1))
@@ -1141,7 +1187,10 @@ def build_retrospective(repo, state, cfg, lang="zh"):
             out.append("- `{}`".format(command))
     out.append("")
 
-    ranked = rank_candidates(backlog, cfg, progress=progress_from_state(state, cfg))
+    ranked = rank_candidates(
+        backlog, cfg, progress=progress_from_state(state, cfg),
+        completed_goals=list(state.get("completed_goals") or []),
+    )
     ready = [r for r in ranked if r.get("status") == "pending" and r.get("ready")]
     out.append("## {}".format("下一步建议" if zh else "Next likely improvement"))
     out.append("")
@@ -1307,7 +1356,10 @@ def build_report(repo, state, cfg, lang="en"):
             out.append("```")
             out.append("")
 
-    ranked = rank_candidates(backlog_data, cfg, progress=progress_from_state(state, cfg))
+    ranked = rank_candidates(
+        backlog_data, cfg, progress=progress_from_state(state, cfg),
+        completed_goals=list(state.get("completed_goals") or []),
+    )
     ready = [r for r in ranked if r.get("status") == "pending" and r.get("ready")]
     if ready:
         top = ready[0]

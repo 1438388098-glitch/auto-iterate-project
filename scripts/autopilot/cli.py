@@ -4,9 +4,21 @@ Each subparser registers its handler via ``set_defaults(func=...)`` — a single
 registration point per command, no second name->handler table to keep in sync."""
 
 import argparse
+import io
 import sys
 
 from . import agent, commands
+
+
+def _force_utf8_stdio():
+    """Windows pipes inherit the ANSI code page on py3.6: a zh report or a
+    seed title with non-GBK characters would crash the loop mid-print with
+    UnicodeEncodeError. Force UTF-8 with replacement on both streams."""
+    for name in ("stdout", "stderr"):
+        stream = getattr(sys, name)
+        buffer = getattr(stream, "buffer", None)
+        if buffer is not None:
+            setattr(sys, name, io.TextIOWrapper(buffer, encoding="utf-8", errors="replace"))
 
 
 def build_parser():
@@ -326,6 +338,7 @@ def build_parser():
 
 
 def main():
+    _force_utf8_stdio()
     parser = build_parser()
     args = parser.parse_args()
     if args.command is None:

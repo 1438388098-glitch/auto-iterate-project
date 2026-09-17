@@ -596,6 +596,15 @@ def _recent_commit_topics(repo, limit=5):
     return topics
 
 
+def _last_completed_round_shas(st):
+    """Commit SHA recorded by the most recent completed round that has one
+    (deferred-commit rounds carry None and are skipped)."""
+    for entry in reversed(st.get("history") or []):
+        if entry.get("status") == "completed" and entry.get("commit_sha"):
+            return [entry["commit_sha"]]
+    return []
+
+
 def _last_completed_candidate_ids(st):
     """Candidate ids recorded by the most recent completed round (bounded to the
     first recorded id for legacy single-candidate history entries)."""
@@ -654,7 +663,16 @@ def cmd_goal_met(args):
         seeds = []
         if next_steps:
             default_type = seed_type or _default_seed_type(saturated)
+            # Replaying the same goal-met must not duplicate the same hypothesis:
+            # every open/promoted seed with an identical (goal, title) is kept.
+            existing_hypotheses = {
+                (s.get("source_goal"), s.get("title"))
+                for s in st.get("goal_seeds") or []
+                if isinstance(s, dict) and s.get("status") in ("open", "promoted")
+            }
             for title in next_steps:
+                if (goal, title) in existing_hypotheses:
+                    continue
                 seed = state.append_seed(st, {
                     "source_goal": goal,
                     "title": title,
@@ -677,13 +695,15 @@ def cmd_goal_met(args):
                 "goal": goal,
                 "met_at": io.now_iso(),
                 "round": st.get("round") or 0,
-                "commit_shas": [],
+                "commit_shas": _last_completed_round_shas(st) if not args.no_auto_context else [],
                 "candidate_ids": round_candidate_ids,
                 "unlocked_capabilities": unlocked,
                 "recent_commit_topics": recent_topics,
                 "saturated_types": saturated,
                 "seed_ids": [seed["id"] for seed in seeds],
             })
+            for seed in seeds:
+                seed["source_event_id"] = goal_event["id"]
         state.save_state(repo, st)
         io.append_log(repo, "goal-met", "success", goal=goal, seeds=[seed["id"] for seed in seeds])
         if state.all_goals_met(cfg, st) and cfg.get("expand_after_goals"):
@@ -810,6 +830,16 @@ def cmd_finish(args):
         return emit_result(args, True, message, data=data)
 
 
+def _seed_num(seed, name, default=None):
+    """Coerce a seed's numeric field (value/effort/risk) to int; hand-edited
+    state files may hold strings or junk — fall back instead of raising."""
+    raw = (seed or {}).get(name)
+    try:
+        return int(raw)
+    except (TypeError, ValueError, OverflowError):
+        return default
+
+
 def cmd_backlog_add(args):
     repo = Path(args.repo).resolve()
     with io.run_lock(repo):
@@ -860,13 +890,13 @@ def cmd_backlog_add(args):
                 )
         candidate_id = "candidate-{:03d}".format(backlog["next_id"])
         value = args.value
-        if value is None:
-            value = (seed or {}).get("value") if seed is not None else None
+        if value is None and seed is not None:
+            value = _seed_num(seed, "value")
         if value is None:
             value = config.LEGACY_IMPACT_SCORE.get(args.impact, 3)
         effort = args.effort
-        if effort is None:
-            effort = (seed or {}).get("effort") if seed is not None else None
+        if effort is None and seed is not None:
+            effort = _seed_num(seed, "effort")
         if effort is None:
             effort = config.LEGACY_EFFORT_SCORE.get(args.effort_level, 3)
         if value < 1 or value > 5:
@@ -901,7 +931,8 @@ def cmd_backlog_add(args):
         }
         if seed is not None:
             candidate["type"] = args.type or seed.get("type") or "feature"
-            candidate["risk"] = args.risk if args.risk is not None else (seed.get("risk") or 1)
+            seed_risk = _seed_num(seed, "risk", default=1)
+            candidate["risk"] = args.risk if args.risk is not None else (seed_risk or 1)
             candidate["from_seed"] = seed["id"]
             candidate["hypothesis"] = seed.get("hypothesis") or ""
         if origin != "observed" or seed is not None:
@@ -1624,9 +1655,12 @@ def cmd_check(args):
         type_stats = st.get("type_stats") or {}
         recent_types = {}
         for candidate_type in sorted(type_stats):
+            entry = type_stats.get(candidate_type)
+            if not isinstance(entry, dict):
+                continue
             try:
-                recent_types[candidate_type] = int((type_stats.get(candidate_type) or {}).get("completed") or 0)
-            except (TypeError, ValueError):
+                recent_types[candidate_type] = int(entry.get("completed") or 0)
+            except (TypeError, ValueError, OverflowError):
                 recent_types[candidate_type] = 0
         saturated = state.saturated_types(st, cfg.get("type_saturation_threshold", 2))
         underused = [t for t in state.VALID_CANDIDATE_TYPES if t not in saturated]
