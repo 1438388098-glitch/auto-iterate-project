@@ -46,6 +46,37 @@ are unchanged; the edges stop biting.
   data fail-clean, dedupe, write-back warn, field coercion), config validation
   matrix entries, wider `GIT_*` isolation, subprocess timeouts.
 
+### Expansion waves (same release; two scout waves + hardening rounds)
+
+- `goal-met` text mode now echoes the created seed ids (Wave 0's next step
+  needs `--from-seed <id>`; agents used to guess `seed-00N`).
+- Goal text is normalized (NFC + zero-width/BOM stripped + trimmed) before
+  recording and inside `all_goals_met`: an invisible character could mark a
+  goal "met" while the stop condition stayed false forever. A `--goal` that
+  matches no configured goal records a warning.
+- Report/retrospective hardening: markdown table cells (backlog, history,
+  seeds) and suggestion lines sanitize newlines/tabs/pipes; `--output`
+  relative paths resolve against `--repo`, not the process CWD.
+- Audit trail: `state-migrate`, `config-drift`, `analysis-load`, and
+  `integrity` (state/backlog validation failures) events in `log.jsonl`.
+- `directive-remove --index N` (directives.json was add-only); malformed
+  `directives.json` now fails cleanly like state/backlog.
+- Fail-clean completeness: corrupt `current_round` (missing `round`) and
+  junk `history` entries exit 2 with a message instead of KeyError/AttributeError
+  (the old failure bricked the run — begin-round refused while every closer
+  crashed); malformed `--repo` paths surface as `[ERROR]` + exit 2 via an
+  OSError net in the entry point.
+- Guidance: unknown seed/candidate ids list the open/pending ids; `undo-round`
+  on a merge commit points at `git revert -m 1` instead of a phantom conflict.
+- Consistency: `backlog-update`/`backlog-pick`/`backlog-remove` require init
+  like their siblings; empty commit subjects no longer leak bare SHAs into
+  `suggested_themes`.
+- Performance: the test harness dispatches in-process (589 interpreter startups
+  eliminated), setup writes repo-local git config directly, and hot commands
+  merge redundant git calls — suite runtime 358s → ~193s.
+- SKILL.md: init flag list completed (`--allow-uncommitted-changes`/`--force`),
+  lens→helper-signal map for Deep Expansion subagents.
+
 ## 1.3.1 (2026-09-17)
 
 刀 B — anti-noise guardrails for direction-seed predictions (proposal §6).

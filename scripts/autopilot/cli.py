@@ -354,4 +354,11 @@ def main():
     args = parser.parse_args()
     if args.command is None:
         parser.error("a command is required")
-    sys.exit(args.func(args))
+    try:
+        code = args.func(args)
+    except OSError as exc:
+        # Malformed paths (e.g. shell-mangled \\?\ device paths) used to escape
+        # as raw tracebacks from ~30 entry points; the contract is [ERROR]+2.
+        print("[ERROR] OS-level failure: {}".format(exc), file=sys.stderr)
+        code = 2
+    sys.exit(code)

@@ -1096,6 +1096,43 @@ class PredictedHardeningTests(RepoTest):
         self.assertNotEqual(result.returncode, 0)
         self.assertNotIn("Traceback", result.stderr)
 
+    def test_corrupt_directives_clean_error(self):
+        self.run_state("init")
+        path = self.repo / ".autopilot" / "directives.json"
+        path.write_text("[]", encoding="utf-8")
+        for command, args in (("directive-add", ("--text", "t")),
+                              ("directive-list", ()),
+                              ("directive-remove", ("--index", "1"))):
+            result = self.run_state(command, *args)
+            self.assertNotEqual(result.returncode, 0, command)
+            self.assertNotIn("Traceback", result.stderr)
+            self.assertIn("directives.json", result.stderr)
+
+    def test_current_round_missing_round_key_clean_error(self):
+        self.run_state("init")
+        state_path = self.repo / ".autopilot" / "state.json"
+        state = json.loads(state_path.read_text(encoding="utf-8"))
+        state["current_round"] = {"title": "broken"}
+        state_path.write_text(json.dumps(state), encoding="utf-8")
+        for command, args in (("complete-round", ("--summary", "s")),
+                              ("block-round", ("--reason", "r")),
+                              ("cancel-round", ("--reason", "r"))):
+            result = self.run_state(command, *args)
+            self.assertNotEqual(result.returncode, 0, command)
+            self.assertNotIn("Traceback", result.stderr)
+            self.assertIn("current_round.round", result.stderr)
+
+    def test_history_junk_clean_error(self):
+        self.run_state("init")
+        state_path = self.repo / ".autopilot" / "state.json"
+        state = json.loads(state_path.read_text(encoding="utf-8"))
+        state["history"] = ["junk"]
+        state_path.write_text(json.dumps(state), encoding="utf-8")
+        result = self.run_state("check", "--brief")
+        self.assertNotEqual(result.returncode, 0)
+        self.assertNotIn("Traceback", result.stderr)
+        self.assertIn("history", result.stderr)
+
     def test_init_rejects_negative_max_predicted(self):
         result = self.run_state("init", "--max-predicted-per-round", "-1")
         self.assertNotEqual(result.returncode, 0)

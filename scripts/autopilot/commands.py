@@ -597,6 +597,9 @@ def _recent_commit_topics(repo, limit=5):
         subject = line.strip()
         if " " in subject:
             subject = subject.split(" ", 1)[1]
+        else:
+            # No separator: a bare sha (empty commit subject) — not a topic.
+            continue
         if subject:
             topics.append(subject)
     topics.reverse()
@@ -1021,6 +1024,8 @@ def cmd_backlog_add(args):
 def cmd_backlog_update(args):
     repo = Path(args.repo).resolve()
     with io.run_lock(repo):
+        if not config.state_path_for(repo).exists():
+            return emit_result(args, False, "[ERROR] Autopilot not initialized. Run init first.")
         backlog = state.load_backlog(repo)
         candidate = state.find_candidate(backlog, args.id)
         if candidate is None:
@@ -1086,6 +1091,8 @@ def cmd_backlog_update(args):
 def cmd_backlog_remove(args):
     repo = Path(args.repo).resolve()
     with io.run_lock(repo):
+        if not config.state_path_for(repo).exists():
+            return emit_result(args, False, "[ERROR] Autopilot not initialized. Run init first.")
         backlog = state.load_backlog(repo)
         candidates = backlog.get("candidates", [])
         updated = [c for c in candidates if c.get("id") != args.id]
@@ -1127,6 +1134,8 @@ def cmd_backlog_rank(args):
 def cmd_backlog_pick(args):
     repo = Path(args.repo).resolve()
     with io.run_lock(repo):
+        if not config.state_path_for(repo).exists():
+            return emit_result(args, False, "[ERROR] Autopilot not initialized. Run init first.")
         backlog = state.load_backlog(repo)
         candidate = state.find_candidate(backlog, args.id)
         if candidate is None:
@@ -1338,10 +1347,15 @@ def _staged_numstat_lines(repo):
 
 def _write_report_output(args, repo, markdown, kind):
     """Shared --output handling: refuse to write outside the target repository
-    unless --force is passed (guards against agent-directed arbitrary writes)."""
+    unless --force is passed (guards against agent-directed arbitrary writes).
+    Relative paths resolve against --repo, not the process CWD — agents invoke
+    the helper from arbitrary working directories."""
     if not args.output:
         return None
-    output = Path(args.output).resolve()
+    candidate = Path(args.output)
+    if not candidate.is_absolute():
+        candidate = repo / candidate
+    output = candidate.resolve()
     try:
         output.relative_to(repo)
     except ValueError:
@@ -1503,6 +1517,8 @@ def cmd_undo_round(args):
             io.append_log(repo, "undo-round", "error", reason="invalid sha")
             return emit_result(args, False, "[ERROR] --sha does not resolve to a commit: {}".format(args.sha))
         full_sha = verify.stdout.strip()
+        parents = io.run_git(repo, "rev-list", "--parents", "-n", "1", full_sha)
+        is_merge = len(parents.stdout.split()) > 2
         if getattr(args, "dry_run", False):
             print(
                 "[DRY-RUN] Would git revert commit {} into a new commit.".format(full_sha),
@@ -1513,6 +1529,15 @@ def cmd_undo_round(args):
         if result.returncode != 0:
             print(result.stderr.strip(), file=sys.stderr)
             io.append_log(repo, "undo-round", "error", reason="revert failed", sha=full_sha)
+            if is_merge:
+                return emit_result(
+                    args, False,
+                    "[ERROR] git revert failed: {} is a merge commit (revert needs a "
+                    "mainline decision). Resolve manually — e.g. `git revert -m 1 {}` — "
+                    "commit, then record the round with commit/complete-round.".format(
+                        full_sha[:12], full_sha[:12]
+                    ),
+                )
             return emit_result(
                 args, False,
                 "[ERROR] git revert failed (likely a conflict). Resolve the conflict and commit "

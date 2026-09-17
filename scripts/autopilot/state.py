@@ -145,6 +145,9 @@ def _validate_state_types(repo, state):
             _state_type_error(path, "'{}' must be a number, got {}".format(key, type(value).__name__))
     if not isinstance(state.get("history", []), list):
         _state_type_error(path, "'history' must be an array")
+    for entry in state.get("history", []):
+        if not isinstance(entry, dict):
+            _state_type_error(path, "'history' items must be objects")
     if not isinstance(state.get("completed_goals", []), list):
         _state_type_error(path, "'completed_goals' must be an array")
     if not isinstance(state.get("goals", []), list):
@@ -164,6 +167,11 @@ def _validate_state_types(repo, state):
     current = state.get("current_round")
     if current is not None and not isinstance(current, dict):
         _state_type_error(path, "'current_round' must be an object or null")
+    if isinstance(current, dict) and not isinstance(current.get("round"), int):
+        # Without a valid round number every round-closing command would die in
+        # a KeyError while begin-round refuses (round already open) — a bricked
+        # run. Fail cleanly instead.
+        _state_type_error(path, "'current_round.round' must be a number")
 
 
 def load_state(repo):
@@ -1102,7 +1110,24 @@ def directives_path_for(repo):
 
 
 def load_directives(repo):
-    return io.load_json(directives_path_for(repo), {"directives": []})
+    directives = io.load_json(directives_path_for(repo), {"directives": []})
+    path = directives_path_for(repo)
+    if not isinstance(directives, dict) or not isinstance(directives.get("directives"), list):
+        print(
+            "[ERROR] Invalid .autopilot/directives.json: must be an object with a "
+            "'directives' array. Fix or delete it and run init again.",
+            file=sys.stderr,
+        )
+        raise SystemExit(2)
+    for entry in directives["directives"]:
+        if not isinstance(entry, dict):
+            print(
+                "[ERROR] Invalid .autopilot/directives.json: every directive must be an object. "
+                "Fix or delete it and run init again.",
+                file=sys.stderr,
+            )
+            raise SystemExit(2)
+    return directives
 
 
 def save_directives(repo, directives):
