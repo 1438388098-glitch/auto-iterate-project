@@ -230,6 +230,7 @@ Each candidate tracks:
 - `value` (1-5) and `effort` (1-5) used for the base value/effort score
 - `status`: `pending`, `picked`, `completed`, or `blocked`
 - `round` and timestamps
+- when promoted from a direction seed: `from_seed` (the seed id) and `hypothesis`
 
 `backlog-rank` sorts pending, dependency-**ready** candidates by score and marks the recommended round batch (`selected`). In the default `ranking_mode: expected` the score is expected value per round (see the `ranking_mode` section above); `ranking_mode: classic` uses the legacy `value / effort` ratio discounted for `risk` (`max(0.5, 1.0 - 0.08 * (risk - 1))`), type saturation (`0.85 ** max(0, completed_of_type - type_saturation_threshold)`), and blocked history (`0.9 ** blocked_of_type`). Candidates whose `depends_on` is not yet satisfied are marked `"ready": false` with a `blocked_by` reason and ranked after ready candidates. Every entry carries a `score_breakdown` so the ranking is transparent. The per-type counts (including the learned value calibration) come from the backlog and are also persisted to `state.type_stats` for the retrospective. `begin-round` refuses to pick a candidate whose deps are unresolved.
 
@@ -242,6 +243,25 @@ python <this-skill>/scripts/autopilot_state.py backlog-update --repo <repo> --id
 python <this-skill>/scripts/autopilot_state.py backlog-remove --repo <repo> --id candidate-001
 ```
 
+## Direction Seeds (Post-Goal Prediction)
+
+`goal-met` can record *direction seeds* — predicted follow-up work ("because we shipped A, B is next") — alongside the completed goal. Seeds live in `state.json` under `goal_seeds` (bounded at 50, text capped at 500 chars); each completed goal also gets a structured snapshot in `goal_events` (bounded at 20): recent commit topics, saturated types, the round's candidates, unlocked capabilities, and the ids of the seeds it spawned. `completed_goals` remains a plain string array, and state files written by schema v5 are migrated on read.
+
+```powershell
+python <this-skill>/scripts/autopilot_state.py goal-met --repo <repo> --goal "<goal>" --next-step "<follow-up>" --next-step "<follow-up 2>" --unlocked-capability "<capability>"
+```
+
+- `--next-step` (repeatable) — one direction seed per occurrence; `type` defaults to the first non-saturated type, `value` to 4, `effort` to 2, `risk` to 1
+- `--seed-type` / `--seed-value` / `--seed-effort` — override the defaults
+- `--no-auto-context` — skip the automatic snapshot (no goal event is recorded)
+
+A seed moves through `open → promoted → verified` or `open → promoted → refuted`:
+
+- `backlog-add --from-seed <id>` promotes it into a candidate (title/type/value/effort/risk default to the seed; explicit flags override). Only `open` seeds can be promoted.
+- `complete-round` on the promoted candidate's round marks the seed `verified`; `block-round` marks it `refuted` with the block reason stored as `outcome` notes (failed hypotheses never re-enter the pool to game the statistics); `cancel-round` returns it to `open`.
+
+In the expand phase (`check` reports `"phase": "expand"`), the `--brief` payload carries an `expansion` object with a stable key set — `seeds` (open seeds with `id`/`title`/`type`/`from_capability`/`source_goal`/`status`; `[]` when none), `completed_goals`, `recent_types`, `saturated_types`, `underused_types`, `suggested_themes`, `min_pending_candidates`. In the iterate phase the key is absent and the `check --brief` output shape is unchanged. See the Post-Goal Direction Prediction chapter in `SKILL.md` for the Wave 0 protocol.
+
 ## State File
 
 `.autopilot/state.json` tracks:
@@ -250,7 +270,7 @@ python <this-skill>/scripts/autopilot_state.py backlog-remove --repo <repo> --id
 - `started_at`, `last_activity_at` (rolling window for `max_minutes`)
 - `deadline` (config): absolute ISO-8601 timer stop; see the `deadline` field above
 - `round`, `completed_rounds`, `blocked_rounds`, `cancelled_rounds`, `reverted_rounds` (cancelled and reverted rounds advance the round-number counter so numbers are never reused)
-- `current_round`, `history`, `completed_goals`
+- `current_round`, `history`, `completed_goals`, `goal_events`, `goal_seeds` (direction seeds — see the section above; migrated into older state files automatically)
 - `estimated_tokens_used`
 - `type_stats` (per-type completed/blocked/blocked-rate/avg-effort/avg-value, refreshed on every round close)
 - `stop_reason` and `finished_at`
@@ -260,19 +280,19 @@ python <this-skill>/scripts/autopilot_state.py backlog-remove --repo <repo> --id
 ## State Helper Commands
 
 - `init` — create config + state (+ optional feature branch). Flags cover every config field: `--goal`, `--goals-from-prompt`, `--max-rounds`, `--max-minutes`, `--deadline`, `--max-tokens`, `--max-round-scope`, `--branch-mode`, `--allow-uncommitted-changes`, `--track-state`, `--check-commands`, `--push`, `--commit-message-prefix`, `--retries-per-round`, `--candidates-per-round`, `--commit-every-rounds`, `--verify-every-rounds`, `--checkpoint-every`, `--expand-after-goals`, `--review-threshold`, `--scan-secrets`/`--no-scan-secrets`, `--secret-pattern`, `--type-saturation-threshold`, `--ranking-mode`, `--min-candidate-value`, `--max-same-type-per-round`, `--min-pending-candidates`, `--max-blocked-in-a-row`, `--allow-path`, `--deny-path`, `--report-lang`, `--force`.
-- `read`, `check`, `diagnose` — inspect state, stop conditions, and repository/git health. `check --brief` returns loop-driving fields only: `continue`/`stop_reason`/`warnings`/`goals_met`/`phase`/`backlog` (`pending`/`ready`/`min_pending_candidates`/`needs_expansion`)/`action_hint` (`work`|`expand`|`stop`)/`next_verify_round`/`next_commit_round`/`next_checkpoint_round` (saves tokens in the loop).
+- `read`, `check`, `diagnose` — inspect state, stop conditions, and repository/git health. `check --brief` returns loop-driving fields only: `continue`/`stop_reason`/`warnings`/`goals_met`/`phase`/`backlog` (`pending`/`ready`/`min_pending_candidates`/`needs_expansion`)/`action_hint` (`work`|`expand`|`stop`)/`next_verify_round`/`next_commit_round`/`next_checkpoint_round` (saves tokens in the loop). In the expand phase an `expansion` object with open seeds and type context is appended (see Direction Seeds above).
 - `detect-agent` — detect the runtime agent (opencode / claude-code / codex / generic) and print adaptation context. Honors a `SKILL_DIR` environment variable for the reported skill directory.
 - `begin-round`, `complete-round`, `block-round`, `cancel-round` — round lifecycle. `begin-round` enforces the clean-tree rule, refuses to pick candidates with unresolved `depends_on`, and refuses to reuse round numbers; `--candidate-id` is repeatable so one round can pick multiple backlog candidates (`candidates_per_round`). `complete-round` accepts an optional `--commit-sha` (omit it on deferred commit rounds when `commit_every_rounds > 1`), an optional `--review-score`/`--review-notes` (required when `review_threshold` is set), auto-writes a Chinese phase report (`.autopilot/phase-report-round-<N>.md`) every 10 completed rounds, and refreshes `state.type_stats`.
 - `commit` — staged-change check, git identity check, path whitelist check (`allow_paths`/`deny_paths`), secret scan (`scan_secrets`, bypassable with `--allow-secrets`), scope guard (including binary files), open-round requirement (skipped in batched mode), and prefix message building.
 - `undo-round` — `git revert` a bad commit (never rewriting history), record a `revert` history entry, and advance the round counter.
-- `goal-met`, `finish` — goals and run closure. `finish` auto-cancels any still-open round, writes `.autopilot/retrospective.md`, and returns to the origin branch in feature mode.
+- `goal-met`, `finish` — goals and run closure. `goal-met` accepts `--next-step`/`--unlocked-capability`/`--seed-*` to record direction seeds (see Direction Seeds above). `finish` auto-cancels any still-open round, writes `.autopilot/retrospective.md`, and returns to the origin branch in feature mode.
 - `report` — print (or write with `--output`) a deterministic markdown run report; `--lang zh|en` overrides `report_lang`.
 - `retrospective` — print (or write with `--output`) the run-level retrospective: per-type stats, blocked rounds, verification commands, and the next ready candidate.
 - `detect-verify` — scan repo entry points and recommend `check_commands` (including `gitleaks`/`detect-secrets` when installed); `--apply` writes them into the config.
 - `analysis-save` / `analysis-load` — persist and read the repository-analysis cache in `.autopilot/analysis.json`; the cache auto-invalidates when HEAD or `.autopilot/config.json` changes.
 - `directive-add` / `directive-list` — manage standing directives in `.autopilot/directives.json`; the loop must honor them in every round.
 - `secret-scan` — scan the staged diff for secret-like content and report findings (exit non-zero on a match).
-- `backlog-add`, `backlog-update`, `backlog-remove`, `backlog-list`, `backlog-rank`, `backlog-pick` — backlog management (candidates carry `type`, `risk`, and `depends_on`; ranking defaults to expected value per round — see `ranking_mode`). `backlog-add` also refreshes `last_activity_at` so expansion scouting does not burn `max_minutes` without progress.
+- `backlog-add`, `backlog-update`, `backlog-remove`, `backlog-list`, `backlog-rank`, `backlog-pick` — backlog management (candidates carry `type`, `risk`, and `depends_on`; ranking defaults to expected value per round — see `ranking_mode`). `backlog-add --from-seed <id>` promotes a direction seed (see Direction Seeds above). `backlog-add` also refreshes `last_activity_at` so expansion scouting does not burn `max_minutes` without progress.
 - `ensure-branch` — create or check out the autopilot feature branch
 - `push` — push the current branch to its remote using an explicit non-force refspec; refuses to run when `push: false`
 

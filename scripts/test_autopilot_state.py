@@ -160,7 +160,7 @@ class UnbornBranchTests(AutopilotTestBase):
         result = self.run_state("init")
         self.assertEqual(result.returncode, 0, result.stderr)
         state = self.read_json("state.json")
-        self.assertEqual(state["schema"], 5)
+        self.assertEqual(state["schema"], 6)
 
     def test_diagnose_reports_unborn(self):
         result = self.run_state("diagnose")
@@ -381,7 +381,7 @@ class RoundFlowTests(RepoTest):
         state_path.write_text(json.dumps(old), encoding="utf-8")
         result = self.run_state("read")
         data = json.loads(result.stdout)
-        self.assertEqual(data["schema"], 5)
+        self.assertEqual(data["schema"], 6)
         self.assertIn("origin_branch", data)
 
 
@@ -523,12 +523,177 @@ class GoalBudgetTests(RepoTest):
         self.assertTrue(data["continue"], data["stop_reason"])
 
 
+class DirectionSeedTests(RepoTest):
+    """Post-goal direction prediction: goal events + direction seeds live in
+    state.json; completed_goals stays a plain string array (schema v6)."""
+
+    def test_v5_state_migrates_with_seed_fields(self):
+        self.run_state("init")
+        state_path = self.repo / ".autopilot" / "state.json"
+        old = json.loads(state_path.read_text(encoding="utf-8"))
+        old["schema"] = 5
+        old.pop("goal_events", None)
+        old.pop("goal_seeds", None)
+        old["goals"] = ["ship it"]
+        old["completed_goals"] = ["ship it"]
+        state_path.write_text(json.dumps(old), encoding="utf-8")
+        data = json.loads(self.run_state("read").stdout)
+        self.assertEqual(data["schema"], 6)
+        self.assertEqual(data["goal_events"], [])
+        self.assertEqual(data["goal_seeds"], [])
+        self.assertEqual(data["completed_goals"], ["ship it"])
+
+    def test_goal_met_creates_event_and_seeds(self):
+        self.run_state("init")
+        result = self.run_state(
+            "goal-met", "--goal", "export module works",
+            "--next-step", "wire export into CLI",
+            "--next-step", "document export usage",
+            "--unlocked-capability", "export module importable",
+            "--json",
+        )
+        self.assertEqual(result.returncode, 0, result.stderr)
+        payload = json.loads(result.stdout)
+        self.assertIn("goal_event", payload)
+        self.assertIn("seeds", payload)
+        self.assertEqual(len(payload["seeds"]), 2)
+        state = self.read_json("state.json")
+        # completed_goals stays a plain string array (invariant).
+        self.assertEqual(state["completed_goals"], ["export module works"])
+        self.assertEqual(len(state["goal_events"]), 1)
+        event = state["goal_events"][0]
+        self.assertEqual(event["goal"], "export module works")
+        self.assertEqual(event["unlocked_capabilities"], ["export module importable"])
+        self.assertEqual(event["seed_ids"], [payload["seeds"][0]["id"], payload["seeds"][1]["id"]])
+        self.assertEqual(len(state["goal_seeds"]), 2)
+        for seed in state["goal_seeds"]:
+            self.assertEqual(seed["status"], "open")
+            self.assertEqual(seed["source_goal"], "export module works")
+            self.assertEqual(seed["value"], 4)
+            self.assertEqual(seed["effort"], 2)
+            self.assertIn("hypothesis", seed)
+
+    def test_goal_met_plain_call_stays_compatible(self):
+        self.run_state("init")
+        self.run_state("goal-met", "--goal", "G")
+        state = self.read_json("state.json")
+        self.assertEqual(state["completed_goals"], ["G"])
+        # Plain call still records the structured goal event (auto context),
+        # but creates no seeds without --next-step.
+        self.assertEqual(len(state["goal_events"]), 1)
+        self.assertEqual(state["goal_events"][0]["seed_ids"], [])
+        self.assertEqual(state["goal_seeds"], [])
+
+    def test_goal_met_no_auto_context_skips_event(self):
+        self.run_state("init")
+        self.run_state("goal-met", "--goal", "G", "--no-auto-context")
+        state = self.read_json("state.json")
+        self.assertEqual(state["completed_goals"], ["G"])
+        self.assertEqual(state["goal_events"], [])
+        self.assertEqual(state["goal_seeds"], [])
+
+    def test_seed_type_avoids_saturated_types(self):
+        self.run_state("init")
+        state_path = self.repo / ".autopilot" / "state.json"
+        state = json.loads(state_path.read_text(encoding="utf-8"))
+        state["type_stats"] = {"feature": {"completed": 5}, "docs": {"completed": 0}}
+        state_path.write_text(json.dumps(state), encoding="utf-8")
+        self.run_state("goal-met", "--goal", "G", "--next-step", "N")
+        state = self.read_json("state.json")
+        self.assertNotEqual(state["goal_seeds"][0]["type"], "feature")
+
+    def test_backlog_add_from_seed_promotes(self):
+        self.run_state("init")
+        self.run_state("goal-met", "--goal", "G", "--next-step", "wire CLI", "--seed-type", "feature")
+        state = self.read_json("state.json")
+        seed_id = state["goal_seeds"][0]["id"]
+        result = self.run_state("backlog-add", "--from-seed", seed_id, "--reason", "r")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        candidate_id = result.stdout.strip().splitlines()[-1]
+        backlog = self.read_json("backlog.json")
+        candidate = [c for c in backlog["candidates"] if c["id"] == candidate_id][0]
+        self.assertEqual(candidate["from_seed"], seed_id)
+        self.assertEqual(candidate["title"], "wire CLI")
+        self.assertEqual(candidate["type"], "feature")
+        self.assertEqual(candidate["value"], 4)
+        state = self.read_json("state.json")
+        seed = [s for s in state["goal_seeds"] if s["id"] == seed_id][0]
+        self.assertEqual(seed["status"], "promoted")
+        self.assertEqual(seed["promoted_candidate_id"], candidate_id)
+
+    def test_backlog_add_from_seed_requires_open(self):
+        self.run_state("init")
+        self.run_state("goal-met", "--goal", "G", "--next-step", "N")
+        seed_id = self.read_json("state.json")["goal_seeds"][0]["id"]
+        # First promote consumes the seed.
+        self.run_state("backlog-add", "--from-seed", seed_id)
+        result = self.run_state("backlog-add", "--from-seed", seed_id)
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("only 'open' seeds", result.stderr)
+
+    def test_complete_round_verifies_seed(self):
+        self.run_state("init")
+        self.run_state("goal-met", "--goal", "G", "--next-step", "N")
+        seed_id = self.read_json("state.json")["goal_seeds"][0]["id"]
+        cid = self.run_state("backlog-add", "--from-seed", seed_id).stdout.strip().splitlines()[-1]
+        self.git("commit", "--allow-empty", "-q", "-m", "base")
+        self.run_state("begin-round", "--title", "t", "--reason", "r", "--candidate-id", cid)
+        self.run_state("complete-round", "--summary", "done")
+        state = self.read_json("state.json")
+        seed = [s for s in state["goal_seeds"] if s["id"] == seed_id][0]
+        self.assertEqual(seed["status"], "verified")
+        self.assertIn("verified_at", seed)
+
+    def test_block_round_refutes_seed_with_notes(self):
+        self.run_state("init")
+        self.run_state("goal-met", "--goal", "G", "--next-step", "N")
+        seed_id = self.read_json("state.json")["goal_seeds"][0]["id"]
+        cid = self.run_state("backlog-add", "--from-seed", seed_id).stdout.strip().splitlines()[-1]
+        self.git("commit", "--allow-empty", "-q", "-m", "base")
+        self.run_state("begin-round", "--title", "t", "--reason", "r", "--candidate-id", cid)
+        self.run_state("block-round", "--reason", "assumption wrong: no entry point")
+        state = self.read_json("state.json")
+        seed = [s for s in state["goal_seeds"] if s["id"] == seed_id][0]
+        self.assertEqual(seed["status"], "refuted")
+        self.assertIn("assumption wrong", seed["outcome"])
+
+    def test_cancel_round_returns_seed_to_open(self):
+        self.run_state("init")
+        self.run_state("goal-met", "--goal", "G", "--next-step", "N")
+        seed_id = self.read_json("state.json")["goal_seeds"][0]["id"]
+        cid = self.run_state("backlog-add", "--from-seed", seed_id).stdout.strip().splitlines()[-1]
+        self.git("commit", "--allow-empty", "-q", "-m", "base")
+        self.run_state("begin-round", "--title", "t", "--reason", "r", "--candidate-id", cid)
+        self.run_state("cancel-round", "--reason", "reprioritized")
+        state = self.read_json("state.json")
+        seed = [s for s in state["goal_seeds"] if s["id"] == seed_id][0]
+        self.assertEqual(seed["status"], "open")
+        self.assertNotIn("promoted_at", seed)
+
+    def test_seed_lists_bounded_and_text_capped(self):
+        self.run_state("init")
+        state_path = self.repo / ".autopilot" / "state.json"
+        state = json.loads(state_path.read_text(encoding="utf-8"))
+        state["goal_seeds"] = [
+            {"id": "seed-{:03d}".format(i), "status": "refuted", "title": "t{}".format(i)}
+            for i in range(1, 51)
+        ]
+        state_path.write_text(json.dumps(state), encoding="utf-8")
+        long_title = "x" * 2000
+        self.run_state("goal-met", "--goal", "G", "--next-step", long_title)
+        state = self.read_json("state.json")
+        self.assertLessEqual(len(state["goal_seeds"]), 50)
+        newest = [s for s in state["goal_seeds"] if s["title"].startswith("x")]
+        self.assertEqual(len(newest), 1)
+        self.assertLessEqual(len(newest[0]["title"]), 500)
+
+
 class MigrationTests(RepoTest):
     def test_migration_persists_fields_on_read(self):
         self.run_state("init")
         state_path = self.repo / ".autopilot" / "state.json"
         state = json.loads(state_path.read_text(encoding="utf-8"))
-        self.assertEqual(state["schema"], 5)
+        self.assertEqual(state["schema"], 6)
         state.pop("estimated_tokens_used", None)
         state_path.write_text(json.dumps(state), encoding="utf-8")
         self.run_state("read")
@@ -2208,10 +2373,40 @@ class ContractTests(RepoTest):
             "started_at", "last_activity_at", "round", "completed_rounds",
             "blocked_rounds", "cancelled_rounds", "reverted_rounds",
             "estimated_tokens_used", "type_stats", "goals", "completed_goals",
+            "goal_events", "goal_seeds",
             "current_round", "history", "stop_reason", "finished_at",
             "config_fingerprint",
         ):
             self.assertIn(key, state_data)
+
+    def test_check_brief_expansion_contract(self):
+        """Expand phase adds a stable-key `expansion` object; iterate phase must
+        NOT carry it (exact-set contract above). `seeds` is [] rather than a
+        missing key even when no goal has produced seeds yet."""
+        self.run_state("init", "--goal", "G", "--expand-after-goals", "--max-rounds", "50")
+        self.run_state("goal-met", "--goal", "G")
+        data = json.loads(self.run_state("check", "--brief").stdout)
+        self.assertEqual(data["phase"], "expand")
+        self.assertEqual(
+            set(data["expansion"]),
+            {
+                "seeds", "completed_goals", "recent_types",
+                "saturated_types", "underused_types", "suggested_themes",
+                "min_pending_candidates",
+            },
+        )
+        self.assertEqual(data["expansion"]["seeds"], [])
+        self.assertEqual(data["expansion"]["completed_goals"], ["G"])
+        self.assertIn("bugfix", data["expansion"]["underused_types"])
+        # With a seed present, the seed summary carries the stable field set.
+        self.run_state("goal-met", "--goal", "G2", "--next-step", "next thing")
+        data = json.loads(self.run_state("check", "--brief").stdout)
+        seeds = data["expansion"]["seeds"]
+        self.assertEqual(len(seeds), 1)
+        self.assertEqual(
+            set(seeds[0]),
+            {"id", "title", "type", "from_capability", "source_goal", "status"},
+        )
 
 
 class ConfigValidationMatrixTests(RepoTest):

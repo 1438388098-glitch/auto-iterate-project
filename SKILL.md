@@ -1,6 +1,6 @@
 ---
 name: auto-iterate-project
-version: 1.2.1
+version: 1.3.0
 description: Automatically iterate any git project inside the current agent session by analyzing the repository, choosing the next high-value improvement, implementing small changes, verifying, committing, and looping until a goal is met or configurable round/time/token limits are reached. Use when the user asks for autonomous project iteration, continuous self-improvement, auto-improve, keep improving this project, full-auto development, or wants the agent to keep making and committing improvements without per-step approval. Also use for Chinese requests like 全自动迭代这个项目, 自动改进并提交这个仓库, 连续自动开发, or 自动推进项目改进.
 ---
 
@@ -190,6 +190,14 @@ Do not push unless config sets `push: true`; when it does, `complete-round` push
 
 If the round satisfies one of the configured goals, run `goal-met --goal "<exact goal text>"`.
 
+Record the follow-on direction in the same call while it is fresh — every `--next-step` creates one **direction seed** (a predicted "because we shipped A, B is next" hypothesis) in `state.json`:
+
+```powershell
+python <this-skill>/scripts/autopilot_state.py goal-met --repo <repo> --goal "<goal>" --next-step "<predicted follow-up>" --unlocked-capability "<capability unlocked>"
+```
+
+`goal-met` also snapshots the context of the completion (recent commit topics, saturated types, the round's candidates) into a goal event, so the expansion phase can reason from what was just delivered instead of rescanning the repo. `completed_goals` stays a plain string array; old state files are migrated automatically.
+
 ### 10. Repeat
 
 Run `check` again after each round.
@@ -204,6 +212,34 @@ Set `checkpoint_every: N` to make the loop pause and consult the user every N ro
 
 Directives are persistent — use `python <this-skill>/scripts/autopilot_state.py directive-add --repo <repo> --text "<standing rule>"` and `directive-list` to read them. At the start of **every** round's Implement step, read `directive-list` and honor the standing rules before writing any code. Directives are how you steer a long autonomous run without stopping it.
 
+## Post-Goal Direction Prediction (Wave 0)
+
+Deep Expansion answers "what else could be improved?"; this protocol answers "because we just shipped X, what does the user need next?". It turns completed goals into *direction seeds* (hypotheses stored in `state.json` under `goal_seeds`) and consumes them before any lens scanning.
+
+**When it triggers** (unattended, never ask the user first):
+
+1. `goal-met` just marked a goal met.
+2. `check` reports `"phase": "expand"` and the first expansion after that is about to run.
+3. A goal is met mid-run while `check` still reports `continue: true`.
+
+**Generate 2-3 hypotheses, each a hard causal sentence**: "because A is done, B is next, and the evidence is C (a verifiable repo fact)". Four causal classes cover most cases:
+
+| Class | Template | Example |
+|---|---|---|
+| enablement | A unlocked capability U → wire U to a real entry point / docs / CLI | just added API X → add README + example |
+| exposure | A changed surface S → harden S's tests / error paths | just changed auth → add 401/403 matrix |
+| journey | with A in hand the user will do J next → make J not break | import works → handle first-sync failure |
+| debt | A bypassed D to hit the goal → remove D | hardcoded path → config option |
+
+**Hypothesis loop**: (1) predict, (2) verify the evidence at minimum cost — a hypothesis whose evidence is gone is rejected, (3) value-gate via `backlog-add --from-seed <id>` + `backlog-rank` (same red lines as Expansion), (4) work the most credible 1-2 via `begin-round`, (5) the seed resolves automatically from the round outcome: `complete-round` → `verified`, `block-round` → `refuted` (with the block reason as notes — failed hypotheses never flow back to game the stats), `cancel-round` → `open` again. A validated causal chain may spawn one more layer of hypotheses, at most two layers deep.
+
+**Wave order** (Expansion Phase below is Wave 1+):
+
+- **Wave 0 (seed wave)**: right after a goal is met, the first expansion must consume open seeds — verify evidence, value-gate, promote, work. Lens-scan Deep Expansion (16 lenses) is **forbidden** in this wave. Exception: if every open seed has been rejected/refuted (none survives the evidence check), skip straight to Wave 1+ instead of burning a round re-judging dead seeds.
+- **Wave 1+ (lens waves)**: the existing Deep Expansion protocol, unchanged. Its subagent prompts should attach a summary of still-open seeds; proposals hitting the same causal chain merge with the seed instead of double-counting.
+
+`check` in expand phase carries the `expansion` context (open seeds, completed goals, saturated/underused types, suggested themes) so both the main agent and its subagents reason from it instead of rescanning.
+
 ## Expansion Phase
 
 Expansion is **continuous and mandatory**, not a one-shot afterthought. It runs when:
@@ -211,6 +247,8 @@ Expansion is **continuous and mandatory**, not a one-shot afterthought. It runs 
 1. `expand_after_goals: true` and all configured goals are met (`check` reports `"phase": "expand"`).
 2. Backlog pending candidates fall below `min_pending_candidates` (default 3) — `check` reports `action_hint: "expand"`.
 3. Backlog pending is 0, or the best ready candidate has no concrete user value.
+
+Wave order: when trigger #1 fires and open goal seeds exist, the first wave is Wave 0 (Post-Goal Direction Prediction above); the lens work below is Wave 1+ and starts only after the seed wave is consumed (or every seed died in the evidence check).
 
 In every expansion wave:
 
@@ -271,6 +309,10 @@ Forbidden behaviors (protocol violations):
 - Sitting in a "nothing to do" state while `continue` is still true.
 - Opening a round with placeholders, churn, or candidates you cannot justify, just to look busy.
 - Declaring "optimization complete" when pending backlog is below `min_pending_candidates` and no expansion wave has been attempted this stretch.
+- Running a lens-scan Deep Expansion right after a goal was met while open direction seeds exist (Wave 0 must come first) — unless every open seed was already rejected/refuted in the evidence check.
+- Generating hypotheses without a "because A, B, evidence C" causal sentence, or without any verifiable repo evidence.
+- Creating direction seeds but never value-gating or promoting them (`backlog-add --from-seed`) — prediction without the verify loop is noise.
+- Idling with `continue: true` on the grounds that "the user should confirm the direction" — seeds are hypotheses, not questions; value-gate them and work.
 
 If you catch yourself about to idle, run Deep Expansion immediately.
 

@@ -28,7 +28,14 @@ PHASE_REPORT_PREFIX = "phase-report-round-"
 EMPTY_TREE = "4b825dc642cb6eb9a060e54bf8d69288fbee4904"
 
 DEFAULT_MAX_ROUNDS = 10
-SCHEMA_VERSION = 5
+SCHEMA_VERSION = 6
+
+# Goal-event / direction-seed sizing constants (single authority — do not
+# hardcode these elsewhere). Seeds and events live in state.json with bounded
+# growth so long-running expansion loops never bloat the state file.
+GOAL_EVENTS_LIMIT = 20
+SEEDS_LIMIT = 50
+SEED_TEXT_LIMIT = 500
 
 # Run/state sizing constants (single authority — do not hardcode these elsewhere).
 RUN_ID_LENGTH = 12

@@ -2,6 +2,39 @@
 
 All notable changes to auto-iterate-project are documented here.
 
+## 1.3.0 (2026-09-17)
+
+Post-Goal Direction Prediction (Wave 0): completed goals become predicted
+follow-up directions ("because we shipped A, B is next"), consumed before any
+lens-scan expansion. Designed in `docs/post-goal-prediction-proposal.md`
+(刀 A; the 刀 B anti-noise ranking factors ship separately in 1.3.1).
+
+### Added
+
+- `goal_events` / `goal_seeds` in `state.json` (schema v5 → v6, migrated
+  idempotently on read; `completed_goals` stays a plain string array; lists are
+  bounded at 20 events / 50 seeds with 500-char text caps).
+- `goal-met --next-step <title>` (repeatable) — each occurrence creates one
+  direction seed; `--unlocked-capability`, `--seed-type/--seed-value/--seed-effort`
+  override the defaults (seed type defaults to the first non-saturated type);
+  `--no-auto-context` skips the automatic snapshot. Every call also records a
+  structured goal event (recent commit topics, saturated types, round candidates).
+- `backlog-add --from-seed <id>` — promotes an open seed into a candidate
+  (title/type/value/effort/risk default to the seed; explicit flags override;
+  the candidate carries `from_seed` + `hypothesis`; the seed becomes `promoted`).
+- Seed write-back on round close: `complete-round` → `verified`,
+  `block-round` → `refuted` (block reason stored as notes — failed hypotheses
+  never re-enter the pool to game the stats), `cancel-round` → `open` again.
+- `check` in the expand phase reports an `expansion` context: open seeds,
+  completed goals, recent/saturated/underused types, suggested themes. The key
+  set is stable — `seeds` is `[]` rather than a missing key when no seeds exist;
+  iterate-phase `check --brief` output is unchanged (no `expansion` key).
+- Thin/empty-backlog warnings in the expand phase point at Wave 0 (seed
+  verification) before lens-scan Deep Expansion.
+- SKILL.md: Post-Goal Direction Prediction chapter (causal hypothesis classes,
+  hypothesis loop, Wave 0 / Wave 1+ ordering with the all-seeds-dead exception),
+  new Anti-Idle violations for prediction without verification.
+
 ## 1.2.1 (2026-09-11)
 
 Audit hardening from multi-lens Deep Expansion: fail-closed guards, ready-aware

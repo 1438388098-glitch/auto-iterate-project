@@ -1,6 +1,6 @@
 # Auto Iterate Project
 
-Version 1.2.1 — see [CHANGELOG.md](CHANGELOG.md) for release history.
+Version 1.3.0 — see [CHANGELOG.md](CHANGELOG.md) for release history.
 
 Automatically iterate any git project inside an agent session: analyze the repository, pick the next high-value improvement, implement small changes, verify, commit, and loop until a goal is met or configurable round/time/token limits are reached.
 
@@ -15,6 +15,7 @@ Works with opencode, Claude Code, Codex, and other agent runtimes (auto-detected
 - **Secret guard**: `commit` scans the staged diff for secret-like content (AWS keys, private keys, GitHub/Slack/Google tokens, `sk-*`) and refuses on a match; `secret-scan` checks the staged diff on demand.
 - **Human checkpoints & directives**: `checkpoint_every: N` pauses the loop to consult you every N rounds; `directive-add` records standing rules that every round must honor (`.autopilot/directives.json`) — steer a long run without stopping it.
 - **Expansion phase**: `expand_after_goals: true` keeps the loop improving after all goals are met, scouting fresh candidates and value-gating them through the backlog rank instead of stopping or bloating.
+- **Post-goal direction prediction (Wave 0)**: `goal-met --next-step` turns each completed goal into direction seeds — "because we shipped A, B is next" hypotheses with verifiable evidence. After a goal, the first expansion must consume these seeds (verify evidence → value-gate → `backlog-add --from-seed`) before any lens scanning; round outcomes resolve the seeds automatically (`complete-round` → verified, `block-round` → refuted with notes, cancel → open again), closing a hit-rate feedback loop for the predictions.
 - **Deep Expansion & anti-idle**: empty or thin backlog is never a stop or an escalation — `check` reports `action_hint: expand` when pending candidates fall below `min_pending_candidates` (default 3). The agent must spawn explore subagents across a rotating multi-lens set (architecture, tests, security, perf, docs/DX, debt, API, concurrency, i18n, config, observability, packaging, data integrity, UX, deps, resilience), keep raising effort when a wave is thin, and never wait out the deadline.
 - **Quality red line**: `review_threshold` requires every completed round to self-score at or above a minimum before it is recorded.
 - **Multiple stop conditions**: goals, `max_rounds`, `max_minutes`, `max_tokens`, `max_blocked_in_a_row`, and a `deadline` timer (e.g. "iterate until tomorrow morning") that stops at an absolute wall-clock moment.

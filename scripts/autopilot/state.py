@@ -32,6 +32,8 @@ def default_state(repo, goals=None, config_fingerprint=None):
         "type_stats": {},
         "goals": list(goals or []),
         "completed_goals": [],
+        "goal_events": [],
+        "goal_seeds": [],
         "current_round": None,
         "history": [],
         "stop_reason": None,
@@ -57,6 +59,8 @@ def migrate_state(state):
         "reverted_rounds": 0,
         "estimated_tokens_used": 0,
         "type_stats": {},
+        "goal_events": [],
+        "goal_seeds": [],
         "repo": None,
         "created_at": io.now_iso(),
         "started_at": None,
@@ -114,6 +118,10 @@ def _validate_state_types(repo, state):
         _state_type_error(path, "'goals' must be an array")
     if not isinstance(state.get("type_stats", {}), dict):
         _state_type_error(path, "'type_stats' must be an object")
+    if not isinstance(state.get("goal_events", []), list):
+        _state_type_error(path, "'goal_events' must be an array")
+    if not isinstance(state.get("goal_seeds", []), list):
+        _state_type_error(path, "'goal_seeds' must be an array")
     current = state.get("current_round")
     if current is not None and not isinstance(current, dict):
         _state_type_error(path, "'current_round' must be an object or null")
@@ -231,6 +239,128 @@ def round_candidate_ids(current):
     if not ids and current.get("candidate_id"):
         ids = [current.get("candidate_id")]
     return ids
+
+
+# --- Post-goal direction prediction (goal events + direction seeds) ---------
+# Seeds carry the "because we shipped X, Y is probably next" hypotheses. They
+# live in state.json (no separate file) with bounded growth; completed_goals
+# stays a plain string array for backward compatibility.
+
+SEED_STATUSES = ("open", "promoted", "verified", "refuted", "rejected")
+
+
+def saturated_types(state, threshold=2):
+    """Types whose completed-candidate count reached the saturation threshold
+    (from the state's type_stats snapshot). Deterministic order."""
+    try:
+        threshold = max(0, int(threshold or 0))
+    except (TypeError, ValueError):
+        threshold = 2
+    result = []
+    for candidate_type in sorted(state.get("type_stats") or {}):
+        entry = (state.get("type_stats") or {}).get(candidate_type) or {}
+        try:
+            completed = int(entry.get("completed") or 0)
+        except (TypeError, ValueError):
+            completed = 0
+        if completed >= threshold:
+            result.append(candidate_type)
+    return result
+
+
+def _next_sequential_id(state, key, prefix):
+    """Next zero-padded id (`ge-003` / `seed-011`) that does not collide with
+    existing entries, even after truncation dropped the oldest ones."""
+    existing = set()
+    for item in state.get(key) or []:
+        if isinstance(item, dict) and str(item.get("id") or "").startswith(prefix):
+            existing.add(str(item.get("id")))
+    counter = 1
+    while "{}{:03d}".format(prefix, counter) in existing:
+        counter += 1
+    return "{}{:03d}".format(prefix, counter)
+
+
+def _truncate_seed_text(text):
+    if isinstance(text, str) and len(text) > io.SEED_TEXT_LIMIT:
+        return text[:io.SEED_TEXT_LIMIT]
+    return text
+
+
+def find_seed(state, seed_id):
+    for seed in state.get("goal_seeds") or []:
+        if isinstance(seed, dict) and seed.get("id") == seed_id:
+            return seed
+    return None
+
+
+def open_seeds(state):
+    """Seeds still awaiting a value-gate / promote decision."""
+    return [s for s in state.get("goal_seeds") or []
+            if isinstance(s, dict) and s.get("status") == "open"]
+
+
+def append_goal_event(st, event):
+    """Append a structured goal-completion record with bounded growth."""
+    event["id"] = _next_sequential_id(st, "goal_events", "ge-")
+    event.setdefault("met_at", io.now_iso())
+    events = st.setdefault("goal_events", [])
+    events.append(event)
+    if len(events) > io.GOAL_EVENTS_LIMIT:
+        del events[: len(events) - io.GOAL_EVENTS_LIMIT]
+    return event
+
+
+def append_seed(st, seed):
+    """Append a direction-seed hypothesis with bounded growth and capped text."""
+    seed["id"] = _next_sequential_id(st, "goal_seeds", "seed-")
+    seed.setdefault("created_at", io.now_iso())
+    seed.setdefault("status", "open")
+    for key in ("title", "hypothesis", "from_capability", "source_goal"):
+        seed[key] = _truncate_seed_text(seed.get(key))
+    seeds = st.setdefault("goal_seeds", [])
+    seeds.append(seed)
+    if len(seeds) > io.SEEDS_LIMIT:
+        del seeds[: len(seeds) - io.SEEDS_LIMIT]
+    return seed
+
+
+def resolve_seed(st, seed_id, status, notes=None, candidate_id=None):
+    """Move a seed along its state machine. Returns the seed or None.
+      open -> promoted (backlog-add --from-seed) -> verified (complete-round)
+                                                 -> refuted  (block-round)
+      open -> rejected (value-gate refusal)
+    Cancelling a round returns its seeds to `open` (stale promotion markers are
+    cleared). Failed hypotheses never flow back silently: a refuted seed keeps
+    its notes so the hit-rate statistics stay honest."""
+    seed = find_seed(st, seed_id)
+    if seed is None:
+        return None
+    if status not in SEED_STATUSES:
+        return None
+    now = io.now_iso()
+    seed["status"] = status
+    seed["updated_at"] = now
+    if status == "promoted":
+        seed["promoted_at"] = now
+        if candidate_id:
+            seed["promoted_candidate_id"] = candidate_id
+    elif status == "verified":
+        seed["verified_at"] = now
+        if candidate_id:
+            seed["promoted_candidate_id"] = candidate_id
+    elif status == "refuted":
+        seed["refuted_at"] = now
+        seed["outcome"] = notes or ""
+    elif status == "rejected":
+        seed["rejected_at"] = now
+        seed["outcome"] = notes or ""
+    elif status == "open":
+        # Cancel write-back: clear the stale promotion markers so the seed can be
+        # re-promoted cleanly (the candidate itself returns to pending too).
+        seed.pop("promoted_at", None)
+        seed.pop("promoted_candidate_id", None)
+    return seed
 
 
 def _assert_safe_ref_name(name, what="branch"):

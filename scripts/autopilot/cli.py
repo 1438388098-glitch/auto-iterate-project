@@ -144,6 +144,16 @@ def build_parser():
     goal_parser = subparsers.add_parser("goal-met", help="Mark a configured goal met")
     goal_parser.add_argument("--repo", default=".")
     goal_parser.add_argument("--goal", required=True)
+    goal_parser.add_argument("--next-step", action="append", default=None,
+                             help="Predicted follow-up direction; each occurrence creates one direction seed (repeatable)")
+    goal_parser.add_argument("--unlocked-capability", action="append", default=None,
+                             help="Capability the completed goal unlocked (repeatable, recorded on the goal event and seeds)")
+    goal_parser.add_argument("--seed-type", default=None,
+                             help="Type for created seeds (default: first non-saturated type)")
+    goal_parser.add_argument("--seed-value", type=int, default=None, help="Seed value 1-5 (default 4)")
+    goal_parser.add_argument("--seed-effort", type=int, default=None, help="Seed effort 1-5 (default 2)")
+    goal_parser.add_argument("--no-auto-context", action="store_true",
+                             help="Skip the automatic commit-topic/type-stats snapshot for the goal event")
     add_json(goal_parser)
     add_dry_run(goal_parser)
     goal_parser.set_defaults(func=commands.cmd_goal_met)
@@ -211,8 +221,11 @@ def build_parser():
 
     backlog_add_parser = subparsers.add_parser("backlog-add", help="Add a backlog candidate")
     backlog_add_parser.add_argument("--repo", default=".")
-    backlog_add_parser.add_argument("--title", required=True)
+    backlog_add_parser.add_argument("--title", default=None,
+                                    help="Candidate title (defaults to the seed title when --from-seed is used)")
     backlog_add_parser.add_argument("--reason")
+    backlog_add_parser.add_argument("--from-seed", default=None,
+                                    help="Promote a direction seed (seed id); title/type/value/effort/risk default to the seed")
     backlog_add_parser.add_argument("--value", type=int, default=None, help="Value 1-5 (preferred)")
     backlog_add_parser.add_argument("--effort", type=int, default=None, help="Effort 1-5 (preferred)")
     backlog_add_parser.add_argument("--type", default=None,

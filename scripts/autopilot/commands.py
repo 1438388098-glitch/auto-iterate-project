@@ -336,6 +336,33 @@ def _refresh_type_stats(repo, st):
     st["type_stats"] = state.compute_type_stats(state.load_backlog(repo))
 
 
+def _resolve_round_seeds(repo, current, outcome, notes=None):
+    """Seed write-back after a round closes: candidates promoted from seeds
+    (`from_seed`) resolve their seed to verified (completed round), refuted
+    (blocked round, notes = the block reason — failed hypotheses keep their
+    evidence and never re-enter the pool to game the stats), or open again
+    (cancelled round, the candidate returns to pending)."""
+    backlog = state.load_backlog(repo)
+    seed_ids = []
+    for candidate_id in state.round_candidate_ids(current):
+        candidate = state.find_candidate(backlog, candidate_id)
+        from_seed = (candidate or {}).get("from_seed")
+        if from_seed and from_seed not in seed_ids:
+            seed_ids.append(from_seed)
+    if not seed_ids:
+        return
+    st = state.load_state(repo)
+    for seed_id in seed_ids:
+        if outcome == "completed":
+            state.resolve_seed(st, seed_id, "verified", candidate_id=None)
+        elif outcome == "blocked":
+            state.resolve_seed(st, seed_id, "refuted", notes=notes)
+        else:
+            state.resolve_seed(st, seed_id, "open")
+    state.save_state(repo, st)
+    io.append_log(repo, "seed-writeback", "success", seeds=seed_ids, outcome=outcome)
+
+
 def _close_round(repo, st, current, status, counter_key, tokens, history_entry,
                  candidate_status, candidate_round=None, candidate_extra=None):
     """Shared round-closing bookkeeping: bump the round counter, append tokens,
@@ -434,6 +461,7 @@ def cmd_complete_round(args):
             repo, "complete-round", "success",
             round=current["round"], commit_sha=args.commit_sha, estimated_tokens=tokens,
         )
+        _resolve_round_seeds(repo, current, "completed")
 
         if st.get("completed_rounds", 0) % io.PHASE_REPORT_INTERVAL == 0:
             state.write_phase_report(repo, st, cfg)
@@ -485,6 +513,7 @@ def cmd_block_round(args):
             candidate_round=current["round"],
         )
         io.append_log(repo, "block-round", "success", round=current["round"], reason=args.reason)
+        _resolve_round_seeds(repo, current, "blocked", notes=args.reason)
         return emit_result(args, True, "[OK] Round blocked.")
 
 
@@ -519,31 +548,126 @@ def cmd_cancel_round(args):
             candidate_status="pending",
         )
         io.append_log(repo, "cancel-round", "success", round=current["round"], reason=args.reason)
+        _resolve_round_seeds(repo, current, "cancelled")
         return emit_result(args, True, "[OK] Round cancelled.")
+
+
+def _recent_commit_topics(repo, limit=5):
+    """Last N commit subjects (sha stripped), oldest last. Empty on unborn repos."""
+    if not io.has_commits(repo):
+        return []
+    result = io.run_git(repo, "log", "--oneline", "-{}".format(limit))
+    if result.returncode != 0:
+        return []
+    topics = []
+    for line in result.stdout.splitlines():
+        subject = line.strip()
+        if " " in subject:
+            subject = subject.split(" ", 1)[1]
+        if subject:
+            topics.append(subject)
+    topics.reverse()
+    return topics
+
+
+def _last_completed_candidate_ids(st):
+    """Candidate ids recorded by the most recent completed round (bounded to the
+    first recorded id for legacy single-candidate history entries)."""
+    for entry in reversed(st.get("history") or []):
+        if entry.get("status") == "completed":
+            candidate_id = entry.get("candidate_id")
+            return [candidate_id] if candidate_id else []
+    return []
+
+
+def _default_seed_type(saturated):
+    """First candidate type that is not yet saturated (seed defaults avoid piling
+    onto a saturated type); falls back to feature."""
+    for candidate_type in state.VALID_CANDIDATE_TYPES:
+        if candidate_type not in saturated:
+            return candidate_type
+    return "feature"
 
 
 def cmd_goal_met(args):
     repo = Path(args.repo).resolve()
     with io.run_lock(repo):
         st = state.load_state(repo)
+        cfg = config.load_config(repo)
         goal = args.goal
         if not goal:
             io.append_log(repo, "goal-met", "error", reason="goal required")
             return emit_result(args, False, "[ERROR] --goal is required.")
+
+        next_steps = list(args.next_step or [])
+        unlocked = list(args.unlocked_capability or [])
+        seed_type = getattr(args, "seed_type", None)
+        if seed_type is not None and seed_type not in state.VALID_CANDIDATE_TYPES:
+            io.append_log(repo, "goal-met", "error", reason="unknown seed type")
+            return emit_result(
+                args, False,
+                "[ERROR] --seed-type must be one of {}.".format("|".join(state.VALID_CANDIDATE_TYPES)),
+            )
+        for name, value in (("--seed-value", args.seed_value), ("--seed-effort", args.seed_effort)):
+            if value is not None and (value < 1 or value > 5):
+                io.append_log(repo, "goal-met", "error", reason="{} out of range".format(name))
+                return emit_result(args, False, "[ERROR] {} must be between 1 and 5.".format(name))
+
         if getattr(args, "dry_run", False):
-            print("[DRY-RUN] Would mark goal as met: {}.".format(goal), file=sys.stderr)
+            print("[DRY-RUN] Would mark goal as met: {} ({} direction seeds).".format(goal, len(next_steps)), file=sys.stderr)
             return 0
+
+        saturated = []
+        recent_topics = []
+        round_candidate_ids = []
+        if not args.no_auto_context:
+            saturated = state.saturated_types(st, cfg.get("type_saturation_threshold", 2))
+            recent_topics = _recent_commit_topics(repo)
+            round_candidate_ids = _last_completed_candidate_ids(st)
+
+        seeds = []
+        if next_steps:
+            default_type = seed_type or _default_seed_type(saturated)
+            for title in next_steps:
+                seed = state.append_seed(st, {
+                    "source_goal": goal,
+                    "title": title,
+                    "hypothesis": "if completed, then: {}".format(title),
+                    "from_capability": unlocked[0] if unlocked else "",
+                    "type": default_type,
+                    "value": args.seed_value if args.seed_value is not None else 4,
+                    "effort": args.seed_effort if args.seed_effort is not None else 2,
+                    "risk": 1,
+                    "status": "open",
+                })
+                seeds.append(seed)
+
         if goal not in st["completed_goals"]:
             st["completed_goals"].append(goal)
-            st["last_activity_at"] = io.now_iso()
+        st["last_activity_at"] = io.now_iso()
+        goal_event = None
+        if not args.no_auto_context or seeds or unlocked:
+            goal_event = state.append_goal_event(st, {
+                "goal": goal,
+                "met_at": io.now_iso(),
+                "round": st.get("round") or 0,
+                "commit_shas": [],
+                "candidate_ids": round_candidate_ids,
+                "unlocked_capabilities": unlocked,
+                "recent_commit_topics": recent_topics,
+                "saturated_types": saturated,
+                "seed_ids": [seed["id"] for seed in seeds],
+            })
         state.save_state(repo, st)
-        io.append_log(repo, "goal-met", "success", goal=goal)
-        cfg = config.load_config(repo)
+        io.append_log(repo, "goal-met", "success", goal=goal, seeds=[seed["id"] for seed in seeds])
         if state.all_goals_met(cfg, st) and cfg.get("expand_after_goals"):
-            message = "[OK] Goal marked met. All goals are met; entering the expansion phase (expand_after_goals)."
+            message = "[OK] Goal marked met. All goals are met; entering the expansion phase (expand_after_goals). Wave 0: verify and value-gate the direction seeds first."
         else:
             message = "[OK] Goal marked met."
-        return emit_result(args, True, message)
+        data = None
+        if getattr(args, "json", False):
+            data = {"goal_event": goal_event, "seeds": seeds}
+        return emit_result(args, True, message, data=data)
 
 
 def cmd_finish(args):
@@ -582,6 +706,7 @@ def cmd_finish(args):
                 candidate_status="pending",
             )
             io.append_log(repo, "cancel-round", "success", round=open_round.get("round"), reason="auto-cancelled at finish")
+            _resolve_round_seeds(repo, open_round, "cancelled")
 
         st["finished_at"] = io.now_iso()
         st["stop_reason"] = args.reason or st.get("stop_reason") or "finished"
@@ -636,9 +761,38 @@ def cmd_backlog_add(args):
     repo = Path(args.repo).resolve()
     with io.run_lock(repo):
         backlog = state.load_backlog(repo)
+        seed = None
+        if getattr(args, "from_seed", None):
+            st = state.load_state(repo)
+            seed = state.find_seed(st, args.from_seed)
+            if seed is None:
+                io.append_log(repo, "backlog-add", "error", reason="seed not found")
+                return emit_result(args, False, "[ERROR] Direction seed not found in state: {}".format(args.from_seed))
+            if seed.get("status") != "open":
+                io.append_log(
+                    repo, "backlog-add", "error", reason="seed not open",
+                )
+                return emit_result(
+                    args, False,
+                    "[ERROR] Seed {} is '{}' (only 'open' seeds can be promoted). "
+                    "Check state.json goal_seeds for candidates that are still open.".format(
+                        args.from_seed, seed.get("status")
+                    ),
+                )
+        title = args.title or (seed or {}).get("title")
+        if not title:
+            return emit_result(args, False, "[ERROR] --title is required (unless --from-seed supplies it).")
         candidate_id = "candidate-{:03d}".format(backlog["next_id"])
-        value = args.value if args.value is not None else config.LEGACY_IMPACT_SCORE.get(args.impact, 3)
-        effort = args.effort if args.effort is not None else config.LEGACY_EFFORT_SCORE.get(args.effort_level, 3)
+        value = args.value
+        if value is None:
+            value = (seed or {}).get("value") if seed is not None else None
+        if value is None:
+            value = config.LEGACY_IMPACT_SCORE.get(args.impact, 3)
+        effort = args.effort
+        if effort is None:
+            effort = (seed or {}).get("effort") if seed is not None else None
+        if effort is None:
+            effort = config.LEGACY_EFFORT_SCORE.get(args.effort_level, 3)
         if value < 1 or value > 5:
             io.append_log(repo, "backlog-add", "error", reason="value out of range")
             return emit_result(args, False, "[ERROR] --value must be between 1 and 5.")
@@ -656,7 +810,7 @@ def cmd_backlog_add(args):
             )
         candidate = {
             "id": candidate_id,
-            "title": args.title,
+            "title": title,
             "reason": args.reason or "",
             "type": args.type or "feature",
             "risk": args.risk if args.risk is not None else 1,
@@ -669,10 +823,15 @@ def cmd_backlog_add(args):
             "created_at": io.now_iso(),
             "updated_at": io.now_iso(),
         }
+        if seed is not None:
+            candidate["type"] = args.type or seed.get("type") or "feature"
+            candidate["risk"] = args.risk if args.risk is not None else (seed.get("risk") or 1)
+            candidate["from_seed"] = seed["id"]
+            candidate["hypothesis"] = seed.get("hypothesis") or ""
         if getattr(args, "dry_run", False):
             print(
                 "[DRY-RUN] Would add candidate {} ({}): {}.".format(
-                    candidate_id, args.type or "feature", args.title
+                    candidate_id, candidate["type"], title
                 ),
                 file=sys.stderr,
             )
@@ -680,6 +839,10 @@ def cmd_backlog_add(args):
         backlog["candidates"].append(candidate)
         backlog["next_id"] += 1
         state.save_backlog(repo, backlog)
+        if seed is not None:
+            st = state.load_state(repo)
+            state.resolve_seed(st, seed["id"], "promoted", candidate_id=candidate_id)
+            state.save_state(repo, st)
         # Expansion/backlog work counts as activity so max_minutes does not burn
         # out while the agent is scouting instead of sitting in begin-round.
         try:
@@ -688,7 +851,7 @@ def cmd_backlog_add(args):
             state.save_state(repo, st)
         except SystemExit:
             pass
-        io.append_log(repo, "backlog-add", "success", candidate_id=candidate_id, title=args.title)
+        io.append_log(repo, "backlog-add", "success", candidate_id=candidate_id, title=title)
         if getattr(args, "json", False):
             return emit_result(args, True, "backlog candidate added", data={"id": candidate_id})
         print(candidate_id)
@@ -1320,12 +1483,22 @@ def cmd_check(args):
 
     backlog = state.load_backlog(repo)
     backlog_watch = _backlog_watch(backlog, cfg)
+    open_seed_list = state.open_seeds(st)
+    seed_hint = ""
+    if open_seed_list:
+        seed_hint = (
+            " Wave 0 first: verify and value-gate the open direction seeds ({}) via "
+            "'backlog-add --from-seed <id>'; lens-scan Deep Expansion is the second wave.".format(
+                ", ".join(seed.get("id") or "" for seed in open_seed_list[:5])
+            )
+        )
     if stop_reason is None and backlog_watch["needs_expansion"]:
         if backlog_watch["pending"] == 0:
             warnings.append(
                 "Backlog has no pending candidates. Do NOT idle or wait for the deadline: "
                 "run Deep Expansion now (spawn explore subagents, add 3-5 candidates with "
                 "backlog-add). Empty backlog is an expansion trigger, not a reason to stop."
+                + seed_hint
             )
         elif backlog_watch["ready"] == 0:
             warnings.append(
@@ -1357,6 +1530,46 @@ def cmd_check(args):
     goals_met = state.all_goals_met(cfg, st)
     payload["goals_met"] = goals_met
     payload["phase"] = "expand" if (goals_met and cfg.get("expand_after_goals")) else "iterate"
+    if payload["phase"] == "expand":
+        # Expansion context for Wave 0 (seed wave). Key set is stable even when
+        # every list is empty — `seeds` is [] rather than a missing key so the
+        # consumer's key-existence check never flips between runs.
+        type_stats = st.get("type_stats") or {}
+        recent_types = {}
+        for candidate_type in sorted(type_stats):
+            try:
+                recent_types[candidate_type] = int((type_stats.get(candidate_type) or {}).get("completed") or 0)
+            except (TypeError, ValueError):
+                recent_types[candidate_type] = 0
+        saturated = state.saturated_types(st, cfg.get("type_saturation_threshold", 2))
+        underused = [t for t in state.VALID_CANDIDATE_TYPES if t not in saturated]
+        suggested_themes = []
+        for event in reversed(st.get("goal_events") or []):
+            if not isinstance(event, dict):
+                continue
+            if event.get("goal"):
+                suggested_themes.append("follow up on goal: {}".format(event["goal"]))
+            suggested_themes.extend((event.get("recent_commit_topics") or [])[:2])
+            break
+        payload["expansion"] = {
+            "seeds": [
+                {
+                    "id": seed.get("id"),
+                    "title": seed.get("title"),
+                    "type": seed.get("type") or "feature",
+                    "from_capability": seed.get("from_capability") or "",
+                    "source_goal": seed.get("source_goal") or "",
+                    "status": seed.get("status"),
+                }
+                for seed in state.open_seeds(st)
+            ],
+            "completed_goals": list(st.get("completed_goals") or []),
+            "recent_types": recent_types,
+            "saturated_types": saturated,
+            "underused_types": underused,
+            "suggested_themes": suggested_themes,
+            "min_pending_candidates": cfg.get("min_pending_candidates") if cfg.get("min_pending_candidates") is not None else 3,
+        }
     completed_total = (
         st.get("completed_rounds", 0)
         + st.get("blocked_rounds", 0)
