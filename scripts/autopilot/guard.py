@@ -23,11 +23,18 @@ def path_allowed(path, allow_paths, deny_paths):
     allow_paths is non-empty and does not match it. Patterns are fnmatch globs
     matched against the full path and the basename; a pattern ending in '/' (or a
     bare directory name without glob characters) also matches everything under
-    that directory."""
+    that directory. Patterns are normalized to forward slashes like the staged
+    path — a Windows-style deny rule ("secrets\\") used to silently never match,
+    a fail-open hole. `**` is treated as "any number of directories (including
+    none)" before fnmatch translation, matching gitignore intuition."""
+    def normalize(value):
+        return value.replace("\\", "/")
+
     def matches(p, pattern):
         if not pattern:
             return False
-        p_norm = p.replace("\\", "/")
+        p_norm = normalize(p)
+        pattern = normalize(pattern)
         if pattern.endswith("/"):
             if p_norm.startswith(pattern) or p_norm.lower().startswith(pattern.lower()):
                 return True
@@ -35,10 +42,24 @@ def path_allowed(path, allow_paths, deny_paths):
             low = p_norm.lower()
             if p_norm == pattern or low.startswith(pattern.lower() + "/"):
                 return True
-        if _fnmatch_any(p_norm, pattern):
+        if _fnmatch_any(p_norm, _expand_globstar(p_norm, pattern)):
             return True
         base = os.path.basename(p_norm)
-        return bool(base and _fnmatch_any(base, pattern))
+        return bool(base and _fnmatch_any(base, _expand_globstar(base, pattern)))
+
+    def _expand_globstar(value, pattern):
+        """fnmatch translates each `*` as `.*` (crossing '/'), yet still requires
+        a literal '/' per pattern slash — so `src/**/*.py` missed `src/a.py`.
+        Collapse `**/` and `/**` so the star run matches zero directories too."""
+        if "**/" in pattern:
+            result = pattern
+            while "**/" in result:
+                collapsed = result.replace("**/", "", 1)
+                if _fnmatch_any(value, collapsed):
+                    return collapsed
+                result = result.replace("**/", "*", 1)
+            return result
+        return pattern
 
     if any(matches(path, pattern) for pattern in (deny_paths or [])):
         return False

@@ -19,6 +19,14 @@ SCRIPT = Path(__file__).resolve().parent / "autopilot_state.py"
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 from autopilot import state as ap_state  # noqa: E402
 from autopilot.cli import build_parser  # noqa: E402
+from autopilot.guard import path_allowed  # noqa: E402
+from autopilot.secrets import SECRET_PATTERNS  # noqa: E402
+
+import re  # noqa: E402
+
+
+def _secret_hit(text):
+    return any(re.search(pattern, text) for pattern in SECRET_PATTERNS)
 
 
 class RunResult(object):
@@ -1044,6 +1052,48 @@ class PredictedHardeningTests(RepoTest):
         self.assertNotIn("stepA\nstepB", output)
         self.assertIn("line1 line2\\|PIPE TAB", output)
         self.assertIn("stepA stepB\\|X", output)
+
+    def test_guard_backslash_deny_matches(self):
+        # A Windows-style deny rule used to silently never match (fail-open).
+        self.assertFalse(path_allowed("secrets/prod/keys.txt", [], ["secrets\\"]))
+        self.assertFalse(path_allowed("secrets/prod/keys.txt", [], ["secrets/"]))
+
+    def test_guard_globstar_matches_zero_directories(self):
+        self.assertFalse(path_allowed("src/a.py", [], ["src/**/*.py"]))
+        self.assertFalse(path_allowed("src/deep/b.py", [], ["src/**/*.py"]))
+        self.assertTrue(path_allowed("src/a.py", ["src/**/*.py"], []))
+        # Bare "*.log" matches by basename under subdirectories.
+        self.assertFalse(path_allowed("notes/a.log", [], ["*.log"]))
+        self.assertTrue(path_allowed("notes/a.log", ["*.log"], []))
+
+    def test_secret_patterns_pkcs8_and_github_variants(self):
+        self.assertTrue(_secret_hit("-----BEGIN ENCRYPTED PRIVATE KEY-----"))
+        self.assertTrue(_secret_hit("-----BEGIN OPENSSH PRIVATE KEY-----"))
+        self.assertTrue(_secret_hit("token: gho_" + "a" * 36))
+        self.assertTrue(_secret_hit("token: ghs_" + "b" * 36))
+        self.assertTrue(_secret_hit("key = " + "sk-proj-" + "c" * 30))
+
+    def test_secret_sk_pattern_word_boundary(self):
+        self.assertFalse(_secret_hit("the task-runner-configuration-for-nightly job"))
+        self.assertFalse(_secret_hit("disk-utility-backup-script-v2 archive"))
+        self.assertTrue(_secret_hit('"sk-live-abcdefghijklmnopqrst"'))
+
+    def test_version_consistency_across_files(self):
+        """Single version authority (scripts/autopilot/__init__.py __version__)
+        must match SKILL.md frontmatter, agents/openai.yaml, README.md, and the
+        newest CHANGELOG section — drift fails here instead of at release time."""
+        import autopilot
+
+        repo_root = Path(__file__).resolve().parent.parent
+        version = autopilot.__version__
+        skill = (repo_root / "SKILL.md").read_text(encoding="utf-8")
+        self.assertIn("version: {}".format(version), skill)
+        yaml_text = (repo_root / "agents" / "openai.yaml").read_text(encoding="utf-8")
+        self.assertIn("version: {}".format(version), yaml_text)
+        readme = (repo_root / "README.md").read_text(encoding="utf-8")
+        self.assertIn("Version {}".format(version), readme)
+        changelog = (repo_root / "CHANGELOG.md").read_text(encoding="utf-8")
+        self.assertIn("## {} (".format(version), changelog)
 
     def test_directive_remove_by_index(self):
         self.run_state("init")

@@ -22,7 +22,11 @@ def _force_utf8_stdio():
 
 
 def build_parser():
+    from . import __version__
+
     parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--version", action="version",
+                        version="auto-iterate-project {}".format(__version__))
     subparsers = parser.add_subparsers(dest="command")
 
     def add_json(sub):
