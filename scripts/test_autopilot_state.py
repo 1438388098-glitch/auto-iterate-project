@@ -55,9 +55,13 @@ class AutopilotTestBase(unittest.TestCase):
         self.env["LC_ALL"] = "C"
         self.env["GIT_CEILING_DIRECTORIES"] = str(Path(self.tmp).parent).replace("\\", "/")
         self.git("init", "-q")
-        self.git("config", "user.name", "Test User")
-        self.git("config", "user.email", "test@example.com")
-        self.git("config", "commit.gpgsign", "false")
+        # Repo-local identity written straight into .git/config: 3 fewer git
+        # subprocesses per test (~250 tests) without changing behavior.
+        (self.repo / ".git" / "config").write_text(
+            "[user]\n\tname = Test User\n\temail = test@example.com\n"
+            "[commit]\n\tgpgsign = false\n",
+            encoding="utf-8",
+        )
 
     def tearDown(self):
         shutil.rmtree(self.tmp, ignore_errors=True)
@@ -108,7 +112,10 @@ class RepoTest(AutopilotTestBase):
         (self.repo / "README.md").write_text("# Test\n", encoding="utf-8")
         self.git("add", "README.md")
         self.git("commit", "-q", "-m", "initial")
-        self.initial_branch = self.git("rev-parse", "--abbrev-ref", "HEAD").stdout.strip()
+        # Read HEAD directly (ref: refs/heads/<name>) — no subprocess, and
+        # independent of the git version's default-branch name.
+        head = (self.repo / ".git" / "HEAD").read_text(encoding="utf-8").strip()
+        self.initial_branch = head.split("/")[-1] if "/" in head else head
 
     def add_file(self, name="feature.py", content="x = 1\n"):
         (self.repo / name).write_text(content, encoding="utf-8")

@@ -309,9 +309,10 @@ def cmd_begin_round(args):
                 file=sys.stderr,
             )
 
-        start_sha = None
-        if io.has_commits(repo):
-            start_sha = io.run_git(repo, "rev-parse", "HEAD").stdout.strip()
+        # One rev-parse answers "has commits?" and yields the SHA together
+        # (has_commits + rev-parse would be two identical-cost calls).
+        head = io.run_git(repo, "rev-parse", "--verify", "-q", "HEAD")
+        start_sha = head.stdout.strip() if head.returncode == 0 else None
 
         current = {
             "round": round_number,
@@ -1772,12 +1773,14 @@ def cmd_diagnose(args):
         return 0
 
     identity_ok, name, email = io.git_identity_ok(repo)
+    has_commits = io.has_commits(repo)
+    branch = io.current_branch(repo)
     info = {
         "is_git_repo": True,
         "repo": str(repo),
-        "has_commits": io.has_commits(repo),
-        "current_branch": io.current_branch(repo),
-        "detached_head": io.is_detached_head(repo),
+        "has_commits": has_commits,
+        "current_branch": branch,
+        "detached_head": bool(has_commits and branch == "HEAD"),
         "dirty": io.working_tree_dirty(repo),
         "user_name": name,
         "user_email": email,
