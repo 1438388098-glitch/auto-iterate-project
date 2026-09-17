@@ -95,6 +95,13 @@ _STATE_INT_KEYS = (
 
 
 def _state_type_error(path, message):
+    # The integrity trail outlives this process's stderr: log before dying so
+    # the first detection of corrupted state is findable after the fact.
+    try:
+        io.append_log(path.parent.parent, "integrity", "error",
+                      file=str(path), message=message)
+    except Exception:
+        pass
     print(
         "[ERROR] Invalid .autopilot/state.json: {}. Fix or delete it and run init again.".format(message),
         file=sys.stderr,
@@ -147,12 +154,18 @@ def load_state(repo):
         raise SystemExit(2)
     changed = migrate_state(state)
     _validate_state_types(repo, state)
-    if state.get("schema", 1) < io.SCHEMA_VERSION:
+    old_schema = state.get("schema", 1)
+    if old_schema < io.SCHEMA_VERSION:
         state["schema"] = io.SCHEMA_VERSION
         changed = True
     state["repo"] = str(repo)
     if changed:
         save_state(repo, state)
+        # Schema upgrades and field backfills mutate the user's state file: an
+        # audit event makes "who changed state.json" answerable (migration, not
+        # corruption).
+        io.append_log(repo, "state-migrate", "success",
+                      from_schema=old_schema, to_schema=io.SCHEMA_VERSION)
     return state
 
 
@@ -172,6 +185,10 @@ def _validate_backlog(repo, backlog):
     path = config.backlog_path_for(repo)
 
     def fail(message):
+        try:
+            io.append_log(repo, "integrity", "error", file=str(path), message=message)
+        except Exception:
+            pass
         print(
             "[ERROR] Invalid .autopilot/backlog.json: {}. Fix or delete it and run init again.".format(message),
             file=sys.stderr,

@@ -232,6 +232,17 @@ def build_parser():
     directive_list_parser.add_argument("--repo", default=".")
     directive_list_parser.set_defaults(func=commands.cmd_directive_list)
 
+    directive_remove_parser = subparsers.add_parser(
+        "directive-remove",
+        help="Remove a standing directive by its 1-based index in directive-list",
+    )
+    directive_remove_parser.add_argument("--repo", default=".")
+    directive_remove_parser.add_argument("--index", type=int, required=True,
+                                         help="1-based position from directive-list output")
+    add_json(directive_remove_parser)
+    add_dry_run(directive_remove_parser)
+    directive_remove_parser.set_defaults(func=commands.cmd_directive_remove)
+
     secret_scan_parser = subparsers.add_parser("secret-scan", help="Scan the staged diff for secret-like content")
     secret_scan_parser.add_argument("--repo", default=".")
     add_json(secret_scan_parser)

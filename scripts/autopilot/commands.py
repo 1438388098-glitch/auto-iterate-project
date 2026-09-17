@@ -1409,6 +1409,7 @@ def cmd_analysis_load(args):
         return emit_result(args, False, "[ERROR] Autopilot not initialized. Run init first.")
     validity, reason = state.analysis_validity(repo)
     data = state.load_analysis(repo)
+    io.append_log(repo, "analysis-load", "success" if validity == "fresh" else "warn", validity=validity)
     payload = {
         "valid": validity == "fresh",
         "status": validity,
@@ -1440,6 +1441,29 @@ def cmd_directive_list(args):
         return emit_result(args, False, "[ERROR] Autopilot not initialized. Run init first.")
     print(json.dumps(state.load_directives(repo), indent=2, ensure_ascii=False))
     return 0
+
+
+def cmd_directive_remove(args):
+    repo = Path(args.repo).resolve()
+    with io.run_lock(repo):
+        if not config.state_path_for(repo).exists():
+            return emit_result(args, False, "[ERROR] Autopilot not initialized. Run init first.")
+        directives = state.load_directives(repo)
+        entries = directives.get("directives") or []
+        index = args.index
+        if index < 1 or index > len(entries):
+            return emit_result(
+                args, False,
+                "[ERROR] --index must be between 1 and {} (as shown by directive-list).".format(len(entries)),
+            )
+        removed = entries.pop(index - 1)
+        state.save_directives(repo, directives)
+        io.append_log(repo, "directive-remove", "success", text=removed.get("text"), index=index)
+        return emit_result(
+            args, True,
+            "[OK] Directive removed: {}".format((removed.get("text") or "")[:80]),
+            data={"count": len(entries)},
+        )
 
 
 def cmd_undo_round(args):

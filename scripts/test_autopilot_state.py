@@ -9,6 +9,7 @@ import subprocess
 import sys
 import tempfile
 import unittest
+from io import StringIO
 from pathlib import Path
 
 SCRIPT = Path(__file__).resolve().parent / "autopilot_state.py"
@@ -17,6 +18,17 @@ SCRIPT = Path(__file__).resolve().parent / "autopilot_state.py"
 # selection): the package lives next to this file.
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 from autopilot import state as ap_state  # noqa: E402
+from autopilot.cli import build_parser  # noqa: E402
+
+
+class RunResult(object):
+    """Minimal subprocess.CompletedProcess stand-in for in-process runs."""
+
+    def __init__(self, returncode, stdout, stderr):
+        self.returncode = returncode
+        self.stdout = stdout
+        self.stderr = stderr
+        self.args = []
 
 
 class AutopilotTestBase(unittest.TestCase):
@@ -62,16 +74,27 @@ class AutopilotTestBase(unittest.TestCase):
         )
 
     def run_state(self, command, *args):
-        return subprocess.run(
-            [sys.executable, str(self.script), command, "--repo", str(self.repo)] + list(args),
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
-            universal_newlines=True,
-            encoding="utf-8",
-            errors="replace",
-            env=self.env,
-            timeout=180,
-        )
+        """In-process invocation of the CLI. ~589 subprocess calls at ~0.33s
+        interpreter startup each dominated the suite runtime; dispatching
+        through build_parser keeps every call site unchanged. Real-subprocess
+        behavior (exit codes through the entry point, UTF-8 stdio) stays
+        covered by the explicit subprocess contract tests."""
+        parser = build_parser()
+        old_out, old_err = sys.stdout, sys.stderr
+        sys.stdout = StringIO()
+        sys.stderr = StringIO()
+        try:
+            try:
+                ns = parser.parse_args([command, "--repo", str(self.repo)] + list(args))
+                code = ns.func(ns)
+            except SystemExit as exc:
+                code = exc.code
+        finally:
+            out, err = sys.stdout.getvalue(), sys.stderr.getvalue()
+            sys.stdout, sys.stderr = old_out, old_err
+        if not isinstance(code, int):
+            code = 0
+        return RunResult(code, out, err)
 
     def read_json(self, name):
         return json.loads((self.repo / ".autopilot" / name).read_text(encoding="utf-8"))
@@ -989,6 +1012,57 @@ class PredictedHardeningTests(RepoTest):
         self.assertNotEqual(result.returncode, 0)
         self.assertNotIn("Traceback", result.stderr)
         self.assertNotIn("candidate-", result.stdout)
+
+    def test_directive_remove_by_index(self):
+        self.run_state("init")
+        self.run_state("directive-add", "--text", "rule one")
+        self.run_state("directive-add", "--text", "rule two")
+        result = self.run_state("directive-remove", "--index", "1")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("rule one", result.stdout)
+        directives = json.loads(self.run_state("directive-list").stdout)
+        self.assertEqual([d["text"] for d in directives["directives"]], ["rule two"])
+        result = self.run_state("directive-remove", "--index", "5")
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("between 1 and 1", result.stderr)
+
+    def test_state_migration_is_logged(self):
+        self.run_state("init")
+        state_path = self.repo / ".autopilot" / "state.json"
+        state = json.loads(state_path.read_text(encoding="utf-8"))
+        state["schema"] = 5
+        state.pop("goal_seeds", None)
+        state_path.write_text(json.dumps(state), encoding="utf-8")
+        self.run_state("read")
+        disk = json.loads(state_path.read_text(encoding="utf-8"))
+        self.assertEqual(disk["schema"], 6)
+        log = (self.repo / ".autopilot" / "log.jsonl").read_text(encoding="utf-8")
+        self.assertIn("state-migrate", log)
+
+    def test_real_subprocess_exit_code_and_utf8(self):
+        """Contract for the real entry point that in-process runs can't cover:
+        process exit code, and UTF-8 stdio without PYTHONIOENCODING (the CLI
+        wraps its own streams)."""
+        self.run_state("init")
+        self.run_state("goal-met", "--goal", "G", "--next-step", "seed \U0001f680 title")
+        env = dict(self.env)
+        env.pop("PYTHONIOENCODING", None)
+        result = subprocess.run(
+            [sys.executable, str(self.script), "check", "--brief", "--repo", str(self.repo)],
+            stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+            universal_newlines=True, encoding="utf-8", errors="replace",
+            env=env, timeout=60,
+        )
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertNotIn("Traceback", result.stderr)
+        result = subprocess.run(
+            [sys.executable, str(self.script), "check", "--repo", str(self.repo.parent)],
+            stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+            universal_newlines=True, encoding="utf-8", errors="replace",
+            env=env, timeout=60,
+        )
+        self.assertNotEqual(result.returncode, 0)
+        self.assertNotIn("Traceback", result.stderr)
 
     def test_init_rejects_negative_max_predicted(self):
         result = self.run_state("init", "--max-predicted-per-round", "-1")

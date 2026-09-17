@@ -74,7 +74,7 @@ python <this-skill>/scripts/autopilot_state.py init --repo <repo> [--branch-mode
 
 `--deadline` is the **timer (定时器)** stop: an absolute wall-clock moment when the run must stop, unlike the `--max-minutes` countdown (倒计时) which measures duration since the last round activity. Accepts an ISO timestamp (`2026-08-10T08:00:00`), a relative duration (`+8h`, `+30min`, `+1d`, `+2w`), or a local `HH:MM` (today, or tomorrow if already passed — e.g. `08:00` for "iterate until tomorrow morning"). It is resolved to an absolute UTC timestamp at init time. See `references/config.md` for details.
 
-`--goals-from-prompt` splits a natural-language request (Chinese or English) into `goals` automatically. `--allow-path`/`--deny-path` seed the commit path whitelist (repeatable). Ranking-related flags not shown above: `--ranking-mode`, `--min-candidate-value`, `--max-same-type-per-round`, `--max-predicted-per-round` (see `references/config.md`).
+`--goals-from-prompt` splits a natural-language request (Chinese or English) into `goals` automatically. `--allow-path`/`--deny-path` seed the commit path whitelist (repeatable). Ranking-related flags not shown above: `--ranking-mode`, `--min-candidate-value`, `--max-same-type-per-round`, `--max-predicted-per-round`. Recovery flags for special situations: `--allow-uncommitted-changes` (start from a dirty tree) and `--force` (reinitialize / override a refusal). All documented in `references/config.md`.
 
 7. If `branch_mode` is `feature`, run `ensure-branch`. On a fresh run `init` already created the branch, so this is only needed when resuming; calling it again is safe.
 8. If `.autopilot/state.json` already exists and is unfinished, run `read` and `check`, then continue from the current state instead of initializing again.
