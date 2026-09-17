@@ -1095,6 +1095,31 @@ class PredictedHardeningTests(RepoTest):
         changelog = (repo_root / "CHANGELOG.md").read_text(encoding="utf-8")
         self.assertIn("## {} (".format(version), changelog)
 
+    def test_parse_deadline_overflow_returns_none(self):
+        from autopilot import io as ap_io
+        self.assertIsNone(ap_io.parse_deadline("+" + "9" * 30 + "w"))
+        self.assertIsNone(ap_io.parse_deadline("+not-a-duration"))
+        self.assertIsNotNone(ap_io.parse_deadline("+1h"))
+
+    def test_git_push_prefers_origin_over_alphabetical_first(self):
+        """Multi-remote repos (fork + origin, standard contribution setup) must
+        not push to the alphabetically-first remote when no upstream is set."""
+        origin = Path(self.tmp) / "origin.git"
+        fork = Path(self.tmp) / "a-fork.git"  # sorts before "origin"
+        for remote in (origin, fork):
+            self.git("init", "-q", "--bare", str(remote))
+        self.git("remote", "add", "fork", str(fork))
+        self.git("remote", "add", "origin", str(origin))
+        self.add_file("f.py")
+        self.git("commit", "-q", "-m", "x")
+        branch = (self.repo / ".git" / "HEAD").read_text(encoding="utf-8").strip().split("/")[-1]
+        output, err = ap_io.git_push(self.repo)
+        self.assertIsNone(err, err)
+        fork_heads = self.git("ls-remote", str(fork), "refs/heads/" + branch).stdout.strip()
+        origin_heads = self.git("ls-remote", str(origin), "refs/heads/" + branch).stdout.strip()
+        self.assertNotEqual(origin_heads, "", "origin (preferred) must receive the push")
+        self.assertEqual(fork_heads, "", "the alphabetically-first fork must be skipped")
+
     def test_directive_remove_by_index(self):
         self.run_state("init")
         self.run_state("directive-add", "--text", "rule one")

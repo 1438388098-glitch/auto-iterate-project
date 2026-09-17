@@ -76,6 +76,21 @@ are unchanged; the edges stop biting.
   merge redundant git calls — suite runtime 358s → ~193s.
 - SKILL.md: init flag list completed (`--allow-uncommitted-changes`/`--force`),
   lens→helper-signal map for Deep Expansion subagents.
+- Guards and scanners: `deny_paths`/`allow_paths` patterns are normalized to
+  forward slashes (a Windows-style `secrets\\` deny rule silently never
+  matched — fail-open) and `**/` collapses to zero directories
+  (`src/**/*.py` now also matches `src/a.py`); the secret scanner catches
+  PKCS#8 `ENCRYPTED PRIVATE KEY` blocks and `gho_/ghs_/ghu_/ghr_` GitHub
+  tokens, and `sk-` requires a word boundary (long hyphenated words ending in
+  "-sk-" no longer block commits); `--deadline` overflow durations fall to the
+  friendly parse error; `git push` prefers `origin`/`upstream` over the
+  alphabetically-first remote.
+- Release hygiene: `scripts/autopilot/__init__.py` gains `__version__` (single
+  authority) with a `--version` flag and a consistency test across SKILL.md /
+  openai.yaml / README / CHANGELOG; CI adds a concurrency group, job timeouts,
+  and package-wide syntax check; README documents the shipped-file surface and
+  junction/symlink installs; `agents/openai.yaml` gains a description with the
+  trigger phrases.
 
 ## 1.3.1 (2026-09-17)
 
