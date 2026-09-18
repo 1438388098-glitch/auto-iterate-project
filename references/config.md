@@ -18,7 +18,7 @@ The helper validates field types on every read: a non-object config, a string `m
 
 ### goals
 
-Array of explicit goals. Empty means open-ended improvement. Use the exact goal text when calling `goal-met`. `init --goals-from-prompt "<request>"` splits a natural-language request (Chinese or English) into `goals` automatically.
+Array of explicit goals. Empty means open-ended improvement. Use the exact goal text when calling `goal-met`. `init --goals-from-prompt "<request>"` splits a natural-language request (Chinese or English) into `goals` automatically. `--goal` and `--goals-from-prompt` are last-write-wins: passing both keeps only the `--goals-from-prompt` result, so pass one of them.
 
 ```json
 {
@@ -221,7 +221,7 @@ String, default `"zh"`. Language for generated reports and the automatic 10-roun
 Useful commands:
 
 ```powershell
-python <this-skill>/scripts/autopilot_state.py backlog-add --repo <repo> --title "<title>" --reason "<reason>" --value 4 --effort 2 --type refactor --risk 2 --depends-on candidate-001
+python <this-skill>/scripts/autopilot_state.py backlog-add --repo <repo> --title "<title>" --reason "<reason>" --value 4 --effort 2 --type refactor --risk 2 --depends-on candidate-002
 python <this-skill>/scripts/autopilot_state.py backlog-list --repo <repo>
 python <this-skill>/scripts/autopilot_state.py backlog-rank --repo <repo>
 ```
@@ -291,14 +291,14 @@ Anti-noise scoring (刀 B): a promoted candidate carries `origin: "predicted"`, 
 - `read`, `check`, `diagnose` — inspect state, stop conditions, and repository/git health. `check --brief` returns loop-driving fields only: `continue`/`stop_reason`/`warnings`/`goals_met`/`phase`/`backlog` (`pending`/`ready`/`min_pending_candidates`/`needs_expansion`)/`action_hint` (`work`|`expand`|`stop`)/`next_verify_round`/`next_commit_round`/`next_checkpoint_round` (saves tokens in the loop). In the expand phase an `expansion` object with open seeds and type context is appended (see Direction Seeds above).
 - `detect-agent` — detect the runtime agent (opencode / claude-code / codex / generic) and print adaptation context. Honors a `SKILL_DIR` environment variable for the reported skill directory.
 - `begin-round`, `complete-round`, `block-round`, `cancel-round` — round lifecycle. `begin-round` enforces the clean-tree rule, refuses to pick candidates with unresolved `depends_on`, and refuses to reuse round numbers; `--candidate-id` is repeatable so one round can pick multiple backlog candidates (`candidates_per_round`). `complete-round` accepts an optional `--commit-sha` (omit it on deferred commit rounds when `commit_every_rounds > 1`), an optional `--review-score`/`--review-notes` (required when `review_threshold` is set), auto-writes a Chinese phase report (`.autopilot/phase-report-round-<N>.md`) every 10 completed rounds, and refreshes `state.type_stats`.
-- `commit` — staged-change check, git identity check, path whitelist check (`allow_paths`/`deny_paths`), secret scan (`scan_secrets`, bypassable with `--allow-secrets`), scope guard (including binary files), open-round requirement (skipped in batched mode), and prefix message building.
+- `commit` — staged-change check, git identity check, path whitelist check (`allow_paths`/`deny_paths`), secret scan (`scan_secrets`, bypassable with `--allow-secrets`), scope guard (including binary files), open-round requirement (always enforced unless `--round <n>` is passed explicitly; what batched mode skips is only the dirty-start check), and prefix message building.
 - `undo-round` — `git revert` a bad commit (never rewriting history), record a `revert` history entry, and advance the round counter.
 - `goal-met`, `finish` — goals and run closure. `goal-met` accepts `--next-step`/`--unlocked-capability`/`--seed-*` to record direction seeds (see Direction Seeds above). `finish` auto-cancels any still-open round, writes `.autopilot/retrospective.md`, and returns to the origin branch in feature mode.
 - `report` — print (or write with `--output`) a deterministic markdown run report; `--lang zh|en` overrides `report_lang`.
 - `retrospective` — print (or write with `--output`) the run-level retrospective: per-type stats, blocked rounds, verification commands, and the next ready candidate.
 - `detect-verify` — scan repo entry points and recommend `check_commands` (including `gitleaks`/`detect-secrets` when installed); `--apply` writes them into the config.
 - `analysis-save` / `analysis-load` — persist and read the repository-analysis cache in `.autopilot/analysis.json`; the cache auto-invalidates when HEAD or `.autopilot/config.json` changes.
-- `directive-add` / `directive-list` — manage standing directives in `.autopilot/directives.json`; the loop must honor them in every round.
+- `directive-add` / `directive-list` / `directive-remove` — manage standing directives in `.autopilot/directives.json`; the loop must honor them in every round. `directive-list` prints each entry with its 1-based `index`; `directive-remove --index <n>` retires it (audit-logged).
 - `secret-scan` — scan the staged diff for secret-like content and report findings (exit non-zero on a match).
 - `backlog-add`, `backlog-update`, `backlog-remove`, `backlog-list`, `backlog-rank`, `backlog-pick` — backlog management (candidates carry `type`, `risk`, and `depends_on`; ranking defaults to expected value per round — see `ranking_mode`). `backlog-add --from-seed <id>` promotes a direction seed (see Direction Seeds above). `backlog-add` also refreshes `last_activity_at` so expansion scouting does not burn `max_minutes` without progress.
 - `ensure-branch` — create or check out the autopilot feature branch

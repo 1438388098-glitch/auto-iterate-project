@@ -1,6 +1,6 @@
 ---
 name: auto-iterate-project
-version: 1.3.2
+version: 1.3.3
 description: Automatically iterate any git project inside the current agent session by analyzing the repository, choosing the next high-value improvement, implementing small changes, verifying, committing, and looping until a goal is met or configurable round/time/token limits are reached. Use when the user asks for autonomous project iteration, continuous self-improvement, auto-improve, keep improving this project, full-auto development, or wants the agent to keep making and committing improvements without per-step approval. Also use for Chinese requests like 全自动迭代这个项目, 自动改进并提交这个仓库, 连续自动开发, or 自动推进项目改进.
 ---
 
@@ -210,7 +210,7 @@ Set `checkpoint_every: N` to make the loop pause and consult the user every N ro
 2. Read `directive-list` to surface standing directives.
 3. Ask the user: continue, change direction (add/edit goals), raise/lower budgets, or stop. Write down any new standing instructions with `directive-add` so every future round honors them.
 
-Directives are persistent — use `python <this-skill>/scripts/autopilot_state.py directive-add --repo <repo> --text "<standing rule>"` and `directive-list` to read them. At the start of **every** round's Implement step, read `directive-list` and honor the standing rules before writing any code. Directives are how you steer a long autonomous run without stopping it.
+Directives are persistent — use `python <this-skill>/scripts/autopilot_state.py directive-add --repo <repo> --text "<standing rule>"` and `directive-list` to read them (`directive-remove --index <n>` retires one by its 1-based list position). At the start of **every** round's Implement step, read `directive-list` and honor the standing rules before writing any code. Directives are how you steer a long autonomous run without stopping it.
 
 ## Post-Goal Direction Prediction (Wave 0)
 
@@ -416,4 +416,7 @@ When the loop stops:
 | `commit` fails with "violate allow_paths/deny_paths" | A staged file is outside the path whitelist | Only stage files the whitelist permits, or adjust `allow_paths`/`deny_paths` |
 | `undo-round` fails with "revert failed" | The revert conflicts with later commits | Resolve the conflict manually, commit, then record the round with `commit`/`complete-round` |
 | `detect-verify` reports nothing | No recognized build/test config | Set `check_commands` manually or pass `--check-commands` on init |
+| `backlog-add --from-seed` says "only 'open' seeds can be promoted" | The seed already moved on (promoted/verified/refuted/rejected) | Read `goal_seeds` statuses via `read`; only `open` seeds promote |
+| `seed-reject` says "only 'open' seeds can be rejected" or "not found" | Terminal states are immutable; the id must exist | List open ids from `check --brief` → `expansion.seeds` or `read` |
+| `directive-remove` says "--index must be between ..." | The index comes from `directive-list` output | Run `directive-list`; every entry carries its 1-based `index` field |
 | Tests fail under `python` but not `python3` | Mixed Python installations | Use `py`/`python3` consistently via the Environment note |

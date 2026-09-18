@@ -1,6 +1,6 @@
 # Auto Iterate Project
 
-Version 1.3.2 — see [CHANGELOG.md](CHANGELOG.md) for release history.
+Version 1.3.3 — see [CHANGELOG.md](CHANGELOG.md) for release history.
 
 Automatically iterate any git project inside an agent session: analyze the repository, pick the next high-value improvement, implement small changes, verify, commit, and loop until a goal is met or configurable round/time/token limits are reached.
 
@@ -36,7 +36,7 @@ If you keep a git clone of this repository, prefer a directory junction (Windows
 
 ```powershell
 # Windows (no admin needed): remove the copy first, then
-cmd /c mklink /J "%USERPROFILE%\.agents\skillsuto-iterate-project" "D:\path	outo-iterate-project"
+cmd /c mklink /J "%USERPROFILE%\.agents\skills\auto-iterate-project" "D:\path\to\auto-iterate-project"
 # macOS / Linux
 ln -s /path/to/auto-iterate-project ~/.agents/skills/auto-iterate-project
 ```
@@ -123,8 +123,11 @@ auto-iterate-project/
     └── autopilot/               # Implementation package (one module per concern)
         ├── io.py                # time, JSON, git, lock, token helpers
         ├── config.py            # .autopilot/config.json schema + validation
-        ├── state.py             # state/backlog, stop conditions, reports
+        ├── state.py             # state/backlog, seeds, stop conditions, reports
         ├── agent.py             # runtime agent detection
         ├── commands.py          # CLI command handlers
+        ├── secrets.py           # staged-diff secret scanning
+        ├── guard.py             # allow_paths/deny_paths commit path matching
+        ├── verify.py            # verification command discovery
         └── cli.py               # argument parsing + dispatch
 ```

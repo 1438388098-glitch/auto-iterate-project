@@ -54,6 +54,22 @@ def cmd_init(args):
             cfg["goals"] = args.goal
         if args.goals_from_prompt:
             cfg["goals"] = state.split_goals(args.goals_from_prompt)
+        # Only negatives are illegal here (zero is meaningful: max_rounds 0
+        # stops immediately, retries 0 disables retrying). This mirrors the
+        # non-negative policy in load_config — before this gate, a negative
+        # knob faked a successful init and then failed on every load, and
+        # max_blocked_in_a_row < 0 silently stopped the loop with zero rounds.
+        for knob in ("--max-rounds", "--max-minutes", "--max-tokens",
+                     "--max-round-scope", "--retries-per-round",
+                     "--max-blocked-in-a-row"):
+            value = getattr(args, knob.lstrip("-").replace("-", "_"), None)
+            if value is not None and value < 0:
+                io.append_log(repo, "init", "error", reason="{} out of range".format(knob))
+                return emit_result(
+                    args, False,
+                    "[ERROR] {} must be a non-negative integer (negative values "
+                    "silently stop the loop or fail on first load).".format(knob),
+                )
         if args.max_rounds is not None:
             cfg["max_rounds"] = args.max_rounds
         if args.max_minutes is not None:
@@ -338,8 +354,12 @@ def cmd_begin_round(args):
 
 def _resolve_tokens(args, repo, start_sha, worktree_baseline=None):
     """Thin wrapper over the single token-estimation authority
-    (io.estimate_tokens_for_round); honors an explicit --tokens override."""
+    (io.estimate_tokens_for_round); honors an explicit --tokens override.
+    Negative overrides would silently refund the budget — refuse them."""
     if args.tokens is not None:
+        if args.tokens < 0:
+            print("[ERROR] --tokens must be a non-negative integer.", file=sys.stderr)
+            raise SystemExit(2)
         return args.tokens
     return io.estimate_tokens_for_round(repo, start_sha, worktree_baseline)
 
@@ -445,6 +465,12 @@ def cmd_complete_round(args):
             return 0
 
         cfg = config.load_config(repo)
+        # Range-check the score even without a configured threshold: an
+        # out-of-band 99 would poison the learned value calibration (clamped,
+        # but still pinned to the ceiling) for the whole run.
+        if getattr(args, "review_score", None) is not None and (args.review_score < 1 or args.review_score > 5):
+            io.append_log(repo, "complete-round", "error", reason="review score out of range")
+            return emit_result(args, False, "[ERROR] --review-score must be between 1 and 5.")
         review_threshold = cfg.get("review_threshold")
         if review_threshold is not None:
             if args.review_score is None:
@@ -454,9 +480,6 @@ def cmd_complete_round(args):
                     "[ERROR] review_threshold is {} but no --review-score was provided. "
                     "Self-review the round on a 1-5 scale and pass --review-score.".format(review_threshold),
                 )
-            if args.review_score < 1 or args.review_score > 5:
-                io.append_log(repo, "complete-round", "error", reason="review score out of range")
-                return emit_result(args, False, "[ERROR] --review-score must be between 1 and 5.")
             if args.review_score < review_threshold:
                 io.append_log(repo, "complete-round", "error", reason="review score below threshold")
                 return emit_result(
@@ -963,6 +986,18 @@ def cmd_backlog_add(args):
                 args, False,
                 "[ERROR] --type must be one of {}.".format("|".join(state.VALID_CANDIDATE_TYPES)),
             )
+        if args.depends_on:
+            for dep_id in args.depends_on:
+                # Forward references are legal (add the dependency target in a
+                # later backlog-add), so an unknown id only warns — loudly.
+                if state.find_candidate(backlog, dep_id) is None:
+                    print(
+                        "[WARN] --depends-on references unknown candidate: {} (forward "
+                        "reference?). It will block this candidate until the id exists "
+                        "and completes — see backlog-list.".format(dep_id),
+                        file=sys.stderr,
+                    )
+                    io.append_log(repo, "backlog-add", "warn", reason="unknown depends_on", dep=dep_id)
         candidate = {
             "id": candidate_id,
             "title": title,
@@ -1070,6 +1105,16 @@ def cmd_backlog_update(args):
             candidate["risk"] = args.risk
             changed.append("risk")
         if args.depends_on is not None:
+            for dep_id in args.depends_on:
+                # Self-reference is always a bug (permanent ready:false lock).
+                if dep_id == args.id:
+                    return emit_result(args, False, "[ERROR] A candidate cannot depend on itself ({}).".format(dep_id))
+                if state.find_candidate(backlog, dep_id) is None:
+                    print(
+                        "[WARN] --depends-on references unknown candidate: {} (forward "
+                        "reference?). See backlog-list.".format(dep_id),
+                        file=sys.stderr,
+                    )
             candidate["depends_on"] = list(args.depends_on)
             changed.append("depends_on")
         if args.status is not None:
@@ -1262,7 +1307,10 @@ def cmd_commit(args):
 
         prefix = cfg.get("commit_message_prefix", "autopilot")
         open_round = st.get("current_round")
-        if args.round:
+        if args.round is not None:
+            if args.round < 1:
+                io.append_log(repo, "commit", "error", reason="round out of range")
+                return emit_result(args, False, "[ERROR] --round must be a positive integer (got {}).".format(args.round))
             round_no = args.round
         elif open_round is not None:
             round_no = open_round.get("round")
@@ -1474,7 +1522,17 @@ def cmd_directive_list(args):
     repo = Path(args.repo).resolve()
     if not config.state_path_for(repo).exists():
         return emit_result(args, False, "[ERROR] Autopilot not initialized. Run init first.")
-    print(json.dumps(state.load_directives(repo), indent=2, ensure_ascii=False))
+    directives = state.load_directives(repo)
+    # Each entry carries its 1-based index so directive-remove --index has an
+    # unambiguous source (the error message points here).
+    payload = {
+        "directives": [
+            dict({"index": position + 1}, **entry)
+            for position, entry in enumerate(directives.get("directives") or [])
+        ]
+    }
+    print(json.dumps(payload, indent=2, ensure_ascii=False))
+    return 0
     return 0
 
 
@@ -1491,6 +1549,12 @@ def cmd_directive_remove(args):
                 args, False,
                 "[ERROR] --index must be between 1 and {} (as shown by directive-list).".format(len(entries)),
             )
+        if getattr(args, "dry_run", False):
+            print(
+                "[DRY-RUN] Would remove directive: {}.".format((entries[index - 1].get("text") or "")[:80]),
+                file=sys.stderr,
+            )
+            return 0
         removed = entries.pop(index - 1)
         state.save_directives(repo, directives)
         io.append_log(repo, "directive-remove", "success", text=removed.get("text"), index=index)
@@ -1579,10 +1643,13 @@ def cmd_detect_verify(args):
     signals = detect_verify_commands(repo)
     commands = [cmd for _, cmd in signals]
     payload = {"detected": [{"tech": tech, "command": cmd} for tech, cmd in signals], "commands": commands}
-    if args.apply:
-        if not commands:
-            io.append_log(repo, "detect-verify", "error", reason="nothing detected")
-            return emit_result(args, False, "[ERROR] No verification commands detected; nothing to apply.")
+    payload["ok"] = bool(commands)
+    payload["message"] = (
+        "[OK] Detected {} verification command(s).".format(len(commands))
+        if commands else
+        "[ERROR] No verification commands detected; nothing to apply."
+    )
+    if commands and args.apply:
         if getattr(args, "dry_run", False):
             print(
                 "[DRY-RUN] Would set check_commands to {}.".format(commands),
@@ -1594,6 +1661,12 @@ def cmd_detect_verify(args):
         config.save_config(repo, cfg)
         io.append_log(repo, "detect-verify", "success", commands=commands)
         return emit_result(args, True, "[OK] check_commands set to {}".format(commands), data=payload)
+    if not commands and args.apply:
+        io.append_log(repo, "detect-verify", "error", reason="nothing detected")
+        if getattr(args, "json", False):
+            print(json.dumps(payload, indent=2, ensure_ascii=False))
+            return 2
+        return emit_result(args, False, payload["message"])
     if getattr(args, "json", False):
         print(json.dumps(payload, indent=2, ensure_ascii=False))
         return 0

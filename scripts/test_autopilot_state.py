@@ -91,8 +91,13 @@ class AutopilotTestBase(unittest.TestCase):
         interpreter startup each dominated the suite runtime; dispatching
         through build_parser keeps every call site unchanged. Real-subprocess
         behavior (exit codes through the entry point, UTF-8 stdio) stays
-        covered by the explicit subprocess contract tests."""
+        covered by the explicit subprocess contract tests. self.env is applied
+        to os.environ for the duration — in-process code would otherwise
+        inherit the developer's git identity/global config."""
         parser = build_parser()
+        old_env = {key: os.environ.get(key) for key in self.env}
+        for key, value in self.env.items():
+            os.environ[key] = value
         old_out, old_err = sys.stdout, sys.stderr
         sys.stdout = StringIO()
         sys.stderr = StringIO()
@@ -105,6 +110,11 @@ class AutopilotTestBase(unittest.TestCase):
         finally:
             out, err = sys.stdout.getvalue(), sys.stderr.getvalue()
             sys.stdout, sys.stderr = old_out, old_err
+            for key, value in old_env.items():
+                if value is None:
+                    os.environ.pop(key, None)
+                else:
+                    os.environ[key] = value
         if not isinstance(code, int):
             code = 0
         return RunResult(code, out, err)
@@ -1038,6 +1048,42 @@ class PredictedHardeningTests(RepoTest):
         self.assertTrue(data["goals_met"])
         self.assertFalse(data["continue"])
 
+    def test_review_score_range_without_threshold(self):
+        self.run_state("init")
+        self.git("commit", "--allow-empty", "-q", "-m", "base")
+        self.run_state("begin-round", "--title", "t", "--reason", "r")
+        result = self.run_state("complete-round", "--summary", "s", "--review-score", "99")
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("between 1 and 5", result.stderr)
+        state = self.read_json("state.json")
+        self.assertEqual(state["history"], [])
+
+    def test_depends_on_warns_forward_ref_and_bans_self(self):
+        self.run_state("init")
+        # Forward reference: allowed, but loudly warned (it blocks until the
+        # target exists and completes).
+        result = self.run_state("backlog-add", "--title", "t", "--depends-on", "candidate-099")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("unknown candidate", result.stderr)
+        self.assertTrue((self.repo / ".autopilot" / "backlog.json").exists())
+        self.run_state("backlog-add", "--title", "c1")
+        result = self.run_state("backlog-update", "--id", "candidate-001", "--depends-on", "candidate-001")
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("cannot depend on itself", result.stderr)
+
+    def test_init_rejects_negative_knobs(self):
+        """Negative init knobs used to fake success (config load failed later)
+        or — worse — silently stop the loop on the first check
+        (max_blocked_in_a_row: 0 >= -1)."""
+        for knob in ("--max-rounds", "--max-tokens", "--max-round-scope",
+                     "--retries-per-round", "--max-blocked-in-a-row", "--max-minutes"):
+            result = self.run_state("init", knob, "-5")
+            self.assertNotEqual(result.returncode, 0, knob)
+            self.assertIn("must be a non-negative integer", result.stderr)
+            self.assertNotIn("Traceback", result.stderr)
+        result = self.run_state("init", "--max-rounds", "3")
+        self.assertEqual(result.returncode, 0, result.stderr)
+
     def test_goal_mismatch_warns(self):
         self.run_state("init", "--goal", "real goal")
         result = self.run_state("goal-met", "--goal", "totally different")
@@ -1120,6 +1166,34 @@ class PredictedHardeningTests(RepoTest):
         origin_heads = self.git("ls-remote", str(origin), "refs/heads/" + branch).stdout.strip()
         self.assertNotEqual(origin_heads, "", "origin (preferred) must receive the push")
         self.assertEqual(fork_heads, "", "the alphabetically-first fork must be skipped")
+
+    def test_directive_list_shows_index(self):
+        self.run_state("init")
+        self.run_state("directive-add", "--text", "rule A")
+        self.run_state("directive-add", "--text", "rule B")
+        data = json.loads(self.run_state("directive-list").stdout)
+        self.assertEqual([d["index"] for d in data["directives"]], [1, 2])
+        # The remove error message points at directive-list: keep them in sync.
+        result = self.run_state("directive-remove", "--index", "9")
+        self.assertIn("as shown by directive-list", result.stderr)
+
+    def test_invalid_override_warns(self):
+        env = dict(self.env)
+        for var in ("OPENCODE", "CLAUDE_CODE", "CODEX", "SKILL_DIR"):
+            env.pop(var, None)
+        env["AUTOPILOT_AGENT"] = "ClaudeCode"
+        result = subprocess.run(
+            [sys.executable, str(self.script), "detect-agent", "--repo", str(self.repo), "--home", str(self.tmp)],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            universal_newlines=True,
+            encoding="utf-8",
+            errors="replace",
+            env=env,
+        )
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("not one of", result.stderr)
+        self.assertIn("generic", result.stderr)
 
     def test_directive_remove_by_index(self):
         self.run_state("init")
@@ -1232,6 +1306,216 @@ class PredictedHardeningTests(RepoTest):
         self.assertEqual(candidate["value"], 4)   # "4" coerced
         self.assertEqual(candidate["effort"], 3)  # junk -> legacy default
         self.assertEqual(candidate["risk"], 2)    # "2" coerced
+
+
+    def test_undo_round_merge_commit_points_at_mainline(self):
+        self.run_state("init")
+        self.git("checkout", "-q", "-b", "side")
+        self.add_file("conflict.txt", "side\n")
+        self.git("commit", "-q", "-m", "side change")
+        self.git("checkout", "-q", self.initial_branch)
+        self.add_file("other.txt", "main\n")
+        self.git("commit", "-q", "-m", "main change")
+        self.git("merge", "-q", "--no-edit", "side")
+        merge_sha = self.git("rev-parse", "HEAD").stdout.strip()
+        result = self.run_state("undo-round", "--sha", merge_sha)
+        self.assertNotEqual(result.returncode, 0)
+        self.assertNotIn("Traceback", result.stderr)
+        self.assertIn("merge commit", result.stderr)
+        self.assertIn("-m 1", result.stderr)
+        state = self.read_json("state.json")
+        self.assertEqual(state["reverted_rounds"], 0)
+
+    def test_goal_met_seed_value_effort_boundaries(self):
+        self.run_state("init", "--goal", "G", "--expand-after-goals", "--max-rounds", "50")
+        for bad in ("0", "6"):
+            result = self.run_state("goal-met", "--goal", "G", "--next-step", "N", "--seed-value", bad)
+            self.assertNotEqual(result.returncode, 0, bad)
+            self.assertIn("must be between 1 and 5", result.stderr)
+        result = self.run_state("goal-met", "--goal", "G", "--next-step", "N",
+                                "--seed-value", "1", "--seed-effort", "5", "--json")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        state = self.read_json("state.json")
+        self.assertEqual(state["goal_seeds"][0]["value"], 1)
+        self.assertEqual(state["goal_seeds"][0]["effort"], 5)
+        result = self.run_state("goal-met", "--goal", "G", "--next-step", "N2", "--seed-type", "bogus")
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("bugfix|feature|refactor|perf|test|docs", result.stderr)
+
+    def test_push_no_remote_json_contract(self):
+        self.run_state("init", "--push")
+        result = self.run_state("push", "--json")
+        self.assertNotEqual(result.returncode, 0)
+        self.assertEqual(result.stderr, "", "JSON mode must keep errors on stdout")
+        payload = json.loads(result.stdout)
+        self.assertFalse(payload["ok"])
+        self.assertIn("No git remote is configured", payload["message"])
+        log = (self.repo / ".autopilot" / "log.jsonl").read_text(encoding="utf-8")
+        self.assertIn('"event": "push"', log)
+
+    def test_report_relative_output_resolves_against_repo(self):
+        self.run_state("init")
+        outside_cwd = Path(self.tmp) / "elsewhere"
+        outside_cwd.mkdir()
+        result = subprocess.run(
+            [sys.executable, str(self.script), "report", "--repo", str(self.repo),
+             "--output", "out.md"],
+            stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+            universal_newlines=True, encoding="utf-8", errors="replace",
+            env=self.env, cwd=str(outside_cwd),
+        )
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertTrue((self.repo / "out.md").exists())
+        self.assertFalse((outside_cwd / "out.md").exists())
+
+    def test_dry_run_mutates_nothing(self):
+        """Table-driven zero-mutation scan over the dry-run branches the matrix
+        found untested: state bytes, backlog bytes, directive bytes, and git
+        HEAD must be identical before and after."""
+        self.run_state("init", "--push")
+        self.git("commit", "--allow-empty", "-q", "-m", "base")
+        self.run_state("directive-add", "--text", "rule")
+        self.run_state("backlog-add", "--title", "seeded", "--value", "3", "--effort", "1")
+        self.run_state("backlog-add", "--title", "work", "--value", "4", "--effort", "2")
+        self.git("add", "-A")
+        self.git("commit", "-q", "-m", "work")
+        sha = self.git("rev-parse", "HEAD").stdout.strip()
+        self.run_state("begin-round", "--title", "t", "--reason", "r", "--candidate-id", "candidate-002")
+        # seed-reject validates the id before its dry-run gate: give it a real seed.
+        self.run_state("goal-met", "--goal", "G", "--next-step", "N")
+
+        def snapshot():
+            directives_path = self.repo / ".autopilot" / "directives.json"
+            return (
+                (self.repo / ".autopilot" / "state.json").read_text(encoding="utf-8"),
+                (self.repo / ".autopilot" / "backlog.json").read_text(encoding="utf-8"),
+                directives_path.read_text(encoding="utf-8") if directives_path.exists() else "",
+                self.git("rev-parse", "HEAD").stdout,
+            )
+
+        # Group A: commands that require an open round (dry-run while open).
+        before = snapshot()
+        for command, args in (
+            ("complete-round", ("--summary", "s")),
+            ("block-round", ("--reason", "b")),
+            ("cancel-round", ("--reason", "c")),
+        ):
+            result = self.run_state(command, *args, "--dry-run")
+            self.assertEqual(result.returncode, 0, (command, result.stderr))
+            self.assertIn("[DRY-RUN]", result.stderr, command)
+            self.assertEqual(snapshot(), before, "dry-run mutated state: " + command)
+        # Close the round for group B (undo-round refuses while one is open).
+        self.run_state("cancel-round", "--reason", "close group A")
+        self.run_state("goal-met", "--goal", "G", "--next-step", "N")
+        before = snapshot()
+        for command, args in (
+            ("goal-met", ("--goal", "G", "--next-step", "N")),
+            ("seed-reject", ("--id", "seed-001", "--reason", "x")),
+            ("finish", ()),
+            ("undo-round", ("--sha", sha)),
+            ("analysis-save", ("--content", "{}")),
+            ("directive-remove", ("--index", "1")),
+            ("backlog-update", ("--id", "candidate-001", "--value", "5")),
+            ("ensure-branch", ()),
+            ("push", ()),
+        ):
+            result = self.run_state(command, *args, "--dry-run")
+            self.assertEqual(result.returncode, 0, (command, result.stderr))
+            self.assertIn("[DRY-RUN]", result.stderr, command)
+            self.assertEqual(snapshot(), before, "dry-run mutated state: " + command)
+        # finish --dry-run must not set finished_at (covered by the snapshot),
+        # and undo-round --dry-run must leave no REVERT_HEAD litter.
+        self.assertFalse((self.repo / ".git" / "REVERT_HEAD").exists())
+
+
+    def test_uninitialized_guard_matrix(self):
+        """Two message families on an uninitialized repo: explicit guards say
+        'not initialized'; load_state-based commands say 'state.json not
+        found'. Both exit 2 with no traceback — drift between them fails here."""
+        explicit = ["directive-list", "secret-scan", "retrospective", "analysis-load"]
+        for command in explicit:
+            result = self.run_state(command)
+            self.assertNotEqual(result.returncode, 0, command)
+            self.assertNotIn("Traceback", result.stderr, command)
+            self.assertIn("not initialized", result.stderr, command)
+        loaders = ["read", ("goal-met", ("--goal", "G")), ("seed-reject", ("--id", "seed-001", "--reason", "r")),
+                   ("report", ())]
+        for item in loaders:
+            command, args = item if isinstance(item, tuple) else (item, ())
+            result = self.run_state(command, *args)
+            self.assertNotEqual(result.returncode, 0, command)
+            self.assertNotIn("Traceback", result.stderr, command)
+            self.assertIn("state.json not found", result.stderr, command)
+
+    def test_commit_identity_gate_json(self):
+        self.run_state("init")
+        self.run_state("begin-round", "--title", "t", "--reason", "r")
+        self.add_file("f.py")
+        self.git("config", "--local", "--unset", "user.name")
+        self.git("config", "--local", "--unset", "user.email")
+        result = self.run_state("commit", "--summary", "s", "--json")
+        self.assertNotEqual(result.returncode, 0)
+        self.assertEqual(result.stderr, "")
+        payload = json.loads(result.stdout)
+        self.assertFalse(payload["ok"])
+        self.assertIn("Git identity is not configured", payload["message"])
+
+    def test_complete_round_push_fail_warns_but_succeeds(self):
+        self.run_state("init", "--push")
+        missing = Path(self.tmp) / "no-such-origin.git"
+        self.git("remote", "add", "origin", str(missing))
+        self.run_state("backlog-add", "--title", "t", "--value", "3", "--effort", "1")
+        self.run_state("begin-round", "--title", "t", "--reason", "r", "--candidate-id", "candidate-001")
+        self.add_file("f.py")
+        self.git("add", "-A")
+        r = self.run_state("commit", "--summary", "s")
+        sha = [l.split()[2].rstrip(":") for l in r.stdout.splitlines() if l.startswith("[OK] Committed ")][0]
+        result = self.run_state("complete-round", "--summary", "done", "--commit-sha", sha)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("push failed", result.stdout + result.stderr)
+        state = self.read_json("state.json")
+        self.assertEqual(state["history"][-1]["status"], "completed")
+
+    def test_agent_empty_env_signal_counts_as_unset(self):
+        env = dict(self.env)
+        for var in ("OPENCODE", "CLAUDE_CODE", "CODEX", "SKILL_DIR", "AUTOPILOT_AGENT"):
+            env.pop(var, None)
+        env["OPENCODE"] = ""
+        result = subprocess.run(
+            [sys.executable, str(self.script), "detect-agent", "--repo", str(self.repo), "--home", str(self.tmp)],
+            stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+            universal_newlines=True, encoding="utf-8", errors="replace", env=env,
+        )
+        data = json.loads(result.stdout)
+        self.assertEqual(data["agent"], "generic")
+        self.assertEqual(data["detected_by"], "fallback")
+
+    def test_commit_round_zero_and_negative_rejected(self):
+        self.run_state("init")
+        self.add_file("f.py")
+        self.git("add", "-A")
+        for bad in ("0", "-5"):
+            result = self.run_state("commit", "--round", bad, "--summary", "s")
+            self.assertNotEqual(result.returncode, 0, bad)
+            self.assertIn("positive integer", result.stderr)
+        result = self.run_state("commit", "--round", "2", "--summary", "s")
+        self.assertEqual(result.returncode, 0, result.stderr)
+
+    def test_negative_tokens_rejected(self):
+        self.run_state("init")
+        self.git("commit", "--allow-empty", "-q", "-m", "base")
+        self.run_state("begin-round", "--title", "t", "--reason", "r")
+        result = self.run_state("complete-round", "--summary", "s", "--tokens", "-5")
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("non-negative", result.stderr)
+
+    def test_detect_verify_json_shape_stable_without_apply(self):
+        (self.repo / "pyproject.toml").write_text("[project]\nname = 'x'\n", encoding="utf-8")
+        result = self.run_state("detect-verify", "--json")
+        data = json.loads(result.stdout)
+        self.assertTrue(data["ok"])
+        self.assertIn("message", data)
+        self.assertIn("detected", data)
 
 
 class DirectionSeedTests(RepoTest):
