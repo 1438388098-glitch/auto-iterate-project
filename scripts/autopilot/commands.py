@@ -54,16 +54,21 @@ def cmd_init(args):
             cfg["goals"] = args.goal
         if args.goals_from_prompt:
             cfg["goals"] = state.split_goals(args.goals_from_prompt)
-        for knob, minimum in (("--max-rounds", 1), ("--max-minutes", 0), ("--max-tokens", 0),
-                              ("--max-round-scope", 1), ("--retries-per-round", 1),
-                              ("--max-blocked-in-a-row", 1)):
+        # Only negatives are illegal here (zero is meaningful: max_rounds 0
+        # stops immediately, retries 0 disables retrying). This mirrors the
+        # non-negative policy in load_config — before this gate, a negative
+        # knob faked a successful init and then failed on every load, and
+        # max_blocked_in_a_row < 0 silently stopped the loop with zero rounds.
+        for knob in ("--max-rounds", "--max-minutes", "--max-tokens",
+                     "--max-round-scope", "--retries-per-round",
+                     "--max-blocked-in-a-row"):
             value = getattr(args, knob.lstrip("-").replace("-", "_"), None)
-            if value is not None and value < minimum:
+            if value is not None and value < 0:
                 io.append_log(repo, "init", "error", reason="{} out of range".format(knob))
                 return emit_result(
                     args, False,
-                    "[ERROR] {} must be a non-negative integer >= {} (negative values would "
-                    "silently stop the loop or fail on first load).".format(knob, minimum),
+                    "[ERROR] {} must be a non-negative integer (negative values "
+                    "silently stop the loop or fail on first load).".format(knob),
                 )
         if args.max_rounds is not None:
             cfg["max_rounds"] = args.max_rounds
