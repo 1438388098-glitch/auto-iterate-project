@@ -979,13 +979,16 @@ def cmd_backlog_add(args):
             )
         if args.depends_on:
             for dep_id in args.depends_on:
+                # Forward references are legal (add the dependency target in a
+                # later backlog-add), so an unknown id only warns — loudly.
                 if state.find_candidate(backlog, dep_id) is None:
-                    io.append_log(repo, "backlog-add", "error", reason="unknown depends_on", dep=dep_id)
-                    return emit_result(
-                        args, False,
-                        "[ERROR] --depends-on references unknown candidate: {}. "
-                        "Existing ids: see backlog-list.".format(dep_id),
+                    print(
+                        "[WARN] --depends-on references unknown candidate: {} (forward "
+                        "reference?). It will block this candidate until the id exists "
+                        "and completes — see backlog-list.".format(dep_id),
+                        file=sys.stderr,
                     )
+                    io.append_log(repo, "backlog-add", "warn", reason="unknown depends_on", dep=dep_id)
         candidate = {
             "id": candidate_id,
             "title": title,
@@ -1094,13 +1097,14 @@ def cmd_backlog_update(args):
             changed.append("risk")
         if args.depends_on is not None:
             for dep_id in args.depends_on:
+                # Self-reference is always a bug (permanent ready:false lock).
                 if dep_id == args.id:
                     return emit_result(args, False, "[ERROR] A candidate cannot depend on itself ({}).".format(dep_id))
                 if state.find_candidate(backlog, dep_id) is None:
-                    return emit_result(
-                        args, False,
-                        "[ERROR] --depends-on references unknown candidate: {}. "
-                        "Existing ids: see backlog-list.".format(dep_id),
+                    print(
+                        "[WARN] --depends-on references unknown candidate: {} (forward "
+                        "reference?). See backlog-list.".format(dep_id),
+                        file=sys.stderr,
                     )
             candidate["depends_on"] = list(args.depends_on)
             changed.append("depends_on")

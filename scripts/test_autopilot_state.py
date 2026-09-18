@@ -1048,19 +1048,17 @@ class PredictedHardeningTests(RepoTest):
         state = self.read_json("state.json")
         self.assertEqual(state["history"], [])
 
-    def test_depends_on_unknown_and_self_rejected(self):
-        self.run_state("init")
+    def test_depends_on_warns_forward_ref_and_bans_self(self):
+        # Forward reference: allowed, but loudly warned (it blocks until the
+        # target exists and completes).
         result = self.run_state("backlog-add", "--title", "t", "--depends-on", "candidate-099")
-        self.assertNotEqual(result.returncode, 0)
+        self.assertEqual(result.returncode, 0, result.stderr)
         self.assertIn("unknown candidate", result.stderr)
-        self.assertFalse((self.repo / ".autopilot" / "backlog.json").exists())
+        self.assertTrue((self.repo / ".autopilot" / "backlog.json").exists())
         self.run_state("backlog-add", "--title", "c1")
         result = self.run_state("backlog-update", "--id", "candidate-001", "--depends-on", "candidate-001")
         self.assertNotEqual(result.returncode, 0)
         self.assertIn("cannot depend on itself", result.stderr)
-        result = self.run_state("backlog-update", "--id", "candidate-001", "--depends-on", "candidate-099")
-        self.assertNotEqual(result.returncode, 0)
-        self.assertIn("unknown candidate", result.stderr)
 
     def test_init_rejects_negative_knobs(self):
         """Negative init knobs used to fake success (config load failed later)
