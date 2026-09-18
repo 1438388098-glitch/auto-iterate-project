@@ -2,6 +2,43 @@
 
 All notable changes to auto-iterate-project are documented here.
 
+## 1.3.3 (2026-09-18)
+
+Second autonomous iteration: fourth scout wave (CLI surface / test blind-spot
+matrix / docs consistency) landed 10 more candidates.
+
+### Fixed
+
+- `init` numeric knobs reject negatives up front (a negative
+  `max_blocked_in_a_row` silently stopped the loop at zero rounds; the other
+  knobs faked a successful init then failed on every config load). Zero stays
+  legal where it is meaningful (max_rounds 0, retries 0).
+- `complete-round --review-score` is range-checked (1-5) even without a
+  configured threshold — an out-of-band 99 pinned the learned calibration.
+- `commit --round 0` no longer falls through the truthiness check into the
+  open-round error; `--round`/`--tokens` reject non-positive values.
+- `detect-verify --json` now carries `ok`/`message` in every mode (shape was
+  drifting between --apply and plain).
+- docs: `--goal`/`--goals-from-prompt` last-write-wins documented; the
+  "skipped in batched mode" commit description corrected; the self-depending
+  example fixed; README project layout lists all nine modules; the Windows
+  junction example is free of stray control characters.
+
+### Added
+
+- Test blind-spot matrix round: merge-commit undo guidance, goal-met seed
+  boundary values, push-without-remote JSON contract, a 15-command `--dry-run`
+  zero-mutation scan, report `--output` relative-to-repo positive case,
+  uninitialized-guard matrix, commit identity gate, push-failure warning
+  branch, agent empty-env contract. The dry-run scan caught and fixed a real
+  bug (`directive-remove --dry-run` actually removed the directive).
+- `directive-list` entries now carry their 1-based `index`
+  (`directive-remove --index` source of truth).
+- `AUTOPILOT_AGENT` invalid values warn on stderr instead of silently
+  degrading to generic.
+- `depends_on`: unknown ids warn loudly (forward references stay legal);
+  self-reference is rejected.
+
 ## 1.3.2 (2026-09-17)
 
 Hardening release from a three-agent audit (robustness deep-review, functional
