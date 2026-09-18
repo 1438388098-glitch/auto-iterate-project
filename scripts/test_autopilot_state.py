@@ -1038,6 +1038,43 @@ class PredictedHardeningTests(RepoTest):
         self.assertTrue(data["goals_met"])
         self.assertFalse(data["continue"])
 
+    def test_review_score_range_without_threshold(self):
+        self.run_state("init")
+        self.git("commit", "--allow-empty", "-q", "-m", "base")
+        self.run_state("begin-round", "--title", "t", "--reason", "r")
+        result = self.run_state("complete-round", "--summary", "s", "--review-score", "99")
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("between 1 and 5", result.stderr)
+        state = self.read_json("state.json")
+        self.assertEqual(state["history"], [])
+
+    def test_depends_on_unknown_and_self_rejected(self):
+        self.run_state("init")
+        result = self.run_state("backlog-add", "--title", "t", "--depends-on", "candidate-099")
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("unknown candidate", result.stderr)
+        self.assertFalse((self.repo / ".autopilot" / "backlog.json").exists())
+        self.run_state("backlog-add", "--title", "c1")
+        result = self.run_state("backlog-update", "--id", "candidate-001", "--depends-on", "candidate-001")
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("cannot depend on itself", result.stderr)
+        result = self.run_state("backlog-update", "--id", "candidate-001", "--depends-on", "candidate-099")
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("unknown candidate", result.stderr)
+
+    def test_init_rejects_negative_knobs(self):
+        """Negative init knobs used to fake success (config load failed later)
+        or — worse — silently stop the loop on the first check
+        (max_blocked_in_a_row: 0 >= -1)."""
+        for knob in ("--max-rounds", "--max-tokens", "--max-round-scope",
+                     "--retries-per-round", "--max-blocked-in-a-row", "--max-minutes"):
+            result = self.run_state("init", knob, "-5")
+            self.assertNotEqual(result.returncode, 0, knob)
+            self.assertIn("must be a non-negative integer", result.stderr)
+            self.assertNotIn("Traceback", result.stderr)
+        result = self.run_state("init", "--max-rounds", "3")
+        self.assertEqual(result.returncode, 0, result.stderr)
+
     def test_goal_mismatch_warns(self):
         self.run_state("init", "--goal", "real goal")
         result = self.run_state("goal-met", "--goal", "totally different")
@@ -1120,6 +1157,34 @@ class PredictedHardeningTests(RepoTest):
         origin_heads = self.git("ls-remote", str(origin), "refs/heads/" + branch).stdout.strip()
         self.assertNotEqual(origin_heads, "", "origin (preferred) must receive the push")
         self.assertEqual(fork_heads, "", "the alphabetically-first fork must be skipped")
+
+    def test_directive_list_shows_index(self):
+        self.run_state("init")
+        self.run_state("directive-add", "--text", "rule A")
+        self.run_state("directive-add", "--text", "rule B")
+        data = json.loads(self.run_state("directive-list").stdout)
+        self.assertEqual([d["index"] for d in data["directives"]], [1, 2])
+        # The remove error message points at directive-list: keep them in sync.
+        result = self.run_state("directive-remove", "--index", "9")
+        self.assertIn("as shown by directive-list", result.stderr)
+
+    def test_invalid_override_warns(self):
+        env = dict(self.env)
+        for var in ("OPENCODE", "CLAUDE_CODE", "CODEX", "SKILL_DIR"):
+            env.pop(var, None)
+        env["AUTOPILOT_AGENT"] = "ClaudeCode"
+        result = subprocess.run(
+            [sys.executable, str(self.script), "detect-agent", "--repo", str(self.repo), "--home", str(self.tmp)],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            universal_newlines=True,
+            encoding="utf-8",
+            errors="replace",
+            env=env,
+        )
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("not one of", result.stderr)
+        self.assertIn("generic", result.stderr)
 
     def test_directive_remove_by_index(self):
         self.run_state("init")

@@ -54,6 +54,17 @@ def cmd_init(args):
             cfg["goals"] = args.goal
         if args.goals_from_prompt:
             cfg["goals"] = state.split_goals(args.goals_from_prompt)
+        for knob, minimum in (("--max-rounds", 1), ("--max-minutes", 0), ("--max-tokens", 0),
+                              ("--max-round-scope", 1), ("--retries-per-round", 1),
+                              ("--max-blocked-in-a-row", 1)):
+            value = getattr(args, knob.lstrip("-").replace("-", "_"), None)
+            if value is not None and value < minimum:
+                io.append_log(repo, "init", "error", reason="{} out of range".format(knob))
+                return emit_result(
+                    args, False,
+                    "[ERROR] {} must be a non-negative integer >= {} (negative values would "
+                    "silently stop the loop or fail on first load).".format(knob, minimum),
+                )
         if args.max_rounds is not None:
             cfg["max_rounds"] = args.max_rounds
         if args.max_minutes is not None:
@@ -445,6 +456,12 @@ def cmd_complete_round(args):
             return 0
 
         cfg = config.load_config(repo)
+        # Range-check the score even without a configured threshold: an
+        # out-of-band 99 would poison the learned value calibration (clamped,
+        # but still pinned to the ceiling) for the whole run.
+        if getattr(args, "review_score", None) is not None and (args.review_score < 1 or args.review_score > 5):
+            io.append_log(repo, "complete-round", "error", reason="review score out of range")
+            return emit_result(args, False, "[ERROR] --review-score must be between 1 and 5.")
         review_threshold = cfg.get("review_threshold")
         if review_threshold is not None:
             if args.review_score is None:
@@ -454,9 +471,6 @@ def cmd_complete_round(args):
                     "[ERROR] review_threshold is {} but no --review-score was provided. "
                     "Self-review the round on a 1-5 scale and pass --review-score.".format(review_threshold),
                 )
-            if args.review_score < 1 or args.review_score > 5:
-                io.append_log(repo, "complete-round", "error", reason="review score out of range")
-                return emit_result(args, False, "[ERROR] --review-score must be between 1 and 5.")
             if args.review_score < review_threshold:
                 io.append_log(repo, "complete-round", "error", reason="review score below threshold")
                 return emit_result(
@@ -963,6 +977,15 @@ def cmd_backlog_add(args):
                 args, False,
                 "[ERROR] --type must be one of {}.".format("|".join(state.VALID_CANDIDATE_TYPES)),
             )
+        if args.depends_on:
+            for dep_id in args.depends_on:
+                if state.find_candidate(backlog, dep_id) is None:
+                    io.append_log(repo, "backlog-add", "error", reason="unknown depends_on", dep=dep_id)
+                    return emit_result(
+                        args, False,
+                        "[ERROR] --depends-on references unknown candidate: {}. "
+                        "Existing ids: see backlog-list.".format(dep_id),
+                    )
         candidate = {
             "id": candidate_id,
             "title": title,
@@ -1070,6 +1093,15 @@ def cmd_backlog_update(args):
             candidate["risk"] = args.risk
             changed.append("risk")
         if args.depends_on is not None:
+            for dep_id in args.depends_on:
+                if dep_id == args.id:
+                    return emit_result(args, False, "[ERROR] A candidate cannot depend on itself ({}).".format(dep_id))
+                if state.find_candidate(backlog, dep_id) is None:
+                    return emit_result(
+                        args, False,
+                        "[ERROR] --depends-on references unknown candidate: {}. "
+                        "Existing ids: see backlog-list.".format(dep_id),
+                    )
             candidate["depends_on"] = list(args.depends_on)
             changed.append("depends_on")
         if args.status is not None:
@@ -1474,7 +1506,17 @@ def cmd_directive_list(args):
     repo = Path(args.repo).resolve()
     if not config.state_path_for(repo).exists():
         return emit_result(args, False, "[ERROR] Autopilot not initialized. Run init first.")
-    print(json.dumps(state.load_directives(repo), indent=2, ensure_ascii=False))
+    directives = state.load_directives(repo)
+    # Each entry carries its 1-based index so directive-remove --index has an
+    # unambiguous source (the error message points here).
+    payload = {
+        "directives": [
+            dict({"index": position + 1}, **entry)
+            for position, entry in enumerate(directives.get("directives") or [])
+        ]
+    }
+    print(json.dumps(payload, indent=2, ensure_ascii=False))
+    return 0
     return 0
 
 

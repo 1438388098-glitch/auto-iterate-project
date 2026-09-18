@@ -3,13 +3,16 @@
 import json
 import os
 import shutil
+import sys
 from pathlib import Path
 
 from . import io
 
 AGENT_OVERRIDE_ENV = "AUTOPILOT_AGENT"
 
-# Env vars that uniquely identify a runtime. Values may be "" or "1"; presence wins.
+# Env vars that uniquely identify a runtime. An empty value counts as unset
+# (`VAR= cmd` in a shell exports the name with ""), keeping accidental exports
+# from hijacking detection.
 AGENT_ENV_SIGNALS = [
     ("opencode", ("OPENCODE",)),
     ("claude-code", ("CLAUDE_CODE",)),
@@ -70,6 +73,13 @@ def detect_agent(cwd=None, home=None):
     override = os.environ.get(AGENT_OVERRIDE_ENV, "")
     if override:
         if override not in KNOWN_AGENTS:
+            print(
+                "[WARN] {}='{}' is not one of {}; falling back to generic. "
+                "Fix the value or unset the variable.".format(
+                    AGENT_OVERRIDE_ENV, override, "|".join(sorted(KNOWN_AGENTS))
+                ),
+                file=sys.stderr,
+            )
             override = "generic"
         return override, "override:{}".format(AGENT_OVERRIDE_ENV)
 
