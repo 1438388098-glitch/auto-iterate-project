@@ -1542,6 +1542,12 @@ def cmd_directive_remove(args):
                 args, False,
                 "[ERROR] --index must be between 1 and {} (as shown by directive-list).".format(len(entries)),
             )
+        if getattr(args, "dry_run", False):
+            print(
+                "[DRY-RUN] Would remove directive: {}.".format((entries[index - 1].get("text") or "")[:80]),
+                file=sys.stderr,
+            )
+            return 0
         removed = entries.pop(index - 1)
         state.save_directives(repo, directives)
         io.append_log(repo, "directive-remove", "success", text=removed.get("text"), index=index)

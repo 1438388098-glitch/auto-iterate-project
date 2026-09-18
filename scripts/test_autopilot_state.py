@@ -1298,6 +1298,126 @@ class PredictedHardeningTests(RepoTest):
         self.assertEqual(candidate["risk"], 2)    # "2" coerced
 
 
+    def test_undo_round_merge_commit_points_at_mainline(self):
+        self.run_state("init")
+        self.git("checkout", "-q", "-b", "side")
+        self.add_file("conflict.txt", "side\n")
+        self.git("commit", "-q", "-m", "side change")
+        self.git("checkout", "-q", self.initial_branch)
+        self.add_file("other.txt", "main\n")
+        self.git("commit", "-q", "-m", "main change")
+        self.git("merge", "-q", "--no-edit", "side")
+        merge_sha = self.git("rev-parse", "HEAD").stdout.strip()
+        result = self.run_state("undo-round", "--sha", merge_sha)
+        self.assertNotEqual(result.returncode, 0)
+        self.assertNotIn("Traceback", result.stderr)
+        self.assertIn("merge commit", result.stderr)
+        self.assertIn("-m 1", result.stderr)
+        state = self.read_json("state.json")
+        self.assertEqual(state["reverted_rounds"], 0)
+
+    def test_goal_met_seed_value_effort_boundaries(self):
+        self.run_state("init", "--goal", "G", "--expand-after-goals", "--max-rounds", "50")
+        for bad in ("0", "6"):
+            result = self.run_state("goal-met", "--goal", "G", "--next-step", "N", "--seed-value", bad)
+            self.assertNotEqual(result.returncode, 0, bad)
+            self.assertIn("must be between 1 and 5", result.stderr)
+        result = self.run_state("goal-met", "--goal", "G", "--next-step", "N",
+                                "--seed-value", "1", "--seed-effort", "5", "--json")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        state = self.read_json("state.json")
+        self.assertEqual(state["goal_seeds"][0]["value"], 1)
+        self.assertEqual(state["goal_seeds"][0]["effort"], 5)
+        result = self.run_state("goal-met", "--goal", "G", "--next-step", "N2", "--seed-type", "bogus")
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("bugfix|feature|refactor|perf|test|docs", result.stderr)
+
+    def test_push_no_remote_json_contract(self):
+        self.run_state("init", "--push")
+        result = self.run_state("push", "--json")
+        self.assertNotEqual(result.returncode, 0)
+        self.assertEqual(result.stderr, "", "JSON mode must keep errors on stdout")
+        payload = json.loads(result.stdout)
+        self.assertFalse(payload["ok"])
+        self.assertIn("No git remote is configured", payload["message"])
+        log = (self.repo / ".autopilot" / "log.jsonl").read_text(encoding="utf-8")
+        self.assertIn('"event": "push"', log)
+
+    def test_report_relative_output_resolves_against_repo(self):
+        self.run_state("init")
+        outside_cwd = Path(self.tmp) / "elsewhere"
+        outside_cwd.mkdir()
+        result = subprocess.run(
+            [sys.executable, str(self.script), "report", "--repo", str(self.repo),
+             "--output", "out.md"],
+            stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+            universal_newlines=True, encoding="utf-8", errors="replace",
+            env=self.env, cwd=str(outside_cwd),
+        )
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertTrue((self.repo / "out.md").exists())
+        self.assertFalse((outside_cwd / "out.md").exists())
+
+    def test_dry_run_mutates_nothing(self):
+        """Table-driven zero-mutation scan over the dry-run branches the matrix
+        found untested: state bytes, backlog bytes, directive bytes, and git
+        HEAD must be identical before and after."""
+        self.run_state("init", "--push")
+        self.git("commit", "--allow-empty", "-q", "-m", "base")
+        self.run_state("directive-add", "--text", "rule")
+        self.run_state("backlog-add", "--title", "seeded", "--value", "3", "--effort", "1")
+        self.run_state("backlog-add", "--title", "work", "--value", "4", "--effort", "2")
+        self.git("add", "-A")
+        self.git("commit", "-q", "-m", "work")
+        sha = self.git("rev-parse", "HEAD").stdout.strip()
+        self.run_state("begin-round", "--title", "t", "--reason", "r", "--candidate-id", "candidate-002")
+        # seed-reject validates the id before its dry-run gate: give it a real seed.
+        self.run_state("goal-met", "--goal", "G", "--next-step", "N")
+
+        def snapshot():
+            directives_path = self.repo / ".autopilot" / "directives.json"
+            return (
+                (self.repo / ".autopilot" / "state.json").read_text(encoding="utf-8"),
+                (self.repo / ".autopilot" / "backlog.json").read_text(encoding="utf-8"),
+                directives_path.read_text(encoding="utf-8") if directives_path.exists() else "",
+                self.git("rev-parse", "HEAD").stdout,
+            )
+
+        # Group A: commands that require an open round (dry-run while open).
+        before = snapshot()
+        for command, args in (
+            ("complete-round", ("--summary", "s")),
+            ("block-round", ("--reason", "b")),
+            ("cancel-round", ("--reason", "c")),
+        ):
+            result = self.run_state(command, *args, "--dry-run")
+            self.assertEqual(result.returncode, 0, (command, result.stderr))
+            self.assertIn("[DRY-RUN]", result.stderr, command)
+            self.assertEqual(snapshot(), before, "dry-run mutated state: " + command)
+        # Close the round for group B (undo-round refuses while one is open).
+        self.run_state("cancel-round", "--reason", "close group A")
+        self.run_state("goal-met", "--goal", "G", "--next-step", "N")
+        before = snapshot()
+        for command, args in (
+            ("goal-met", ("--goal", "G", "--next-step", "N")),
+            ("seed-reject", ("--id", "seed-001", "--reason", "x")),
+            ("finish", ()),
+            ("undo-round", ("--sha", sha)),
+            ("analysis-save", ("--content", "{}")),
+            ("directive-remove", ("--index", "1")),
+            ("backlog-update", ("--id", "candidate-001", "--value", "5")),
+            ("ensure-branch", ()),
+            ("push", ()),
+        ):
+            result = self.run_state(command, *args, "--dry-run")
+            self.assertEqual(result.returncode, 0, (command, result.stderr))
+            self.assertIn("[DRY-RUN]", result.stderr, command)
+            self.assertEqual(snapshot(), before, "dry-run mutated state: " + command)
+        # finish --dry-run must not set finished_at (covered by the snapshot),
+        # and undo-round --dry-run must leave no REVERT_HEAD litter.
+        self.assertFalse((self.repo / ".git" / "REVERT_HEAD").exists())
+
+
 class DirectionSeedTests(RepoTest):
     """Post-goal direction prediction: goal events + direction seeds live in
     state.json; completed_goals stays a plain string array (schema v6)."""
