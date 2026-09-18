@@ -91,8 +91,13 @@ class AutopilotTestBase(unittest.TestCase):
         interpreter startup each dominated the suite runtime; dispatching
         through build_parser keeps every call site unchanged. Real-subprocess
         behavior (exit codes through the entry point, UTF-8 stdio) stays
-        covered by the explicit subprocess contract tests."""
+        covered by the explicit subprocess contract tests. self.env is applied
+        to os.environ for the duration — in-process code would otherwise
+        inherit the developer's git identity/global config."""
         parser = build_parser()
+        old_env = {key: os.environ.get(key) for key in self.env}
+        for key, value in self.env.items():
+            os.environ[key] = value
         old_out, old_err = sys.stdout, sys.stderr
         sys.stdout = StringIO()
         sys.stderr = StringIO()
@@ -105,6 +110,11 @@ class AutopilotTestBase(unittest.TestCase):
         finally:
             out, err = sys.stdout.getvalue(), sys.stderr.getvalue()
             sys.stdout, sys.stderr = old_out, old_err
+            for key, value in old_env.items():
+                if value is None:
+                    os.environ.pop(key, None)
+                else:
+                    os.environ[key] = value
         if not isinstance(code, int):
             code = 0
         return RunResult(code, out, err)
@@ -1416,6 +1426,96 @@ class PredictedHardeningTests(RepoTest):
         # finish --dry-run must not set finished_at (covered by the snapshot),
         # and undo-round --dry-run must leave no REVERT_HEAD litter.
         self.assertFalse((self.repo / ".git" / "REVERT_HEAD").exists())
+
+
+    def test_uninitialized_guard_matrix(self):
+        """Two message families on an uninitialized repo: explicit guards say
+        'not initialized'; load_state-based commands say 'state.json not
+        found'. Both exit 2 with no traceback — drift between them fails here."""
+        explicit = ["directive-list", "secret-scan", "retrospective", "analysis-load"]
+        for command in explicit:
+            result = self.run_state(command)
+            self.assertNotEqual(result.returncode, 0, command)
+            self.assertNotIn("Traceback", result.stderr, command)
+            self.assertIn("not initialized", result.stderr, command)
+        loaders = ["read", ("goal-met", ("--goal", "G")), ("seed-reject", ("--id", "seed-001", "--reason", "r")),
+                   ("report", ())]
+        for item in loaders:
+            command, args = item if isinstance(item, tuple) else (item, ())
+            result = self.run_state(command, *args)
+            self.assertNotEqual(result.returncode, 0, command)
+            self.assertNotIn("Traceback", result.stderr, command)
+            self.assertIn("state.json not found", result.stderr, command)
+
+    def test_commit_identity_gate_json(self):
+        self.run_state("init")
+        self.run_state("begin-round", "--title", "t", "--reason", "r")
+        self.add_file("f.py")
+        self.git("config", "--local", "--unset", "user.name")
+        self.git("config", "--local", "--unset", "user.email")
+        result = self.run_state("commit", "--summary", "s", "--json")
+        self.assertNotEqual(result.returncode, 0)
+        self.assertEqual(result.stderr, "")
+        payload = json.loads(result.stdout)
+        self.assertFalse(payload["ok"])
+        self.assertIn("Git identity is not configured", payload["message"])
+
+    def test_complete_round_push_fail_warns_but_succeeds(self):
+        self.run_state("init", "--push")
+        missing = Path(self.tmp) / "no-such-origin.git"
+        self.git("remote", "add", "origin", str(missing))
+        self.run_state("backlog-add", "--title", "t", "--value", "3", "--effort", "1")
+        self.run_state("begin-round", "--title", "t", "--reason", "r", "--candidate-id", "candidate-001")
+        self.add_file("f.py")
+        self.git("add", "-A")
+        r = self.run_state("commit", "--summary", "s")
+        sha = [l.split()[2].rstrip(":") for l in r.stdout.splitlines() if l.startswith("[OK] Committed ")][0]
+        result = self.run_state("complete-round", "--summary", "done", "--commit-sha", sha)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("push failed", result.stdout + result.stderr)
+        state = self.read_json("state.json")
+        self.assertEqual(state["history"][-1]["status"], "completed")
+
+    def test_agent_empty_env_signal_counts_as_unset(self):
+        env = dict(self.env)
+        for var in ("OPENCODE", "CLAUDE_CODE", "CODEX", "SKILL_DIR", "AUTOPILOT_AGENT"):
+            env.pop(var, None)
+        env["OPENCODE"] = ""
+        result = subprocess.run(
+            [sys.executable, str(self.script), "detect-agent", "--repo", str(self.repo), "--home", str(self.tmp)],
+            stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+            universal_newlines=True, encoding="utf-8", errors="replace", env=env,
+        )
+        data = json.loads(result.stdout)
+        self.assertEqual(data["agent"], "generic")
+        self.assertEqual(data["detected_by"], "fallback")
+
+    def test_commit_round_zero_and_negative_rejected(self):
+        self.run_state("init")
+        self.add_file("f.py")
+        self.git("add", "-A")
+        for bad in ("0", "-5"):
+            result = self.run_state("commit", "--round", bad, "--summary", "s")
+            self.assertNotEqual(result.returncode, 0, bad)
+            self.assertIn("positive integer", result.stderr)
+        result = self.run_state("commit", "--round", "2", "--summary", "s")
+        self.assertEqual(result.returncode, 0, result.stderr)
+
+    def test_negative_tokens_rejected(self):
+        self.run_state("init")
+        self.git("commit", "--allow-empty", "-q", "-m", "base")
+        self.run_state("begin-round", "--title", "t", "--reason", "r")
+        result = self.run_state("complete-round", "--summary", "s", "--tokens", "-5")
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("non-negative", result.stderr)
+
+    def test_detect_verify_json_shape_stable_without_apply(self):
+        (self.repo / "pyproject.toml").write_text("[project]\nname = 'x'\n", encoding="utf-8")
+        result = self.run_state("detect-verify", "--json")
+        data = json.loads(result.stdout)
+        self.assertTrue(data["ok"])
+        self.assertIn("message", data)
+        self.assertIn("detected", data)
 
 
 class DirectionSeedTests(RepoTest):

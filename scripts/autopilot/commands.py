@@ -354,8 +354,12 @@ def cmd_begin_round(args):
 
 def _resolve_tokens(args, repo, start_sha, worktree_baseline=None):
     """Thin wrapper over the single token-estimation authority
-    (io.estimate_tokens_for_round); honors an explicit --tokens override."""
+    (io.estimate_tokens_for_round); honors an explicit --tokens override.
+    Negative overrides would silently refund the budget — refuse them."""
     if args.tokens is not None:
+        if args.tokens < 0:
+            print("[ERROR] --tokens must be a non-negative integer.", file=sys.stderr)
+            raise SystemExit(2)
         return args.tokens
     return io.estimate_tokens_for_round(repo, start_sha, worktree_baseline)
 
@@ -1303,7 +1307,10 @@ def cmd_commit(args):
 
         prefix = cfg.get("commit_message_prefix", "autopilot")
         open_round = st.get("current_round")
-        if args.round:
+        if args.round is not None:
+            if args.round < 1:
+                io.append_log(repo, "commit", "error", reason="round out of range")
+                return emit_result(args, False, "[ERROR] --round must be a positive integer (got {}).".format(args.round))
             round_no = args.round
         elif open_round is not None:
             round_no = open_round.get("round")
@@ -1636,10 +1643,13 @@ def cmd_detect_verify(args):
     signals = detect_verify_commands(repo)
     commands = [cmd for _, cmd in signals]
     payload = {"detected": [{"tech": tech, "command": cmd} for tech, cmd in signals], "commands": commands}
-    if args.apply:
-        if not commands:
-            io.append_log(repo, "detect-verify", "error", reason="nothing detected")
-            return emit_result(args, False, "[ERROR] No verification commands detected; nothing to apply.")
+    payload["ok"] = bool(commands)
+    payload["message"] = (
+        "[OK] Detected {} verification command(s).".format(len(commands))
+        if commands else
+        "[ERROR] No verification commands detected; nothing to apply."
+    )
+    if commands and args.apply:
         if getattr(args, "dry_run", False):
             print(
                 "[DRY-RUN] Would set check_commands to {}.".format(commands),
@@ -1651,6 +1661,12 @@ def cmd_detect_verify(args):
         config.save_config(repo, cfg)
         io.append_log(repo, "detect-verify", "success", commands=commands)
         return emit_result(args, True, "[OK] check_commands set to {}".format(commands), data=payload)
+    if not commands and args.apply:
+        io.append_log(repo, "detect-verify", "error", reason="nothing detected")
+        if getattr(args, "json", False):
+            print(json.dumps(payload, indent=2, ensure_ascii=False))
+            return 2
+        return emit_result(args, False, payload["message"])
     if getattr(args, "json", False):
         print(json.dumps(payload, indent=2, ensure_ascii=False))
         return 0
