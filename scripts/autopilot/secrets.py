@@ -60,7 +60,9 @@ def scan_staged_diff(repo, extra_patterns=None):
     list of findings (pattern, file, masked text), deduplicated per pattern+line.
     Uses -U0 so context lines are not read, and core.quotepath=false so non-ASCII
     file names are reported literally. Fail-closed: if git diff fails, the scan
-    reports a synthetic finding instead of pretending the tree is clean."""
+    reports a synthetic finding instead of pretending the tree is clean. Staged
+    BINARY files also produce a finding: their content is unscannable, so a
+    binary can only be committed via --allow-secrets (same fail-closed promise)."""
     diff = io.run_git(repo, "-c", "core.quotepath=false", "diff", "--cached", "-U0")
     if diff.returncode != 0:
         detail = (diff.stderr or diff.stdout or "git diff failed").strip()
@@ -99,6 +101,23 @@ def scan_staged_diff(repo, extra_patterns=None):
                         "pattern": compiled.pattern,
                         "file": current_file,
                         "text": mask_secret_text(line[1:]),
+                    }
+                )
+    numstat = io.run_git(repo, "-c", "core.quotepath=false", "diff", "--cached", "--numstat")
+    if numstat.returncode == 0:
+        for line in numstat.stdout.splitlines():
+            parts = line.split("\t")
+            if len(parts) >= 3 and parts[0] == "-" and parts[1] == "-":
+                binary_file = parts[2]
+                key = ("binary-staged", binary_file)
+                if key in seen:
+                    continue
+                seen.add(key)
+                findings.append(
+                    {
+                        "pattern": "binary-staged",
+                        "file": binary_file,
+                        "text": "binary file staged; content not scannable",
                     }
                 )
     return findings

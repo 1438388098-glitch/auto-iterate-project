@@ -9,7 +9,7 @@ description: Automatically iterate any git project inside the current agent sess
 ## Operating Contract
 
 - Operate in the current working directory unless the user names a different git repository path.
-- Batch by default for efficiency. Each round works on `candidates_per_round` backlog candidates (default `3`); each candidate is implemented and verified as its own unit inside the round. Full regression verification runs once every `verify_every_rounds` rounds (default `3`). Commits are deferred and flushed once every `commit_every_rounds` rounds (default `5`), so work accumulates across rounds and is committed as one batch instead of per candidate. Set any of these to `1` for the original one-change-per-round / verify-and-commit-every-round contract.
+- Batch by default for efficiency. Each round works on `candidates_per_round` backlog candidates (default `4`); each candidate is implemented and verified as its own unit inside the round. Full regression verification runs once every `verify_every_rounds` rounds (default `3`). Commits are deferred and flushed once every `commit_every_rounds` rounds (default `5`), so work accumulates across rounds and is committed as one batch instead of per candidate. Set any of these to `1` for the original one-change-per-round / verify-and-commit-every-round contract.
 - Commit only after verification. Do not push by default.
 - Do not rely on host-specific goal tools. This skill owns its loop and state through `.autopilot/`.
 - Maintain a visible improvement backlog in `.autopilot/backlog.json`.
@@ -74,7 +74,7 @@ python <this-skill>/scripts/autopilot_state.py init --repo <repo> [--branch-mode
 
 `--deadline` is the **timer (定时器)** stop: an absolute wall-clock moment when the run must stop, unlike the `--max-minutes` countdown (倒计时) which measures duration since the last round activity. Accepts an ISO timestamp (`2026-08-10T08:00:00`), a relative duration (`+8h`, `+30min`, `+1d`, `+2w`), or a local `HH:MM` (today, or tomorrow if already passed — e.g. `08:00` for "iterate until tomorrow morning"). It is resolved to an absolute UTC timestamp at init time. See `references/config.md` for details.
 
-`--goals-from-prompt` splits a natural-language request (Chinese or English) into `goals` automatically. `--allow-path`/`--deny-path` seed the commit path whitelist (repeatable). Ranking-related flags not shown above: `--ranking-mode`, `--min-candidate-value`, `--max-same-type-per-round`, `--max-predicted-per-round`. Recovery flags for special situations: `--allow-uncommitted-changes` (start from a dirty tree) and `--force` (reinitialize / override a refusal). All documented in `references/config.md`.
+`--goals-from-prompt` splits a natural-language request (Chinese or English) into `goals` automatically. `--allow-path`/`--deny-path` seed the commit path whitelist (repeatable). Ranking-related flags not shown above: `--ranking-mode`, `--min-candidate-value`, `--max-same-type-per-round`, `--max-predicted-per-round`, `--max-expansion-per-round`. Recovery flags for special situations: `--allow-uncommitted-changes` (start from a dirty tree) and `--force` (reinitialize / override a refusal). All documented in `references/config.md`.
 
 7. If `branch_mode` is `feature`, run `ensure-branch`. On a fresh run `init` already created the branch, so this is only needed when resuming; calling it again is safe.
 8. If `.autopilot/state.json` already exists and is unfinished, run `read` and `check`, then continue from the current state instead of initializing again.
@@ -93,7 +93,7 @@ Use the analysis cache to avoid re-reading the whole repo every round:
 
 1. Run `python <this-skill>/scripts/autopilot_state.py analysis-load --repo <repo>`.
 2. If it reports `"valid": true`, reuse the cached analysis and do **not** re-scan the tree, README, or CI files. Update only what the current candidate needs.
-3. If it reports `missing`/`stale`, gather fresh context and save it back with `analysis-save --content '<json>'` so the next rounds inherit this understanding. The cache auto-invalidates when `git HEAD` moves or `.autopilot/config.json` changes, so it never goes stale silently.
+3. If it reports `missing`/`stale`, gather fresh context and save it back with `analysis-save --content '<json>'` so the next rounds inherit this understanding. Invalidation is only *judged* at `analysis-load` time — nothing watches it in the background. `check` exposes the cache state in its `analysis` payload (`status`: missing/fresh/stale, `commits_behind`: how many commits the cache predates), so before the next expansion wave, read that payload: a stale cache means every proposal is grounded in a repo that no longer exists. Every expansion wave must start with a fresh scan and `analysis-save`.
 
 Fresh analysis gathers:
 
@@ -122,9 +122,9 @@ When nothing matches, run `python <this-skill>/scripts/autopilot_state.py detect
 ### 3. Maintain the Backlog
 
 - Use `backlog-add` to record 3-5 concrete improvement candidates with title, reason, a numeric `value` (1-5), `effort` (1-5), a `type` (`bugfix|feature|refactor|perf|test|docs`, default `feature`), an optional `risk` (1-5, default 1), and optional `depends-on <candidate-id>` prereqs.
-- Use `backlog-rank` to list pending candidates sorted by expected value per round. The default `ranking_mode: expected` is NOT a value/effort ratio — the scarce resource in a run is rounds, not effort — so it scores `value × success rate (from the type's blocked history) × value calibration (learned from past review scores) × dependency-unlock bonus × budget-aware risk factor × saturation × backlog-mix penalty ÷ log2(1+effort)`. Entries carry `selected` (the recommended round batch), `below_floor` (below `min_candidate_value`, at most one such quick-win per round), `unlocks` (pending candidates that depend on this one), and `ready`/`blocked_by` for prereqs. Set `ranking_mode: classic` for the legacy value/effort ratio. Read the `score_breakdown` to pick deliberately instead of reflexively.
-- Pick the `selected` candidates (default `candidates_per_round` 3) for the round. The batch applies a diversity quota (`max_same_type_per_round`, default 2) and a value floor (`min_candidate_value`, default 3): picking several below-floor candidates in one round triggers a warning.
-- Choose the top `candidates_per_round` **ready** pending candidates (default `3`). Set `candidates_per_round: N` in `.autopilot/config.json` (or `init --candidates-per-round N`) to batch N independent changes per round and amortize the per-round overhead.
+- Use `backlog-rank` to list pending candidates sorted by expected value per round. The default `ranking_mode: expected` is NOT a value/effort ratio — the scarce resource in a run is rounds, not effort — so it scores `value × success rate (from the type's blocked history) × value calibration (learned from past review scores) × dependency-unlock bonus × budget-aware risk factor × saturation × backlog-mix penalty ÷ effort cost`. Saturation and the mix penalty lower the *diversity* signal, not the value judgment (the saturation factor is floored at 0.35), so a value>=4 candidate of the dominant type still deserves serious consideration; effort costs nothing within one round's batch width (`candidates_per_round`) and grows linearly only beyond it. Entries carry `selected` (the recommended round batch), `below_floor` (below `min_candidate_value`; such quick-wins only fill slots the main pool left open), `cut_reason` (why a ready above-floor entry was skipped: `quota`/`late_run`/`type`/`cutoff`/`batch_full`), `unlocks` (pending candidates that depend on this one), and `ready`/`blocked_by` for prereqs. Set `ranking_mode: classic` for the legacy value/effort ratio. Read the `score_breakdown` to pick deliberately instead of reflexively.
+- Pick the `selected` candidates (default `candidates_per_round` 4) for the round. The batch applies a diversity quota (`max_same_type_per_round`, default 2) and a value floor (`min_candidate_value`, default 3): picking several below-floor candidates in one round triggers a warning. When the batch comes back empty while ready candidates exist, `check` reports `selected_empty_reason` (`quota`/`late_run`/`cutoff`/`floor`) — read it to decide between Deep Expansion (quota/late_run exhausted the pool) and an explicit `--candidate-id` round (the entries are real work but the constraints refused them).
+- Choose the top `candidates_per_round` **ready** pending candidates (default `4`). Set `candidates_per_round: N` in `.autopilot/config.json` (or `init --candidates-per-round N`) to batch N independent changes per round and amortize the per-round overhead.
 - Do not combine unrelated candidates into a single change; within a round, each candidate is still implemented and reviewed as its own unit.
 - **Thin-backlog rule**: `check` reports `backlog.pending`, `backlog.ready`, and `action_hint`. When `action_hint` is `"expand"` (ready==0, or pending < `min_pending_candidates`), run Deep Expansion **in parallel with** any ready work — do **not** wait to "fill" the backlog before `begin-round`. With ≥1 ready candidate you may open a round immediately while expansion tops up the rest. Never start a round that has no ready candidates when the backlog is empty.
 - Quality gate: only open a round whose changes you can justify in one concrete sentence each ("why is this valuable to the user"). If the best available candidate has no clear value, **do not stop and do not idle** — run Deep Expansion (see below) to discover stronger candidates. Do not escalate merely because a scan looked empty; keep expanding while budgets remain.
@@ -140,9 +140,9 @@ python <this-skill>/scripts/autopilot_state.py begin-round --repo <repo> --title
 
 All passed candidates are marked `picked`; the helper records the list in `current_round.candidate_ids` and updates every one of them to `completed`/`blocked`/`pending` when the round closes.
 
-`begin-round` refuses to open a round when a stop condition is already reached (all goals met without `expand_after_goals`, `max_rounds`, `max_minutes`, `max_tokens`, `max_blocked_in_a_row`, or a finished run). It also refuses to open the **first** round of a run on a dirty tree when `allow_uncommitted_changes` is false (later rounds only warn, so a cancelled round's leftover changes never deadlock the loop). When the backlog has ready pending candidates, `begin-round` requires at least one `--candidate-id` (empty rounds on a stocked backlog are churn). If it fails, run `check` and resolve the stop reason instead.
+`begin-round` refuses to open a round when a stop condition is already reached (all goals met without `expand_after_goals`, `max_rounds`, `max_minutes`, `max_tokens`, `max_blocked_in_a_row`, or a finished run). It also refuses to open the **first** round of a run on a dirty tree when `allow_uncommitted_changes` is false (later rounds only warn, so a cancelled round's leftover changes never deadlock the loop). When the backlog has ready above-floor pending candidates, `begin-round` requires at least one `--candidate-id` (empty rounds on a stocked backlog are churn); when only below-floor candidates are ready it refuses with a Deep Expansion pointer — passing an explicit `--candidate-id` is how you consciously accept a quick win. If it fails, run `check` and resolve the stop reason instead.
 
-Cancelled rounds advance the round-number counter (`cancelled_rounds`), so `cancel-round` followed by `begin-round` produces a new round number instead of reusing the old one.
+Cancelled rounds advance the round-number counter (`cancelled_rounds`), so `cancel-round` followed by `begin-round` produces a new round number instead of reusing the old one. A **zero-work cancel** (no working-tree delta against the round's snapshot, no commit, under 10 minutes — the probe-retry case) records an `aborted` round instead: it does not advance any round budget and burns no token base, while the round number stays unique via the `round_seq` sequence.
 
 ### 5. Implement & Self-Review
 
@@ -179,7 +179,7 @@ Do not push unless config sets `push: true`; when it does, `complete-round` push
 
 ### 8. Record the Round
 
-- On success: run `complete-round` with title and summary. On a commit round, pass `--commit-sha <sha>` from the commit helper; on a deferred round, omit it — the round is recorded and the changes stay in the working tree for the next batch. If `review_threshold` is configured (1-5), `complete-round` requires a `--review-score` at least as high — self-review the round against the quality gate first and pass `--review-notes` to record the rationale. Token accounting is estimated automatically from the round's own diff (no double counting of earlier uncommitted batches) unless you pass `--tokens`.
+- On success: run `complete-round` with title and summary. On a commit round, pass `--commit-sha <sha>` from the commit helper; on a deferred round, omit it — the round is recorded and the changes stay in the working tree for the next batch. **Every** `complete-round` gets an honest self-review `--review-score` (1-5), independent of `review_threshold` (the threshold only decides whether the score is *enforced*) — the scores feed the value calibration that keeps backlog ranking honest; add `--review-notes` to record the rationale. Token accounting is estimated automatically from the round's own diff (no double counting of earlier uncommitted batches) unless you pass `--tokens`.
 - On blocked: run `block-round` with title and reason, and do not commit that round.
 - To abandon a round without counting it as blocked: run `cancel-round` (the round's candidates return to `pending`).
 - The helper automatically updates every backlog candidate attached to the round to `completed`, `blocked`, or back to `pending`, and refreshes the per-type stats (`state.type_stats`) that power ranking and the retrospective.
@@ -188,13 +188,15 @@ Do not push unless config sets `push: true`; when it does, `complete-round` push
 
 ### 9. Mark Goals
 
-If the round satisfies one of the configured goals, run `goal-met --goal "<exact goal text>"`.
+If the round satisfies one of the configured goals, run `goal-met --goal "<exact goal text>" --round <the round that completed it>`. The `--round` must match a completed round in history — it is the evidence that the claim is real; a `goal-met` without `--round` is recorded as **unverified** and withholds the "all goals met" stop (check lists such goals under `goals_unverified` and warns not to finish). Optionally add `--evidence "<how you know it is met>"` for the audit trail.
 
 Record the follow-on direction in the same call while it is fresh — every `--next-step` creates one **direction seed** (a predicted "because we shipped A, B is next" hypothesis) in `state.json`:
 
 ```powershell
-python <this-skill>/scripts/autopilot_state.py goal-met --repo <repo> --goal "<goal>" --next-step "<predicted follow-up>" --unlocked-capability "<capability unlocked>"
+python <this-skill>/scripts/autopilot_state.py goal-met --repo <repo> --goal "<goal>" --round <n> --next-step "<predicted follow-up>" --unlocked-capability "<capability unlocked>" --seed-type feature --seed-value 4 --seed-effort 2
 ```
+
+The seed defaults (`type`: first non-saturated non-bugfix type, `value` 4, `effort` 2, `risk` 2) distort ranking when they are wrong — pass `--seed-type`/`--seed-value`/`--seed-effort` explicitly when you know better.
 
 `goal-met` also snapshots the context of the completion (recent commit topics, saturated types, the round's candidates) into a goal event, so the expansion phase can reason from what was just delivered instead of rescanning the repo. `completed_goals` stays a plain string array; old state files are migrated automatically.
 
@@ -233,7 +235,7 @@ Deep Expansion answers "what else could be improved?"; this protocol answers "be
 
 **Hypothesis loop**: (1) predict, (2) verify the evidence at minimum cost — a hypothesis whose evidence is gone is rejected via `seed-reject --id <id> --reason "<why>"` (dead seeds leave the open list so the Wave 0 exception can fire), (3) value-gate via `backlog-add --from-seed <id>` + `backlog-rank` (same red lines as Expansion), (4) work the most credible 1-2 via `begin-round`, (5) the seed resolves automatically from the round outcome: `complete-round` → `verified`, `block-round` → `refuted` (with the block reason as notes — failed hypotheses never flow back to game the stats), `cancel-round` → `open` again. A validated causal chain may spawn one more layer of hypotheses, at most two layers deep.
 
-**Anti-noise guardrails (刀 B)**: promoted seeds carry `origin: "predicted"` and a `confidence` (default 0.75) that discounts their score — belief is not value. `max_predicted_per_round` (default 1) caps how many predicted candidates enter one recommended batch, observed work wins score ties, and in the late run (progress > 0.7) predicted work is cut entirely while observed candidates are still ready. Predictions keep their own blocked/review sub-account: consecutive failures sink future predictions without contaminating the observed work's stats, and the run report shows the hit rate (「方向假设」section). When tuning `max_predicted_per_round` or confidence defaults, justify the change from the sub-account's hit-rate samples — not from intuition.
+**Anti-noise guardrails (刀 B)**: promoted seeds carry `origin: "predicted"` and a `confidence` (default 0.75) that discounts their score — belief is not value. `max_predicted_per_round` (default 1) caps how many predicted candidates enter one recommended batch, observed work wins score ties, and in the late run (progress > 0.7) predicted work is cut entirely while observed candidates are still ready. Predictions keep their own blocked/review sub-account: consecutive failures sink future predictions without contaminating the observed work's stats, and the run report shows the hit rate (「方向假设」section). `expansion`-origin candidates are a separate lane with their own quota (`max_expansion_per_round`, default null = uncapped) and are **not** cut in the late run — they already passed the main agent's value gate, while a predicted candidate is still an unproven hypothesis. When tuning `max_predicted_per_round` or confidence defaults, justify the change from the sub-account's hit-rate samples — not from intuition.
 
 **Wave order** (Expansion Phase below is Wave 1+):
 
@@ -254,7 +256,7 @@ Wave order: when trigger #1 fires and open goal seeds exist, the first wave is W
 
 In every expansion wave:
 
-- **Scout with fresh eyes**: do not reuse the same analysis that got you here. Run `analysis-save` with a fresh scan, and propose 3-5 expansion candidates from a detached perspective (what would a user or a different engineer want next?).
+- **Scout with fresh eyes**: do not reuse the same analysis that got you here. Read `check`'s `analysis.status`/`commits_behind`, rescan the repo, and run `analysis-save` with the fresh scan before spawning subagents. Pick this wave's lenses from `lenses_unused`, and record the wave afterwards with `expansion-record --lens ...`. Propose 3-5 expansion candidates from a detached perspective (what would a user or a different engineer want next?).
 - **Value-gate before building**: add candidates with `type`/`value`/`effort`/`risk` and let `backlog-rank` score them. A candidate whose value cannot be stated in one concrete sentence is rejected — no random feature bloat. Prefer candidates in a `type` you have not saturated (`score_breakdown.saturation_factor` exposes this).
 - Keep honoring `review_threshold`, verification, and commit batching as usual.
 
@@ -268,23 +270,25 @@ When `check` returns `action_hint: "expand"`, the backlog is empty, or local ana
 
 ### Wave shape
 
-1. **Spawn explore subagents in parallel** (3-6 per wave, never the same lens set twice). Each subagent must return 2-5 concrete improvement candidates — not vibes. Cover a rotating subset of these lenses:
-   - architecture / coupling / module boundaries / layering violations
-   - tests, coverage gaps, flaky fixtures, missing edge-case matrix
-   - security, secrets, authz, input validation, dependency hygiene
-   - performance, I/O, algorithmic hotspots, N+1, memory churn
-   - docs, CLI ergonomics, error messages, DX of public surfaces
-   - dead code, TODO/FIXME/HACK debt, unfinished features, commented-out logic
-   - API design, backward compatibility, schema/versioning
-   - concurrency, async correctness, resource cleanup, context managers
-   - i18n / accessibility / Windows-path / encoding edge cases
-   - config surface, defaults, env handling, feature flags
-   - observability: logging, metrics, actionable errors vs silent failure
-   - packaging, install, CI matrix, release/version drift
-   - data integrity, migrations, idempotency, rollback paths
-   - UX copy, naming consistency, surprising defaults
-   - dependency graph: unused deps, outdated pins, duplicate abstractions
-   - cross-cutting: rate limits, timeouts, retries, circuit breakers
+1. **Pick this wave's lenses from the helper, not from memory**: read `check`'s `lenses_unused` (top-level payload; `wave_no` counts past waves) and assign 3-6 subagents one unused lens each. At the end of the wave, record it: `expansion-record --repo <repo> --lens <lens> ...` (repeat `--lens` once per lens used). Repeating the previous wave's exact lens set triggers a `[WARN]` and an `expansion-wave` warn event — rotation is observable, not taken on faith. Each subagent must return 2-5 concrete improvement candidates **with evidence** — not vibes. Lens → probe command → evidence the subagent must bring back:
+
+   | Lens | Probe command (adapt to the repo) | Required evidence |
+   |---|---|---|
+   | tests | `python -m coverage run -m pytest && coverage report --show-missing` (or the repo's equivalent) | list of uncovered public entry points / branches, with file:line |
+   | performance | `python -m cProfile -s cumtime <real workload>` | hotspot functions with elapsed-time percentages |
+   | security / dependency | `pip-audit`; `pip list --outdated` (Node: `npm audit`) | outdated/vulnerable dependency list with versions |
+   | observability | `grep -rn "except Exception\|except: pass\|TODO\|FIXME" --include=*.py` | itemized list of swallowed exceptions / silent failures (file:line) |
+   | docs / ux-copy | walk the README quickstart and the main CLI end-to-end by hand | step-by-step friction points (which step, what tripped) |
+   | dependency-graph | list "A must land before B" pairs from imports/entry points | explicit pairs, each promoted with `backlog-add --depends-on` |
+   | architecture | `git log -p` on the hottest files plus an import-direction scan | layering violations / circular imports as module:line pairs |
+   | dead-code | public symbol audit + `grep -rn "TODO\|FIXME\|HACK"` | unused/dead symbols and unfinished work with file:line |
+   | api-design | read the public entry-point signatures and their docs | inconsistency / breaking-change risks as symbol:line |
+   | concurrency | `grep -rn "threading\|asyncio\|Lock\|thread=True"` | shared mutable state and missing cleanup, file:line |
+   | i18n | grep for hardcoded user-facing strings and non-ASCII handling | encoding/copy leaks with file:line |
+   | config | diff `--help` output against `references/config.md`/defaults | defaults that disagree with docs, flag by flag |
+   | packaging | install/build smoke (`pip install -e .` or equivalent, then `--help`) | broken entry points / missing metadata, step by step |
+   | data-integrity | exercise migration/rollback paths and idempotency tests | gaps where data can be corrupted or half-written |
+   | cross-cutting | `grep -rn "timeout\|retry\|backoff"` at network/subprocess call sites | call sites missing timeouts/retries, file:line |
 
    Lens → helper-signal map (what to consult per lens family before proposing):
 
@@ -295,13 +299,13 @@ When `check` returns `action_hint: "expand"`, the backlog is empty, or local ana
    | security / secrets / config surface | `secret-scan`, `config.py` validation branches, `references/config.md` |
    | docs / UX copy / CLI ergonomics | diff between `SKILL.md`/`README.md`/`references/config.md` claims and `--help` output |
    | observability / data integrity | `.autopilot/log.jsonl` event coverage, migration tests in `scripts/test_autopilot_state.py` |
-   | any origin tagging | `backlog-add --origin expansion` (shares the predicted quota; see `max_predicted_per_round`) |
-2. **Judge and ingest**: for each proposal, require one concrete user-facing sentence of value. Add winners with `backlog-add` (`type`/`value`/`effort`/`risk`; use `depends-on` when needed). Reject vague or cosmetic noise — but do not reject merely because effort is high; high-value large work is still work.
-3. **If still thin, escalate the search, not the conversation**:
+   | any origin tagging | `backlog-add --origin expansion` (separate quota: `max_expansion_per_round`, default uncapped — expansion work already passed the value gate, unlike unproven predictions; see 刀 B guardrails) |
+2. **Judge and ingest**: for each proposal, require one concrete user-facing sentence of value **and evidence — a file:line quote or a probe-command output snippet**. Proposals without evidence get exactly one follow-up round; still unevidenced, they are rejected. Record winning candidates with `backlog-add` and put the evidence trail in `--evidence` (it is stored on the candidate and feeds ranking/retrospective audits); pass `type`/`value`/`effort`/`risk` explicitly and use `depends-on` when needed. Reject vague or cosmetic noise — but do not reject merely because effort is high; high-value large work is still work.
+3. **If still thin, escalate the search, not the conversation** — and let the helper's counters decide where you are: `wave_no` is the number of recorded waves, `lenses_unused` the lenses not yet tried.
    - Wave 2: lower `min_candidate_value` floor temporarily (accept 2s), look at adjacent modules, user-facing polish, test debt.
    - Wave 3+: change *depth* — read the hardest/most-used paths end-to-end; trace a real user journey; audit every public symbol; re-scan after `git log -p` for regressions the history already hints at.
    - Wave 4+: change *scope* — sibling packages, scripts, CI workflows, generated files, docs site, examples, packaging metadata.
-   - Keep spawning until you have `min_pending_candidates` ready pending items or a budget stop fires. **Never finish with reason "expansion exhausted" while budgets remain.**
+   - Keep spawning until you have `min_pending_candidates` ready pending items or a budget stop fires. **Never finish with reason "expansion exhausted" while budgets remain** — this is now enforced in code: while the budgets (`max_rounds`/`max_minutes`/`deadline`/`max_tokens`) are not exhausted and `check` still returns `continue: true`, a `finish` without `--force` is refused. The only honest finish reasons are "a stop condition fired" or "the user explicitly asked (finish --force)". Declaring expansion exhausted has its own bar: **2 consecutive recorded waves (`expansion-record`), each with >=3 subagents over >=3 unused lenses (`lenses_unused` before the wave), yielding zero candidates that pass the value gate** — and even then the run only stops on a budget, not on the declaration.
 4. **No-subagent runtime fallback**: if the host has no Task/Agent/explore tool, run the same lenses **serially in-process**: one lens per pass, `analysis-save` between passes, `git log -p` archaeology, end-to-end traces of public entry points. Do not claim "cannot expand" and do not re-read the same three files hoping for new ideas.
 5. **After goals are met** (especially with `expand_after_goals: true`), treat every subsequent thin backlog the same way: expand outward via subagents instead of finishing early.
 
@@ -333,7 +337,7 @@ If you catch yourself about to idle, run Deep Expansion immediately.
 
 Stop when any of these is true:
 
-- All configured goals are met **and** `expand_after_goals` is false (when it is true, enter the Expansion Phase instead of stopping).
+- All configured goals are met **and** `expand_after_goals` is false (when it is true, enter the Expansion Phase instead of stopping). A goal marked met without `goal-met --round <completed round>` counts as unverified and withholds this stop.
 - `max_rounds` is reached (counted as completed + blocked + cancelled + reverted rounds, matching the round-number counter).
 - `max_minutes` is reached. This is wall-clock time since the most recent round activity (`init`/`begin-round`/`complete-round`/`block-round`/`cancel-round`/`goal-met`/`backlog-add`). Pausing the run does not pause the clock: if the pause is longer than the remaining budget, the resumed run stops on the first `check`. Set `max_minutes` to `null` for unlimited.
 - `deadline` is reached. The timer (定时器) stops the run at an **absolute** wall-clock moment (for example "iterate until tomorrow morning"), independent of round activity. It complements `max_minutes`: the countdown (倒计时) measures duration since the last round; the deadline is a fixed point in time. Set it with `init --deadline <expr>`; a deadline already in the past stops the run on the first `check`. Set `deadline` to `null` to disable.
@@ -360,7 +364,7 @@ An empty or thin backlog is **never** an escalation. Keep running Deep Expansion
 When the loop stops:
 
 1. If `commit_every_rounds` is enabled and the last round did not commit, **flush the pending changes** with a final `commit --round <n> --summary "flush accumulated changes"` (or commit within the open round) so no verified work is left uncommitted.
-2. Run `finish --reason "<stop reason>"`. It auto-cancels any still-open round (returning its candidate to pending), writes `.autopilot/retrospective.md` (per-type completion/blocked stats, blocked rounds, verification commands, next likely improvement), and in `feature` mode returns to the branch you started on; pass `--stay` to remain on the autopilot branch.
+2. Run `finish --reason "<stop reason>"`. The finish gate refuses while no stop condition is reached and value>=floor ready candidates remain (or the backlog needs expansion) — in that case run Deep Expansion instead; pass `--force` only when the user explicitly asked to stop. `finish` auto-cancels any still-open round (returning its candidate to pending), writes `.autopilot/retrospective.md` (per-type completion/blocked stats, blocked rounds, verification commands, next likely improvement), and in `feature` mode returns to the branch you started on; pass `--stay` to remain on the autopilot branch.
 3. Write `.autopilot/last-summary.md` with completed rounds, blocked rounds, commit SHAs, active branch, remaining goals, backlog status, and the next likely improvement. Write it in the user's language when you know it (the default English trigger suggests English output; the Chinese trigger suggests Chinese). You can generate the underlying data deterministically with `python <this-skill>/scripts/autopilot_state.py report --repo <repo> [--lang zh|en] [--output <file>]`.
 4. Report a short summary to the user.
 
@@ -380,7 +384,7 @@ When the loop stops:
 - Never push unless config sets `push: true`; this skill defaults to false, and the `push` command refuses to run when disabled.
 - Never commit user changes that existed before the run unless `allow_uncommitted_changes` is true. The helper now enforces this by refusing `init` and the first `begin-round` on a dirty tree.
 - Never ignore a failing verification result to make a commit.
-- Never commit content that looks like a secret. The `commit` helper scans the staged diff for common secret patterns (AWS `AKIA*` keys, private-key blocks, GitHub `ghp_`/`github_pat_` tokens, Slack tokens, Google API keys, JWTs, `sk-*` including `sk-proj-`/`sk-ant-`) and refuses on a match; only bypass with `--allow-secrets` (or `scan_secrets: false`) when you have verified the content is not sensitive. If the scan cannot read the staged diff, it fails closed. Run `secret-scan` at any time to check the staged diff.
+- Never commit content that looks like a secret. The `commit` helper scans the staged diff for common secret patterns (AWS `AKIA*` keys, private-key blocks, GitHub `ghp_`/`github_pat_` tokens, Slack tokens, Google API keys, JWTs, `sk-*` including `sk-proj-`/`sk-ant-`) and refuses on a match; only bypass with `--allow-secrets` (or `scan_secrets: false`) when you have verified the content is not sensitive. If the scan cannot read the staged diff, it fails closed. A staged BINARY file also produces a finding (`binary-staged`): its content is unscannable, so binaries need the same explicit `--allow-secrets` after you have verified they are safe. Run `secret-scan` at any time to check the staged diff.
 - Never run without a stop condition. The helper warns when none is configured; enforce at least one of goals, `max_rounds`, `max_minutes`, `max_tokens`, or `max_blocked_in_a_row`.
 - Never idle until the deadline. While `check` says continue, always begin a round or Deep Expansion. Waiting out the clock is a protocol violation.
 - Never delete files outside the change needed for the current round unless the repo's tests prove the deletion is safe.
@@ -396,15 +400,15 @@ When the loop stops:
 | `commit` fails with "exceeds max_round_scope" | The accumulated batch is too large | Stage a subset, commit, then stage the rest and commit again within the same round |
 | `commit` fails with "Secret-like content detected" | The staged diff matches a secret pattern | Remove the secret, or commit with `--allow-secrets` / set `scan_secrets: false` after verifying it is not sensitive |
 | `begin-round` says a round is open | A previous round was interrupted | `read` the state, then `complete-round`, `block-round`, or `cancel-round` |
-| `begin-round` fails with "Autopilot is stopped" | A stop condition is already reached | Run `check`, resolve the stop reason (e.g. raise `max_rounds`) or run `finish` |
+| `begin-round` fails with "Autopilot is stopped" | A stop condition is already reached | Run `check`, resolve the stop reason (e.g. raise `max_rounds`, or `config-set --expand-after-goals` when all goals are met) or run `finish`; note `finish` without `--force` is itself refused while a stop condition is unmet and ready candidates remain — pass `--force` only on explicit user request |
 | `commit` fails with "No round is open" | Nothing began the current round | Run `begin-round` first, or pass `--round <n>` for an intentional orphan commit |
 | "Another autopilot run appears active" | Stale `.autopilot/lock` or a real concurrent run | Wait for the other run, or delete `.autopilot/lock` if that process is dead; the helper now also removes corrupt lock files and locks left by other hosts automatically |
-| `check` reports `max_minutes` right after resume | Budget measures wall-clock since last activity, and the pause consumed it | Expected behavior; raise `max_minutes` or set it to `null` |
+| `check` reports `max_minutes` right after resume | Budget measures wall-clock since last activity, and the pause consumed it | Expected behavior; raise `max_minutes` or set it to `null`. Real exits: any `backlog-add`/`goal-met`/`begin-round` refreshes the activity clock, or edit `max_minutes`/`deadline` in `.autopilot/config.json` — `check`'s `budget` payload (`remaining_minutes`, `deadline_remaining_minutes`) shows exactly how much is left |
 | `check` reports `deadline reached` right after resume | The absolute `deadline` moment has already passed | Expected behavior; raise it with `init --force --deadline <expr>` or set `deadline` to `null` in config |
 | `git log` fails during analysis | Repo has no commits yet | Skip log analysis; the first round creates the initial commit |
 | `begin-round` refuses with "Working tree is dirty" | Dirty tree on the first round with `allow_uncommitted_changes: false` | Commit/stash user changes, or set `allow_uncommitted_changes: true` (or run `init --force` to override) |
 | `begin-round` refuses with "depends on unfinished work" | The candidate's `depends_on` prereq is not completed | Complete and record the prereq first, or pick a dependency-ready candidate (`backlog-rank` marks `"ready": false`) |
-| `complete-round` refuses with "review score" | `review_threshold` is set and `--review-score` is missing or below it | Self-review the round on 1-5 and pass `--review-score` (>= threshold), or `block-round` and rework |
+| `complete-round` refuses with "review score" | `review_threshold` is set and `--review-score` is missing or below it | Self-review the round on 1-5 and pass `--review-score` (>= threshold), `block-round` and rework, or `complete-round --below-threshold` to record the low score as a completed round (it does not count blocked, so a legitimate-but-imperfect round no longer burns the blocked streak) |
 | `goal-met` reports expansion instead of stopping | `expand_after_goals: true` | Expected; the loop keeps improving until a budget stops it. Disable the flag to stop at the goal |
 | `check` reports `action_hint: expand` / empty pending backlog | Pending candidates < `min_pending_candidates` | Run Deep Expansion (spawn explore subagents, `backlog-add`) — do not idle or treat this as a stop |
 | Run idles until deadline with no new commits | Agent skipped expansion or waited out the clock | Protocol violation; follow Anti-Idle Discipline: every continue=true check must begin-round or expand |

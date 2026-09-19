@@ -50,16 +50,21 @@ def default_state(repo, goals=None, config_fingerprint=None):
         "started_at": started_at,
         "last_activity_at": started_at,
         "round": 0,
+        "round_seq": 0,
         "completed_rounds": 0,
         "blocked_rounds": 0,
         "cancelled_rounds": 0,
         "reverted_rounds": 0,
         "estimated_tokens_used": 0,
+        "run_start_sha": None,
+        "billed_text": 0,
+        "billed_binary": 0,
         "type_stats": {},
         "goals": list(goals or []),
         "completed_goals": [],
         "goal_events": [],
         "goal_seeds": [],
+        "expansion_waves": [],
         "current_round": None,
         "history": [],
         "stop_reason": None,
@@ -87,6 +92,7 @@ def migrate_state(state):
         "type_stats": {},
         "goal_events": [],
         "goal_seeds": [],
+        "expansion_waves": [],
         "repo": None,
         "created_at": io.now_iso(),
         "started_at": None,
@@ -94,12 +100,26 @@ def migrate_state(state):
         "stop_reason": None,
         "finished_at": None,
         "config_fingerprint": None,
+        "run_start_sha": None,
+        "billed_text": 0,
+        "billed_binary": 0,
     }
     changed = False
     for key, value in defaults.items():
         if key not in state:
             state[key] = value
             changed = True
+    if "round_seq" not in state:
+        # Round numbers must never be reused, but zero-work aborted rounds no
+        # longer advance the round counters; backfill the sequence from the
+        # counters of every round the old scheme actually counted.
+        state["round_seq"] = (
+            state.get("completed_rounds", 0)
+            + state.get("blocked_rounds", 0)
+            + state.get("cancelled_rounds", 0)
+            + state.get("reverted_rounds", 0)
+        )
+        changed = True
     if state.get("started_at") is None:
         state["started_at"] = state.get("created_at")
         changed = True
@@ -112,6 +132,7 @@ def migrate_state(state):
 _STATE_INT_KEYS = (
     "schema",
     "round",
+    "round_seq",
     "completed_rounds",
     "blocked_rounds",
     "cancelled_rounds",
@@ -187,6 +208,16 @@ def load_state(repo):
         )
         raise SystemExit(2)
     changed = migrate_state(state)
+    if state.get("run_start_sha") is None:
+        # Pre-anchor states must not fall back to EMPTY_TREE: that bills the
+        # whole EMPTY_TREE..HEAD diff as one round and can fake-trigger
+        # max_tokens. Anchor billing at first load instead — work committed
+        # before the upgrade is unreconstructable and stays unbilled on
+        # purpose. EMPTY_TREE (an existing value) is left alone so an unborn
+        # repo does not churn the state file on every load.
+        head = io.run_git(repo, "rev-parse", "--verify", "-q", "HEAD")
+        state["run_start_sha"] = head.stdout.strip() if head.returncode == 0 else io.EMPTY_TREE
+        changed = True
     _validate_state_types(repo, state)
     old_schema = state.get("schema", 1)
     if old_schema < io.SCHEMA_VERSION:
@@ -357,11 +388,13 @@ def saturated_types(state, threshold=2):
 
 
 def _next_sequential_id(state, key, prefix):
-    """Next zero-padded id (`ge-003` / `seed-011`). The counter is MONOTONIC:
-    it starts past the highest suffix ever issued (not just past existing
-    entries), so ids truncated away by the bounded lists are never reused —
-    a stale candidate.from_seed can never come to point at a newer, unrelated
-    seed."""
+    """Next zero-padded id (`ge-003` / `seed-011`). Numbering is simply the
+    highest suffix among existing entries + 1 — there is no persistent counter.
+    Ids are still never reused in the normal flow: the append helpers number
+    before appending, and the bounded lists only truncate from the head
+    (``del events[:n]`` / ``del seeds[:n]``), so the maximum suffix survives
+    every truncation and the next id is always fresh — a stale
+    candidate.from_seed can never come to point at a newer, unrelated seed."""
     existing = set()
     max_counter = 0
     for item in state.get(key) or []:
@@ -420,6 +453,47 @@ def append_seed(st, seed):
     if len(seeds) > io.SEEDS_LIMIT:
         del seeds[: len(seeds) - io.SEEDS_LIMIT]
     return seed
+
+
+# Deep Expansion lens rotation (single authority; SKILL.md's lens table mirrors
+# this order). expansion-record refuses lenses outside this tuple, and check
+# reports the unused remainder so the agent can rotate deliberately.
+EXPANSION_LENSES = (
+    "architecture",
+    "tests",
+    "security",
+    "performance",
+    "docs",
+    "dead-code",
+    "api-design",
+    "concurrency",
+    "i18n",
+    "config",
+    "observability",
+    "packaging",
+    "data-integrity",
+    "ux-copy",
+    "dependency-graph",
+    "cross-cutting",
+)
+
+
+def append_expansion_wave(st, lenses):
+    """Append one Deep Expansion wave record with bounded growth (oldest
+    trimmed). Lenses are deduplicated and sorted — the record is a set
+    snapshot used to verify lens rotation across waves; `added` counts the
+    candidates the wave produced (0 at record time; the audit trail lives in
+    log.jsonl's backlog-add events between the two waves)."""
+    waves = st.setdefault("expansion_waves", [])
+    wave = {
+        "at": io.now_iso(),
+        "lenses": sorted(set(lenses or [])),
+        "added": 0,
+    }
+    waves.append(wave)
+    if len(waves) > io.EXPANSION_WAVES_LIMIT:
+        del waves[: len(waves) - io.EXPANSION_WAVES_LIMIT]
+    return wave
 
 
 def resolve_seed(st, seed_id, status, notes=None, candidate_id=None):
@@ -544,11 +618,12 @@ _GOAL_CONNECTORS = ("并且", "以及", "同时", "另外", "还有")
 
 def split_goals(text):
     """Split a natural-language request into concrete goals by sentence and comma
-    delimiters, stripping leading connectors like 以及/并且."""
+    delimiters, stripping leading connectors like 以及/并且. A dot between two
+    digits is a decimal point (v1.3.3 / 3.5), not a sentence break."""
     if not text:
         return []
     goals = []
-    for part in re.split(r"[。．；;\n\r，,、.]+", text):
+    for part in re.split(r"(?:(?<![0-9])\.(?![0-9])|[。．；;\n\r，,、])+", text):
         goal = part.strip(" \t\u3000")
         for conn in _GOAL_CONNECTORS:
             if goal.startswith(conn) and len(goal) > len(conn):
@@ -572,7 +647,11 @@ def compute_stop_reason(state, cfg):
         stop_reason = state["stop_reason"]
 
     if stop_reason is None:
-        if all_goals_met(cfg, state) and not cfg.get("expand_after_goals"):
+        if (
+            all_goals_met(cfg, state)
+            and not cfg.get("expand_after_goals")
+            and not unverified_goals(state, cfg)
+        ):
             stop_reason = "all goals met"
 
     if stop_reason is None:
@@ -592,7 +671,11 @@ def compute_stop_reason(state, cfg):
         consecutive_blocked = count_consecutive_blocked(state)
         max_blocked = cfg.get("max_blocked_in_a_row")
         if max_blocked is not None and consecutive_blocked >= max_blocked:
-            stop_reason = "max_blocked_in_a_row reached ({}/{})".format(consecutive_blocked, max_blocked)
+            stop_reason = (
+                "max_blocked_in_a_row reached ({}/{}); quality-failed rounds can complete "
+                "instead: complete-round --below-threshold records the low score without "
+                "counting blocked".format(consecutive_blocked, max_blocked)
+            )
 
     if stop_reason is None:
         max_minutes = cfg.get("max_minutes")
@@ -634,6 +717,33 @@ def all_goals_met(cfg, state):
         return False
     completed = {normalize_goal_text(goal) for goal in state.get("completed_goals") or []}
     return all(normalize_goal_text(goal) in completed for goal in goals)
+
+
+def unverified_goals(state, cfg):
+    """Configured goals recorded in completed_goals whose latest matching
+    goal_event was written without evidence (goal-met ran without --round).
+    compute_stop_reason withholds "all goals met" while this list is non-empty:
+    a goal-met claim not anchored to a completed round is an assertion, not
+    evidence. Goals with no surviving goal_event (event list truncation,
+    --no-auto-context) stay verified — blocking on absent data would brick
+    migrated/truncated runs; only a positive unverified marker withholds the
+    stop."""
+    completed = {normalize_goal_text(goal) for goal in state.get("completed_goals") or []}
+    if not completed:
+        return []
+    events = [event for event in state.get("goal_events") or [] if isinstance(event, dict)]
+    result = []
+    for goal in cfg.get("goals") or state.get("goals") or []:
+        normalized = normalize_goal_text(goal)
+        if normalized not in completed:
+            continue
+        latest = None
+        for event in events:
+            if normalize_goal_text(event.get("goal") or "") == normalized:
+                latest = event
+        if latest is not None and latest.get("unverified"):
+            result.append(goal)
+    return result
 
 
 def _candidate_score(candidate):
@@ -695,8 +805,16 @@ def compute_type_stats(backlog):
     VALID_CANDIDATE_TYPES list are grouped under their own key.
     Predicted-origin candidates (`origin: "predicted"`) are excluded here — they
     are accounted in compute_predicted_account, so a failed prediction never
-    drags down the success rate of observed work in the same type."""
+    drags down the success rate of observed work in the same type.
+    Calibration cold start: a type with fewer than three reviewed candidates
+    borrows the run-wide review/value ratio (clamped 0.6-1.5) once at least
+    three completed candidates anywhere carry a review score — early reviews
+    then already shape ranking instead of every type starting neutral."""
     stats = {}
+    global_review_sum = 0.0
+    global_review_n = 0
+    global_value_sum = 0
+    global_value_n = 0
     for candidate in backlog.get("candidates", []):
         if candidate.get("origin") == "predicted":
             continue
@@ -711,17 +829,25 @@ def compute_type_stats(backlog):
             entry["total"] += 1
             if status == "completed":
                 entry["completed"] += 1
+                parsed_value = 0
                 try:
+                    parsed_value = int(candidate.get("value") or 0)
                     entry["effort_sum"] += int(candidate.get("effort") or 0)
-                    entry["value_sum"] += int(candidate.get("value") or 0)
+                    entry["value_sum"] += parsed_value
                 except (TypeError, ValueError):
                     pass
+                # Global calibration samples accumulate here, BEFORE the per-type
+                # sums are popped below — the fallback needs the same evidence.
+                global_value_sum += parsed_value
+                global_value_n += 1
                 review = candidate.get("review_score")
                 # `review == review` rejects NaN, which would poison the average
                 # and the calibration factor.
                 if isinstance(review, (int, float)) and not isinstance(review, bool) and review == review:
                     entry["review_sum"] += review
                     entry["review_n"] += 1
+                    global_review_sum += review
+                    global_review_n += 1
             else:
                 entry["blocked"] += 1
     for entry in stats.values():
@@ -736,6 +862,16 @@ def compute_type_stats(backlog):
         entry["review_avg"] = review_avg
         if entry["review_n"] >= 3 and avg_value > 0 and review_avg is not None:
             entry["calibration"] = round(max(0.6, min(1.5, review_avg / avg_value)), 2)
+        elif (
+            entry["review_n"] < 3
+            and global_review_n >= 3
+            and global_value_n > 0
+            and global_value_sum > 0
+        ):
+            entry["calibration"] = round(
+                max(0.6, min(1.5, (global_review_sum / global_review_n) / (global_value_sum / global_value_n))),
+                2,
+            )
         else:
             entry["calibration"] = 1.0
         entry.pop("effort_sum", None)
@@ -834,7 +970,7 @@ def _score_classic(candidate, type_stats=None, saturation_threshold=2):
 
 def _score_expected(candidate, type_stats=None, saturation_threshold=2,
                     unlocks=0, pending_mix=0.0, risk_weight=0.08,
-                    completed_goals=None, predicted_account=None):
+                    completed_goals=None, predicted_account=None, batch_width=3):
     """Expected-value-per-round scoring (ranking_mode: expected, default).
 
     The scarce resource in an autopilot run is rounds, not effort — per-round
@@ -849,9 +985,14 @@ def _score_expected(candidate, type_stats=None, saturation_threshold=2,
                                                        than half a real unlock
         x dependency unlock bonus                   <- foundational work pays
         x budget-aware risk factor                  <- take swings early, play safe late
-        x completed-type saturation                 <- stop grinding one area
+        x completed-type saturation                 <- stop grinding one area (floored
+                                                       at 0.35: it dents the diversity
+                                                       signal, never vetoes value)
         x prospective backlog-mix penalty           <- diversify BEFORE over-grinding
-        / log2(1 + effort)                          <- sublinear effort cost, tie-break only
+        / effort cost                               <- free within one round's batch
+                                                       width, linear beyond it (the
+                                                       formula's premise is that
+                                                       per-round overhead dominates)
 
     Predicted-origin candidates draw their success rate from the predicted
     sub-account once it has PREDICTED_SAMPLE_FLOOR resolved samples; before that
@@ -910,12 +1051,24 @@ def _score_expected(candidate, type_stats=None, saturation_threshold=2,
         threshold = max(0, int(saturation_threshold or 0))
     except (TypeError, ValueError):
         threshold = 2
-    saturation_factor = 0.7 ** max(0, completed_n - threshold)
+    # Logarithmic decay with a hard floor (0.7**k reaches 0.045 at k=9 and
+    # 4.6e-05 at k=28): saturation dents the diversity signal but must never
+    # veto a genuinely valuable candidate of the dominant type.
+    over = max(0, completed_n - threshold)
+    saturation_factor = max(0.35, 1.0 - 0.12 * math.log2(1 + over))
 
     mix_penalty = 1.0 - 0.3 * max(0.0, min(1.0, pending_mix))
 
     effort = _resolved_effort(candidate)
-    effort_cost = math.log2(1 + effort)
+    try:
+        width = int(batch_width)
+    except (TypeError, ValueError, OverflowError):
+        width = 3
+    # Effort is free within one round's batch width (per-round overhead
+    # dominates anyway) and linear beyond it — the score ranks value per round,
+    # so a candidate that still fits this round's batch must not lose to a
+    # lighter one that would leave the batch idle.
+    effort_cost = 1.0 + 0.15 * max(0, effort - max(1, width))
 
     expected_value = value * success_rate * calibration
     score = (expected_value * unlock_bonus * risk_factor * saturation_factor * mix_penalty
@@ -942,16 +1095,19 @@ def _score_expected(candidate, type_stats=None, saturation_threshold=2,
 
 def candidate_adjusted_score(candidate, type_stats=None, saturation_threshold=2,
                              cfg=None, unlocks=0, pending_mix=0.0, risk_weight=0.08,
-                             completed_goals=None, predicted_account=None):
+                             completed_goals=None, predicted_account=None, batch_width=None):
     """Adjusted score for one candidate. Dispatches on cfg ranking_mode:
     'expected' (default) or 'classic'. Returns (score, breakdown). The
     prediction factors (completed_goals / predicted_account) only apply in
-    expected mode — classic stays the legacy value/effort ratio."""
+    expected mode — classic stays the legacy value/effort ratio. `batch_width`
+    feeds the effort cost (falls back to _score_expected's default when None)."""
     if (cfg or {}).get("ranking_mode", "expected") == "classic":
         return _score_classic(candidate, type_stats, saturation_threshold)
+    kwargs = {} if batch_width is None else {"batch_width": batch_width}
     return _score_expected(candidate, type_stats, saturation_threshold,
                            unlocks=unlocks, pending_mix=pending_mix, risk_weight=risk_weight,
-                           completed_goals=completed_goals, predicted_account=predicted_account)
+                           completed_goals=completed_goals, predicted_account=predicted_account,
+                           **kwargs)
 
 
 def _unlocks_map(backlog):
@@ -977,23 +1133,35 @@ def _mark_selection(entries, cfg, progress=None):
     """Mark the recommended round batch (`selected: true`). Selection is a
     constrained pick over the ranked list, separate from scoring:
       - only pending + ready candidates are eligible
-      - value below min_candidate_value is demoted (below_floor) and at most one
-        such quick-win fills a remaining slot
+      - value below min_candidate_value is demoted (below_floor); such
+        quick-wins only fill slots the main pool left open
       - at most max_same_type_per_round candidates of the same type per round
-      - at most max_predicted_per_round (default 1) predicted/expansion-origin
-        candidates per batch (刀 B anti-noise quota); observed wins score ties
-      - late run (progress > 0.7): predicted work is cut entirely while observed
-        candidates are still ready
-      - batch cutoff: stop once the score drops below 40% of the best eligible
+      - origin quotas are separate (刀 B anti-noise): predicted candidates are
+        capped by max_predicted_per_round (default 1, unproven hypotheses),
+        expansion candidates by max_expansion_per_round (None = uncapped,
+        they already passed the main agent's value gate); observed wins ties
+      - late run (progress > 0.7): predicted work is cut entirely while
+        observed candidates are still ready; expansion is not cut
+      - the 40% score cutoff uses the FIRST SELECTED entry as its base (the
+        top-ranked entry may be quota-cut, which would raise the bar for
+        everything else) and only prunes below-floor entries — above-floor
+        candidates are always eligible until the batch is full
+      - ready above-floor entries skipped by a constraint get `cut_reason`:
+        'late_run' | 'quota' | 'type' | 'cutoff', or 'batch_full' when the
+        batch is already full (so consumers can tell why nothing was picked)
     """
     n = cfg.get("candidates_per_round") or 3
     max_per_type = cfg.get("max_same_type_per_round") or 2
     max_predicted = cfg.get("max_predicted_per_round")
     if max_predicted is None:
         max_predicted = len(entries)
+    max_expansion = cfg.get("max_expansion_per_round")
+    if max_expansion is None:
+        max_expansion = len(entries)
     late_run = progress is not None and progress > 0.7
     for entry in entries:
         entry["selected"] = False
+        entry.pop("cut_reason", None)
     pool = [e for e in entries if e.get("status") == "pending" and e.get("ready") and not e.get("below_floor")]
     below = [e for e in entries if e.get("status") == "pending" and e.get("ready") and e.get("below_floor")]
     observed_ready = any((e.get("origin") or "observed") == "observed" for e in pool)
@@ -1001,32 +1169,59 @@ def _mark_selection(entries, cfg, progress=None):
     selected = []
     type_counts = {}
     predicted_count = 0
-    top_score = pool[0]["score"] if pool else None
+    expansion_count = 0
+    cutoff_base = None
     for entry in pool:
+        origin = entry.get("origin") or "observed"
         if len(selected) >= n:
-            break
-        candidate_type = entry.get("type") or "feature"
-        if (entry.get("origin") or "observed") != "observed":
-            if predicted_count >= predicted_quota:
-                continue
-        if type_counts.get(candidate_type, 0) >= max_per_type:
+            entry["cut_reason"] = "batch_full"
             continue
-        if top_score is not None and entry["score"] < 0.4 * top_score:
+        if origin == "predicted" and late_run and observed_ready:
+            entry["cut_reason"] = "late_run"
+            continue
+        if origin == "predicted" and predicted_count >= predicted_quota:
+            entry["cut_reason"] = "quota"
+            continue
+        if origin == "expansion" and expansion_count >= max_expansion:
+            entry["cut_reason"] = "quota"
+            continue
+        candidate_type = entry.get("type") or "feature"
+        if type_counts.get(candidate_type, 0) >= max_per_type:
+            entry["cut_reason"] = "type"
+            continue
+        if cutoff_base is not None and entry["score"] < 0.4 * cutoff_base and entry.get("below_floor"):
+            entry["cut_reason"] = "cutoff"
             break
         selected.append(entry)
+        if cutoff_base is None:
+            cutoff_base = entry["score"]
         type_counts[candidate_type] = type_counts.get(candidate_type, 0) + 1
-        if (entry.get("origin") or "observed") != "observed":
+        if origin == "predicted":
             predicted_count += 1
+        elif origin == "expansion":
+            expansion_count += 1
     if len(selected) < n and below:
-        # The quick-win fallback obeys the same predicted quota / late-run cut as
-        # the main loop, or a below-floor predicted candidate would bypass both.
-        entry = below[0]
-        if (entry.get("origin") or "observed") != "observed":
-            if predicted_count < predicted_quota:
-                selected.append(entry)
-                predicted_count += 1
-        else:
+        # The quick-win fallback fills the slots the main pool left open. It
+        # obeys the same origin quotas / late-run cut (a below-floor predicted
+        # candidate must not bypass either) and the 40% cutoff against the
+        # batch's base — a quick-win far below it is noise, not work.
+        for entry in below:
+            if len(selected) >= n:
+                break
+            origin = entry.get("origin") or "observed"
+            if origin == "predicted" and late_run and observed_ready:
+                continue
+            if origin == "predicted" and predicted_count >= predicted_quota:
+                continue
+            if origin == "expansion" and expansion_count >= max_expansion:
+                continue
+            if cutoff_base is not None and entry["score"] < 0.4 * cutoff_base and entry.get("below_floor"):
+                break
             selected.append(entry)
+            if origin == "predicted":
+                predicted_count += 1
+            elif origin == "expansion":
+                expansion_count += 1
     for entry in selected:
         entry["selected"] = True
 
@@ -1078,6 +1273,7 @@ def rank_candidates(backlog, cfg, progress=None, completed_goals=None):
             risk_weight=risk_weight,
             completed_goals=completed_goals,
             predicted_account=predicted_account,
+            batch_width=cfg.get("candidates_per_round") or 1,
         )
         entry["score"] = round(score, 3)
         entry["score_breakdown"] = breakdown
@@ -1181,6 +1377,25 @@ def analysis_validity(repo):
     return "fresh", "cached analysis is up to date"
 
 
+def analysis_commits_behind(repo):
+    """How many commits the cached analysis predates (None when there is no
+    cache, no parseable git_head, or the count cannot be determined). Gives the
+    staleness a magnitude so the agent can judge whether a rescan is due."""
+    analysis = load_analysis(repo)
+    if not isinstance(analysis, dict):
+        return None
+    cached_head = analysis.get("git_head")
+    if not cached_head:
+        return None
+    result = io.run_git(repo, "rev-list", "--count", "{}..HEAD".format(cached_head))
+    if result.returncode != 0:
+        return None
+    try:
+        return int(result.stdout.strip())
+    except (TypeError, ValueError, OverflowError):
+        return None
+
+
 def build_retrospective(repo, state, cfg, lang="zh"):
     """Run-level retrospective: per-type success stats, blocked rounds, and the
     verification setup, in the configured language."""
@@ -1276,6 +1491,7 @@ def build_retrospective(repo, state, cfg, lang="zh"):
 _STATUS_LABELS = {
     "zh": {
         "completed": "已完成", "blocked": "受阻", "cancelled": "已取消",
+        "aborted": "空转取消",
         "revert": "已回滚", "picked": "进行中", "pending": "待处理",
         "run_report": "Auto Iterate 运行报告", "meta": "运行信息", "goals": "目标",
         "counts": "轮次统计", "history": "轮次历史", "backlog": "改进清单",
@@ -1288,6 +1504,7 @@ _STATUS_LABELS = {
     },
     "en": {
         "completed": "completed", "blocked": "blocked", "cancelled": "cancelled",
+        "aborted": "aborted",
         "revert": "reverted", "picked": "in progress", "pending": "pending",
         "run_report": "Auto Iterate Run Report", "meta": "Run info", "goals": "Goals",
         "counts": "Round counts", "history": "Round history", "backlog": "Backlog",
@@ -1323,14 +1540,16 @@ def build_report(repo, state, cfg, lang="en"):
     out.append("")
 
     goals = cfg.get("goals") or state.get("goals") or []
-    completed = set(state.get("completed_goals") or [])
+    # Same normalization as all_goals_met: a goal recorded with (or without)
+    # zero-width characters must not make the report contradict the stop logic.
+    completed = {normalize_goal_text(goal) for goal in state.get("completed_goals") or []}
     out.append("## {}".format(L["goals"]))
     out.append("")
     if not goals:
         out.append("- {}".format(L["none"]))
     else:
         for goal in goals:
-            mark = "x" if goal in completed else " "
+            mark = "x" if normalize_goal_text(goal) in completed else " "
             out.append("- [{}] {}".format(mark, goal))
     out.append("")
 

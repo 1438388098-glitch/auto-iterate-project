@@ -19,6 +19,7 @@ SCRIPT = Path(__file__).resolve().parent / "autopilot_state.py"
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 from autopilot import state as ap_state  # noqa: E402
 from autopilot import io as ap_io  # noqa: E402
+from autopilot import commands as commands_module  # noqa: E402
 from autopilot.cli import build_parser  # noqa: E402
 from autopilot.guard import path_allowed  # noqa: E402
 from autopilot.secrets import SECRET_PATTERNS  # noqa: E402
@@ -156,7 +157,7 @@ class InitTests(RepoTest):
         self.assertEqual(config["max_rounds"], 10)
         self.assertFalse(config["track_state"])
         self.assertEqual(config["check_commands"], [])
-        self.assertEqual(config["candidates_per_round"], 3)
+        self.assertEqual(config["candidates_per_round"], 4)
         self.assertEqual(config["commit_every_rounds"], 5)
         self.assertEqual(config["verify_every_rounds"], 3)
         self.assertTrue(config["scan_secrets"])
@@ -392,7 +393,7 @@ class RoundFlowTests(RepoTest):
         self.run_state("commit", "--summary", "add feature")
         sha = self.git("rev-parse", "HEAD").stdout.strip()
         self.run_state("complete-round", "--summary", "done", "--commit-sha", sha)
-        self.run_state("goal-met", "--goal", "Ship feature")
+        self.run_state("goal-met", "--goal", "Ship feature", "--round", "1")
         result = self.run_state("check")
         data = json.loads(result.stdout)
         self.assertFalse(data["continue"])
@@ -501,13 +502,13 @@ class BranchTests(RepoTest):
         self.assertEqual(state["origin_branch"], self.initial_branch)
         current = self.git("rev-parse", "--abbrev-ref", "HEAD").stdout.strip()
         self.assertNotEqual(current, self.initial_branch)
-        self.run_state("finish")
+        self.run_state("finish", "--force")
         current = self.git("rev-parse", "--abbrev-ref", "HEAD").stdout.strip()
         self.assertEqual(current, self.initial_branch)
 
     def test_finish_stay_keeps_branch(self):
         self.run_state("init", "--branch-mode", "feature")
-        self.run_state("finish", "--stay")
+        self.run_state("finish", "--force", "--stay")
         current = self.git("rev-parse", "--abbrev-ref", "HEAD").stdout.strip()
         self.assertNotEqual(current, self.initial_branch)
 
@@ -530,7 +531,7 @@ class BeginRoundStopTests(RepoTest):
     def test_refuses_after_goals_met(self):
         self.run_state("init", "--goal", "Ship")
         self._complete_one_round()
-        self.run_state("goal-met", "--goal", "Ship")
+        self.run_state("goal-met", "--goal", "Ship", "--round", "1")
         result = self.run_state("begin-round", "--title", "r2", "--reason", "y")
         self.assertNotEqual(result.returncode, 0)
         self.assertIn("stopped", result.stderr.lower())
@@ -546,9 +547,913 @@ class BeginRoundStopTests(RepoTest):
 
     def test_refuses_when_already_finished(self):
         self.run_state("init")
-        self.run_state("finish", "--reason", "done")
+        self.run_state("finish", "--force", "--reason", "done")
         result = self.run_state("begin-round", "--title", "r", "--reason", "x")
         self.assertNotEqual(result.returncode, 0)
+
+
+class FinishGateTests(RepoTest):
+    """P0 anti-early-stop gate: finish is refused while no stop condition is
+    reached and work remains; --force overrides; a real stop still finishes."""
+
+    def _add_candidate(self):
+        result = self.run_state("backlog-add", "--title", "A", "--reason", "r",
+                                "--value", "3", "--effort", "2")
+        self.assertEqual(result.returncode, 0, result.stderr)
+
+    def _log_events(self):
+        log_path = self.repo / ".autopilot" / "log.jsonl"
+        return [json.loads(line) for line in log_path.read_text(encoding="utf-8").splitlines()
+                if line.strip()]
+
+    def test_finish_refuses_while_ready_work_and_no_stop_condition(self):
+        self.run_state("init")
+        self._add_candidate()
+        result = self.run_state("finish", "--reason", "x")
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("Refusing to finish", result.stderr)
+        self.assertIn("value>=floor ready candidates", result.stderr)
+        self.assertIn("pass --force", result.stderr)
+        state = self.read_json("state.json")
+        self.assertIsNone(state["finished_at"])
+        data = json.loads(self.run_state("check", "--brief").stdout)
+        self.assertTrue(data["continue"])
+
+    def test_finish_force_overrides_gate(self):
+        self.run_state("init")
+        self._add_candidate()
+        result = self.run_state("finish", "--force", "--reason", "user asked to stop")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        state = self.read_json("state.json")
+        self.assertIsNotNone(state["finished_at"])
+        forced = [e for e in self._log_events() if e.get("event") == "finish-forced"]
+        self.assertEqual(len(forced), 1)
+        self.assertEqual(forced[-1].get("reason"), "user asked to stop")
+        self.assertEqual(forced[-1].get("ready"), 1)
+
+    def test_finish_allowed_after_stop_condition(self):
+        self.run_state("init", "--max-rounds", "1")
+        self.run_state("begin-round", "--title", "r", "--reason", "x")
+        self.add_file()
+        self.run_state("commit", "--summary", "add feature")
+        sha = self.git("rev-parse", "HEAD").stdout.strip()
+        self.run_state("complete-round", "--summary", "done", "--commit-sha", sha)
+        result = self.run_state("finish", "--reason", "max rounds reached")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        state = self.read_json("state.json")
+        self.assertIsNotNone(state["finished_at"])
+        self.assertEqual([e for e in self._log_events() if e.get("event") == "finish-forced"], [])
+
+
+class GoalEvidenceTests(RepoTest):
+    """goal-met without --round is an unevidenced claim: recorded, but unverified
+    goals withhold the 'all goals met' stop until evidence lands."""
+
+    def _complete_one_round(self):
+        self.run_state("begin-round", "--title", "r", "--reason", "x")
+        self.add_file()
+        self.run_state("commit", "--summary", "add feature")
+        sha = self.git("rev-parse", "HEAD").stdout.strip()
+        self.run_state("complete-round", "--summary", "done", "--commit-sha", sha)
+
+    def test_goal_met_without_round_marks_unverified(self):
+        self.run_state("init", "--goal", "G")
+        result = self.run_state("goal-met", "--goal", "G")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        state = self.read_json("state.json")
+        self.assertTrue(state["goal_events"][-1]["unverified"])
+        data = json.loads(self.run_state("check", "--brief").stdout)
+        self.assertIn("G", data["goals_unverified"])
+        self.assertTrue(data["goals_met"])
+        self.assertIsNone(data["stop_reason"])
+        self.assertTrue(data["continue"])
+        # With valuable ready work left, the warning names the unverified goal.
+        self.run_state("backlog-add", "--title", "A", "--reason", "r", "--value", "3", "--effort", "2")
+        data = json.loads(self.run_state("check", "--brief").stdout)
+        self.assertTrue(any("G" in w and "不得 finish" in w for w in data["warnings"]))
+
+    def test_goal_met_with_round_verifies(self):
+        self.run_state("init", "--goal", "G")
+        self._complete_one_round()
+        result = self.run_state("goal-met", "--goal", "G", "--round", "1")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        state = self.read_json("state.json")
+        self.assertFalse(state["goal_events"][-1]["unverified"])
+        self.assertEqual(state["goal_events"][-1]["round"], 1)
+        data = json.loads(self.run_state("check", "--brief").stdout)
+        self.assertEqual(data["goals_unverified"], [])
+        self.assertIn("all goals met", data["stop_reason"])
+        self.assertFalse(data["continue"])
+
+    def test_goal_met_round_without_completed_history_refused(self):
+        self.run_state("init", "--goal", "G")
+        result = self.run_state("goal-met", "--goal", "G", "--round", "2")
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("--round 2", result.stderr)
+        self.assertIn("completed round", result.stderr)
+        state = self.read_json("state.json")
+        self.assertEqual(state["completed_goals"], [])
+
+
+class RankingBatchTests(unittest.TestCase):
+    """Direct tests of the rewritten batch selection and scoring factors
+    (expansion quota split, late-run scope, cutoff base, calibration cold start)."""
+
+    @staticmethod
+    def _entry(entry_id, origin=None, below=False, score=5.0, ctype="refactor"):
+        entry = {"id": entry_id, "title": entry_id, "type": ctype, "status": "pending",
+                 "ready": True, "score": score, "below_floor": below}
+        if origin:
+            entry["origin"] = origin
+        return entry
+
+    @staticmethod
+    def _cfg(**overrides):
+        cfg = {"candidates_per_round": 3, "max_same_type_per_round": 2,
+               "max_predicted_per_round": 1, "max_expansion_per_round": None}
+        cfg.update(overrides)
+        return cfg
+
+    def test_expansion_origin_not_capped_by_predicted_quota(self):
+        entries = [
+            self._entry("p", origin="predicted", score=5.0, ctype="refactor"),
+            self._entry("x", origin="expansion", score=4.0, ctype="bugfix"),
+            self._entry("o", score=3.0, ctype="perf"),
+        ]
+        ap_state._mark_selection(entries, self._cfg(max_predicted_per_round=1))
+        self.assertEqual([(e["id"], e["selected"]) for e in entries],
+                         [("p", True), ("x", True), ("o", True)])
+
+    def test_expansion_quota_zero_still_blocks_expansion(self):
+        entries = [
+            self._entry("x", origin="expansion", score=4.0, ctype="bugfix"),
+            self._entry("o", score=3.0, ctype="perf"),
+        ]
+        ap_state._mark_selection(entries, self._cfg(max_predicted_per_round=1,
+                                                    max_expansion_per_round=0))
+        by_id = {e["id"]: e for e in entries}
+        self.assertFalse(by_id["x"].get("selected"))
+        self.assertEqual(by_id["x"].get("cut_reason"), "quota")
+        self.assertTrue(by_id["o"].get("selected"))
+
+    def test_late_run_cuts_predicted_not_expansion(self):
+        entries = [
+            self._entry("p1", origin="predicted", score=5.0, ctype="refactor"),
+            self._entry("p2", origin="predicted", score=4.0, ctype="bugfix"),
+            self._entry("o", score=3.0, ctype="perf"),
+            self._entry("x", origin="expansion", score=2.0, ctype="docs"),
+        ]
+        ap_state._mark_selection(entries, self._cfg(), progress=0.8)
+        by_id = {e["id"]: e for e in entries}
+        self.assertEqual(by_id["p1"].get("cut_reason"), "late_run")
+        self.assertEqual(by_id["p2"].get("cut_reason"), "late_run")
+        self.assertFalse(by_id["p1"].get("selected"))
+        self.assertFalse(by_id["p2"].get("selected"))
+        self.assertTrue(by_id["o"].get("selected"))
+        self.assertTrue(by_id["x"].get("selected"))
+
+    def test_cutoff_only_prunes_below_floor(self):
+        # ES-4 scenario, hardened: the top entry sets the cutoff base; an
+        # above-floor entry below the 40% line stays eligible (only the batch
+        # width can stop it), while a below-floor entry under the line is
+        # pruned from the quick-win fallback.
+        entries = [
+            self._entry("top", score=4.25, ctype="refactor"),
+            self._entry("above", score=1.5, ctype="bugfix"),
+            self._entry("floorish", below=True, score=1.609, ctype="perf"),
+        ]
+        ap_state._mark_selection(entries, self._cfg())
+        by_id = {e["id"]: e for e in entries}
+        self.assertTrue(by_id["top"].get("selected"))
+        self.assertTrue(by_id["above"].get("selected"))
+        self.assertFalse(by_id["floorish"].get("selected"))
+
+        # All-below-floor pool with the predicted quota at zero: the fallback
+        # loop must still fill the batch from observed quick-wins.
+        entries = [
+            self._entry("bp", origin="predicted", below=True, score=2.0, ctype="refactor"),
+            self._entry("bo1", below=True, score=1.5, ctype="bugfix"),
+            self._entry("bo2", below=True, score=1.2, ctype="perf"),
+        ]
+        ap_state._mark_selection(entries, self._cfg(max_predicted_per_round=0))
+        selected = [e["id"] for e in entries if e.get("selected")]
+        self.assertEqual(selected, ["bo1", "bo2"])
+
+    def test_saturation_factor_floor(self):
+        score, breakdown = ap_state._score_expected(
+            {"id": "c", "title": "t", "value": 4, "effort": 2, "type": "feature"},
+            type_stats={"feature": {"completed": 30, "blocked": 0, "blocked_rate": 0.0,
+                                    "calibration": 1.0}},
+            saturation_threshold=2,
+        )
+        # 1 - 0.12*log2(1+28) = 0.417 (the old 0.7**28 was 4.6e-05).
+        self.assertEqual(breakdown["saturation_factor"], 0.417)
+
+    def test_effort_cost_batch_width(self):
+        for effort, expected in ((1, 1.0), (2, 1.0), (3, 1.0), (4, 1.0), (5, 1.15)):
+            _, breakdown = ap_state._score_expected(
+                {"id": "c", "title": "t", "value": 5, "effort": effort},
+                type_stats={}, batch_width=4,
+            )
+            self.assertEqual(breakdown["effort_cost"], expected, effort)
+        # rank_candidates feeds cfg's candidates_per_round as the batch width.
+        backlog = {"candidates": [{"id": "c1", "title": "t", "status": "pending",
+                                   "value": 5, "effort": 5}]}
+        ranked = ap_state.rank_candidates(backlog, {"candidates_per_round": 4})
+        self.assertEqual(ranked[0]["score_breakdown"]["effort_cost"], 1.15)
+        ranked = ap_state.rank_candidates(backlog, {"candidates_per_round": 3})
+        self.assertEqual(ranked[0]["score_breakdown"]["effort_cost"], 1.3)
+
+    def test_score_breakdown_table(self):
+        # mix_penalty: clamped to [0, 1] on the pending_mix input.
+        for mix, expected in ((0.0, 1.0), (1.0, 0.7), (1.7, 0.7)):
+            _, breakdown = ap_state._score_expected(
+                {"id": "c", "title": "t", "value": 3, "effort": 1},
+                type_stats={}, pending_mix=mix,
+            )
+            self.assertEqual(breakdown["mix_penalty"], expected, mix)
+        # Predicted sub-account: below PREDICTED_SAMPLE_FLOOR the type rate is
+        # discounted (x0.75); at/above it the sub-account value is used as-is.
+        type_stats = {"perf": {"completed": 3, "blocked": 1, "blocked_rate": 0.25,
+                               "calibration": 1.0}}
+        _, warm = ap_state._score_expected(
+            {"id": "c", "title": "t", "value": 3, "effort": 1, "origin": "predicted",
+             "type": "perf"},
+            type_stats=type_stats,
+            predicted_account={"done": 2, "success_rate": 0.9},
+        )
+        self.assertEqual(warm["success_rate"], round(0.75 * 0.75, 3))
+        _, mature = ap_state._score_expected(
+            {"id": "c", "title": "t", "value": 3, "effort": 1, "origin": "predicted",
+             "type": "perf"},
+            type_stats=type_stats,
+            predicted_account={"done": 3, "success_rate": 0.9},
+        )
+        self.assertEqual(mature["success_rate"], 0.9)
+        # Risk weights: flat when progress is unknown, then 0.05 + 0.10*progress.
+        for progress, expected in ((None, 0.08), (0.0, 0.05), (0.5, 0.10), (1.0, 0.15)):
+            self.assertAlmostEqual(ap_state._risk_weight_for({}, progress), expected, places=3)
+        # A late run punishes risk=5 harder than an early one.
+        _, early = ap_state._score_expected(
+            {"id": "c", "title": "t", "value": 3, "effort": 1, "risk": 5},
+            type_stats={}, risk_weight=0.05,
+        )
+        _, late = ap_state._score_expected(
+            {"id": "c", "title": "t", "value": 3, "effort": 1, "risk": 5},
+            type_stats={}, risk_weight=0.15,
+        )
+        self.assertEqual(early["risk_factor"], 0.8)
+        self.assertEqual(late["risk_factor"], 0.4)
+        # The goal-chain bonus requires the based_on goal to actually be met.
+        _, unmet = ap_state._score_expected(
+            {"id": "c", "title": "t", "value": 3, "effort": 1, "based_on": "unmet goal"},
+            type_stats={}, completed_goals=["met goal"],
+        )
+        self.assertEqual(unmet["goal_chain_factor"], 1.0)
+
+    def test_calibration_falls_back_to_global(self):
+        backlog = {"candidates": [
+            {"type": "docs", "status": "completed", "value": 4, "review_score": 5},
+            {"type": "docs", "status": "completed", "value": 4, "review_score": 5},
+            {"type": "perf", "status": "completed", "value": 5, "review_score": 2},
+            {"type": "perf", "status": "completed", "value": 5, "review_score": 2},
+            {"type": "perf", "status": "completed", "value": 5, "review_score": 2},
+        ]}
+        stats = ap_state.compute_type_stats(backlog)
+        # docs has only 2 reviews of its own, but the run-wide ratio exists:
+        # global review avg 3.2 / global value avg 4.6 = 0.6957 -> 0.7.
+        self.assertEqual(stats["docs"]["review_n"], 2)
+        self.assertEqual(stats["docs"]["calibration"], 0.7)
+        # perf has 3 reviews of its own and keeps its own (clamped) ratio.
+        self.assertEqual(stats["perf"]["calibration"], 0.6)
+
+    def test_stop_reason_precedence(self):
+        base_state = {
+            "finished_at": None, "stop_reason": None, "goals": [], "completed_goals": [],
+            "goal_events": [], "completed_rounds": 0, "blocked_rounds": 0,
+            "cancelled_rounds": 0, "reverted_rounds": 0, "history": [],
+            "estimated_tokens_used": 0, "last_activity_at": None, "started_at": None,
+        }
+        base_cfg = {"goals": [], "max_rounds": None, "max_minutes": None, "max_tokens": None,
+                    "max_blocked_in_a_row": None, "deadline": None, "expand_after_goals": False}
+        # finished_at wins over everything.
+        st = dict(base_state, finished_at="T", completed_goals=["A"], completed_rounds=5)
+        cfg = dict(base_cfg, goals=["A"], max_rounds=1)
+        self.assertEqual(ap_state.compute_stop_reason(st, cfg), "already finished")
+        # Verified goals beat max_rounds and a blocked streak.
+        st = dict(base_state, completed_goals=["A"], completed_rounds=5,
+                  blocked_rounds=2, history=[{"round": 1, "status": "blocked"}])
+        cfg = dict(base_cfg, goals=["A"], max_rounds=1, max_blocked_in_a_row=1)
+        self.assertEqual(ap_state.compute_stop_reason(st, cfg), "all goals met")
+        # max_rounds beats a blocked streak.
+        st = dict(base_state, completed_rounds=5, blocked_rounds=2,
+                  history=[{"round": 1, "status": "blocked"}])
+        cfg = dict(base_cfg, max_rounds=1, max_blocked_in_a_row=1)
+        self.assertEqual(ap_state.compute_stop_reason(st, cfg), "max_rounds reached")
+        # A blocked streak beats max_minutes.
+        st = dict(base_state, blocked_rounds=2,
+                  history=[{"round": 1, "status": "blocked"},
+                           {"round": 2, "status": "blocked"}],
+                  last_activity_at="2020-01-01T00:00:00+00:00",
+                  started_at="2020-01-01T00:00:00+00:00")
+        cfg = dict(base_cfg, max_blocked_in_a_row=2, max_minutes=1)
+        self.assertIn("max_blocked_in_a_row", ap_state.compute_stop_reason(st, cfg))
+        # max_minutes beats deadline.
+        st = dict(base_state, last_activity_at="2020-01-01T00:00:00+00:00",
+                  started_at="2020-01-01T00:00:00+00:00")
+        cfg = dict(base_cfg, max_minutes=1, deadline="2000-01-01T00:00:00+00:00")
+        self.assertIn("max_minutes", ap_state.compute_stop_reason(st, cfg))
+
+
+class BatchContractTests(RepoTest):
+    """CLI-level contracts tying check's hints to what ranking actually picks."""
+
+    def _configure(self, **overrides):
+        cfg_path = self.repo / ".autopilot" / "config.json"
+        cfg = json.loads(cfg_path.read_text(encoding="utf-8"))
+        cfg.update(overrides)
+        cfg_path.write_text(json.dumps(cfg), encoding="utf-8")
+
+    def test_selected_empty_reason_surfaced(self):
+        # TG-3 hardened: every ready above-floor candidate is predicted and the
+        # predicted quota is 0 -> the batch is empty. min_pending_candidates=0
+        # keeps needs_expansion false, so ONLY the batch contract can turn the
+        # hint away from "work".
+        self.run_state("init", "--min-pending-candidates", "0")
+        self._configure(max_predicted_per_round=0)
+        self.run_state("backlog-add", "--title", "pred-a", "--reason", "r", "--value", "5",
+                       "--effort", "1", "--origin", "predicted", "--confidence", "0.9",
+                       "--type", "refactor")
+        self.run_state("backlog-add", "--title", "pred-b", "--reason", "r", "--value", "4",
+                       "--effort", "2", "--origin", "predicted", "--confidence", "0.9",
+                       "--type", "perf")
+        data = json.loads(self.run_state("check", "--brief").stdout)
+        self.assertEqual(data["action_hint"], "expand")
+        self.assertEqual(data["selected_count"], 0)
+        self.assertEqual(data["selected_empty_reason"], "quota")
+        self.assertEqual(data["backlog"]["ready"], 2)
+
+        # TG-3's original shape, now fixed: a value>=floor observed candidate is
+        # always eligible until the batch is full, quota or not.
+        self._configure(max_predicted_per_round=0)
+        self.run_state("backlog-add", "--title", "obs", "--reason", "r", "--value", "3",
+                       "--effort", "5", "--type", "bugfix")
+        data = json.loads(self.run_state("check", "--brief").stdout)
+        self.assertEqual(data["selected_count"], 1)
+        self.assertIsNone(data["selected_empty_reason"])
+
+    def test_type_stats_consistent_after_backlog_update(self):
+        self.run_state("init")
+        self.run_state("backlog-add", "--title", "A", "--reason", "r", "--value", "4",
+                       "--effort", "2", "--type", "docs")
+        self.run_state("backlog-add", "--title", "B", "--reason", "r", "--value", "4",
+                       "--effort", "2", "--type", "docs")
+        ids = [c["id"] for c in self.read_json("backlog.json")["candidates"]]
+        result = self.run_state("backlog-update", "--id", ids[0], "--status", "completed")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        expected = ap_state.compute_type_stats(self.read_json("backlog.json"))
+        self.assertEqual(self.read_json("state.json")["type_stats"], expected)
+        result = self.run_state("backlog-remove", "--id", ids[1])
+        self.assertEqual(result.returncode, 0, result.stderr)
+        expected = ap_state.compute_type_stats(self.read_json("backlog.json"))
+        self.assertEqual(self.read_json("state.json")["type_stats"], expected)
+
+    def test_expansion_brief_content(self):
+        self.run_state("init", "--goal", "G", "--expand-after-goals",
+                       "--type-saturation-threshold", "2")
+        for i in range(3):
+            self.run_state("backlog-add", "--title", "d{}".format(i), "--reason", "r",
+                           "--value", "4", "--effort", "2", "--type", "docs")
+        backlog_path = self.repo / ".autopilot" / "backlog.json"
+        backlog = json.loads(backlog_path.read_text(encoding="utf-8"))
+        for c in backlog["candidates"]:
+            c["status"] = "completed"
+        backlog_path.write_text(json.dumps(backlog), encoding="utf-8")
+        # backlog-update refreshes state.type_stats from the backlog.
+        ids = [c["id"] for c in self.read_json("backlog.json")["candidates"]]
+        self.run_state("backlog-update", "--id", ids[0], "--title", "d0")
+        self.run_state("begin-round", "--title", "r", "--reason", "x")
+        self.add_file()
+        self.run_state("commit", "--summary", "add feature")
+        sha = self.git("rev-parse", "HEAD").stdout.strip()
+        self.run_state("complete-round", "--summary", "done", "--commit-sha", sha)
+        self.run_state("goal-met", "--goal", "G", "--round", "1")
+        data = json.loads(self.run_state("check", "--brief").stdout)
+        self.assertEqual(data["phase"], "expand")
+        self.assertEqual(data["expansion"]["saturated_types"], ["docs"])
+
+    def test_suggested_themes_content(self):
+        self.run_state("init", "--goal", "G", "--expand-after-goals")
+        self.add_file()
+        self.git("add", "feature.py")
+        self.git("commit", "-q", "-m", "add feature")
+        self.run_state("goal-met", "--goal", "G")
+        self.run_state("goal-met", "--goal", "G")
+        data = json.loads(self.run_state("check", "--brief").stdout)
+        self.assertEqual(
+            data["expansion"]["suggested_themes"],
+            ["follow up on goal: G", "initial", "add feature"],
+        )
+
+    def test_begin_round_error_names_below_floor_pool(self):
+        self.run_state("init")
+        self.run_state("backlog-add", "--title", "Chore", "--reason", "r",
+                       "--value", "2", "--effort", "1")
+        result = self.run_state("begin-round", "--title", "r", "--reason", "x")
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("below-floor", result.stderr)
+        self.assertIn("Deep Expansion", result.stderr)
+        self.assertIn("--candidate-id", result.stderr)
+
+    def test_default_seed_type_skips_bugfix(self):
+        self.assertEqual(ap_state.VALID_CANDIDATE_TYPES[0], "bugfix")  # order sanity
+        self.assertEqual(commands_module._default_seed_type([]), "feature")
+        self.assertEqual(commands_module._default_seed_type(["bugfix"]), "feature")
+        self.assertEqual(
+            commands_module._default_seed_type(["bugfix", "feature", "refactor", "perf", "test"]),
+            "docs",
+        )
+        # Everything saturated -> the feature fallback.
+        self.assertEqual(
+            commands_module._default_seed_type(list(ap_state.VALID_CANDIDATE_TYPES)),
+            "feature",
+        )
+
+    def test_seed_defaults_risk_two(self):
+        self.run_state("init", "--goal", "G")
+        result = self.run_state("goal-met", "--goal", "G", "--next-step", "N")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        state = self.read_json("state.json")
+        self.assertEqual(state["goal_seeds"][0]["risk"], 2)
+
+
+class ExpansionWaveTests(RepoTest):
+    """Deep Expansion waves are recorded and observable: lens rotation via
+    expansion_waves + check's lenses_unused, cache staleness via analysis payload."""
+
+    def _record(self, *lenses):
+        args = ["expansion-record"]
+        for lens in lenses:
+            args.extend(["--lens", lens])
+        return self.run_state(*args)
+
+    def _log_events(self):
+        log_path = self.repo / ".autopilot" / "log.jsonl"
+        return [json.loads(line) for line in log_path.read_text(encoding="utf-8").splitlines()
+                if line.strip()]
+
+    def test_expansion_wave_recorded(self):
+        self.run_state("init")
+        result = self._record("tests", "performance")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        result = self._record("security", "tests")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        state = self.read_json("state.json")
+        waves = state["expansion_waves"]
+        self.assertEqual(len(waves), 2)
+        self.assertEqual(waves[0]["lenses"], ["performance", "tests"])
+        self.assertEqual(waves[1]["lenses"], ["security", "tests"])
+        data = json.loads(self.run_state("check", "--brief").stdout)
+        self.assertEqual(data["wave_no"], 2)
+        # Union across waves, in wave order (each wave's lenses are stored as a
+        # sorted set snapshot).
+        self.assertEqual(data["lenses_used"], ["performance", "tests", "security"])
+        expected_unused = [lens for lens in ap_state.EXPANSION_LENSES
+                           if lens not in data["lenses_used"]]
+        self.assertEqual(data["lenses_unused"], expected_unused)
+        self.assertNotIn("tests", data["lenses_unused"])
+        self.assertIn("architecture", data["lenses_unused"])
+
+    def test_consecutive_same_lens_waves_warn(self):
+        self.run_state("init")
+        first = self._record("tests", "performance")
+        self.assertEqual(first.returncode, 0, first.stderr)
+        second = self._record("performance", "tests")
+        self.assertEqual(second.returncode, 0, second.stderr)
+        self.assertIn("[WARN]", second.stderr)
+        self.assertIn("same lens set", second.stderr)
+        warns = [e for e in self._log_events()
+                 if e.get("event") == "expansion-wave" and e.get("status") == "warn"]
+        self.assertEqual(len(warns), 1)
+        self.assertEqual(warns[-1].get("reason"), "same lens set as previous wave")
+        # A different set afterwards does not warn again.
+        third = self._record("security")
+        self.assertEqual(third.returncode, 0, third.stderr)
+        self.assertNotIn("[WARN]", third.stderr)
+        self.assertEqual(len(warns), 1)
+
+    def test_expansion_record_rejects_unknown_lens(self):
+        self.run_state("init")
+        result = self._record("tests", "vibes")
+        self.assertEqual(result.returncode, 2)
+        self.assertIn("Unknown expansion lens", result.stderr)
+        self.assertIn("vibes", result.stderr)
+        self.assertEqual(self.read_json("state.json")["expansion_waves"], [])
+
+    def test_check_surfaces_stale_analysis(self):
+        self.run_state("init")
+        result = self.run_state("analysis-save", "--content", '{"summary": "fresh scan"}')
+        self.assertEqual(result.returncode, 0, result.stderr)
+        data = json.loads(self.run_state("check", "--brief").stdout)
+        self.assertEqual(data["analysis"]["status"], "fresh")
+        # Three commits push the cache past the stale-warning threshold.
+        for i in range(3):
+            (self.repo / "file{}.py".format(i)).write_text("x = {}\n".format(i), encoding="utf-8")
+            self.git("add", "file{}.py".format(i))
+            self.git("commit", "-q", "-m", "commit {}".format(i))
+        data = json.loads(self.run_state("check", "--brief").stdout)
+        self.assertEqual(data["analysis"]["status"], "stale")
+        self.assertGreaterEqual(data["analysis"]["commits_behind"], 3)
+        self.assertTrue(any("analysis cache is" in w and "commits stale" in w
+                            for w in data["warnings"]))
+        # Cache staleness is a hint, never a stop.
+        self.assertTrue(data["continue"])
+        self.assertIsNone(data["stop_reason"])
+
+    def test_check_works_without_analysis(self):
+        self.run_state("init")
+        data = json.loads(self.run_state("check", "--brief").stdout)
+        self.assertEqual(data["analysis"]["status"], "missing")
+        self.assertIsNone(data["analysis"]["commits_behind"])
+        # A missing cache must not downgrade the loop's action hint.
+        self.assertEqual(data["action_hint"], "expand")
+        self.assertTrue(data["continue"])
+
+    def test_analysis_staleness_tracks_each_commit(self):
+        self.run_state("init")
+        self.run_state("analysis-save", "--content", '{"summary": "fresh scan"}')
+        data = json.loads(self.run_state("check", "--brief").stdout)
+        self.assertEqual(data["analysis"]["status"], "fresh")
+        self.assertEqual(data["analysis"]["commits_behind"], 0)
+        (self.repo / "a.py").write_text("a = 1\n", encoding="utf-8")
+        self.git("add", "a.py")
+        self.git("commit", "-q", "-m", "first")
+        first = json.loads(self.run_state("check", "--brief").stdout)
+        self.assertEqual(first["analysis"]["status"], "stale")
+        self.assertEqual(first["analysis"]["commits_behind"], 1)
+        (self.repo / "b.py").write_text("b = 2\n", encoding="utf-8")
+        self.git("add", "b.py")
+        self.git("commit", "-q", "-m", "second")
+        second = json.loads(self.run_state("check", "--brief").stdout)
+        self.assertEqual(second["analysis"]["status"], "stale")
+        self.assertEqual(second["analysis"]["commits_behind"], 2)
+        self.assertGreater(second["analysis"]["commits_behind"],
+                           first["analysis"]["commits_behind"])
+
+
+class ConfigSetTests(RepoTest):
+    """config-set reopens an 'all goals met' stop and re-fingerprints state so
+    the deliberate change is not flagged as config-drift."""
+
+    def _complete_one_round(self):
+        self.run_state("begin-round", "--title", "r", "--reason", "x")
+        self.add_file()
+        self.run_state("commit", "--summary", "add feature")
+        sha = self.git("rev-parse", "HEAD").stdout.strip()
+        self.run_state("complete-round", "--summary", "done", "--commit-sha", sha)
+
+    def test_config_set_expands_after_goals(self):
+        self.run_state("init", "--goal", "G")
+        self._complete_one_round()
+        self.run_state("goal-met", "--goal", "G", "--round", "1")
+        refused = self.run_state("begin-round", "--title", "r2", "--reason", "y")
+        self.assertNotEqual(refused.returncode, 0)
+        self.assertIn("all goals met", refused.stderr)
+        self.assertIn("config-set --expand-after-goals", refused.stderr)
+        result = self.run_state("config-set", "--expand-after-goals")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        config = self.read_json("config.json")
+        self.assertTrue(config["expand_after_goals"])
+        opened = self.run_state("begin-round", "--title", "r2", "--reason", "y")
+        self.assertEqual(opened.returncode, 0, opened.stderr)
+
+    def test_config_set_refreshes_fingerprint(self):
+        self.run_state("init")
+        config_path = self.repo / ".autopilot" / "config.json"
+        config = json.loads(config_path.read_text(encoding="utf-8"))
+        config["min_pending_candidates"] = 5
+        config_path.write_text(json.dumps(config), encoding="utf-8")
+        drifted = json.loads(self.run_state("check", "--brief").stdout)
+        self.assertTrue(any("config.json changed since init" in w for w in drifted["warnings"]))
+        result = self.run_state("config-set", "--expand-after-goals")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        state = self.read_json("state.json")
+        self.assertEqual(
+            state["config_fingerprint"],
+            ap_io.file_sha256(self.repo / ".autopilot" / "config.json"),
+        )
+        data = json.loads(self.run_state("check", "--brief").stdout)
+        self.assertFalse(any("config.json changed since init" in w for w in data["warnings"]))
+        self.assertEqual(self.read_json("config.json")["min_pending_candidates"], 5)
+
+
+class BudgetAccountingTests(RepoTest):
+    """P1 budget/round accounting: zero-work cancels do not consume a round,
+    tokens are billed monotonically per run, blocked streaks and budgets are
+    observable in check."""
+
+    def _touch_staged(self, name, lines=10):
+        (self.repo / name).write_text("x = 1\n" * lines, encoding="utf-8")
+        self.git("add", name)
+
+    def test_zero_work_cancel_does_not_consume_round(self):
+        self.run_state("init")
+        self.run_state("begin-round", "--title", "probe", "--reason", "x")
+        result = self.run_state("cancel-round", "--reason", "wrong flag")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        state = self.read_json("state.json")
+        self.assertEqual(
+            (state["completed_rounds"], state["blocked_rounds"], state["cancelled_rounds"]),
+            (0, 0, 0),
+        )
+        self.assertEqual(state["history"][-1]["status"], "aborted")
+        self.assertEqual(state["estimated_tokens_used"], 0)
+        # The next round gets a fresh number from round_seq (never reuses 1).
+        self.run_state("begin-round", "--title", "real", "--reason", "x")
+        state = self.read_json("state.json")
+        self.assertEqual(state["current_round"]["round"], 2)
+        self.assertEqual(state["round_seq"], 2)
+        # aborted does not advance the max_rounds denominator: with
+        # max_rounds 2 the one real completed round still allows round 3.
+        self.run_state("complete-round", "--summary", "done")
+        result = self.run_state("begin-round", "--title", "r3", "--reason", "x")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(self.read_json("state.json")["current_round"]["round"], 3)
+
+    def test_zero_work_cancel_thresholds(self):
+        self.run_state("init")
+        # Working-tree changes exist -> still a billed cancelled round.
+        self.run_state("begin-round", "--title", "a", "--reason", "x")
+        self.add_file()
+        self.run_state("cancel-round", "--reason", "real work pending")
+        state = self.read_json("state.json")
+        self.assertEqual(state["history"][-1]["status"], "cancelled")
+        self.assertEqual(state["cancelled_rounds"], 1)
+        # A commit happened during the round -> cancelled.
+        self.run_state("begin-round", "--title", "b", "--reason", "x")
+        self.add_file("b.py")
+        self.git("add", "b.py")
+        self.git("commit", "-q", "-m", "work")
+        self.run_state("cancel-round", "--reason", "after commit")
+        state = self.read_json("state.json")
+        self.assertEqual(state["history"][-1]["status"], "cancelled")
+        self.assertEqual(state["cancelled_rounds"], 2)
+        # Old probe (>10 minutes) with no changes -> cancelled again.
+        self.run_state("begin-round", "--title", "c", "--reason", "x")
+        state_path = self.repo / ".autopilot" / "state.json"
+        state = json.loads(state_path.read_text(encoding="utf-8"))
+        state["current_round"]["started_at"] = "2020-01-01T00:00:00+00:00"
+        state_path.write_text(json.dumps(state), encoding="utf-8")
+        self.run_state("cancel-round", "--reason", "stale probe")
+        state = self.read_json("state.json")
+        self.assertEqual(state["history"][-1]["status"], "cancelled")
+        self.assertEqual(state["cancelled_rounds"], 3)
+
+    def test_token_accounting_monotonic(self):
+        # QA-3: two staged rounds committed in round 3 used to bill the same
+        # 20 lines twice ([620, 620, 740] = 1980); the run-level water marks
+        # bill them once ([620, 620, 500] = 1740).
+        self.run_state("init")
+        self.run_state("begin-round", "--title", "r1", "--reason", "x")
+        self._touch_staged("w1.py")
+        self.run_state("complete-round", "--summary", "r1")
+        self.run_state("begin-round", "--title", "r2", "--reason", "x")
+        self._touch_staged("w2.py")
+        self.run_state("complete-round", "--summary", "r2")
+        self.run_state("begin-round", "--title", "r3", "--reason", "x")
+        self.git("commit", "-q", "-m", "batch")
+        sha = self.git("rev-parse", "HEAD").stdout.strip()
+        self.run_state("complete-round", "--summary", "r3", "--commit-sha", sha)
+        state = self.read_json("state.json")
+        tokens = [entry["estimated_tokens"] for entry in state["history"]]
+        self.assertEqual(tokens, [620, 620, 500])
+        self.assertEqual(state["estimated_tokens_used"], 1740)
+
+    def test_check_reports_blocked_streak(self):
+        self.run_state("init")
+        self.run_state("begin-round", "--title", "a", "--reason", "x")
+        self.run_state("block-round", "--reason", "b1")
+        data = json.loads(self.run_state("check", "--brief").stdout)
+        self.assertEqual(data["blocked_streak"], 1)
+        self.assertTrue(any("one more blocked round stops the run" in w for w in data["warnings"]))
+        # Second blocked round fires max_blocked_in_a_row (default 2).
+        self.run_state("begin-round", "--title", "b", "--reason", "x")
+        self.run_state("block-round", "--reason", "b2")
+        data = json.loads(self.run_state("check", "--brief").stdout)
+        self.assertEqual(data["blocked_streak"], 2)
+        self.assertTrue(data["stop_reason"].startswith("max_blocked_in_a_row"))
+
+    def test_complete_round_below_threshold_records_score(self):
+        self.run_state("init", "--review-threshold", "4", "--goal", "G")
+        self.run_state("backlog-add", "--title", "A", "--reason", "r", "--value", "4",
+                       "--effort", "2", "--type", "docs")
+        cid = self.read_json("backlog.json")["candidates"][0]["id"]
+        self.run_state("begin-round", "--title", "A", "--reason", "r", "--candidate-id", cid)
+        self.add_file()
+        self.git("add", "feature.py")
+        self.git("commit", "-q", "-m", "work")
+        sha = self.git("rev-parse", "HEAD").stdout.strip()
+        # Without the flag the refusal stands (original behavior locked).
+        refused = self.run_state("complete-round", "--summary", "s", "--commit-sha", sha,
+                                 "--review-score", "3")
+        self.assertNotEqual(refused.returncode, 0)
+        self.assertIn("below review_threshold", refused.stderr)
+        result = self.run_state("complete-round", "--summary", "s", "--commit-sha", sha,
+                                "--review-score", "3", "--below-threshold")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        state = self.read_json("state.json")
+        self.assertEqual(state["history"][-1]["review_score"], 3)
+        self.assertTrue(state["history"][-1]["below_threshold"])
+        self.assertEqual(state["history"][-1]["status"], "completed")
+        self.assertEqual(state["blocked_rounds"], 0)
+        # The low score still lands in the calibration ledger.
+        self.assertGreaterEqual(self.read_json("state.json")["type_stats"]["docs"]["review_n"], 1)
+
+    def test_check_reports_budget_remaining(self):
+        self.run_state("init", "--max-minutes", "60")
+        state = self.read_json("state.json")
+        data = json.loads(self.run_state("check", "--brief").stdout)
+        self.assertEqual(data["budget"]["max_minutes"], 60)
+        self.assertEqual(data["budget"]["last_activity_at"], state["last_activity_at"])
+        self.assertIsNotNone(data["budget"]["remaining_minutes"])
+        self.assertGreater(data["budget"]["remaining_minutes"], 0)
+        self.assertLessEqual(data["budget"]["remaining_minutes"], 60)
+
+    def test_resume_after_crash_mid_round(self):
+        self.run_state("init")
+        self.run_state("begin-round", "--title", "r", "--reason", "x")
+        # Simulate a crash that killed the process holding the lock.
+        lock = self.repo / ".autopilot" / "lock"
+        if lock.exists():
+            lock.unlink()
+        data = json.loads(self.run_state("check", "--brief").stdout)
+        self.assertTrue(any("current_round is open" in w for w in data["warnings"]))
+        self.assertTrue(data["continue"])
+        self.add_file()
+        self.run_state("commit", "--summary", "add feature")
+        sha = self.git("rev-parse", "HEAD").stdout.strip()
+        result = self.run_state("complete-round", "--summary", "done", "--commit-sha", sha)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        state = self.read_json("state.json")
+        self.assertEqual(state["completed_rounds"], 1)
+        self.assertEqual(state["history"][-1]["status"], "completed")
+
+    def test_paused_run_stops_on_first_check(self):
+        self.run_state("init", "--max-minutes", "1")
+        self.run_state("begin-round", "--title", "r", "--reason", "x")
+        state_path = self.repo / ".autopilot" / "state.json"
+        state = json.loads(state_path.read_text(encoding="utf-8"))
+        state["last_activity_at"] = "2020-01-01T00:00:00+00:00"
+        state_path.write_text(json.dumps(state), encoding="utf-8")
+        data = json.loads(self.run_state("check", "--brief").stdout)
+        self.assertFalse(data["continue"])
+        self.assertIn("max_minutes", data["stop_reason"])
+
+    def test_resume_after_deadline_pass(self):
+        self.run_state("init", "--deadline", "2020-01-01T00:00:00")
+        data = json.loads(self.run_state("check", "--brief").stdout)
+        self.assertFalse(data["continue"])
+        self.assertIn("deadline", data["stop_reason"])
+
+    def test_schedule_hints_include_boundary_round(self):
+        self.run_state("init", "--commit-every-rounds", "5", "--verify-every-rounds", "3",
+                       "--checkpoint-every", "2")
+        state_path = self.repo / ".autopilot" / "state.json"
+        for completed, expected_commit in ((4, 5), (5, 5), (6, 10)):
+            state = json.loads(state_path.read_text(encoding="utf-8"))
+            state["completed_rounds"] = completed
+            state_path.write_text(json.dumps(state), encoding="utf-8")
+            data = json.loads(self.run_state("check", "--brief").stdout)
+            self.assertEqual(data["next_commit_round"], expected_commit, completed)
+            self.assertEqual(data["next_verify_round"], ((max(1, completed) - 1) // 3 + 1) * 3)
+            self.assertEqual(data["next_checkpoint_round"], ((max(1, completed) - 1) // 2 + 1) * 2)
+        # A brand-new run (current_number 0) still points at the first boundary.
+        self.run_state("init", "--force", "--checkpoint-every", "2")
+        data = json.loads(self.run_state("check", "--brief").stdout)
+        self.assertEqual(data["next_checkpoint_round"], 2)
+
+
+class RobustnessTests(RepoTest):
+    """P2 hardening: config validation mirrors (QA-1/2/6), binary staged-diff
+    findings (QA-5), goal-text normalization (QA-7/8), and IO fail-closed
+    behaviors (QA-9/10)."""
+
+    def _write_config(self, payload):
+        config_path = self.repo / ".autopilot" / "config.json"
+        config_path.parent.mkdir(exist_ok=True)
+        config_path.write_text(json.dumps(payload), encoding="utf-8")
+
+    def _assert_load_config_exits(self, repo, expected_fragment):
+        from autopilot import config as config_module
+        with self.assertRaises(SystemExit) as ctx:
+            config_module.load_config(repo)
+        self.assertEqual(ctx.exception.code, 2)
+        self.assertIn(expected_fragment, ctx.exception.__class__.__name__ + str(ctx.exception))
+
+    def test_negative_blocked_and_retries_rejected(self):
+        self.run_state("init")
+        self._write_config({"max_blocked_in_a_row": -1})
+        from autopilot import config as config_module
+        with self.assertRaises(SystemExit) as ctx:
+            config_module.load_config(self.repo)
+        self.assertEqual(ctx.exception.code, 2)
+        # The error prints to stderr; capture the message via save of stderr.
+        result = self.run_state("check")
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("'max_blocked_in_a_row'", result.stderr)
+        self._write_config({"retries_per_round": -1})
+        result = self.run_state("check")
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("'retries_per_round'", result.stderr)
+
+    def test_nan_budget_rejected(self):
+        result = self.run_state("init", "--force", "--max-minutes", "nan")
+        self.assertEqual(result.returncode, 2)
+        self.assertIn("finite", result.stderr)
+        self.run_state("init", "--force")
+        self._write_config({"max_minutes": 1e999})
+        from autopilot import config as config_module
+        with self.assertRaises(SystemExit) as ctx:
+            config_module.load_config(self.repo)
+        self.assertEqual(ctx.exception.code, 2)
+        result = self.run_state("check")
+        self.assertIn("finite", result.stderr)
+
+    def test_binary_staged_produces_finding(self):
+        self.run_state("init")
+        self.run_state("begin-round", "--title", "r", "--reason", "x")
+        # A real binary blob whose (unscannable) content carries a token shape.
+        payload = b"\x00\x01\x02ghp_" + b"A" * 36 + b"\xff\xfe"
+        (self.repo / "keystore.bin").write_bytes(payload)
+        self.git("add", "keystore.bin")
+        from autopilot import secrets as secrets_module
+        findings = secrets_module.scan_staged_diff(self.repo)
+        binary = [f for f in findings if f.get("pattern") == "binary-staged"]
+        self.assertEqual(len(binary), 1)
+        self.assertEqual(binary[0]["file"], "keystore.bin")
+        self.assertIn("not scannable", binary[0]["text"])
+        # The commit helper refuses without --allow-secrets.
+        refused = self.run_state("commit", "--summary", "add keystore")
+        self.assertNotEqual(refused.returncode, 0)
+        self.assertIn("secret", refused.stderr.lower())
+        allowed = self.run_state("commit", "--summary", "add keystore", "--allow-secrets")
+        self.assertEqual(allowed.returncode, 0, allowed.stderr)
+
+    def test_init_force_rebuilds_config_fresh(self):
+        self.run_state("init")
+        self._write_config({"ranking_mode": "bogus"})
+        # init without --force still inherits and refuses to save; with --force
+        # the defaults + CLI win and the config becomes loadable again.
+        inherited = self.run_state("init", "--force")  # sanity: force is accepted
+        self.assertEqual(inherited.returncode, 0, inherited.stderr)
+        self._write_config({"ranking_mode": "bogus", "max_rounds": 3})
+        result = self.run_state("init", "--force")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(self.read_json("config.json")["ranking_mode"], "expected")
+        self.assertEqual(self.read_json("config.json")["max_rounds"], 10)
+        self.assertEqual(self.run_state("check").returncode, 0)
+
+    def test_split_goals_keeps_version_numbers(self):
+        self.assertEqual(
+            ap_state.split_goals("升级到 v1.3.3 并修复崩溃"),
+            ["升级到 v1.3.3 并修复崩溃"],
+        )
+        self.assertEqual(ap_state.split_goals("支持 3.5 版本"), ["支持 3.5 版本"])
+        # Sentence dots still split.
+        self.assertEqual(ap_state.split_goals("修复崩溃.加测试"), ["修复崩溃", "加测试"])
+
+    def test_report_goal_checkbox_normalizes(self):
+        self.run_state("init", "--force", "--goal", "发布 v1.3.3")
+        state_path = self.repo / ".autopilot" / "state.json"
+        state = json.loads(state_path.read_text(encoding="utf-8"))
+        state["completed_goals"] = ["发布 v1.3.3"]
+        state_path.write_text(json.dumps(state), encoding="utf-8")
+        cfg_path = self.repo / ".autopilot" / "config.json"
+        cfg = json.loads(cfg_path.read_text(encoding="utf-8"))
+        cfg["goals"] = ["发布 v1.3.3\u200b"]
+        cfg_path.write_text(json.dumps(cfg), encoding="utf-8")
+        # all_goals_met normalizes; the report checkbox must agree with it.
+        self.assertTrue(ap_state.all_goals_met(self.read_json("config.json"), state))
+        report = self.run_state("report")
+        self.assertEqual(report.returncode, 0, report.stderr)
+        self.assertIn("- [x]", report.stdout)
+
+    def test_pid_alive_permission_error_is_alive(self):
+        import autopilot.io as ap_io_module
+        original_run = ap_io_module.subprocess.run
+
+        def refuse(*args, **kwargs):
+            raise PermissionError("EPERM: operation not permitted")
+
+        try:
+            ap_io_module.subprocess.run = refuse
+            # PermissionError (EPERM) means the holder EXISTS: on POSIX os.kill
+            # raises it, on Windows the tasklist probe surfaces the same error
+            # class — both must fail closed to "alive" so a cross-user live
+            # lock is never deleted.
+            self.assertTrue(ap_io_module._pid_alive(12345))
+        finally:
+            ap_io_module.subprocess.run = original_run
 
 
 class OrphanCommitTests(RepoTest):
@@ -670,8 +1575,10 @@ class PredictedOriginTests(RepoTest):
 
     def test_consecutive_blocked_predictions_sink_without_contaminating_observed(self):
         """Three blocked predictions: the next predicted sinks via its sub-account;
-        the observed candidate of the same type keeps a clean success rate."""
-        self.run_state("init")
+        the observed candidate of the same type keeps a clean success rate. With a
+        one-slot batch the sunk predicted no longer competes with the observed
+        candidate (above-floor candidates only fill slots until the batch is full)."""
+        self.run_state("init", "--candidates-per-round", "1")
         for i in range(3):
             self._add("--title", "p{}".format(i), "--value", "5", "--effort", "1",
                       "--origin", "predicted", "--confidence", "0.9", "--type", "refactor")
@@ -689,6 +1596,7 @@ class PredictedOriginTests(RepoTest):
         self.assertEqual(by_id[pred4]["score_breakdown"]["success_rate"], 0.0)
         self.assertEqual(by_id[obs]["score_breakdown"]["success_rate"], 1.0)
         self.assertFalse(by_id[pred4].get("selected"))
+        self.assertEqual(by_id[pred4].get("cut_reason"), "batch_full")
         self.assertTrue(by_id[obs].get("selected"))
 
     def test_late_run_cuts_predicted_when_observed_ready(self):
@@ -764,7 +1672,7 @@ class PredictedOriginTests(RepoTest):
         self.assertIn("受阻 1", output)
 
 
-class ImportUnitTests(unittest.TestCase):
+class SeedScoringHelperTests(unittest.TestCase):
     """Adversarial direct tests of pure helpers (no subprocess, no temp repo)."""
 
     # -- resolve_seed state machine ------------------------------------------
@@ -845,12 +1753,15 @@ class ImportUnitTests(unittest.TestCase):
         self.assertEqual(ap_state._resolved_value({"value": float("inf")}), 3)
         self.assertEqual(ap_state._resolved_effort({"effort": float("inf")}), 3)
 
-    # -- _next_sequential_id monotonic after truncation -----------------------
+    # -- _next_sequential_id: fresh ids survive head truncation ----------------
     def test_sequential_id_never_reuses_truncated_ids(self):
         st = {"goal_seeds": [{"id": "seed-{:03d}".format(i), "title": str(i)} for i in range(1, 51)]}
         self.assertEqual(ap_state._next_sequential_id(st, "goal_seeds", "seed-"), "seed-051")
         st["goal_seeds"] = st["goal_seeds"][1:]  # seed-001 truncated away
-        self.assertEqual(ap_state._next_sequential_id(st, "goal_seeds", "seed-"), "seed-052")
+        # Numbering is max(existing suffix) + 1 and the bounded lists only
+        # truncate from the head, so the maximum suffix always survives: the
+        # next id is again seed-051 — fresh, never a reuse of seed-001.
+        self.assertEqual(ap_state._next_sequential_id(st, "goal_seeds", "seed-"), "seed-051")
 
     # -- _mark_selection quota edges ------------------------------------------
     @staticmethod
@@ -1041,7 +1952,12 @@ class PredictedHardeningTests(RepoTest):
 
     def test_goal_invisible_chars_cannot_fake_success(self):
         self.run_state("init", "--goal", "提升测试质量", "--max-rounds", "5")
-        result = self.run_state("goal-met", "--goal", "提升测试质量\u200b")
+        self.run_state("begin-round", "--title", "r", "--reason", "x")
+        self.add_file()
+        self.run_state("commit", "--summary", "add feature")
+        sha = self.git("rev-parse", "HEAD").stdout.strip()
+        self.run_state("complete-round", "--summary", "done", "--commit-sha", sha)
+        result = self.run_state("goal-met", "--goal", "提升测试质量\u200b", "--round", "1")
         self.assertEqual(result.returncode, 0, result.stderr)
         # The near-duplicate must not leave the run unable to stop.
         data = json.loads(self.run_state("check", "--brief").stdout)
@@ -1695,6 +2611,21 @@ class MigrationTests(RepoTest):
         disk = json.loads(state_path.read_text(encoding="utf-8"))
         self.assertIn("estimated_tokens_used", disk)
 
+    def test_migrated_state_anchors_tokens_at_load_not_empty_tree(self):
+        self.run_state("init")
+        state_path = self.repo / ".autopilot" / "state.json"
+        state = json.loads(state_path.read_text(encoding="utf-8"))
+        state.pop("run_start_sha", None)
+        state_path.write_text(json.dumps(state), encoding="utf-8")
+        self.run_state("read")
+        anchor = json.loads(state_path.read_text(encoding="utf-8"))["run_start_sha"]
+        head = self.git("rev-parse", "HEAD").stdout.strip()
+        self.assertEqual(anchor, head)
+        # Anchored at HEAD: the pre-upgrade commit history must not be billed
+        # (EMPTY_TREE would bill the whole repo and fake-trigger max_tokens).
+        _, total_text, total_binary = ap_io.estimate_tokens_for_round(self.repo, anchor, 0, 0)
+        self.assertEqual((total_text, total_binary), (0, 0))
+
 
 class TokenEstimateTests(RepoTest):
     def test_estimate_anchors_on_round_start(self):
@@ -1903,7 +2834,7 @@ class DetectAgentTests(unittest.TestCase):
         self.assertEqual(data["agent"], "generic")
 
 
-class ImportUnitTests(unittest.TestCase):
+class PureHelperUnitTests(unittest.TestCase):
     """Direct unit tests for pure helpers (import the module, no subprocess/git setup)."""
 
     script = SCRIPT
@@ -2041,8 +2972,10 @@ class ImportUnitTests(unittest.TestCase):
             {"docs": {"completed": 3, "blocked": 0}},
             2,
         )
-        self.assertAlmostEqual(score, 5.0 * 0.7, places=3)
-        self.assertAlmostEqual(breakdown["saturation_factor"], 0.7, places=3)
+        # Logarithmic decay, floored at 0.35: one completed over threshold
+        # costs 0.12 (1 - 0.12*log2(2) = 0.88), not the old exponential 0.7.
+        self.assertAlmostEqual(score, 5.0 * 0.88, places=3)
+        self.assertAlmostEqual(breakdown["saturation_factor"], 0.88, places=3)
 
     def test_candidate_adjusted_score_blocked_history(self):
         ap = self.ap
@@ -2216,6 +3149,10 @@ class OptimizationTests(RepoTest):
     def test_cancel_then_round_numbers_advance(self):
         self.run_state("init")
         self.run_state("begin-round", "--title", "c", "--reason", "x")
+        # Real work happened, so this is a billed cancelled round (a zero-work
+        # probe would be aborted: no counters, but the round number still
+        # advances via round_seq).
+        self.add_file()
         self.run_state("cancel-round", "--reason", "changed mind")
         self.run_state("begin-round", "--title", "r2", "--reason", "x")
         state = self.read_json("state.json")
@@ -2317,7 +3254,7 @@ class OptimizationTests(RepoTest):
     def test_finish_auto_cancels_open_round(self):
         self.run_state("init")
         self.run_state("begin-round", "--title", "r", "--reason", "x")
-        result = self.run_state("finish", "--reason", "done")
+        result = self.run_state("finish", "--force", "--reason", "done")
         self.assertEqual(result.returncode, 0, result.stderr)
         state = self.read_json("state.json")
         self.assertIsNone(state["current_round"])
@@ -2385,7 +3322,12 @@ class OptimizationTests(RepoTest):
         config_path.write_text(json.dumps(config), encoding="utf-8")
         (self.repo / "blob.bin").write_bytes(b"\x00\x01\x02")
         self.git("add", "blob.bin")
-        result = self.run_state("commit", "--summary", "bin")
+        # The unscannable binary first trips the secret scan (binary-staged);
+        # --allow-secrets passes it so the scope guard can do its own refusal.
+        blocked = self.run_state("commit", "--summary", "bin")
+        self.assertNotEqual(blocked.returncode, 0)
+        self.assertIn("binary file staged", blocked.stderr)
+        result = self.run_state("commit", "--summary", "bin", "--allow-secrets")
         self.assertNotEqual(result.returncode, 0)
         self.assertIn("max_round_scope", result.stderr)
 
@@ -2846,7 +3788,7 @@ class RetrospectiveTests(RepoTest):
         sha = self.git("rev-parse", "HEAD").stdout.strip()
         self.run_state("commit", "--summary", "add feature")
         self.run_state("complete-round", "--summary", "done", "--commit-sha", sha)
-        result = self.run_state("finish", "--reason", "done", "--json")
+        result = self.run_state("finish", "--force", "--reason", "done", "--json")
         data = json.loads(result.stdout)
         self.assertTrue(data["ok"])
         self.assertTrue((self.repo / ".autopilot" / "retrospective.md").exists())
@@ -2873,7 +3815,7 @@ class ExpandPhaseTests(RepoTest):
         self.run_state("commit", "--summary", "add feature")
         sha = self.git("rev-parse", "HEAD").stdout.strip()
         self.run_state("complete-round", "--summary", "done", "--commit-sha", sha)
-        self.run_state("goal-met", "--goal", "G")
+        self.run_state("goal-met", "--goal", "G", "--round", "1")
 
     def test_default_stops_after_goals_met(self):
         self.run_state("init", "--goal", "G")
@@ -3212,7 +4154,7 @@ class FailurePathTests(RepoTest):
 
     def test_ensure_branch_refuses_tracked_changes(self):
         self.run_state("init", "--branch-mode", "feature")
-        self.run_state("finish")
+        self.run_state("finish", "--force")
         (self.repo / "README.md").write_text("# changed by user\n", encoding="utf-8")
         result = self.run_state("ensure-branch")
         self.assertNotEqual(result.returncode, 0)
@@ -3306,9 +4248,11 @@ class ContractTests(RepoTest):
         self.assertEqual(
             set(data),
             {
-                "continue", "stop_reason", "warnings", "goals_met", "phase",
-                "next_verify_round", "next_commit_round", "next_checkpoint_round",
-                "backlog", "action_hint",
+                "continue", "stop_reason", "warnings", "goals_met", "goals_unverified",
+                "phase", "next_verify_round", "next_commit_round", "next_checkpoint_round",
+                "backlog", "action_hint", "selected_count", "selected_empty_reason",
+                "wave_no", "lenses_used", "lenses_unused", "analysis",
+                "blocked_streak", "budget",
             },
         )
         self.assertEqual(
@@ -3402,7 +4346,7 @@ class ContractTests(RepoTest):
             "started_at", "last_activity_at", "round", "completed_rounds",
             "blocked_rounds", "cancelled_rounds", "reverted_rounds",
             "estimated_tokens_used", "type_stats", "goals", "completed_goals",
-            "goal_events", "goal_seeds",
+            "goal_events", "goal_seeds", "expansion_waves",
             "current_round", "history", "stop_reason", "finished_at",
             "config_fingerprint",
         ):
@@ -3582,6 +4526,9 @@ class MaxRoundsCountingTests(RepoTest):
     def test_cancelled_rounds_count_toward_max_rounds(self):
         self.run_state("init", "--max-rounds", "1")
         self.run_state("begin-round", "--title", "r", "--reason", "x")
+        # Real work happened: this cancel is a billed cancelled round (a
+        # zero-work probe would be aborted and consume no budget).
+        self.add_file()
         self.run_state("cancel-round", "--reason", "nope")
         result = self.run_state("begin-round", "--title", "r2", "--reason", "y")
         self.assertNotEqual(result.returncode, 0)
@@ -3636,6 +4583,27 @@ class HistoryBoundTests(unittest.TestCase):
         self.assertEqual(st["history"][-1]["round"], 104)
         self.assertEqual(st["history"][0]["round"], 105 - self.apstate.io.HISTORY_LIMIT)
         self.assertEqual(len(st["history"][0]["title"]), self.apstate.io.HISTORY_TEXT_LIMIT)
+
+
+class SuiteIntegrityTests(unittest.TestCase):
+    """Meta-guard: discovery must collect every test method defined in this
+    file. Two classes once shared the name ImportUnitTests and the second
+    silently shadowed the first — 14 cases ran zero times while the suite
+    stayed green. A duplicate class name or any other collection drift now
+    fails the build."""
+
+    def test_suite_collects_every_defined_test(self):
+        suite = unittest.defaultTestLoader.discover(
+            str(SCRIPT.parent), pattern=SCRIPT.name, top_level_dir=str(SCRIPT.parent),
+        )
+        collected = suite.countTestCases()
+        # Line-anchored: the counting expression itself must not be counted.
+        defined = len(re.findall(r"(?m)^\s*def test_", SCRIPT.read_text(encoding="utf-8")))
+        self.assertEqual(
+            collected, defined,
+            "unittest discover collected {} tests but the source defines {} test methods "
+            "(duplicate class name shadows cases?)".format(collected, defined),
+        )
 
 
 if __name__ == "__main__":

@@ -52,7 +52,7 @@ def build_parser():
     init_parser.add_argument("--push", action="store_true")
     init_parser.add_argument("--commit-message-prefix", default=None)
     init_parser.add_argument("--retries-per-round", type=int, default=None)
-    init_parser.add_argument("--candidates-per-round", type=int, default=None, help="Backlog candidates to work per round (default 3)")
+    init_parser.add_argument("--candidates-per-round", type=int, default=None, help="Backlog candidates to work per round (default 4)")
     init_parser.add_argument("--max-blocked-in-a-row", type=int, default=None)
     init_parser.add_argument("--commit-every-rounds", type=int, default=None,
                              help="Commit accumulated changes once per this many rounds (default 5)")
@@ -82,6 +82,8 @@ def build_parser():
                              help="check action_hint=expand when pending backlog falls below this (default 3)")
     init_parser.add_argument("--max-predicted-per-round", type=int, default=None,
                              help="Anti-noise quota: at most this many predicted-origin candidates per recommended round (default 1; null disables)")
+    init_parser.add_argument("--max-expansion-per-round", type=int, default=None,
+                             help="Quota for expansion-origin candidates per recommended round (default null = uncapped; expansion work already passed the main agent's value gate)")
     init_parser.add_argument("--allow-path", action="append", default=None, help="Glob of paths allowed in commits (repeatable)")
     init_parser.add_argument("--deny-path", action="append", default=None, help="Glob of paths never allowed in commits (repeatable)")
     init_parser.add_argument("--report-lang", choices=["zh", "en"], default=None)
@@ -118,6 +120,9 @@ def build_parser():
     complete_parser.add_argument("--review-score", type=int, default=None,
                                  help="Self-review score 1-5 (required when config review_threshold is set)")
     complete_parser.add_argument("--review-notes", default=None, help="Optional self-review notes")
+    complete_parser.add_argument("--below-threshold", action="store_true",
+                                 help="Record the round as completed even when --review-score is below review_threshold "
+                                      "(the low score still feeds calibration; it does not count as blocked)")
     add_json(complete_parser)
     add_dry_run(complete_parser)
     complete_parser.set_defaults(func=commands.cmd_complete_round)
@@ -170,6 +175,11 @@ def build_parser():
                              help="Type for created seeds (default: first non-saturated type)")
     goal_parser.add_argument("--seed-value", type=int, default=None, help="Seed value 1-5 (default 4)")
     goal_parser.add_argument("--seed-effort", type=int, default=None, help="Seed effort 1-5 (default 2)")
+    goal_parser.add_argument("--round", type=int, default=None,
+                             help="Round number that completed this goal (must match a completed history entry); "
+                                  "omitting it marks the goal unverified and withholds the 'all goals met' stop")
+    goal_parser.add_argument("--evidence", default=None,
+                             help="Audit-only note on the evidence that the goal is met (recorded on the goal event)")
     goal_parser.add_argument("--no-auto-context", action="store_true",
                              help="Skip the automatic commit-topic/type-stats snapshot for the goal event")
     add_json(goal_parser)
@@ -191,6 +201,8 @@ def build_parser():
     finish_parser.add_argument("--repo", default=".")
     finish_parser.add_argument("--reason")
     finish_parser.add_argument("--stay", action="store_true", help="Stay on the autopilot branch instead of returning to origin")
+    finish_parser.add_argument("--force", action="store_true",
+                               help="Finish even while no stop condition is reached and ready work remains (user-approved early stop)")
     add_json(finish_parser)
     add_dry_run(finish_parser)
     finish_parser.set_defaults(func=commands.cmd_finish)
@@ -258,6 +270,28 @@ def build_parser():
     add_json(detect_verify_parser)
     add_dry_run(detect_verify_parser)
     detect_verify_parser.set_defaults(func=commands.cmd_detect_verify)
+
+    config_set_parser = subparsers.add_parser(
+        "config-set",
+        help="Update .autopilot/config.json at runtime and re-fingerprint state",
+    )
+    config_set_parser.add_argument("--repo", default=".")
+    config_set_parser.add_argument("--expand-after-goals", action="store_true",
+                                   help="Keep iterating after all goals are met (scout new candidates instead of stopping)")
+    add_json(config_set_parser)
+    add_dry_run(config_set_parser)
+    config_set_parser.set_defaults(func=commands.cmd_config_set)
+
+    expansion_record_parser = subparsers.add_parser(
+        "expansion-record",
+        help="Record one Deep Expansion wave's lenses (rotation audit trail)",
+    )
+    expansion_record_parser.add_argument("--repo", default=".")
+    expansion_record_parser.add_argument("--lens", action="append", required=True,
+                                         help="Lens used by this wave (repeatable; must be one of the EXPANSION_LENSES)")
+    add_json(expansion_record_parser)
+    add_dry_run(expansion_record_parser)
+    expansion_record_parser.set_defaults(func=commands.cmd_expansion_record)
 
     backlog_add_parser = subparsers.add_parser("backlog-add", help="Add a backlog candidate")
     backlog_add_parser.add_argument("--repo", default=".")

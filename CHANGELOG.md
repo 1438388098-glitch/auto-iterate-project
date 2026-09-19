@@ -2,6 +2,160 @@
 
 All notable changes to auto-iterate-project are documented here.
 
+## Unreleased
+
+P0 anti-early-stop hardening: an autonomous run once finished ~5 hours before
+its deadline with a "backlog exhausted" reason and zero helper pushback. The
+helper now enforces honest finishing in code instead of trusting the prompt.
+
+### Changed
+
+- Ranking/batch fixes from the real-data audit (ES/DX/TG findings, deduped):
+  - `_mark_selection`: `expansion`-origin candidates are no longer capped by
+    the predicted quota nor cut in the late run (they get their own
+    `max_expansion_per_round`, default uncapped — expansion work already
+    passed the main agent's value gate). The 40% cutoff now uses the FIRST
+    SELECTED entry as its base (the top-ranked entry can be quota-cut, which
+    used to raise the bar for everything else and empty the batch) and only
+    prunes below-floor entries; above-floor candidates stay eligible until
+    the batch is full. The below-floor quick-win fallback fills all remaining
+    slots (still obeying origin quotas). Skipped ready entries carry
+    `cut_reason` (`quota`/`late_run`/`type`/`cutoff`/`batch_full`).
+  - Saturation decay is logarithmic with a 0.35 floor (28 completed over
+    threshold now yields 0.417 instead of 4.6e-05), so the dominant type's
+    value>=4 work is dented, not vetoed. Effort cost is free within one
+    round's batch width and linear beyond it, replacing the unconditional
+    log2(1+effort) that fought the batch-width default.
+  - `check` runs one `rank_candidates` pass and reports `selected_count` /
+    `selected_empty_reason`; `action_hint` is forced to `expand` when the
+    batch is empty while ready candidates remain (contract: "work" implies a
+    non-empty selection). New warnings: calibration never activated
+    (`review_threshold` unset, 3+ completed rounds, zero review scores) and a
+    capacity hint when pending >= 2x the batch width.
+  - `compute_type_stats` calibration cold start: a type with <3 reviewed
+    candidates borrows the run-wide review/value ratio (clamped 0.6-1.5).
+  - `backlog-update`/`backlog-remove` refresh `state.type_stats`, so the
+    expansion payload can no longer contradict what ranking computes fresh.
+- Defaults & seeds: `candidates_per_round` 3 -> 4 (per-round overhead
+  amortizes over more work); `begin-round`'s no-candidate refusal now splits
+  above-floor from below-only pools ("Only below-floor candidates are ready
+  (N). Run Deep Expansion first, or pass --candidate-id explicitly to accept
+  a quick win."); `backlog-add --origin expansion --evidence ...` defaults to
+  confidence 0.9 (predictions stay 0.75); goal-met seeds skip `bugfix` as the
+  default type and default to `risk` 2.
+
+### Added
+
+- Config/IO/scanner hardening from the QA audit (all reproduced on this repo
+  before fixing):
+  - `max_blocked_in_a_row`/`retries_per_round` reject negatives at load time
+    (a hand-edited `-1` used to produce `max_blocked_in_a_row reached (0/-1)`
+    — a permanently stopped run); `0` stays legal and is now documented.
+  - Budget knobs reject NaN/±inf: `init --max-minutes nan` used to succeed
+    (rc 0, literal `NaN` written to config.json, every `check` continuing
+    forever); a hand-edited `1e999` is rejected at load.
+  - `init` validates the merged config with the same `validate_config` the
+    next `load_config` applies, and `init --force` no longer inherits the
+    existing config — it rebuilds from defaults + CLI flags, a real recovery
+    exit for a config that could never be loaded again.
+  - Staged BINARY files produce a `binary-staged` finding (content is not
+    scannable), so committing one requires the same explicit
+    `--allow-secrets`; the fail-closed promise of the scan now covers blobs.
+  - `split_goals` no longer splits on decimal points ("升级到 v1.3.3" stayed
+    one goal); the report's goal checkboxes use the same goal-text
+    normalization as `all_goals_met` (no more `[ ]` contradicting a stopped
+    run); `save_json` fsyncs before the atomic rename and refuses NaN/inf
+    payloads; `_pid_alive` treats a PermissionError (EPERM, POSIX) as
+    "alive", aligning the fail-closed behavior with the Windows branch.
+- Budget & round accounting fixes from the QA/ES audit:
+  - Zero-work cancels no longer consume the run: a cancel with no working-tree
+    delta against the round's snapshot, no commit, and a life under 10 minutes
+    records an `aborted` history entry (labels: 空转取消 / aborted), advances
+    no round counter and burns no token base; round numbers stay unique via a
+    new `round_seq` sequence (migrated from the old counters). A real-work
+    cancel still counts as `cancelled`.
+  - Tokens are billed monotonically per run: `run_start_sha` (anchored at
+    init) plus the worktree/index delta are two disjoint measurements of the
+    run's true total, and each round is charged only the delta above the
+    persisted `billed_text`/`billed_binary` water marks. The QA-3 scenario
+    (two staged rounds committed in a third) now bills [620, 620, 500] instead
+    of double-counting the same 20 lines ([620, 620, 740]). A `--tokens`
+    override still advances the water marks so overridden lines are not billed
+    again later.
+  - `check` reports `blocked_streak` (warning at 1..max-1: "one more blocked
+    round stops the run"), a `budget` payload (`max_minutes`,
+    `last_activity_at`, `remaining_minutes`, `deadline_remaining_minutes`),
+    and boundary-correct schedule hints (round 5 with
+    `commit_every_rounds: 5` reports `next_commit_round` 5, not 10).
+  - `complete-round --below-threshold` records a quality-failed round as
+    completed with its low score (calibration still learns from it) without
+    counting blocked — the only in-run exit once `max_blocked_in_a_row` fires,
+    since begin-round is refused after the stop. The max_blocked stop message
+    and the SKILL.md troubleshooting row point at it.
+- Expansion-wave protocol is now recorded in state instead of being an
+  unenforceable prompt rule: `expansion-record --lens <lens> ...` writes
+  bounded `{at, lenses, added}` records into `state.expansion_waves` (new
+  state field, backfilled by migration, capped at 20 waves); an unknown lens
+  exits 2, and repeating the previous wave's exact lens set warns (an
+  `expansion-wave` warn event) without refusing. `check` reports `wave_no`,
+  the `lenses_used` union, and the ordered `lenses_unused` remainder, so the
+  16-lens rotation and the Wave 2/3/4 escalation ladder are finally auditable.
+- `check` exposes the repository-analysis cache in an `analysis` payload
+  (`status` missing/fresh/stale, `reason`, `commits_behind` — how many commits
+  the cached analysis predates) and warns when an expansion is due while the
+  cache is >=3 commits stale; staleness is a hint, never a stop.
+- SKILL.md's Deep Expansion section now maps every lens to a probe command
+  and the evidence a subagent must bring back, requires unevidenced proposals
+  to be rejected (evidence goes into `backlog-add --evidence`), and defines
+  the bar for ever claiming "expansion exhausted" (2 recorded waves x >=3
+  subagents x >=3 unused lenses with zero value-gated candidates).
+- `finish --force`: `finish` without it is refused (exit 2) while no stop
+  condition is reached and value>=floor ready candidates remain (or the
+  backlog needs expansion); the refusal mutates nothing, so an open round
+  survives a refused finish. A forced finish logs a `finish-forced` event with
+  the reason and ready count.
+- `goal-met --round <n>` / `--evidence`: `--round` must match a completed
+  round in history and marks the claim verified; without it the goal event is
+  `unverified: true` and the "all goals met" stop is withheld.
+  `unverified_goals()` backs `check`'s new `goals_unverified` payload, plus a
+  warning naming the goal while valuable ready candidates remain.
+- `config-set --expand-after-goals`: runtime config adjustment that reloads
+  and re-validates the config, saves it, and refreshes state's
+  `config_fingerprint` (no config-drift false alarm); reopens an "all goals
+  met" stop for the expansion phase. `begin-round`'s all-goals-met refusal now
+  points at it and reports the remaining ready candidates.
+- Test-suite integrity guard: `unittest discover` count must equal the count
+  of test methods defined in the source — a duplicate class name that silently
+  shadows tests now fails the build.
+
+### Fixed
+
+- A state file migrated from a pre-v1.4 version had no `run_start_sha` anchor,
+  and token estimation silently fell back to `EMPTY_TREE`: the next
+  complete/block/cancel-round billed the entire `EMPTY_TREE..HEAD` diff as one
+  round (12 tokens/line) and could fake-trigger `max_tokens` — an early stop
+  of exactly the kind this release set out to kill. `load_state` now anchors
+  such a state at the current `HEAD` on first load (work committed before the
+  upgrade stays unbilled on purpose; an existing `EMPTY_TREE` value is left
+  alone so an unborn repo does not churn the file). Guard test:
+  `test_migrated_state_anchors_tokens_at_load_not_empty_tree`.
+- `references/config.md` still documented the removed `0.7 ** (completed -
+  threshold)` saturation decay and the `÷ log2(1 + effort)` effort divisor;
+  synced to the shipped formulas (logarithmic saturation with a 0.35 floor,
+  batch-width-aware linear effort cost) and the calibration cold-start global
+  fallback. `SKILL.md` default `candidates_per_round` 3 -> 4, and
+  `--max-expansion-per-round` added to both flag lists.
+- Two test classes shared the name `ImportUnitTests`; discovery collected only
+  the second, so the first class's 14 cases (among them the sequential-id
+  truncation test) never ran while the suite stayed green. Renamed to
+  `SeedScoringHelperTests` / `PureHelperUnitTests` (280 -> 303 collected).
+- `test_sequential_id_never_reuses_truncated_ids` asserted an unreachable
+  scenario: `_next_sequential_id` numbers from the max surviving suffix + 1
+  and the bounded lists truncate only from the head, so the maximum suffix
+  always survives and no id is ever reused in the normal flow. The assertion,
+  and the `_next_sequential_id` docstring that overclaimed a persistent
+  "monotonic counter", now describe the actual (and still safe) mechanism.
+
 ## 1.3.3 (2026-09-18)
 
 Second autonomous iteration: fourth scout wave (CLI surface / test blind-spot

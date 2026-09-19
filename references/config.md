@@ -62,7 +62,7 @@ The expression is resolved to an absolute UTC timestamp once at `init` time, so 
 
 Soft stop based on `estimated_tokens_used` accumulated by `complete-round`, `block-round`, and `cancel-round`. `null` means unlimited.
 
-The helper auto-estimates tokens per round when `--tokens` is omitted, using the heuristic `500 + 12 * changed lines + 100 * binary files`, where changed lines come from the diff between the round's start SHA (recorded by `begin-round`) and `HEAD`, plus the working-tree/index delta measured against a snapshot taken at `begin-round`. Anchoring on the round start SHA means a round never re-counts lines committed in earlier rounds, and the worktree baseline means a deferred (batched) round never double counts earlier rounds' still-uncommitted lines. For a tighter estimate, pass `--tokens` with your own value from the session.
+The helper auto-estimates tokens per round when `--tokens` is omitted, using the heuristic `500 + 12 * changed lines + 100 * binary files`. Accounting is run-level monotonic: the run's total changed units are the committed diff from `run_start_sha` (anchored at `init`) to `HEAD` plus the current working-tree/index delta against `HEAD` — two disjoint measurements whose sum is the run's true total, so each line is billed exactly once no matter how many rounds it sat uncommitted before being committed. Each round is charged only the delta above the persisted high-water marks (`billed_text`/`billed_binary` in state); the 500-token base applies to every round closed with real work (a zero-work cancel is `aborted` and burns nothing). For a tighter estimate, pass `--tokens` with your own value from the session — the override still advances the water marks so the real lines are not billed again later.
 
 ### max_round_scope
 
@@ -86,15 +86,15 @@ String. Default `"autopilot"`. The `commit` helper builds messages as `<prefix>(
 
 ### retries_per_round
 
-Integer. Default `3`. Maximum fix-and-retry attempts within one round before the round is marked blocked. This is an **agent-side convention**: the helper does not count retries, so the agent enforces the budget itself and switches to `block-round` when exhausted.
+Integer. Default `3`. Maximum fix-and-retry attempts within one round before the round is marked blocked. `0` disables retrying entirely (block on the first failure); a negative value is rejected by validation. This is an **agent-side convention**: the helper does not count retries, so the agent enforces the budget itself and switches to `block-round` when exhausted.
 
 ### candidates_per_round
 
-Integer, default `3`. How many backlog candidates one round works on. Each candidate is still implemented and reviewed as its own unit inside the round, so one round batches several independent changes and amortizes the per-round overhead. Set it to `1` for the original one-change-per-round contract. `begin-round --candidate-id` is repeated once per candidate; the helper accepts any number and updates every attached candidate's status when the round closes.
+Integer, default `4`. How many backlog candidates one round works on. Each candidate is still implemented and reviewed as its own unit inside the round, so one round batches several independent changes and amortizes the per-round overhead. Set it to `1` for the original one-change-per-round contract. `begin-round --candidate-id` is repeated once per candidate; the helper accepts any number and updates every attached candidate's status when the round closes.
 
 ```json
 {
-  "candidates_per_round": 3
+  "candidates_per_round": 4
 }
 ```
 
@@ -130,24 +130,24 @@ Array of regex strings, default `[]`. Extra patterns appended to the built-in se
 
 ### type_saturation_threshold
 
-Integer, default `2`. After this many candidates of the same `type` have been completed, `backlog-rank` downweights further same-type pending candidates by `0.7` per additional completion (`0.7 ** (completed - threshold)` in the default `ranking_mode: expected`; `0.85` in `classic`). This stops the loop from grinding out the same low-hanging-fruit category forever. Set to a large number to disable.
+Integer, default `2`. After this many candidates of the same `type` have been completed, `backlog-rank` downweights further same-type pending candidates by logarithmic decay with a hard floor (`max(0.35, 1.0 - 0.12 * log2(1 + max(0, completed - threshold)))` in the default `ranking_mode: expected`; `0.85` power decay in `classic`). Saturation dents the diversity signal but must never veto a genuinely valuable candidate of the dominant type. This stops the loop from grinding out the same low-hanging-fruit category forever. Set to a large number to disable.
 
 ### ranking_mode
 
 String, default `"expected"`. How `backlog-rank` scores candidates:
 
-- `expected` (default): expected **value per round** — the scarce resource in a run is rounds, not effort. Score = `value × success_rate (1 − blocked_rate of the type) × calibration (learned from past self-review scores, clamped 0.6-1.5, needs ≥3 samples) × unlock_bonus (1 + 0.15 × pending candidates that depend on this one) × risk_factor × saturation × mix_penalty (1 − 0.3 × pending share of the type) ÷ log2(1 + effort)`. The risk factor tightens as the round budget is consumed (`risk_weight` 0.05 → 0.15), so early rounds take swings and late rounds play it safe.
+- `expected` (default): expected **value per round** — the scarce resource in a run is rounds, not effort. Score = `value × success_rate (1 − blocked_rate of the type) × calibration (review_avg / value_avg of the type, clamped 0.6-1.5; a type with fewer than 3 resolved samples borrows the run-wide global review/value ratio once that has ≥3 samples) × unlock_bonus (1 + 0.15 × pending candidates that depend on this one) × risk_factor × saturation × mix_penalty (1 − 0.3 × pending share of the type) ÷ effort_cost (free within the round's batch width, then `1 + 0.15 × (effort − width)` beyond it — a candidate that still fits this round's batch must not lose to a lighter one that would leave the batch idle)`. The risk factor tightens as the round budget is consumed (`risk_weight` 0.05 → 0.15), so early rounds take swings and late rounds play it safe.
 - `classic`: the legacy `value / effort` ratio with fixed risk/saturation/blocked discounts.
 
 Every `backlog-rank` entry carries a `score_breakdown` exposing each factor, plus `selected` (the recommended round batch), `below_floor`, `unlocks`, and `ready`/`blocked_by`.
 
 ### min_candidate_value
 
-Integer 1-5, default `3`. Pending candidates whose (resolved) value is below this are demoted: `below_floor: true`, ranked after same-score above-floor candidates, and at most one such quick-win fills a remaining slot in the recommended batch. `begin-round` prints a warning when several below-floor candidates are picked in one round. Set to `null` to disable the floor.
+Integer 1-5, default `3`. Pending candidates whose (resolved) value is below this are demoted: `below_floor: true`, ranked after same-score above-floor candidates, and such quick-wins only fill slots the main pool left open in the recommended batch (subject to the same origin quotas and the 40% cutoff). `begin-round` prints a warning when several below-floor candidates are picked in one round, and refuses an empty `--candidate-id` round while only below-floor candidates are ready. Set to `null` to disable the floor.
 
 ### max_same_type_per_round
 
-Positive integer, default `2`. Diversity quota used when marking the recommended round batch (`selected: true`): at most this many candidates of the same type are included per round. The recommended batch also stops once a candidate's score drops below 40% of the best eligible candidate (batch cutoff). Set to `null` to disable the quota.
+Positive integer, default `2`. Diversity quota used when marking the recommended round batch (`selected: true`): at most this many candidates of the same type are included per round. The batch cutoff uses 40% of the FIRST SELECTED entry's score as its base and only prunes below-floor entries — above-floor candidates stay eligible until the batch is full. Ready above-floor entries skipped by a constraint carry `cut_reason` (`quota`/`late_run`/`type`/`cutoff`, or `batch_full`), which `check` surfaces as `selected_empty_reason` when the batch comes back empty. Set to `null` to disable the quota.
 
 ### min_pending_candidates
 
@@ -155,11 +155,15 @@ Non-negative integer, default `3`. When the backlog has fewer than this many `pe
 
 ### max_predicted_per_round
 
-Non-negative integer or `null`, default `1`. Anti-noise quota for direction-seed predictions (刀 B): at most this many non-observed candidates (predicted **and** expansion origins share the quota) may enter one recommended round batch (`selected`). Predicted candidates also carry a `confidence` (0.5-1.0, default 0.75) that discounts their score, observed work wins score ties, and in the late run (progress > 0.7) non-observed work is cut entirely while observed candidates remain ready. Predicted candidates keep their own blocked/review sub-account, so consecutive failures sink future predictions without contaminating the observed work's per-type statistics; with fewer than 3 resolved predictions the score uses a conservative prior (type success rate × 0.75). `ranking_mode: classic` ignores every prediction factor. Set to `null` to disable the quota. Init flag: `--max-predicted-per-round N`. Tune this (or the confidence defaults) only from the predicted sub-account's hit-rate samples in `report` — not from intuition.
+Non-negative integer or `null`, default `1`. Anti-noise quota for direction-seed predictions (刀 B): at most this many `predicted`-origin candidates may enter one recommended round batch (`selected`). The `expansion` origin has its own separate quota (`max_expansion_per_round`) — expansion work already passed the main agent's value gate, while a prediction is still an unproven hypothesis. Predicted candidates also carry a `confidence` (0.5-1.0, default 0.75; expansion with evidence defaults to 0.9) that discounts their score, observed work wins score ties, and in the late run (progress > 0.7) predicted work is cut entirely while observed candidates remain ready (expansion is not cut). Predicted candidates keep their own blocked/review sub-account, so consecutive failures sink future predictions without contaminating the observed work's per-type statistics; with fewer than 3 resolved predictions the score uses a conservative prior (type success rate × 0.75). `ranking_mode: classic` ignores every prediction factor. Set to `null` to disable the quota. Init flag: `--max-predicted-per-round N`. Tune this (or the confidence defaults) only from the predicted sub-account's hit-rate samples in `report` — not from intuition.
+
+### max_expansion_per_round
+
+Non-negative integer or `null`, default `null` (uncapped). Quota for `expansion`-origin candidates per recommended round batch, kept separate from `max_predicted_per_round`: expansion candidates were judged valuable by the main agent before entering the backlog, so they are not discounted by default and are not cut in the late run. Set an integer to cap how many expansion candidates join one batch. Init flag: `--max-expansion-per-round N`.
 
 ### max_blocked_in_a_row
 
-Integer. Default `2`. Hard stop after this many consecutive blocked rounds, checked by the state helper rather than only by agent judgment.
+Integer. Default `2`. Hard stop after this many consecutive blocked rounds, checked by the state helper rather than only by agent judgment. `0` means the run stops on the FIRST blocked round (a legal but harsh choice — the configurator owns that); a negative value is rejected by validation.
 
 ### check_commands
 
@@ -192,7 +196,7 @@ String, default `"zh"`. Language for generated reports and the automatic 10-roun
   "branch_mode": "feature",
   "commit_message_prefix": "autopilot",
   "retries_per_round": 3,
-  "candidates_per_round": 3,
+  "candidates_per_round": 4,
   "commit_every_rounds": 5,
   "verify_every_rounds": 3,
   "checkpoint_every": 6,
@@ -252,9 +256,11 @@ python <this-skill>/scripts/autopilot_state.py backlog-remove --repo <repo> --id
 `goal-met` can record *direction seeds* — predicted follow-up work ("because we shipped A, B is next") — alongside the completed goal. Seeds live in `state.json` under `goal_seeds` (bounded at 50, text capped at 500 chars); each completed goal also gets a structured snapshot in `goal_events` (bounded at 20): recent commit topics, saturated types, the round's candidates, unlocked capabilities, and the ids of the seeds it spawned. `completed_goals` remains a plain string array, and state files written by schema v5 are migrated on read.
 
 ```powershell
-python <this-skill>/scripts/autopilot_state.py goal-met --repo <repo> --goal "<goal>" --next-step "<follow-up>" --next-step "<follow-up 2>" --unlocked-capability "<capability>"
+python <this-skill>/scripts/autopilot_state.py goal-met --repo <repo> --goal "<goal>" --round <n> --next-step "<follow-up>" --next-step "<follow-up 2>" --unlocked-capability "<capability>"
 ```
 
+- `--round <n>` — the round that completed this goal; must match a completed history entry. Without it the goal event is recorded `unverified: true` and the "all goals met" stop is withheld (`check` lists the goals under `goals_unverified`)
+- `--evidence` — audit-only note on how you know the goal is met (recorded on the goal event, not scored)
 - `--next-step` (repeatable) — one direction seed per occurrence; `type` defaults to the first non-saturated type, `value` to 4, `effort` to 2, `risk` to 1
 - `--seed-type` / `--seed-value` / `--seed-effort` — override the defaults
 - `--no-auto-context` — skip the automatic snapshot (no goal event is recorded unless `--next-step`/`--unlocked-capability` also produced seeds or capabilities, in which case the event records just those links)
@@ -287,17 +293,18 @@ Anti-noise scoring (刀 B): a promoted candidate carries `origin: "predicted"`, 
 
 ## State Helper Commands
 
-- `init` — create config + state (+ optional feature branch). Flags cover every config field: `--goal`, `--goals-from-prompt`, `--max-rounds`, `--max-minutes`, `--deadline`, `--max-tokens`, `--max-round-scope`, `--branch-mode`, `--allow-uncommitted-changes`, `--track-state`, `--check-commands`, `--push`, `--commit-message-prefix`, `--retries-per-round`, `--candidates-per-round`, `--commit-every-rounds`, `--verify-every-rounds`, `--checkpoint-every`, `--expand-after-goals`, `--review-threshold`, `--scan-secrets`/`--no-scan-secrets`, `--secret-pattern`, `--type-saturation-threshold`, `--ranking-mode`, `--min-candidate-value`, `--max-same-type-per-round`, `--min-pending-candidates`, `--max-predicted-per-round`, `--max-blocked-in-a-row`, `--allow-path`, `--deny-path`, `--report-lang`, `--force`.
-- `read`, `check`, `diagnose` — inspect state, stop conditions, and repository/git health. `check --brief` returns loop-driving fields only: `continue`/`stop_reason`/`warnings`/`goals_met`/`phase`/`backlog` (`pending`/`ready`/`min_pending_candidates`/`needs_expansion`)/`action_hint` (`work`|`expand`|`stop`)/`next_verify_round`/`next_commit_round`/`next_checkpoint_round` (saves tokens in the loop). In the expand phase an `expansion` object with open seeds and type context is appended (see Direction Seeds above).
+- `init` — create config + state (+ optional feature branch). Flags cover every config field: `--goal`, `--goals-from-prompt`, `--max-rounds`, `--max-minutes`, `--deadline`, `--max-tokens`, `--max-round-scope`, `--branch-mode`, `--allow-uncommitted-changes`, `--track-state`, `--check-commands`, `--push`, `--commit-message-prefix`, `--retries-per-round`, `--candidates-per-round`, `--commit-every-rounds`, `--verify-every-rounds`, `--checkpoint-every`, `--expand-after-goals`, `--review-threshold`, `--scan-secrets`/`--no-scan-secrets`, `--secret-pattern`, `--type-saturation-threshold`, `--ranking-mode`, `--min-candidate-value`, `--max-same-type-per-round`, `--min-pending-candidates`, `--max-predicted-per-round`, `--max-expansion-per-round`, `--max-blocked-in-a-row`, `--allow-path`, `--deny-path`, `--report-lang`, `--force`.
+- `read`, `check`, `diagnose` — inspect state, stop conditions, and repository/git health. `check --brief` returns loop-driving fields only: `continue`/`stop_reason`/`warnings`/`goals_met`/`phase`/`backlog` (`pending`/`ready`/`min_pending_candidates`/`needs_expansion`)/`action_hint` (`work`|`expand`|`stop`)/`next_verify_round`/`next_commit_round`/`next_checkpoint_round`/`blocked_streak`/`wave_no`/`lenses_used`/`lenses_unused`/`analysis`/`budget` (`remaining_minutes`/`deadline_remaining_minutes`) (saves tokens in the loop). In the expand phase an `expansion` object with open seeds and type context is appended (see Direction Seeds above).
 - `detect-agent` — detect the runtime agent (opencode / claude-code / codex / generic) and print adaptation context. Honors a `SKILL_DIR` environment variable for the reported skill directory.
-- `begin-round`, `complete-round`, `block-round`, `cancel-round` — round lifecycle. `begin-round` enforces the clean-tree rule, refuses to pick candidates with unresolved `depends_on`, and refuses to reuse round numbers; `--candidate-id` is repeatable so one round can pick multiple backlog candidates (`candidates_per_round`). `complete-round` accepts an optional `--commit-sha` (omit it on deferred commit rounds when `commit_every_rounds > 1`), an optional `--review-score`/`--review-notes` (required when `review_threshold` is set), auto-writes a Chinese phase report (`.autopilot/phase-report-round-<N>.md`) every 10 completed rounds, and refreshes `state.type_stats`.
+- `begin-round`, `complete-round`, `block-round`, `cancel-round` — round lifecycle. `begin-round` enforces the clean-tree rule, refuses to pick candidates with unresolved `depends_on`, and refuses to reuse round numbers; `--candidate-id` is repeatable so one round can pick multiple backlog candidates (`candidates_per_round`). `complete-round` accepts an optional `--commit-sha` (omit it on deferred commit rounds when `commit_every_rounds > 1`), an optional `--review-score`/`--review-notes` (pass a score every round — it feeds the value calibration; enforced only when `review_threshold` is set) and `--below-threshold` (records a below-threshold round as completed with its low score, without counting blocked — the only in-run exit once `max_blocked_in_a_row` fires), auto-writes a Chinese phase report (`.autopilot/phase-report-round-<N>.md`) every 10 completed rounds, and refreshes `state.type_stats`. A `cancel-round` with zero work (no tree delta, no commit, under 10 minutes) records an `aborted` round that consumes no round budget and no token base.
 - `commit` — staged-change check, git identity check, path whitelist check (`allow_paths`/`deny_paths`), secret scan (`scan_secrets`, bypassable with `--allow-secrets`), scope guard (including binary files), open-round requirement (always enforced unless `--round <n>` is passed explicitly; what batched mode skips is only the dirty-start check), and prefix message building.
 - `undo-round` — `git revert` a bad commit (never rewriting history), record a `revert` history entry, and advance the round counter.
-- `goal-met`, `finish` — goals and run closure. `goal-met` accepts `--next-step`/`--unlocked-capability`/`--seed-*` to record direction seeds (see Direction Seeds above). `finish` auto-cancels any still-open round, writes `.autopilot/retrospective.md`, and returns to the origin branch in feature mode.
+- `goal-met`, `finish` — goals and run closure. `goal-met` accepts `--round`/`--evidence` (verification anchor; omitting `--round` marks the goal unverified) and `--next-step`/`--unlocked-capability`/`--seed-*` to record direction seeds (see Direction Seeds above). `finish` auto-cancels any still-open round, writes `.autopilot/retrospective.md`, and returns to the origin branch in feature mode; while no stop condition is reached and value>=floor ready candidates remain it is refused unless `--force` is passed (a forced finish logs `finish-forced`). `config-set --expand-after-goals` rewrites the config and refreshes the state config fingerprint.
 - `report` — print (or write with `--output`) a deterministic markdown run report; `--lang zh|en` overrides `report_lang`.
 - `retrospective` — print (or write with `--output`) the run-level retrospective: per-type stats, blocked rounds, verification commands, and the next ready candidate.
 - `detect-verify` — scan repo entry points and recommend `check_commands` (including `gitleaks`/`detect-secrets` when installed); `--apply` writes them into the config.
-- `analysis-save` / `analysis-load` — persist and read the repository-analysis cache in `.autopilot/analysis.json`; the cache auto-invalidates when HEAD or `.autopilot/config.json` changes.
+- `analysis-save` / `analysis-load` — persist and read the repository-analysis cache in `.autopilot/analysis.json`; the cache auto-invalidates when HEAD or `.autopilot/config.json` changes. `check` surfaces the cache state in its `analysis` payload (`status`: missing/fresh/stale, `reason`, `commits_behind`) and warns when an expansion is due while the cache is >=3 commits stale.
+- `expansion-record` — record one Deep Expansion wave's lens set into `state.expansion_waves` (bounded at 20, oldest trimmed). Lenses must come from the fixed 16-lens list (`EXPANSION_LENSES`); an unknown lens exits 2. `check` reports `wave_no`, the order-preserving `lenses_used` union, and the ordered `lenses_unused` remainder so the next wave rotates lenses deliberately; repeating the previous wave's exact lens set warns (an `expansion-wave` warn event) but is not refused.
 - `directive-add` / `directive-list` / `directive-remove` — manage standing directives in `.autopilot/directives.json`; the loop must honor them in every round. `directive-list` prints each entry with its 1-based `index`; `directive-remove --index <n>` retires it (audit-logged).
 - `secret-scan` — scan the staged diff for secret-like content and report findings (exit non-zero on a match).
 - `backlog-add`, `backlog-update`, `backlog-remove`, `backlog-list`, `backlog-rank`, `backlog-pick` — backlog management (candidates carry `type`, `risk`, and `depends_on`; ranking defaults to expected value per round — see `ranking_mode`). `backlog-add --from-seed <id>` promotes a direction seed (see Direction Seeds above). `backlog-add` also refreshes `last_activity_at` so expansion scouting does not burn `max_minutes` without progress.

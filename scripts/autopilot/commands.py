@@ -5,8 +5,10 @@ Orchestration only: secret scanning lives in ``secrets``, path guarding in
 ``io.estimate_tokens_for_round``."""
 
 import json
+import math
 import sys
 import uuid
+from datetime import datetime, timezone
 from pathlib import Path
 
 from . import config, io, state
@@ -45,9 +47,14 @@ def cmd_init(args):
             return 0
 
         cfg = config.default_config(repo)
-        existing_config = io.load_json(config.config_path_for(repo), None)
-        if existing_config is not None:
-            cfg.update(existing_config)
+        # Inherit the existing config only WITHOUT --force: with --force the
+        # defaults plus this command line are the single source of truth, so
+        # `init --force` is a real recovery exit for a corrupt config (it used
+        # to carry the broken values over and re-create the same dead state).
+        if not args.force:
+            existing_config = io.load_json(config.config_path_for(repo), None)
+            if existing_config is not None:
+                cfg.update(existing_config)
         cfg["repo"] = str(repo)
 
         if args.goal:
@@ -61,9 +68,19 @@ def cmd_init(args):
         # max_blocked_in_a_row < 0 silently stopped the loop with zero rounds.
         for knob in ("--max-rounds", "--max-minutes", "--max-tokens",
                      "--max-round-scope", "--retries-per-round",
-                     "--max-blocked-in-a-row"):
+                     "--max-blocked-in-a-row", "--max-expansion-per-round"):
             value = getattr(args, knob.lstrip("-").replace("-", "_"), None)
-            if value is not None and value < 0:
+            if value is None:
+                continue
+            # `--max-minutes nan` passes every comparison, fakes a successful
+            # init, and writes a literal NaN into config.json.
+            if isinstance(value, float) and not math.isfinite(value):
+                io.append_log(repo, "init", "error", reason="{} not finite".format(knob))
+                return emit_result(
+                    args, False,
+                    "[ERROR] {} must be a finite number (NaN/inf budgets never trigger).".format(knob),
+                )
+            if value < 0:
                 io.append_log(repo, "init", "error", reason="{} out of range".format(knob))
                 return emit_result(
                     args, False,
@@ -163,6 +180,9 @@ def cmd_init(args):
                 io.append_log(repo, "init", "error", reason="max_predicted_per_round out of range")
                 return emit_result(args, False, "[ERROR] --max-predicted-per-round must be a non-negative integer.")
             cfg["max_predicted_per_round"] = args.max_predicted_per_round
+        # Negative values are already rejected by the knob gate above.
+        if getattr(args, "max_expansion_per_round", None) is not None:
+            cfg["max_expansion_per_round"] = args.max_expansion_per_round
         if args.allow_path:
             cfg["allow_paths"] = list(args.allow_path)
         if args.deny_path:
@@ -188,6 +208,9 @@ def cmd_init(args):
             )
             return 0
 
+        # Same validation the next load_config would apply — an init that
+        # writes a config it could never re-load is a bricked run.
+        config.validate_config(cfg)
         config.save_config(repo, cfg)
         started_at = io.now_iso()
         run_id = uuid.uuid4().hex[:io.RUN_ID_LENGTH]
@@ -196,6 +219,10 @@ def cmd_init(args):
         st["created_at"] = started_at
         st["started_at"] = started_at
         st["last_activity_at"] = started_at
+        # Anchor for run-level monotonic token accounting: everything this run
+        # commits is measured from here (EMPTY_TREE on an unborn repo).
+        init_head = io.run_git(repo, "rev-parse", "--verify", "-q", "HEAD")
+        st["run_start_sha"] = init_head.stdout.strip() if init_head.returncode == 0 else io.EMPTY_TREE
         state.save_state(repo, st)
         io.ensure_git_exclude(git_dir, cfg.get("track_state", False), to_stderr=getattr(args, "json", False))
         state.ensure_branch(repo, st, cfg, to_stderr=getattr(args, "json", False))
@@ -221,15 +248,22 @@ def cmd_begin_round(args):
         stop_reason = state.compute_stop_reason(st, cfg)
         if stop_reason is not None:
             io.append_log(repo, "begin-round", "error", reason=stop_reason)
+            if stop_reason == "all goals met":
+                # The stop-reason string itself stays untouched (priority tests
+                # pin it); only the refusal message explains the way back in.
+                n = _ready_valuable_count(state.load_backlog(repo), cfg.get("min_candidate_value"))
+                return emit_result(
+                    args, False,
+                    "[ERROR] Autopilot is stopped: all goals met (expand_after_goals=false)。"
+                    "backlog 尚有 {} 条 value>=min_candidate_value 的 ready 候选；"
+                    "要继续探索请运行 config-set --expand-after-goals 或修改 .autopilot/config.json。".format(n),
+                )
             return emit_result(args, False, "[ERROR] Autopilot is stopped: {}. Finish or adjust the config before opening a new round.".format(stop_reason))
 
-        round_number = (
-            st.get("completed_rounds", 0)
-            + st.get("blocked_rounds", 0)
-            + st.get("cancelled_rounds", 0)
-            + st.get("reverted_rounds", 0)
-            + 1
-        )
+        # Round numbers come from a monotonic sequence, not from the round
+        # counters: zero-work aborted rounds do not advance max_rounds's
+        # denominator, yet their numbers are never reused.
+        round_number = st.get("round_seq", 0) + 1
         if getattr(args, "dry_run", False):
             print(
                 "[DRY-RUN] Would open round {}: {}.".format(round_number, args.title),
@@ -238,22 +272,37 @@ def cmd_begin_round(args):
             return 0
         candidate_ids = list(args.candidate_id) if args.candidate_id else []
         backlog = state.load_backlog(repo)
-        ready_pending = []
+        floor = cfg.get("min_candidate_value")
+        ready_above = []
+        ready_below = []
         for candidate in backlog.get("candidates") or []:
             if candidate.get("status") != "pending":
                 continue
             missing, is_ready = state.candidate_deps_status(backlog, candidate)
-            if is_ready:
-                ready_pending.append(candidate)
+            if not is_ready:
+                continue
+            below = floor is not None and state._resolved_value(candidate) < floor
+            (ready_below if below else ready_above).append(candidate)
         if not candidate_ids:
-            if ready_pending:
+            if ready_above:
                 io.append_log(repo, "begin-round", "error", reason="no candidate ids while ready backlog exists")
                 return emit_result(
                     args, False,
                     "[ERROR] begin-round requires at least one --candidate-id when the backlog "
                     "has ready pending candidates (found {}). Pick with backlog-rank, or clear/"
                     "complete those candidates first. Empty rounds on a stocked backlog are refused "
-                    "to prevent churn.".format(len(ready_pending)),
+                    "to prevent churn.".format(len(ready_above)),
+                )
+            if ready_below:
+                io.append_log(
+                    repo, "begin-round", "error",
+                    reason="only below-floor candidates ready",
+                    ready=len(ready_below),
+                )
+                return emit_result(
+                    args, False,
+                    "[ERROR] Only below-floor candidates are ready ({}). Run Deep Expansion first, "
+                    "or pass --candidate-id explicitly to accept a quick win.".format(len(ready_below)),
                 )
             print(
                 "[WARN] begin-round without --candidate-id and no ready pending backlog items; "
@@ -283,7 +332,6 @@ def cmd_begin_round(args):
                     )
             state.update_candidates_status(repo, candidate_ids, "picked", round_number, backlog=backlog)
 
-        floor = cfg.get("min_candidate_value")
         if floor is not None:
             low_value_ids = [
                 cid for cid in candidate_ids
@@ -342,6 +390,7 @@ def cmd_begin_round(args):
             "started_at": io.now_iso(),
         }
         st["round"] = round_number
+        st["round_seq"] = round_number
         st["current_round"] = current
         st["last_activity_at"] = current["started_at"]
         state.save_state(repo, st)
@@ -352,16 +401,31 @@ def cmd_begin_round(args):
         return 0
 
 
-def _resolve_tokens(args, repo, start_sha, worktree_baseline=None):
+def _resolve_tokens(args, repo, st):
     """Thin wrapper over the single token-estimation authority
-    (io.estimate_tokens_for_round); honors an explicit --tokens override.
-    Negative overrides would silently refund the budget — refuse them."""
-    if args.tokens is not None:
+    (io.estimate_tokens_for_round). Run-level monotonic accounting: the round
+    is charged the run-wide delta above the already-billed water marks read
+    from state; the returned (billed_text, billed_binary) tuple must be
+    persisted by _close_round. An explicit --tokens override skips estimation
+    but still advances the water marks to the current totals, so the
+    overridden round's real lines are never billed again by a later round.
+    Negative overrides would silently refund the budget — refuse them.
+    Returns (tokens, (billed_text, billed_binary))."""
+    run_start_sha = st.get("run_start_sha")
+    billed_text = st.get("billed_text") or 0
+    billed_binary = st.get("billed_binary") or 0
+    if getattr(args, "tokens", None) is not None:
         if args.tokens < 0:
             print("[ERROR] --tokens must be a non-negative integer.", file=sys.stderr)
             raise SystemExit(2)
-        return args.tokens
-    return io.estimate_tokens_for_round(repo, start_sha, worktree_baseline)
+        _, total_text, total_binary = io.estimate_tokens_for_round(
+            repo, run_start_sha, billed_text, billed_binary
+        )
+        return args.tokens, (max(billed_text, total_text), max(billed_binary, total_binary))
+    tokens, total_text, total_binary = io.estimate_tokens_for_round(
+        repo, run_start_sha, billed_text, billed_binary
+    )
+    return tokens, (total_text, total_binary)
 
 
 def _refresh_type_stats(repo, st):
@@ -413,15 +477,19 @@ def _resolve_round_seeds_in_state(repo, st, current, outcome, notes=None):
 
 def _close_round(repo, st, current, status, counter_key, tokens, history_entry,
                  candidate_status, candidate_round=None, candidate_extra=None,
-                 seed_outcome=None, seed_notes=None):
+                 seed_outcome=None, seed_notes=None, billed=None):
     """Shared round-closing bookkeeping: bump the round counter, append tokens,
     record bounded history, release the round, update candidates in one backlog
     pass, resolve this round's seeds into the SAME state save, refresh type
-    stats, and persist state."""
+    stats, and persist state. `billed` is the run's advanced (text, binary)
+    water-mark tuple from _resolve_tokens; run_start_sha is already on state
+    and is persisted along with it."""
     if counter_key:
         st[counter_key] = st.get(counter_key, 0) + 1
     if tokens:
         st["estimated_tokens_used"] += tokens
+    if billed is not None:
+        st["billed_text"], st["billed_binary"] = billed
     st["last_activity_at"] = io.now_iso()
     history_entry.setdefault("status", status)
     state.append_history(st, history_entry)
@@ -454,7 +522,7 @@ def cmd_complete_round(args):
                     "[ERROR] --commit-sha does not resolve to a commit: {}".format(args.commit_sha),
                 )
 
-        tokens = _resolve_tokens(args, repo, current.get("start_sha"), current.get("worktree_baseline"))
+        tokens, billed = _resolve_tokens(args, repo, st)
         if getattr(args, "dry_run", False):
             print(
                 "[DRY-RUN] Would record round {} as completed with {} estimated tokens.".format(
@@ -472,6 +540,7 @@ def cmd_complete_round(args):
             io.append_log(repo, "complete-round", "error", reason="review score out of range")
             return emit_result(args, False, "[ERROR] --review-score must be between 1 and 5.")
         review_threshold = cfg.get("review_threshold")
+        below_threshold = False
         if review_threshold is not None:
             if args.review_score is None:
                 io.append_log(repo, "complete-round", "error", reason="review score required")
@@ -481,14 +550,20 @@ def cmd_complete_round(args):
                     "Self-review the round on a 1-5 scale and pass --review-score.".format(review_threshold),
                 )
             if args.review_score < review_threshold:
-                io.append_log(repo, "complete-round", "error", reason="review score below threshold")
-                return emit_result(
-                    args, False,
-                    "[ERROR] Self-review score {} is below review_threshold {}. "
-                    "Rework the round and re-verify, or run block-round.".format(
-                        args.review_score, review_threshold
-                    ),
-                )
+                if not getattr(args, "below_threshold", False):
+                    io.append_log(repo, "complete-round", "error", reason="review score below threshold")
+                    return emit_result(
+                        args, False,
+                        "[ERROR] Self-review score {} is below review_threshold {}. "
+                        "Rework the round and re-verify, run block-round, or pass "
+                        "--below-threshold to record the low score without blocking the run.".format(
+                            args.review_score, review_threshold
+                        ),
+                    )
+                # Explicit quality admit-down: the round stays completed (it
+                # does NOT count blocked, so the blocked streak resets), and
+                # the low score still feeds the calibration ledger.
+                below_threshold = True
 
         _close_round(
             repo, st, current,
@@ -505,6 +580,7 @@ def cmd_complete_round(args):
                 "candidate_id": current.get("candidate_id"),
                 "review_score": getattr(args, "review_score", None),
                 "review_notes": getattr(args, "review_notes", None) or "",
+                "below_threshold": below_threshold,
             },
             candidate_status="completed",
             candidate_round=current["round"],
@@ -512,7 +588,14 @@ def cmd_complete_round(args):
                 {"review_score": args.review_score} if getattr(args, "review_score", None) is not None else None
             ),
             seed_outcome="completed",
+            billed=billed,
         )
+        if below_threshold:
+            io.append_log(
+                repo, "complete-round", "warn",
+                round=current["round"], reason="below threshold accepted",
+                review_score=args.review_score, threshold=review_threshold,
+            )
         io.append_log(
             repo, "complete-round", "success",
             round=current["round"], commit_sha=args.commit_sha, estimated_tokens=tokens,
@@ -545,7 +628,7 @@ def cmd_block_round(args):
             io.append_log(repo, "block-round", "error", reason="no open round")
             return emit_result(args, False, "[ERROR] No open round to block.")
 
-        tokens = _resolve_tokens(args, repo, current.get("start_sha"), current.get("worktree_baseline"))
+        tokens, billed = _resolve_tokens(args, repo, st)
         if getattr(args, "dry_run", False):
             print(
                 "[DRY-RUN] Would mark round {} as blocked: {}.".format(current["round"], args.reason),
@@ -568,6 +651,7 @@ def cmd_block_round(args):
             candidate_round=current["round"],
             seed_outcome="blocked",
             seed_notes=args.reason,
+            billed=billed,
         )
         io.append_log(repo, "block-round", "success", round=current["round"], reason=args.reason)
         return emit_result(args, True, "[OK] Round blocked.")
@@ -582,13 +666,62 @@ def cmd_cancel_round(args):
             io.append_log(repo, "cancel-round", "error", reason="no open round")
             return emit_result(args, False, "[ERROR] No open round to cancel.")
 
-        tokens = _resolve_tokens(args, repo, current.get("start_sha"), current.get("worktree_baseline"))
+        # Zero-work probe retries (wrong flags, malformed refs, forgotten
+        # --reason...) used to be billed as full cancelled rounds: a cancelled
+        # round advanced max_rounds AND took the 500-token base each time.
+        # A round with no working-tree delta against its begin-round snapshot,
+        # no commit, and a short life is an aborted probe, not work.
+        started = io.parse_time(current.get("started_at"))
+        head = io.run_git(repo, "rev-parse", "--verify", "-q", "HEAD")
+        head_sha = head.stdout.strip() if head.returncode == 0 else None
+        elapsed = None
+        if started is not None:
+            elapsed = (io.parse_time(io.now_iso()) - started).total_seconds()
+        zero_work = (
+            io.worktree_change_lines(repo) == current.get("worktree_baseline")
+            and head_sha == current.get("start_sha")
+            and elapsed is not None and elapsed < 600
+        )
+
+        if zero_work:
+            tokens, billed = 0, None
+        else:
+            tokens, billed = _resolve_tokens(args, repo, st)
         if getattr(args, "dry_run", False):
             print(
-                "[DRY-RUN] Would cancel round {}: {}.".format(current["round"], args.reason or ""),
+                "[DRY-RUN] Would cancel round {}{}: {}.".format(
+                    current["round"],
+                    " as aborted (zero work)" if zero_work else "",
+                    args.reason or "",
+                ),
                 file=sys.stderr,
             )
             return 0
+        if zero_work:
+            _close_round(
+                repo, st, current,
+                status="aborted",
+                counter_key=None,
+                tokens=0,
+                history_entry={
+                    "round": current["round"],
+                    "status": "aborted",
+                    "title": args.title or current.get("title"),
+                    "reason": args.reason or "",
+                    "candidate_id": current.get("candidate_id"),
+                },
+                candidate_status="pending",
+                seed_outcome="cancelled",
+            )
+            io.append_log(
+                repo, "cancel-round", "success", round=current["round"],
+                reason=args.reason, zero_work=True,
+            )
+            return emit_result(
+                args, True,
+                "[OK] Round aborted (zero work): no changes, no commit, under 10 minutes "
+                "— no round budget or token base consumed.",
+            )
         _close_round(
             repo, st, current,
             status="cancelled",
@@ -603,6 +736,7 @@ def cmd_cancel_round(args):
             },
             candidate_status="pending",
             seed_outcome="cancelled",
+            billed=billed,
         )
         io.append_log(repo, "cancel-round", "success", round=current["round"], reason=args.reason)
         return emit_result(args, True, "[OK] Round cancelled.")
@@ -650,9 +784,10 @@ def _last_completed_candidate_ids(st):
 
 def _default_seed_type(saturated):
     """First candidate type that is not yet saturated (seed defaults avoid piling
-    onto a saturated type); falls back to feature."""
+    onto a saturated type), skipping bugfix: a passive repair is not a
+    "because we shipped A, B is next" prediction shape. Falls back to feature."""
     for candidate_type in state.VALID_CANDIDATE_TYPES:
-        if candidate_type not in saturated:
+        if candidate_type != "bugfix" and candidate_type not in saturated:
             return candidate_type
     return "feature"
 
@@ -700,6 +835,24 @@ def cmd_goal_met(args):
                 io.append_log(repo, "goal-met", "error", reason="{} out of range".format(name))
                 return emit_result(args, False, "[ERROR] {} must be between 1 and 5.".format(name))
 
+        goal_round = getattr(args, "round", None)
+        if goal_round is not None:
+            # Verification anchor: --round must point at a round that actually
+            # completed. Without it the claim stays unverified and cannot stop
+            # the run (state.unverified_goals).
+            completed_rounds = {
+                entry.get("round")
+                for entry in st.get("history") or []
+                if isinstance(entry, dict) and entry.get("status") == "completed"
+            }
+            if goal_round not in completed_rounds:
+                io.append_log(repo, "goal-met", "error", reason="round not completed")
+                return emit_result(
+                    args, False,
+                    "[ERROR] --round {} does not match a completed round in history; a goal can only "
+                    "be verified against a round that actually completed.".format(goal_round),
+                )
+
         if getattr(args, "dry_run", False):
             print("[DRY-RUN] Would mark goal as met: {} ({} direction seeds).".format(goal, len(next_steps)), file=sys.stderr)
             return 0
@@ -733,7 +886,9 @@ def cmd_goal_met(args):
                     "type": default_type,
                     "value": args.seed_value if args.seed_value is not None else 4,
                     "effort": args.seed_effort if args.seed_effort is not None else 2,
-                    "risk": 1,
+                    # 2 not 1: a prediction is inherently less certain than
+                    # observed work — an unearned low risk inflates its rank.
+                    "risk": 2,
                     "status": "open",
                 })
                 seeds.append(seed)
@@ -747,7 +902,12 @@ def cmd_goal_met(args):
             goal_event = state.append_goal_event(st, {
                 "goal": goal,
                 "met_at": io.now_iso(),
-                "round": st.get("round") or 0,
+                "round": goal_round if goal_round is not None else (st.get("round") or 0),
+                "evidence": getattr(args, "evidence", None) or "",
+                # No completed-round anchor -> the claim stays unverified and
+                # compute_stop_reason withholds "all goals met" until a
+                # goal-met --round <completed round> lands.
+                "unverified": goal_round is None,
                 "commit_shas": _last_completed_round_shas(st) if not args.no_auto_context else [],
                 "candidate_ids": round_candidate_ids,
                 "unlocked_capabilities": unlocked,
@@ -819,6 +979,28 @@ def cmd_finish(args):
                 file=sys.stderr,
             )
             return 0
+
+        # P0 anti-early-stop gate: an honest finish needs a reached stop
+        # condition or an explicit --force. Budgets remaining plus actionable
+        # (or expansion-needing) backlog is exactly the premature stop this
+        # skill exists to prevent — refuse before any state mutation, so a
+        # refused finish leaves the run (and any open round) untouched.
+        backlog = state.load_backlog(repo)
+        watch = _backlog_watch(backlog, cfg)
+        ready_floor = _ready_valuable_count(backlog, cfg.get("min_candidate_value"))
+        gate_blocks = (
+            state.compute_stop_reason(st, cfg) is None
+            and (watch["needs_expansion"] or ready_floor > 0)
+        )
+        if gate_blocks:
+            if not getattr(args, "force", False):
+                io.append_log(repo, "finish", "error", reason="gate: work remains")
+                return emit_result(
+                    args, False,
+                    "[ERROR] Refusing to finish: no stop condition reached and {} value>=floor ready "
+                    "candidates remain. Run Deep Expansion, or pass --force to override.".format(ready_floor),
+                )
+            io.append_log(repo, "finish-forced", "success", reason=args.reason, ready=ready_floor)
 
         open_round = st.get("current_round")
         if open_round is not None:
@@ -950,7 +1132,13 @@ def cmd_backlog_add(args):
             confidence = 1.0
         else:
             if confidence is None:
-                confidence = 0.75
+                if origin == "expansion" and getattr(args, "evidence", None):
+                    # Expansion work already survived the main agent's value gate,
+                    # and a stated evidence trail justifies a milder discount than
+                    # unproven predictions get.
+                    confidence = 0.9
+                else:
+                    confidence = 0.75
             # Chained comparison: NaN fails it too (NaN < 0.5 is False, so a
             # naive `confidence < 0.5 or confidence > 1.0` would let NaN through).
             if not (0.5 <= confidence <= 1.0):
@@ -1129,6 +1317,13 @@ def cmd_backlog_update(args):
             )
         candidate["updated_at"] = io.now_iso()
         state.save_backlog(repo, backlog)
+        # Keep state.type_stats in sync with the backlog: check's expansion
+        # payload reads the state snapshot, and a stale snapshot (e.g. after
+        # hand-flipping a status to completed) would contradict what
+        # rank_candidates computes fresh from the backlog on the same state.
+        st = state.load_state(repo)
+        _refresh_type_stats(repo, st)
+        state.save_state(repo, st)
         io.append_log(repo, "backlog-update", "success", candidate_id=args.id, fields=changed)
         return emit_result(args, True, "[OK] Updated candidate {}: {}".format(args.id, ", ".join(changed)))
 
@@ -1149,6 +1344,10 @@ def cmd_backlog_remove(args):
             return 0
         backlog["candidates"] = updated
         state.save_backlog(repo, backlog)
+        # Same sync as backlog-update: state.type_stats must not go stale.
+        st = state.load_state(repo)
+        _refresh_type_stats(repo, st)
+        state.save_state(repo, st)
         io.append_log(repo, "backlog-remove", "success", candidate_id=args.id)
         return emit_result(args, True, "[OK] Removed candidate {}.".format(args.id))
 
@@ -1503,6 +1702,101 @@ def cmd_analysis_load(args):
     return 0
 
 
+def cmd_config_set(args):
+    """Runtime config adjustment (currently only --expand-after-goals). Rewrites
+    .autopilot/config.json and refreshes state's config_fingerprint, so the
+    deliberate change is not flagged as config-drift — and an "all goals met"
+    stop can be reopened for the expansion phase without touching files by hand."""
+    repo = Path(args.repo).resolve()
+    with io.run_lock(repo):
+        if not config.state_path_for(repo).exists():
+            return emit_result(args, False, "[ERROR] Autopilot not initialized. Run init first.")
+        if not getattr(args, "expand_after_goals", False):
+            io.append_log(repo, "config-set", "error", reason="nothing to set")
+            return emit_result(
+                args, False,
+                "[ERROR] config-set requires at least one field to set (currently only --expand-after-goals).",
+            )
+        # load_config validates the on-disk file; the single mutation is the
+        # literal True, so the merged result cannot fail validation — but the
+        # reload below re-runs the full validator over what we actually wrote.
+        cfg = config.load_config(repo)
+        if getattr(args, "dry_run", False):
+            print(
+                "[DRY-RUN] Would set expand_after_goals=true in .autopilot/config.json "
+                "and refresh the state config fingerprint.",
+                file=sys.stderr,
+            )
+            return 0
+        cfg["expand_after_goals"] = True
+        config.save_config(repo, cfg)
+        reloaded = config.load_config(repo)
+        if not reloaded.get("expand_after_goals"):
+            io.append_log(repo, "config-set", "error", reason="reload mismatch")
+            return emit_result(args, False, "[ERROR] config-set could not persist expand_after_goals=true.")
+        st = state.load_state(repo)
+        st["config_fingerprint"] = io.file_sha256(config.config_path_for(repo))
+        state.save_state(repo, st)
+        io.append_log(repo, "config-set", "success", expand_after_goals=True)
+        return emit_result(
+            args, True,
+            "[OK] Config updated: expand_after_goals=true; config fingerprint refreshed (no config-drift warning).",
+        )
+
+
+def cmd_expansion_record(args):
+    """Record one Deep Expansion wave's lens set into state.expansion_waves.
+    Makes the SKILL.md lens-rotation rule ("never the same set twice") auditable:
+    check reports wave_no / lenses_used / lenses_unused from these records, and
+    repeating the previous wave's exact set warns instead of silently passing."""
+    repo = Path(args.repo).resolve()
+    with io.run_lock(repo):
+        if not config.state_path_for(repo).exists():
+            return emit_result(args, False, "[ERROR] Autopilot not initialized. Run init first.")
+        lenses = list(args.lens or [])
+        unknown = [lens for lens in lenses if lens not in state.EXPANSION_LENSES]
+        if unknown:
+            io.append_log(repo, "expansion-wave", "error", reason="unknown lens", lenses=unknown)
+            return emit_result(
+                args, False,
+                "[ERROR] Unknown expansion lens: {}. Must be one of: {}.".format(
+                    ", ".join(unknown), ", ".join(state.EXPANSION_LENSES)
+                ),
+            )
+        if getattr(args, "dry_run", False):
+            print(
+                "[DRY-RUN] Would record expansion wave with lenses: {}.".format(
+                    ", ".join(sorted(set(lenses)))
+                ),
+                file=sys.stderr,
+            )
+            return 0
+        st = state.load_state(repo)
+        previous = st.get("expansion_waves") or []
+        previous_set = set(previous[-1].get("lenses") or []) if previous else None
+        wave = state.append_expansion_wave(st, lenses)
+        st["last_activity_at"] = io.now_iso()
+        state.save_state(repo, st)
+        repeated = previous_set is not None and set(wave["lenses"]) == previous_set
+        if repeated:
+            print(
+                "[WARN] This wave used the same lens set as the previous one; rotate lenses "
+                "(see check expansion.lenses_unused).",
+                file=sys.stderr,
+            )
+            io.append_log(
+                repo, "expansion-wave", "warn",
+                reason="same lens set as previous wave", lenses=wave["lenses"],
+            )
+        io.append_log(repo, "expansion-wave", "success", lenses=wave["lenses"], wave_no=len(st.get("expansion_waves") or []))
+        message = "[OK] Expansion wave {} recorded (lenses: {}).".format(
+            len(st.get("expansion_waves") or []), ", ".join(wave["lenses"])
+        )
+        if repeated:
+            message += " Warning: same lens set as the previous wave."
+        return emit_result(args, True, message, data={"wave": wave})
+
+
 def cmd_directive_add(args):
     repo = Path(args.repo).resolve()
     with io.run_lock(repo):
@@ -1608,13 +1902,8 @@ def cmd_undo_round(args):
                 "manually, then record the round with commit/complete-round.",
             )
         revert_sha = io.run_git(repo, "rev-parse", "HEAD").stdout.strip()
-        round_number = (
-            st.get("completed_rounds", 0)
-            + st.get("blocked_rounds", 0)
-            + st.get("cancelled_rounds", 0)
-            + st.get("reverted_rounds", 0)
-            + 1
-        )
+        # Round numbers come from the same monotonic sequence as begin-round.
+        round_number = st.get("round_seq", 0) + 1
         st["reverted_rounds"] = st.get("reverted_rounds", 0) + 1
         st["last_activity_at"] = io.now_iso()
         state.append_history(
@@ -1629,6 +1918,8 @@ def cmd_undo_round(args):
                 "candidate_id": None,
             },
         )
+        st["round"] = round_number
+        st["round_seq"] = round_number
         state.save_state(repo, st)
         io.append_log(repo, "undo-round", "success", round=round_number, commit_sha=revert_sha, reverted_sha=full_sha)
         return emit_result(
@@ -1704,6 +1995,21 @@ def _backlog_watch(backlog, cfg):
     }
 
 
+def _ready_valuable_count(backlog, floor):
+    """Pending candidates that are dependency-ready and at or above the value
+    floor (``floor: null`` disables the filter). Shared by the finish gate,
+    check's unverified-goal warning, and begin-round's goals-met refusal —
+    "work remains" must mean the same thing in all three."""
+    count = 0
+    for candidate in backlog.get("candidates") or []:
+        if candidate.get("status") != "pending":
+            continue
+        _, is_ready = state.candidate_deps_status(backlog, candidate)
+        if is_ready and (floor is None or state._resolved_value(candidate) >= floor):
+            count += 1
+    return count
+
+
 def cmd_check(args):
     repo = Path(args.repo).resolve()
     st = state.load_state(repo)
@@ -1767,8 +2073,82 @@ def cmd_check(args):
         if remotes.returncode == 0 and not remotes.stdout.strip():
             warnings.append("push is true but no git remote is configured; complete-round will warn on every push attempt.")
 
+    blocked_streak = state.count_consecutive_blocked(st)
+    max_blocked = cfg.get("max_blocked_in_a_row")
+    if max_blocked is not None and 1 <= blocked_streak < max_blocked:
+        warnings.append(
+            "blocked streak {}/{}: one more blocked round stops the run; a quality-failed "
+            "round can complete instead via complete-round --below-threshold".format(
+                blocked_streak, max_blocked
+            )
+        )
+
+    if (
+        cfg.get("review_threshold") is None
+        and st.get("completed_rounds", 0) >= 3
+        and all((entry.get("review_n") or 0) == 0 for entry in (st.get("type_stats") or {}).values())
+    ):
+        warnings.append(
+            "价值校准未激活，候选 value 自评未经验证；每轮 complete-round 传 --review-score"
+        )
+
     backlog = state.load_backlog(repo)
     backlog_watch = _backlog_watch(backlog, cfg)
+    candidates_per_round = cfg.get("candidates_per_round") or 1
+    if backlog_watch["pending"] >= 2 * candidates_per_round:
+        warnings.append(
+            "Backlog pending ({}) is at least twice the batch width ({}); consider raising "
+            "candidates_per_round to amortize the per-round fixed cost (verify, commit) over "
+            "more work.".format(backlog_watch["pending"], candidates_per_round)
+        )
+    goals_unverified = state.unverified_goals(st, cfg)
+    ready_floor = _ready_valuable_count(backlog, cfg.get("min_candidate_value"))
+    if goals_unverified and ready_floor > 0:
+        warnings.append(
+            "goal {} 未提供完成证据；尚有 {} 条 value>=floor 的 ready 候选，不得 finish".format(
+                ", ".join(goals_unverified), ready_floor
+            )
+        )
+    # Lens-rotation observability: Deep Expansion runs in BOTH phases (thin
+    # backlog and post-goal expansion), so the rotation keys live at the top
+    # level rather than inside the expand-only payload. lenses_used is the
+    # order-preserving union across recorded waves; lenses_unused is what the
+    # next wave should draw from.
+    waves = [w for w in (st.get("expansion_waves") or []) if isinstance(w, dict)]
+    lenses_used = []
+    for wave in waves:
+        for lens in wave.get("lenses") or []:
+            if lens not in lenses_used:
+                lenses_used.append(lens)
+    analysis_status, analysis_reason = state.analysis_validity(repo)
+    commits_behind = state.analysis_commits_behind(repo)
+    if backlog_watch["needs_expansion"] and analysis_status == "stale" and (commits_behind or 0) >= 3:
+        warnings.append(
+            "analysis cache is {} commits stale; run analysis-load + analysis-save with a "
+            "fresh scan before the next expansion wave".format(commits_behind)
+        )
+    ranking_expected = cfg.get("ranking_mode", "expected") == "expected"
+    ranked = None
+    selected_entries = []
+    selected_empty_reason = None
+    if ranking_expected:
+        # One rank pass shared with the batch contract: check must never say
+        # "work" while rank_candidates would mark an empty selection — the two
+        # answers come from the same computation, not two drifted ones.
+        ranked = state.rank_candidates(
+            backlog, cfg, progress=state.progress_from_state(st, cfg),
+            completed_goals=list(st.get("completed_goals") or []),
+        )
+        selected_entries = [e for e in ranked if e.get("selected")]
+        if not selected_entries:
+            ready_pool = [e for e in ranked
+                          if e.get("status") == "pending" and e.get("ready") and not e.get("below_floor")]
+            ready_below = [e for e in ranked
+                           if e.get("status") == "pending" and e.get("ready") and e.get("below_floor")]
+            if ready_pool:
+                selected_empty_reason = ready_pool[0].get("cut_reason") or "quota"
+            elif ready_below:
+                selected_empty_reason = "floor"
     open_seed_list = state.open_seeds(st)
     seed_hint = ""
     if open_seed_list:
@@ -1805,6 +2185,17 @@ def cmd_check(args):
     action_hint = "expand" if (stop_reason is None and backlog_watch["needs_expansion"]) else (
         "stop" if stop_reason is not None else "work"
     )
+    if (
+        action_hint == "work"
+        and ranking_expected
+        and not selected_entries
+        and backlog_watch["ready"] > 0
+    ):
+        # Contract: action_hint=work must imply a non-empty recommended batch.
+        # Quota/type/cutoff cuts emptied the batch while ready candidates sit
+        # in the pool — expanding (new candidates or quota relief) is the
+        # honest move, not grinding a pool rank refused to select.
+        action_hint = "expand"
 
     payload = {
         "continue": stop_reason is None,
@@ -1812,9 +2203,20 @@ def cmd_check(args):
         "warnings": warnings,
         "backlog": backlog_watch,
         "action_hint": action_hint,
+        "selected_count": len(selected_entries) if ranking_expected else None,
+        "selected_empty_reason": selected_empty_reason,
+        "wave_no": len(waves),
+        "lenses_used": lenses_used,
+        "lenses_unused": [lens for lens in state.EXPANSION_LENSES if lens not in lenses_used],
+        "analysis": {
+            "status": analysis_status,
+            "reason": analysis_reason,
+            "commits_behind": commits_behind,
+        },
     }
     goals_met = state.all_goals_met(cfg, st)
     payload["goals_met"] = goals_met
+    payload["goals_unverified"] = goals_unverified
     payload["phase"] = "expand" if (goals_met and cfg.get("expand_after_goals")) else "iterate"
     if payload["phase"] == "expand":
         # Expansion context for Wave 0 (seed wave). Key set is stable even when
@@ -1866,14 +2268,39 @@ def cmd_check(args):
         + st.get("reverted_rounds", 0)
     )
     current_number = completed_total + (1 if st.get("current_round") else 0)
+    # Boundary math: round k itself IS a boundary when k % every == 0, so the
+    # next boundary after round k is computed from k-1 (round 5 with
+    # commit_every_rounds 5 reports next_commit_round 5, not 10).
+    anchor = max(1, current_number)
     verify_every = cfg.get("verify_every_rounds") or 1
     commit_every = cfg.get("commit_every_rounds") or 1
-    payload["next_verify_round"] = ((current_number // verify_every) + 1) * verify_every
-    payload["next_commit_round"] = ((current_number // commit_every) + 1) * commit_every
+    payload["next_verify_round"] = ((anchor - 1) // verify_every + 1) * verify_every
+    payload["next_commit_round"] = ((anchor - 1) // commit_every + 1) * commit_every
     checkpoint_every = cfg.get("checkpoint_every")
     payload["next_checkpoint_round"] = (
-        ((current_number // checkpoint_every) + 1) * checkpoint_every if checkpoint_every else None
+        ((anchor - 1) // checkpoint_every + 1) * checkpoint_every if checkpoint_every else None
     )
+    payload["blocked_streak"] = blocked_streak
+
+    # Budget observability: max_minutes measures wall-clock since the last
+    # round activity (pausing burns it), deadline is an absolute moment.
+    max_minutes = cfg.get("max_minutes")
+    remaining_minutes = None
+    if max_minutes is not None:
+        last_activity = io.parse_time(st.get("last_activity_at") or st.get("started_at"))
+        if last_activity is not None:
+            elapsed = (datetime.now(timezone.utc) - last_activity).total_seconds() / 60
+            remaining_minutes = round(max(0.0, max_minutes - elapsed), 1)
+    deadline_remaining = None
+    deadline_at = io.parse_time(cfg.get("deadline"))
+    if deadline_at is not None:
+        deadline_remaining = round((deadline_at - datetime.now(timezone.utc)).total_seconds() / 60, 1)
+    payload["budget"] = {
+        "max_minutes": max_minutes,
+        "last_activity_at": st.get("last_activity_at"),
+        "remaining_minutes": remaining_minutes,
+        "deadline_remaining_minutes": deadline_remaining,
+    }
     if not getattr(args, "brief", False):
         payload["state"] = st
         payload["config"] = cfg
