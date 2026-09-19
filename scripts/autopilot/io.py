@@ -36,6 +36,7 @@ SCHEMA_VERSION = 6
 GOAL_EVENTS_LIMIT = 20
 SEEDS_LIMIT = 50
 SEED_TEXT_LIMIT = 500
+EXPANSION_WAVES_LIMIT = 20
 
 # Run/state sizing constants (single authority — do not hardcode these elsewhere).
 RUN_ID_LENGTH = 12

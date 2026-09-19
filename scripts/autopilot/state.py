@@ -60,6 +60,7 @@ def default_state(repo, goals=None, config_fingerprint=None):
         "completed_goals": [],
         "goal_events": [],
         "goal_seeds": [],
+        "expansion_waves": [],
         "current_round": None,
         "history": [],
         "stop_reason": None,
@@ -87,6 +88,7 @@ def migrate_state(state):
         "type_stats": {},
         "goal_events": [],
         "goal_seeds": [],
+        "expansion_waves": [],
         "repo": None,
         "created_at": io.now_iso(),
         "started_at": None,
@@ -422,6 +424,47 @@ def append_seed(st, seed):
     if len(seeds) > io.SEEDS_LIMIT:
         del seeds[: len(seeds) - io.SEEDS_LIMIT]
     return seed
+
+
+# Deep Expansion lens rotation (single authority; SKILL.md's lens table mirrors
+# this order). expansion-record refuses lenses outside this tuple, and check
+# reports the unused remainder so the agent can rotate deliberately.
+EXPANSION_LENSES = (
+    "architecture",
+    "tests",
+    "security",
+    "performance",
+    "docs",
+    "dead-code",
+    "api-design",
+    "concurrency",
+    "i18n",
+    "config",
+    "observability",
+    "packaging",
+    "data-integrity",
+    "ux-copy",
+    "dependency-graph",
+    "cross-cutting",
+)
+
+
+def append_expansion_wave(st, lenses):
+    """Append one Deep Expansion wave record with bounded growth (oldest
+    trimmed). Lenses are deduplicated and sorted — the record is a set
+    snapshot used to verify lens rotation across waves; `added` counts the
+    candidates the wave produced (0 at record time; the audit trail lives in
+    log.jsonl's backlog-add events between the two waves)."""
+    waves = st.setdefault("expansion_waves", [])
+    wave = {
+        "at": io.now_iso(),
+        "lenses": sorted(set(lenses or [])),
+        "added": 0,
+    }
+    waves.append(wave)
+    if len(waves) > io.EXPANSION_WAVES_LIMIT:
+        del waves[: len(waves) - io.EXPANSION_WAVES_LIMIT]
+    return wave
 
 
 def resolve_seed(st, seed_id, status, notes=None, candidate_id=None):
@@ -1298,6 +1341,25 @@ def analysis_validity(repo):
     if cached_mtime != current_mtime:
         return "stale", "autopilot config changed since the analysis was saved"
     return "fresh", "cached analysis is up to date"
+
+
+def analysis_commits_behind(repo):
+    """How many commits the cached analysis predates (None when there is no
+    cache, no parseable git_head, or the count cannot be determined). Gives the
+    staleness a magnitude so the agent can judge whether a rescan is due."""
+    analysis = load_analysis(repo)
+    if not isinstance(analysis, dict):
+        return None
+    cached_head = analysis.get("git_head")
+    if not cached_head:
+        return None
+    result = io.run_git(repo, "rev-list", "--count", "{}..HEAD".format(cached_head))
+    if result.returncode != 0:
+        return None
+    try:
+        return int(result.stdout.strip())
+    except (TypeError, ValueError, OverflowError):
+        return None
 
 
 def build_retrospective(repo, state, cfg, lang="zh"):

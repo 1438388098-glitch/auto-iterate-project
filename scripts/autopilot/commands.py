@@ -1637,6 +1637,59 @@ def cmd_config_set(args):
         )
 
 
+def cmd_expansion_record(args):
+    """Record one Deep Expansion wave's lens set into state.expansion_waves.
+    Makes the SKILL.md lens-rotation rule ("never the same set twice") auditable:
+    check reports wave_no / lenses_used / lenses_unused from these records, and
+    repeating the previous wave's exact set warns instead of silently passing."""
+    repo = Path(args.repo).resolve()
+    with io.run_lock(repo):
+        if not config.state_path_for(repo).exists():
+            return emit_result(args, False, "[ERROR] Autopilot not initialized. Run init first.")
+        lenses = list(args.lens or [])
+        unknown = [lens for lens in lenses if lens not in state.EXPANSION_LENSES]
+        if unknown:
+            io.append_log(repo, "expansion-wave", "error", reason="unknown lens", lenses=unknown)
+            return emit_result(
+                args, False,
+                "[ERROR] Unknown expansion lens: {}. Must be one of: {}.".format(
+                    ", ".join(unknown), ", ".join(state.EXPANSION_LENSES)
+                ),
+            )
+        if getattr(args, "dry_run", False):
+            print(
+                "[DRY-RUN] Would record expansion wave with lenses: {}.".format(
+                    ", ".join(sorted(set(lenses)))
+                ),
+                file=sys.stderr,
+            )
+            return 0
+        st = state.load_state(repo)
+        previous = st.get("expansion_waves") or []
+        previous_set = set(previous[-1].get("lenses") or []) if previous else None
+        wave = state.append_expansion_wave(st, lenses)
+        st["last_activity_at"] = io.now_iso()
+        state.save_state(repo, st)
+        repeated = previous_set is not None and set(wave["lenses"]) == previous_set
+        if repeated:
+            print(
+                "[WARN] This wave used the same lens set as the previous one; rotate lenses "
+                "(see check expansion.lenses_unused).",
+                file=sys.stderr,
+            )
+            io.append_log(
+                repo, "expansion-wave", "warn",
+                reason="same lens set as previous wave", lenses=wave["lenses"],
+            )
+        io.append_log(repo, "expansion-wave", "success", lenses=wave["lenses"], wave_no=len(st.get("expansion_waves") or []))
+        message = "[OK] Expansion wave {} recorded (lenses: {}).".format(
+            len(st.get("expansion_waves") or []), ", ".join(wave["lenses"])
+        )
+        if repeated:
+            message += " Warning: same lens set as the previous wave."
+        return emit_result(args, True, message, data={"wave": wave})
+
+
 def cmd_directive_add(args):
     repo = Path(args.repo).resolve()
     with io.run_lock(repo):
@@ -1942,6 +1995,24 @@ def cmd_check(args):
                 ", ".join(goals_unverified), ready_floor
             )
         )
+    # Lens-rotation observability: Deep Expansion runs in BOTH phases (thin
+    # backlog and post-goal expansion), so the rotation keys live at the top
+    # level rather than inside the expand-only payload. lenses_used is the
+    # order-preserving union across recorded waves; lenses_unused is what the
+    # next wave should draw from.
+    waves = [w for w in (st.get("expansion_waves") or []) if isinstance(w, dict)]
+    lenses_used = []
+    for wave in waves:
+        for lens in wave.get("lenses") or []:
+            if lens not in lenses_used:
+                lenses_used.append(lens)
+    analysis_status, analysis_reason = state.analysis_validity(repo)
+    commits_behind = state.analysis_commits_behind(repo)
+    if backlog_watch["needs_expansion"] and analysis_status == "stale" and (commits_behind or 0) >= 3:
+        warnings.append(
+            "analysis cache is {} commits stale; run analysis-load + analysis-save with a "
+            "fresh scan before the next expansion wave".format(commits_behind)
+        )
     ranking_expected = cfg.get("ranking_mode", "expected") == "expected"
     ranked = None
     selected_entries = []
@@ -2020,6 +2091,14 @@ def cmd_check(args):
         "action_hint": action_hint,
         "selected_count": len(selected_entries) if ranking_expected else None,
         "selected_empty_reason": selected_empty_reason,
+        "wave_no": len(waves),
+        "lenses_used": lenses_used,
+        "lenses_unused": [lens for lens in state.EXPANSION_LENSES if lens not in lenses_used],
+        "analysis": {
+            "status": analysis_status,
+            "reason": analysis_reason,
+            "commits_behind": commits_behind,
+        },
     }
     goals_met = state.all_goals_met(cfg, st)
     payload["goals_met"] = goals_met

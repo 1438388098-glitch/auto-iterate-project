@@ -987,6 +987,120 @@ class BatchContractTests(RepoTest):
         self.assertEqual(state["goal_seeds"][0]["risk"], 2)
 
 
+class ExpansionWaveTests(RepoTest):
+    """Deep Expansion waves are recorded and observable: lens rotation via
+    expansion_waves + check's lenses_unused, cache staleness via analysis payload."""
+
+    def _record(self, *lenses):
+        args = ["expansion-record"]
+        for lens in lenses:
+            args.extend(["--lens", lens])
+        return self.run_state(*args)
+
+    def _log_events(self):
+        log_path = self.repo / ".autopilot" / "log.jsonl"
+        return [json.loads(line) for line in log_path.read_text(encoding="utf-8").splitlines()
+                if line.strip()]
+
+    def test_expansion_wave_recorded(self):
+        self.run_state("init")
+        result = self._record("tests", "performance")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        result = self._record("security", "tests")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        state = self.read_json("state.json")
+        waves = state["expansion_waves"]
+        self.assertEqual(len(waves), 2)
+        self.assertEqual(waves[0]["lenses"], ["performance", "tests"])
+        self.assertEqual(waves[1]["lenses"], ["security", "tests"])
+        data = json.loads(self.run_state("check", "--brief").stdout)
+        self.assertEqual(data["wave_no"], 2)
+        # Union across waves, in wave order (each wave's lenses are stored as a
+        # sorted set snapshot).
+        self.assertEqual(data["lenses_used"], ["performance", "tests", "security"])
+        expected_unused = [lens for lens in ap_state.EXPANSION_LENSES
+                           if lens not in data["lenses_used"]]
+        self.assertEqual(data["lenses_unused"], expected_unused)
+        self.assertNotIn("tests", data["lenses_unused"])
+        self.assertIn("architecture", data["lenses_unused"])
+
+    def test_consecutive_same_lens_waves_warn(self):
+        self.run_state("init")
+        first = self._record("tests", "performance")
+        self.assertEqual(first.returncode, 0, first.stderr)
+        second = self._record("performance", "tests")
+        self.assertEqual(second.returncode, 0, second.stderr)
+        self.assertIn("[WARN]", second.stderr)
+        self.assertIn("same lens set", second.stderr)
+        warns = [e for e in self._log_events()
+                 if e.get("event") == "expansion-wave" and e.get("status") == "warn"]
+        self.assertEqual(len(warns), 1)
+        self.assertEqual(warns[-1].get("reason"), "same lens set as previous wave")
+        # A different set afterwards does not warn again.
+        third = self._record("security")
+        self.assertEqual(third.returncode, 0, third.stderr)
+        self.assertNotIn("[WARN]", third.stderr)
+        self.assertEqual(len(warns), 1)
+
+    def test_expansion_record_rejects_unknown_lens(self):
+        self.run_state("init")
+        result = self._record("tests", "vibes")
+        self.assertEqual(result.returncode, 2)
+        self.assertIn("Unknown expansion lens", result.stderr)
+        self.assertIn("vibes", result.stderr)
+        self.assertEqual(self.read_json("state.json")["expansion_waves"], [])
+
+    def test_check_surfaces_stale_analysis(self):
+        self.run_state("init")
+        result = self.run_state("analysis-save", "--content", '{"summary": "fresh scan"}')
+        self.assertEqual(result.returncode, 0, result.stderr)
+        data = json.loads(self.run_state("check", "--brief").stdout)
+        self.assertEqual(data["analysis"]["status"], "fresh")
+        # Three commits push the cache past the stale-warning threshold.
+        for i in range(3):
+            (self.repo / "file{}.py".format(i)).write_text("x = {}\n".format(i), encoding="utf-8")
+            self.git("add", "file{}.py".format(i))
+            self.git("commit", "-q", "-m", "commit {}".format(i))
+        data = json.loads(self.run_state("check", "--brief").stdout)
+        self.assertEqual(data["analysis"]["status"], "stale")
+        self.assertGreaterEqual(data["analysis"]["commits_behind"], 3)
+        self.assertTrue(any("analysis cache is" in w and "commits stale" in w
+                            for w in data["warnings"]))
+        # Cache staleness is a hint, never a stop.
+        self.assertTrue(data["continue"])
+        self.assertIsNone(data["stop_reason"])
+
+    def test_check_works_without_analysis(self):
+        self.run_state("init")
+        data = json.loads(self.run_state("check", "--brief").stdout)
+        self.assertEqual(data["analysis"]["status"], "missing")
+        self.assertIsNone(data["analysis"]["commits_behind"])
+        # A missing cache must not downgrade the loop's action hint.
+        self.assertEqual(data["action_hint"], "expand")
+        self.assertTrue(data["continue"])
+
+    def test_analysis_staleness_tracks_each_commit(self):
+        self.run_state("init")
+        self.run_state("analysis-save", "--content", '{"summary": "fresh scan"}')
+        data = json.loads(self.run_state("check", "--brief").stdout)
+        self.assertEqual(data["analysis"]["status"], "fresh")
+        self.assertEqual(data["analysis"]["commits_behind"], 0)
+        (self.repo / "a.py").write_text("a = 1\n", encoding="utf-8")
+        self.git("add", "a.py")
+        self.git("commit", "-q", "-m", "first")
+        first = json.loads(self.run_state("check", "--brief").stdout)
+        self.assertEqual(first["analysis"]["status"], "stale")
+        self.assertEqual(first["analysis"]["commits_behind"], 1)
+        (self.repo / "b.py").write_text("b = 2\n", encoding="utf-8")
+        self.git("add", "b.py")
+        self.git("commit", "-q", "-m", "second")
+        second = json.loads(self.run_state("check", "--brief").stdout)
+        self.assertEqual(second["analysis"]["status"], "stale")
+        self.assertEqual(second["analysis"]["commits_behind"], 2)
+        self.assertGreater(second["analysis"]["commits_behind"],
+                           first["analysis"]["commits_behind"])
+
+
 class ConfigSetTests(RepoTest):
     """config-set reopens an 'all goals met' stop and re-fingerprints state so
     the deliberate change is not flagged as config-drift."""
@@ -3804,6 +3918,7 @@ class ContractTests(RepoTest):
                 "continue", "stop_reason", "warnings", "goals_met", "goals_unverified",
                 "phase", "next_verify_round", "next_commit_round", "next_checkpoint_round",
                 "backlog", "action_hint", "selected_count", "selected_empty_reason",
+                "wave_no", "lenses_used", "lenses_unused", "analysis",
             },
         )
         self.assertEqual(
@@ -3897,7 +4012,7 @@ class ContractTests(RepoTest):
             "started_at", "last_activity_at", "round", "completed_rounds",
             "blocked_rounds", "cancelled_rounds", "reverted_rounds",
             "estimated_tokens_used", "type_stats", "goals", "completed_goals",
-            "goal_events", "goal_seeds",
+            "goal_events", "goal_seeds", "expansion_waves",
             "current_round", "history", "stop_reason", "finished_at",
             "config_fingerprint",
         ):

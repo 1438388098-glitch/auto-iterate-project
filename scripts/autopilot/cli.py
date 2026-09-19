@@ -279,6 +279,17 @@ def build_parser():
     add_dry_run(config_set_parser)
     config_set_parser.set_defaults(func=commands.cmd_config_set)
 
+    expansion_record_parser = subparsers.add_parser(
+        "expansion-record",
+        help="Record one Deep Expansion wave's lenses (rotation audit trail)",
+    )
+    expansion_record_parser.add_argument("--repo", default=".")
+    expansion_record_parser.add_argument("--lens", action="append", required=True,
+                                         help="Lens used by this wave (repeatable; must be one of the EXPANSION_LENSES)")
+    add_json(expansion_record_parser)
+    add_dry_run(expansion_record_parser)
+    expansion_record_parser.set_defaults(func=commands.cmd_expansion_record)
+
     backlog_add_parser = subparsers.add_parser("backlog-add", help="Add a backlog candidate")
     backlog_add_parser.add_argument("--repo", default=".")
     backlog_add_parser.add_argument("--title", default=None,
