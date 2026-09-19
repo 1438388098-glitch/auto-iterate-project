@@ -46,6 +46,23 @@ helper now enforces honest finishing in code instead of trusting the prompt.
 
 ### Added
 
+- Expansion-wave protocol is now recorded in state instead of being an
+  unenforceable prompt rule: `expansion-record --lens <lens> ...` writes
+  bounded `{at, lenses, added}` records into `state.expansion_waves` (new
+  state field, backfilled by migration, capped at 20 waves); an unknown lens
+  exits 2, and repeating the previous wave's exact lens set warns (an
+  `expansion-wave` warn event) without refusing. `check` reports `wave_no`,
+  the `lenses_used` union, and the ordered `lenses_unused` remainder, so the
+  16-lens rotation and the Wave 2/3/4 escalation ladder are finally auditable.
+- `check` exposes the repository-analysis cache in an `analysis` payload
+  (`status` missing/fresh/stale, `reason`, `commits_behind` — how many commits
+  the cached analysis predates) and warns when an expansion is due while the
+  cache is >=3 commits stale; staleness is a hint, never a stop.
+- SKILL.md's Deep Expansion section now maps every lens to a probe command
+  and the evidence a subagent must bring back, requires unevidenced proposals
+  to be rejected (evidence goes into `backlog-add --evidence`), and defines
+  the bar for ever claiming "expansion exhausted" (2 recorded waves x >=3
+  subagents x >=3 unused lenses with zero value-gated candidates).
 - `finish --force`: `finish` without it is refused (exit 2) while no stop
   condition is reached and value>=floor ready candidates remain (or the
   backlog needs expansion); the refusal mutates nothing, so an open round

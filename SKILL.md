@@ -93,7 +93,7 @@ Use the analysis cache to avoid re-reading the whole repo every round:
 
 1. Run `python <this-skill>/scripts/autopilot_state.py analysis-load --repo <repo>`.
 2. If it reports `"valid": true`, reuse the cached analysis and do **not** re-scan the tree, README, or CI files. Update only what the current candidate needs.
-3. If it reports `missing`/`stale`, gather fresh context and save it back with `analysis-save --content '<json>'` so the next rounds inherit this understanding. The cache auto-invalidates when `git HEAD` moves or `.autopilot/config.json` changes, so it never goes stale silently.
+3. If it reports `missing`/`stale`, gather fresh context and save it back with `analysis-save --content '<json>'` so the next rounds inherit this understanding. Invalidation is only *judged* at `analysis-load` time — nothing watches it in the background. `check` exposes the cache state in its `analysis` payload (`status`: missing/fresh/stale, `commits_behind`: how many commits the cache predates), so before the next expansion wave, read that payload: a stale cache means every proposal is grounded in a repo that no longer exists. Every expansion wave must start with a fresh scan and `analysis-save`.
 
 Fresh analysis gathers:
 
@@ -256,7 +256,7 @@ Wave order: when trigger #1 fires and open goal seeds exist, the first wave is W
 
 In every expansion wave:
 
-- **Scout with fresh eyes**: do not reuse the same analysis that got you here. Run `analysis-save` with a fresh scan, and propose 3-5 expansion candidates from a detached perspective (what would a user or a different engineer want next?).
+- **Scout with fresh eyes**: do not reuse the same analysis that got you here. Read `check`'s `analysis.status`/`commits_behind`, rescan the repo, and run `analysis-save` with the fresh scan before spawning subagents. Pick this wave's lenses from `lenses_unused`, and record the wave afterwards with `expansion-record --lens ...`. Propose 3-5 expansion candidates from a detached perspective (what would a user or a different engineer want next?).
 - **Value-gate before building**: add candidates with `type`/`value`/`effort`/`risk` and let `backlog-rank` score them. A candidate whose value cannot be stated in one concrete sentence is rejected — no random feature bloat. Prefer candidates in a `type` you have not saturated (`score_breakdown.saturation_factor` exposes this).
 - Keep honoring `review_threshold`, verification, and commit batching as usual.
 
@@ -270,23 +270,25 @@ When `check` returns `action_hint: "expand"`, the backlog is empty, or local ana
 
 ### Wave shape
 
-1. **Spawn explore subagents in parallel** (3-6 per wave, never the same lens set twice). Each subagent must return 2-5 concrete improvement candidates — not vibes. Cover a rotating subset of these lenses:
-   - architecture / coupling / module boundaries / layering violations
-   - tests, coverage gaps, flaky fixtures, missing edge-case matrix
-   - security, secrets, authz, input validation, dependency hygiene
-   - performance, I/O, algorithmic hotspots, N+1, memory churn
-   - docs, CLI ergonomics, error messages, DX of public surfaces
-   - dead code, TODO/FIXME/HACK debt, unfinished features, commented-out logic
-   - API design, backward compatibility, schema/versioning
-   - concurrency, async correctness, resource cleanup, context managers
-   - i18n / accessibility / Windows-path / encoding edge cases
-   - config surface, defaults, env handling, feature flags
-   - observability: logging, metrics, actionable errors vs silent failure
-   - packaging, install, CI matrix, release/version drift
-   - data integrity, migrations, idempotency, rollback paths
-   - UX copy, naming consistency, surprising defaults
-   - dependency graph: unused deps, outdated pins, duplicate abstractions
-   - cross-cutting: rate limits, timeouts, retries, circuit breakers
+1. **Pick this wave's lenses from the helper, not from memory**: read `check`'s `lenses_unused` (top-level payload; `wave_no` counts past waves) and assign 3-6 subagents one unused lens each. At the end of the wave, record it: `expansion-record --repo <repo> --lens <lens> ...` (repeat `--lens` once per lens used). Repeating the previous wave's exact lens set triggers a `[WARN]` and an `expansion-wave` warn event — rotation is observable, not taken on faith. Each subagent must return 2-5 concrete improvement candidates **with evidence** — not vibes. Lens → probe command → evidence the subagent must bring back:
+
+   | Lens | Probe command (adapt to the repo) | Required evidence |
+   |---|---|---|
+   | tests | `python -m coverage run -m pytest && coverage report --show-missing` (or the repo's equivalent) | list of uncovered public entry points / branches, with file:line |
+   | performance | `python -m cProfile -s cumtime <real workload>` | hotspot functions with elapsed-time percentages |
+   | security / dependency | `pip-audit`; `pip list --outdated` (Node: `npm audit`) | outdated/vulnerable dependency list with versions |
+   | observability | `grep -rn "except Exception\|except: pass\|TODO\|FIXME" --include=*.py` | itemized list of swallowed exceptions / silent failures (file:line) |
+   | docs / ux-copy | walk the README quickstart and the main CLI end-to-end by hand | step-by-step friction points (which step, what tripped) |
+   | dependency-graph | list "A must land before B" pairs from imports/entry points | explicit pairs, each promoted with `backlog-add --depends-on` |
+   | architecture | `git log -p` on the hottest files plus an import-direction scan | layering violations / circular imports as module:line pairs |
+   | dead-code | public symbol audit + `grep -rn "TODO\|FIXME\|HACK"` | unused/dead symbols and unfinished work with file:line |
+   | api-design | read the public entry-point signatures and their docs | inconsistency / breaking-change risks as symbol:line |
+   | concurrency | `grep -rn "threading\|asyncio\|Lock\|thread=True"` | shared mutable state and missing cleanup, file:line |
+   | i18n | grep for hardcoded user-facing strings and non-ASCII handling | encoding/copy leaks with file:line |
+   | config | diff `--help` output against `references/config.md`/defaults | defaults that disagree with docs, flag by flag |
+   | packaging | install/build smoke (`pip install -e .` or equivalent, then `--help`) | broken entry points / missing metadata, step by step |
+   | data-integrity | exercise migration/rollback paths and idempotency tests | gaps where data can be corrupted or half-written |
+   | cross-cutting | `grep -rn "timeout\|retry\|backoff"` at network/subprocess call sites | call sites missing timeouts/retries, file:line |
 
    Lens → helper-signal map (what to consult per lens family before proposing):
 
@@ -298,12 +300,12 @@ When `check` returns `action_hint: "expand"`, the backlog is empty, or local ana
    | docs / UX copy / CLI ergonomics | diff between `SKILL.md`/`README.md`/`references/config.md` claims and `--help` output |
    | observability / data integrity | `.autopilot/log.jsonl` event coverage, migration tests in `scripts/test_autopilot_state.py` |
    | any origin tagging | `backlog-add --origin expansion` (separate quota: `max_expansion_per_round`, default uncapped — expansion work already passed the value gate, unlike unproven predictions; see 刀 B guardrails) |
-2. **Judge and ingest**: for each proposal, require one concrete user-facing sentence of value. Add winners with `backlog-add` (`type`/`value`/`effort`/`risk`; use `depends-on` when needed). Reject vague or cosmetic noise — but do not reject merely because effort is high; high-value large work is still work.
-3. **If still thin, escalate the search, not the conversation**:
+2. **Judge and ingest**: for each proposal, require one concrete user-facing sentence of value **and evidence — a file:line quote or a probe-command output snippet**. Proposals without evidence get exactly one follow-up round; still unevidenced, they are rejected. Record winning candidates with `backlog-add` and put the evidence trail in `--evidence` (it is stored on the candidate and feeds ranking/retrospective audits); pass `type`/`value`/`effort`/`risk` explicitly and use `depends-on` when needed. Reject vague or cosmetic noise — but do not reject merely because effort is high; high-value large work is still work.
+3. **If still thin, escalate the search, not the conversation** — and let the helper's counters decide where you are: `wave_no` is the number of recorded waves, `lenses_unused` the lenses not yet tried.
    - Wave 2: lower `min_candidate_value` floor temporarily (accept 2s), look at adjacent modules, user-facing polish, test debt.
    - Wave 3+: change *depth* — read the hardest/most-used paths end-to-end; trace a real user journey; audit every public symbol; re-scan after `git log -p` for regressions the history already hints at.
    - Wave 4+: change *scope* — sibling packages, scripts, CI workflows, generated files, docs site, examples, packaging metadata.
-   - Keep spawning until you have `min_pending_candidates` ready pending items or a budget stop fires. **Never finish with reason "expansion exhausted" while budgets remain** — this is now enforced in code: while the budgets (`max_rounds`/`max_minutes`/`deadline`/`max_tokens`) are not exhausted and `check` still returns `continue: true`, a `finish` without `--force` is refused. The only honest finish reasons are "a stop condition fired" or "the user explicitly asked (finish --force)".
+   - Keep spawning until you have `min_pending_candidates` ready pending items or a budget stop fires. **Never finish with reason "expansion exhausted" while budgets remain** — this is now enforced in code: while the budgets (`max_rounds`/`max_minutes`/`deadline`/`max_tokens`) are not exhausted and `check` still returns `continue: true`, a `finish` without `--force` is refused. The only honest finish reasons are "a stop condition fired" or "the user explicitly asked (finish --force)". Declaring expansion exhausted has its own bar: **2 consecutive recorded waves (`expansion-record`), each with >=3 subagents over >=3 unused lenses (`lenses_unused` before the wave), yielding zero candidates that pass the value gate** — and even then the run only stops on a budget, not on the declaration.
 4. **No-subagent runtime fallback**: if the host has no Task/Agent/explore tool, run the same lenses **serially in-process**: one lens per pass, `analysis-save` between passes, `git log -p` archaeology, end-to-end traces of public entry points. Do not claim "cannot expand" and do not re-read the same three files hoping for new ideas.
 5. **After goals are met** (especially with `expand_after_goals: true`), treat every subsequent thin backlog the same way: expand outward via subagents instead of finishing early.
 
