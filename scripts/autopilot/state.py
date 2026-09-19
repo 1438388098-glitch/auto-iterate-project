@@ -208,6 +208,16 @@ def load_state(repo):
         )
         raise SystemExit(2)
     changed = migrate_state(state)
+    if state.get("run_start_sha") is None:
+        # Pre-anchor states must not fall back to EMPTY_TREE: that bills the
+        # whole EMPTY_TREE..HEAD diff as one round and can fake-trigger
+        # max_tokens. Anchor billing at first load instead — work committed
+        # before the upgrade is unreconstructable and stays unbilled on
+        # purpose. EMPTY_TREE (an existing value) is left alone so an unborn
+        # repo does not churn the state file on every load.
+        head = io.run_git(repo, "rev-parse", "--verify", "-q", "HEAD")
+        state["run_start_sha"] = head.stdout.strip() if head.returncode == 0 else io.EMPTY_TREE
+        changed = True
     _validate_state_types(repo, state)
     old_schema = state.get("schema", 1)
     if old_schema < io.SCHEMA_VERSION:

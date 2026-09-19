@@ -2611,6 +2611,21 @@ class MigrationTests(RepoTest):
         disk = json.loads(state_path.read_text(encoding="utf-8"))
         self.assertIn("estimated_tokens_used", disk)
 
+    def test_migrated_state_anchors_tokens_at_load_not_empty_tree(self):
+        self.run_state("init")
+        state_path = self.repo / ".autopilot" / "state.json"
+        state = json.loads(state_path.read_text(encoding="utf-8"))
+        state.pop("run_start_sha", None)
+        state_path.write_text(json.dumps(state), encoding="utf-8")
+        self.run_state("read")
+        anchor = json.loads(state_path.read_text(encoding="utf-8"))["run_start_sha"]
+        head = self.git("rev-parse", "HEAD").stdout.strip()
+        self.assertEqual(anchor, head)
+        # Anchored at HEAD: the pre-upgrade commit history must not be billed
+        # (EMPTY_TREE would bill the whole repo and fake-trigger max_tokens).
+        _, total_text, total_binary = ap_io.estimate_tokens_for_round(self.repo, anchor, 0, 0)
+        self.assertEqual((total_text, total_binary), (0, 0))
+
 
 class TokenEstimateTests(RepoTest):
     def test_estimate_anchors_on_round_start(self):
