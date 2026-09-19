@@ -46,6 +46,31 @@ helper now enforces honest finishing in code instead of trusting the prompt.
 
 ### Added
 
+- Budget & round accounting fixes from the QA/ES audit:
+  - Zero-work cancels no longer consume the run: a cancel with no working-tree
+    delta against the round's snapshot, no commit, and a life under 10 minutes
+    records an `aborted` history entry (labels: 空转取消 / aborted), advances
+    no round counter and burns no token base; round numbers stay unique via a
+    new `round_seq` sequence (migrated from the old counters). A real-work
+    cancel still counts as `cancelled`.
+  - Tokens are billed monotonically per run: `run_start_sha` (anchored at
+    init) plus the worktree/index delta are two disjoint measurements of the
+    run's true total, and each round is charged only the delta above the
+    persisted `billed_text`/`billed_binary` water marks. The QA-3 scenario
+    (two staged rounds committed in a third) now bills [620, 620, 500] instead
+    of double-counting the same 20 lines ([620, 620, 740]). A `--tokens`
+    override still advances the water marks so overridden lines are not billed
+    again later.
+  - `check` reports `blocked_streak` (warning at 1..max-1: "one more blocked
+    round stops the run"), a `budget` payload (`max_minutes`,
+    `last_activity_at`, `remaining_minutes`, `deadline_remaining_minutes`),
+    and boundary-correct schedule hints (round 5 with
+    `commit_every_rounds: 5` reports `next_commit_round` 5, not 10).
+  - `complete-round --below-threshold` records a quality-failed round as
+    completed with its low score (calibration still learns from it) without
+    counting blocked — the only in-run exit once `max_blocked_in_a_row` fires,
+    since begin-round is refused after the stop. The max_blocked stop message
+    and the SKILL.md troubleshooting row point at it.
 - Expansion-wave protocol is now recorded in state instead of being an
   unenforceable prompt rule: `expansion-record --lens <lens> ...` writes
   bounded `{at, lenses, added}` records into `state.expansion_waves` (new
