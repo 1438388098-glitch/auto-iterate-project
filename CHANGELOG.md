@@ -8,6 +8,42 @@ P0 anti-early-stop hardening: an autonomous run once finished ~5 hours before
 its deadline with a "backlog exhausted" reason and zero helper pushback. The
 helper now enforces honest finishing in code instead of trusting the prompt.
 
+### Changed
+
+- Ranking/batch fixes from the real-data audit (ES/DX/TG findings, deduped):
+  - `_mark_selection`: `expansion`-origin candidates are no longer capped by
+    the predicted quota nor cut in the late run (they get their own
+    `max_expansion_per_round`, default uncapped — expansion work already
+    passed the main agent's value gate). The 40% cutoff now uses the FIRST
+    SELECTED entry as its base (the top-ranked entry can be quota-cut, which
+    used to raise the bar for everything else and empty the batch) and only
+    prunes below-floor entries; above-floor candidates stay eligible until
+    the batch is full. The below-floor quick-win fallback fills all remaining
+    slots (still obeying origin quotas). Skipped ready entries carry
+    `cut_reason` (`quota`/`late_run`/`type`/`cutoff`/`batch_full`).
+  - Saturation decay is logarithmic with a 0.35 floor (28 completed over
+    threshold now yields 0.417 instead of 4.6e-05), so the dominant type's
+    value>=4 work is dented, not vetoed. Effort cost is free within one
+    round's batch width and linear beyond it, replacing the unconditional
+    log2(1+effort) that fought the batch-width default.
+  - `check` runs one `rank_candidates` pass and reports `selected_count` /
+    `selected_empty_reason`; `action_hint` is forced to `expand` when the
+    batch is empty while ready candidates remain (contract: "work" implies a
+    non-empty selection). New warnings: calibration never activated
+    (`review_threshold` unset, 3+ completed rounds, zero review scores) and a
+    capacity hint when pending >= 2x the batch width.
+  - `compute_type_stats` calibration cold start: a type with <3 reviewed
+    candidates borrows the run-wide review/value ratio (clamped 0.6-1.5).
+  - `backlog-update`/`backlog-remove` refresh `state.type_stats`, so the
+    expansion payload can no longer contradict what ranking computes fresh.
+- Defaults & seeds: `candidates_per_round` 3 -> 4 (per-round overhead
+  amortizes over more work); `begin-round`'s no-candidate refusal now splits
+  above-floor from below-only pools ("Only below-floor candidates are ready
+  (N). Run Deep Expansion first, or pass --candidate-id explicitly to accept
+  a quick win."); `backlog-add --origin expansion --evidence ...` defaults to
+  confidence 0.9 (predictions stay 0.75); goal-met seeds skip `bugfix` as the
+  default type and default to `risk` 2.
+
 ### Added
 
 - `finish --force`: `finish` without it is refused (exit 2) while no stop
