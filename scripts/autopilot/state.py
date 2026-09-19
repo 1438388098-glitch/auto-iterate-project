@@ -50,11 +50,15 @@ def default_state(repo, goals=None, config_fingerprint=None):
         "started_at": started_at,
         "last_activity_at": started_at,
         "round": 0,
+        "round_seq": 0,
         "completed_rounds": 0,
         "blocked_rounds": 0,
         "cancelled_rounds": 0,
         "reverted_rounds": 0,
         "estimated_tokens_used": 0,
+        "run_start_sha": None,
+        "billed_text": 0,
+        "billed_binary": 0,
         "type_stats": {},
         "goals": list(goals or []),
         "completed_goals": [],
@@ -96,12 +100,26 @@ def migrate_state(state):
         "stop_reason": None,
         "finished_at": None,
         "config_fingerprint": None,
+        "run_start_sha": None,
+        "billed_text": 0,
+        "billed_binary": 0,
     }
     changed = False
     for key, value in defaults.items():
         if key not in state:
             state[key] = value
             changed = True
+    if "round_seq" not in state:
+        # Round numbers must never be reused, but zero-work aborted rounds no
+        # longer advance the round counters; backfill the sequence from the
+        # counters of every round the old scheme actually counted.
+        state["round_seq"] = (
+            state.get("completed_rounds", 0)
+            + state.get("blocked_rounds", 0)
+            + state.get("cancelled_rounds", 0)
+            + state.get("reverted_rounds", 0)
+        )
+        changed = True
     if state.get("started_at") is None:
         state["started_at"] = state.get("created_at")
         changed = True
@@ -114,6 +132,7 @@ def migrate_state(state):
 _STATE_INT_KEYS = (
     "schema",
     "round",
+    "round_seq",
     "completed_rounds",
     "blocked_rounds",
     "cancelled_rounds",
@@ -641,7 +660,11 @@ def compute_stop_reason(state, cfg):
         consecutive_blocked = count_consecutive_blocked(state)
         max_blocked = cfg.get("max_blocked_in_a_row")
         if max_blocked is not None and consecutive_blocked >= max_blocked:
-            stop_reason = "max_blocked_in_a_row reached ({}/{})".format(consecutive_blocked, max_blocked)
+            stop_reason = (
+                "max_blocked_in_a_row reached ({}/{}); quality-failed rounds can complete "
+                "instead: complete-round --below-threshold records the low score without "
+                "counting blocked".format(consecutive_blocked, max_blocked)
+            )
 
     if stop_reason is None:
         max_minutes = cfg.get("max_minutes")
@@ -1457,6 +1480,7 @@ def build_retrospective(repo, state, cfg, lang="zh"):
 _STATUS_LABELS = {
     "zh": {
         "completed": "已完成", "blocked": "受阻", "cancelled": "已取消",
+        "aborted": "空转取消",
         "revert": "已回滚", "picked": "进行中", "pending": "待处理",
         "run_report": "Auto Iterate 运行报告", "meta": "运行信息", "goals": "目标",
         "counts": "轮次统计", "history": "轮次历史", "backlog": "改进清单",
@@ -1469,6 +1493,7 @@ _STATUS_LABELS = {
     },
     "en": {
         "completed": "completed", "blocked": "blocked", "cancelled": "cancelled",
+        "aborted": "aborted",
         "revert": "reverted", "picked": "in progress", "pending": "pending",
         "run_report": "Auto Iterate Run Report", "meta": "Run info", "goals": "Goals",
         "counts": "Round counts", "history": "Round history", "backlog": "Backlog",

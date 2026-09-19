@@ -1147,6 +1147,192 @@ class ConfigSetTests(RepoTest):
         self.assertEqual(self.read_json("config.json")["min_pending_candidates"], 5)
 
 
+class BudgetAccountingTests(RepoTest):
+    """P1 budget/round accounting: zero-work cancels do not consume a round,
+    tokens are billed monotonically per run, blocked streaks and budgets are
+    observable in check."""
+
+    def _touch_staged(self, name, lines=10):
+        (self.repo / name).write_text("x = 1\n" * lines, encoding="utf-8")
+        self.git("add", name)
+
+    def test_zero_work_cancel_does_not_consume_round(self):
+        self.run_state("init")
+        self.run_state("begin-round", "--title", "probe", "--reason", "x")
+        result = self.run_state("cancel-round", "--reason", "wrong flag")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        state = self.read_json("state.json")
+        self.assertEqual(
+            (state["completed_rounds"], state["blocked_rounds"], state["cancelled_rounds"]),
+            (0, 0, 0),
+        )
+        self.assertEqual(state["history"][-1]["status"], "aborted")
+        self.assertEqual(state["estimated_tokens_used"], 0)
+        # The next round gets a fresh number from round_seq (never reuses 1).
+        self.run_state("begin-round", "--title", "real", "--reason", "x")
+        state = self.read_json("state.json")
+        self.assertEqual(state["current_round"]["round"], 2)
+        self.assertEqual(state["round_seq"], 2)
+        # aborted does not advance the max_rounds denominator: with
+        # max_rounds 2 the one real completed round still allows round 3.
+        self.run_state("complete-round", "--summary", "done")
+        result = self.run_state("begin-round", "--title", "r3", "--reason", "x")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(self.read_json("state.json")["current_round"]["round"], 3)
+
+    def test_zero_work_cancel_thresholds(self):
+        self.run_state("init")
+        # Working-tree changes exist -> still a billed cancelled round.
+        self.run_state("begin-round", "--title", "a", "--reason", "x")
+        self.add_file()
+        self.run_state("cancel-round", "--reason", "real work pending")
+        state = self.read_json("state.json")
+        self.assertEqual(state["history"][-1]["status"], "cancelled")
+        self.assertEqual(state["cancelled_rounds"], 1)
+        # A commit happened during the round -> cancelled.
+        self.run_state("begin-round", "--title", "b", "--reason", "x")
+        self.add_file("b.py")
+        self.git("add", "b.py")
+        self.git("commit", "-q", "-m", "work")
+        self.run_state("cancel-round", "--reason", "after commit")
+        state = self.read_json("state.json")
+        self.assertEqual(state["history"][-1]["status"], "cancelled")
+        self.assertEqual(state["cancelled_rounds"], 2)
+        # Old probe (>10 minutes) with no changes -> cancelled again.
+        self.run_state("begin-round", "--title", "c", "--reason", "x")
+        state_path = self.repo / ".autopilot" / "state.json"
+        state = json.loads(state_path.read_text(encoding="utf-8"))
+        state["current_round"]["started_at"] = "2020-01-01T00:00:00+00:00"
+        state_path.write_text(json.dumps(state), encoding="utf-8")
+        self.run_state("cancel-round", "--reason", "stale probe")
+        state = self.read_json("state.json")
+        self.assertEqual(state["history"][-1]["status"], "cancelled")
+        self.assertEqual(state["cancelled_rounds"], 3)
+
+    def test_token_accounting_monotonic(self):
+        # QA-3: two staged rounds committed in round 3 used to bill the same
+        # 20 lines twice ([620, 620, 740] = 1980); the run-level water marks
+        # bill them once ([620, 620, 500] = 1740).
+        self.run_state("init")
+        self.run_state("begin-round", "--title", "r1", "--reason", "x")
+        self._touch_staged("w1.py")
+        self.run_state("complete-round", "--summary", "r1")
+        self.run_state("begin-round", "--title", "r2", "--reason", "x")
+        self._touch_staged("w2.py")
+        self.run_state("complete-round", "--summary", "r2")
+        self.run_state("begin-round", "--title", "r3", "--reason", "x")
+        self.git("commit", "-q", "-m", "batch")
+        sha = self.git("rev-parse", "HEAD").stdout.strip()
+        self.run_state("complete-round", "--summary", "r3", "--commit-sha", sha)
+        state = self.read_json("state.json")
+        tokens = [entry["estimated_tokens"] for entry in state["history"]]
+        self.assertEqual(tokens, [620, 620, 500])
+        self.assertEqual(state["estimated_tokens_used"], 1740)
+
+    def test_check_reports_blocked_streak(self):
+        self.run_state("init")
+        self.run_state("begin-round", "--title", "a", "--reason", "x")
+        self.run_state("block-round", "--reason", "b1")
+        data = json.loads(self.run_state("check", "--brief").stdout)
+        self.assertEqual(data["blocked_streak"], 1)
+        self.assertTrue(any("one more blocked round stops the run" in w for w in data["warnings"]))
+        # Second blocked round fires max_blocked_in_a_row (default 2).
+        self.run_state("begin-round", "--title", "b", "--reason", "x")
+        self.run_state("block-round", "--reason", "b2")
+        data = json.loads(self.run_state("check", "--brief").stdout)
+        self.assertEqual(data["blocked_streak"], 2)
+        self.assertTrue(data["stop_reason"].startswith("max_blocked_in_a_row"))
+
+    def test_complete_round_below_threshold_records_score(self):
+        self.run_state("init", "--review-threshold", "4", "--goal", "G")
+        self.run_state("backlog-add", "--title", "A", "--reason", "r", "--value", "4",
+                       "--effort", "2", "--type", "docs")
+        cid = self.read_json("backlog.json")["candidates"][0]["id"]
+        self.run_state("begin-round", "--title", "A", "--reason", "r", "--candidate-id", cid)
+        self.add_file()
+        self.git("add", "feature.py")
+        self.git("commit", "-q", "-m", "work")
+        sha = self.git("rev-parse", "HEAD").stdout.strip()
+        # Without the flag the refusal stands (original behavior locked).
+        refused = self.run_state("complete-round", "--summary", "s", "--commit-sha", sha,
+                                 "--review-score", "3")
+        self.assertNotEqual(refused.returncode, 0)
+        self.assertIn("below review_threshold", refused.stderr)
+        result = self.run_state("complete-round", "--summary", "s", "--commit-sha", sha,
+                                "--review-score", "3", "--below-threshold")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        state = self.read_json("state.json")
+        self.assertEqual(state["history"][-1]["review_score"], 3)
+        self.assertTrue(state["history"][-1]["below_threshold"])
+        self.assertEqual(state["history"][-1]["status"], "completed")
+        self.assertEqual(state["blocked_rounds"], 0)
+        # The low score still lands in the calibration ledger.
+        self.assertGreaterEqual(self.read_json("state.json")["type_stats"]["docs"]["review_n"], 1)
+
+    def test_check_reports_budget_remaining(self):
+        self.run_state("init", "--max-minutes", "60")
+        state = self.read_json("state.json")
+        data = json.loads(self.run_state("check", "--brief").stdout)
+        self.assertEqual(data["budget"]["max_minutes"], 60)
+        self.assertEqual(data["budget"]["last_activity_at"], state["last_activity_at"])
+        self.assertIsNotNone(data["budget"]["remaining_minutes"])
+        self.assertGreater(data["budget"]["remaining_minutes"], 0)
+        self.assertLessEqual(data["budget"]["remaining_minutes"], 60)
+
+    def test_resume_after_crash_mid_round(self):
+        self.run_state("init")
+        self.run_state("begin-round", "--title", "r", "--reason", "x")
+        # Simulate a crash that killed the process holding the lock.
+        lock = self.repo / ".autopilot" / "lock"
+        if lock.exists():
+            lock.unlink()
+        data = json.loads(self.run_state("check", "--brief").stdout)
+        self.assertTrue(any("current_round is open" in w for w in data["warnings"]))
+        self.assertTrue(data["continue"])
+        self.add_file()
+        self.run_state("commit", "--summary", "add feature")
+        sha = self.git("rev-parse", "HEAD").stdout.strip()
+        result = self.run_state("complete-round", "--summary", "done", "--commit-sha", sha)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        state = self.read_json("state.json")
+        self.assertEqual(state["completed_rounds"], 1)
+        self.assertEqual(state["history"][-1]["status"], "completed")
+
+    def test_paused_run_stops_on_first_check(self):
+        self.run_state("init", "--max-minutes", "1")
+        self.run_state("begin-round", "--title", "r", "--reason", "x")
+        state_path = self.repo / ".autopilot" / "state.json"
+        state = json.loads(state_path.read_text(encoding="utf-8"))
+        state["last_activity_at"] = "2020-01-01T00:00:00+00:00"
+        state_path.write_text(json.dumps(state), encoding="utf-8")
+        data = json.loads(self.run_state("check", "--brief").stdout)
+        self.assertFalse(data["continue"])
+        self.assertIn("max_minutes", data["stop_reason"])
+
+    def test_resume_after_deadline_pass(self):
+        self.run_state("init", "--deadline", "2020-01-01T00:00:00")
+        data = json.loads(self.run_state("check", "--brief").stdout)
+        self.assertFalse(data["continue"])
+        self.assertIn("deadline", data["stop_reason"])
+
+    def test_schedule_hints_include_boundary_round(self):
+        self.run_state("init", "--commit-every-rounds", "5", "--verify-every-rounds", "3",
+                       "--checkpoint-every", "2")
+        state_path = self.repo / ".autopilot" / "state.json"
+        for completed, expected_commit in ((4, 5), (5, 5), (6, 10)):
+            state = json.loads(state_path.read_text(encoding="utf-8"))
+            state["completed_rounds"] = completed
+            state_path.write_text(json.dumps(state), encoding="utf-8")
+            data = json.loads(self.run_state("check", "--brief").stdout)
+            self.assertEqual(data["next_commit_round"], expected_commit, completed)
+            self.assertEqual(data["next_verify_round"], ((max(1, completed) - 1) // 3 + 1) * 3)
+            self.assertEqual(data["next_checkpoint_round"], ((max(1, completed) - 1) // 2 + 1) * 2)
+        # A brand-new run (current_number 0) still points at the first boundary.
+        self.run_state("init", "--force", "--checkpoint-every", "2")
+        data = json.loads(self.run_state("check", "--brief").stdout)
+        self.assertEqual(data["next_checkpoint_round"], 2)
+
+
 class OrphanCommitTests(RepoTest):
     def test_commit_refuses_without_open_round(self):
         self.run_state("init")
@@ -2825,6 +3011,10 @@ class OptimizationTests(RepoTest):
     def test_cancel_then_round_numbers_advance(self):
         self.run_state("init")
         self.run_state("begin-round", "--title", "c", "--reason", "x")
+        # Real work happened, so this is a billed cancelled round (a zero-work
+        # probe would be aborted: no counters, but the round number still
+        # advances via round_seq).
+        self.add_file()
         self.run_state("cancel-round", "--reason", "changed mind")
         self.run_state("begin-round", "--title", "r2", "--reason", "x")
         state = self.read_json("state.json")
@@ -3919,6 +4109,7 @@ class ContractTests(RepoTest):
                 "phase", "next_verify_round", "next_commit_round", "next_checkpoint_round",
                 "backlog", "action_hint", "selected_count", "selected_empty_reason",
                 "wave_no", "lenses_used", "lenses_unused", "analysis",
+                "blocked_streak", "budget",
             },
         )
         self.assertEqual(
@@ -4192,6 +4383,9 @@ class MaxRoundsCountingTests(RepoTest):
     def test_cancelled_rounds_count_toward_max_rounds(self):
         self.run_state("init", "--max-rounds", "1")
         self.run_state("begin-round", "--title", "r", "--reason", "x")
+        # Real work happened: this cancel is a billed cancelled round (a
+        # zero-work probe would be aborted and consume no budget).
+        self.add_file()
         self.run_state("cancel-round", "--reason", "nope")
         result = self.run_state("begin-round", "--title", "r2", "--reason", "y")
         self.assertNotEqual(result.returncode, 0)

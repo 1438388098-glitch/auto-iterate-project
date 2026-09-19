@@ -120,6 +120,9 @@ def build_parser():
     complete_parser.add_argument("--review-score", type=int, default=None,
                                  help="Self-review score 1-5 (required when config review_threshold is set)")
     complete_parser.add_argument("--review-notes", default=None, help="Optional self-review notes")
+    complete_parser.add_argument("--below-threshold", action="store_true",
+                                 help="Record the round as completed even when --review-score is below review_threshold "
+                                      "(the low score still feeds calibration; it does not count as blocked)")
     add_json(complete_parser)
     add_dry_run(complete_parser)
     complete_parser.set_defaults(func=commands.cmd_complete_round)

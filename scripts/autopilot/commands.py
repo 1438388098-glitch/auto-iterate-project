@@ -7,6 +7,7 @@ Orchestration only: secret scanning lives in ``secrets``, path guarding in
 import json
 import sys
 import uuid
+from datetime import datetime, timezone
 from pathlib import Path
 
 from . import config, io, state
@@ -199,6 +200,10 @@ def cmd_init(args):
         st["created_at"] = started_at
         st["started_at"] = started_at
         st["last_activity_at"] = started_at
+        # Anchor for run-level monotonic token accounting: everything this run
+        # commits is measured from here (EMPTY_TREE on an unborn repo).
+        init_head = io.run_git(repo, "rev-parse", "--verify", "-q", "HEAD")
+        st["run_start_sha"] = init_head.stdout.strip() if init_head.returncode == 0 else io.EMPTY_TREE
         state.save_state(repo, st)
         io.ensure_git_exclude(git_dir, cfg.get("track_state", False), to_stderr=getattr(args, "json", False))
         state.ensure_branch(repo, st, cfg, to_stderr=getattr(args, "json", False))
@@ -236,13 +241,10 @@ def cmd_begin_round(args):
                 )
             return emit_result(args, False, "[ERROR] Autopilot is stopped: {}. Finish or adjust the config before opening a new round.".format(stop_reason))
 
-        round_number = (
-            st.get("completed_rounds", 0)
-            + st.get("blocked_rounds", 0)
-            + st.get("cancelled_rounds", 0)
-            + st.get("reverted_rounds", 0)
-            + 1
-        )
+        # Round numbers come from a monotonic sequence, not from the round
+        # counters: zero-work aborted rounds do not advance max_rounds's
+        # denominator, yet their numbers are never reused.
+        round_number = st.get("round_seq", 0) + 1
         if getattr(args, "dry_run", False):
             print(
                 "[DRY-RUN] Would open round {}: {}.".format(round_number, args.title),
@@ -369,6 +371,7 @@ def cmd_begin_round(args):
             "started_at": io.now_iso(),
         }
         st["round"] = round_number
+        st["round_seq"] = round_number
         st["current_round"] = current
         st["last_activity_at"] = current["started_at"]
         state.save_state(repo, st)
@@ -379,16 +382,31 @@ def cmd_begin_round(args):
         return 0
 
 
-def _resolve_tokens(args, repo, start_sha, worktree_baseline=None):
+def _resolve_tokens(args, repo, st):
     """Thin wrapper over the single token-estimation authority
-    (io.estimate_tokens_for_round); honors an explicit --tokens override.
-    Negative overrides would silently refund the budget — refuse them."""
-    if args.tokens is not None:
+    (io.estimate_tokens_for_round). Run-level monotonic accounting: the round
+    is charged the run-wide delta above the already-billed water marks read
+    from state; the returned (billed_text, billed_binary) tuple must be
+    persisted by _close_round. An explicit --tokens override skips estimation
+    but still advances the water marks to the current totals, so the
+    overridden round's real lines are never billed again by a later round.
+    Negative overrides would silently refund the budget — refuse them.
+    Returns (tokens, (billed_text, billed_binary))."""
+    run_start_sha = st.get("run_start_sha")
+    billed_text = st.get("billed_text") or 0
+    billed_binary = st.get("billed_binary") or 0
+    if getattr(args, "tokens", None) is not None:
         if args.tokens < 0:
             print("[ERROR] --tokens must be a non-negative integer.", file=sys.stderr)
             raise SystemExit(2)
-        return args.tokens
-    return io.estimate_tokens_for_round(repo, start_sha, worktree_baseline)
+        _, total_text, total_binary = io.estimate_tokens_for_round(
+            repo, run_start_sha, billed_text, billed_binary
+        )
+        return args.tokens, (max(billed_text, total_text), max(billed_binary, total_binary))
+    tokens, total_text, total_binary = io.estimate_tokens_for_round(
+        repo, run_start_sha, billed_text, billed_binary
+    )
+    return tokens, (total_text, total_binary)
 
 
 def _refresh_type_stats(repo, st):
@@ -440,15 +458,19 @@ def _resolve_round_seeds_in_state(repo, st, current, outcome, notes=None):
 
 def _close_round(repo, st, current, status, counter_key, tokens, history_entry,
                  candidate_status, candidate_round=None, candidate_extra=None,
-                 seed_outcome=None, seed_notes=None):
+                 seed_outcome=None, seed_notes=None, billed=None):
     """Shared round-closing bookkeeping: bump the round counter, append tokens,
     record bounded history, release the round, update candidates in one backlog
     pass, resolve this round's seeds into the SAME state save, refresh type
-    stats, and persist state."""
+    stats, and persist state. `billed` is the run's advanced (text, binary)
+    water-mark tuple from _resolve_tokens; run_start_sha is already on state
+    and is persisted along with it."""
     if counter_key:
         st[counter_key] = st.get(counter_key, 0) + 1
     if tokens:
         st["estimated_tokens_used"] += tokens
+    if billed is not None:
+        st["billed_text"], st["billed_binary"] = billed
     st["last_activity_at"] = io.now_iso()
     history_entry.setdefault("status", status)
     state.append_history(st, history_entry)
@@ -481,7 +503,7 @@ def cmd_complete_round(args):
                     "[ERROR] --commit-sha does not resolve to a commit: {}".format(args.commit_sha),
                 )
 
-        tokens = _resolve_tokens(args, repo, current.get("start_sha"), current.get("worktree_baseline"))
+        tokens, billed = _resolve_tokens(args, repo, st)
         if getattr(args, "dry_run", False):
             print(
                 "[DRY-RUN] Would record round {} as completed with {} estimated tokens.".format(
@@ -499,6 +521,7 @@ def cmd_complete_round(args):
             io.append_log(repo, "complete-round", "error", reason="review score out of range")
             return emit_result(args, False, "[ERROR] --review-score must be between 1 and 5.")
         review_threshold = cfg.get("review_threshold")
+        below_threshold = False
         if review_threshold is not None:
             if args.review_score is None:
                 io.append_log(repo, "complete-round", "error", reason="review score required")
@@ -508,14 +531,20 @@ def cmd_complete_round(args):
                     "Self-review the round on a 1-5 scale and pass --review-score.".format(review_threshold),
                 )
             if args.review_score < review_threshold:
-                io.append_log(repo, "complete-round", "error", reason="review score below threshold")
-                return emit_result(
-                    args, False,
-                    "[ERROR] Self-review score {} is below review_threshold {}. "
-                    "Rework the round and re-verify, or run block-round.".format(
-                        args.review_score, review_threshold
-                    ),
-                )
+                if not getattr(args, "below_threshold", False):
+                    io.append_log(repo, "complete-round", "error", reason="review score below threshold")
+                    return emit_result(
+                        args, False,
+                        "[ERROR] Self-review score {} is below review_threshold {}. "
+                        "Rework the round and re-verify, run block-round, or pass "
+                        "--below-threshold to record the low score without blocking the run.".format(
+                            args.review_score, review_threshold
+                        ),
+                    )
+                # Explicit quality admit-down: the round stays completed (it
+                # does NOT count blocked, so the blocked streak resets), and
+                # the low score still feeds the calibration ledger.
+                below_threshold = True
 
         _close_round(
             repo, st, current,
@@ -532,6 +561,7 @@ def cmd_complete_round(args):
                 "candidate_id": current.get("candidate_id"),
                 "review_score": getattr(args, "review_score", None),
                 "review_notes": getattr(args, "review_notes", None) or "",
+                "below_threshold": below_threshold,
             },
             candidate_status="completed",
             candidate_round=current["round"],
@@ -539,7 +569,14 @@ def cmd_complete_round(args):
                 {"review_score": args.review_score} if getattr(args, "review_score", None) is not None else None
             ),
             seed_outcome="completed",
+            billed=billed,
         )
+        if below_threshold:
+            io.append_log(
+                repo, "complete-round", "warn",
+                round=current["round"], reason="below threshold accepted",
+                review_score=args.review_score, threshold=review_threshold,
+            )
         io.append_log(
             repo, "complete-round", "success",
             round=current["round"], commit_sha=args.commit_sha, estimated_tokens=tokens,
@@ -572,7 +609,7 @@ def cmd_block_round(args):
             io.append_log(repo, "block-round", "error", reason="no open round")
             return emit_result(args, False, "[ERROR] No open round to block.")
 
-        tokens = _resolve_tokens(args, repo, current.get("start_sha"), current.get("worktree_baseline"))
+        tokens, billed = _resolve_tokens(args, repo, st)
         if getattr(args, "dry_run", False):
             print(
                 "[DRY-RUN] Would mark round {} as blocked: {}.".format(current["round"], args.reason),
@@ -595,6 +632,7 @@ def cmd_block_round(args):
             candidate_round=current["round"],
             seed_outcome="blocked",
             seed_notes=args.reason,
+            billed=billed,
         )
         io.append_log(repo, "block-round", "success", round=current["round"], reason=args.reason)
         return emit_result(args, True, "[OK] Round blocked.")
@@ -609,13 +647,62 @@ def cmd_cancel_round(args):
             io.append_log(repo, "cancel-round", "error", reason="no open round")
             return emit_result(args, False, "[ERROR] No open round to cancel.")
 
-        tokens = _resolve_tokens(args, repo, current.get("start_sha"), current.get("worktree_baseline"))
+        # Zero-work probe retries (wrong flags, malformed refs, forgotten
+        # --reason...) used to be billed as full cancelled rounds: a cancelled
+        # round advanced max_rounds AND took the 500-token base each time.
+        # A round with no working-tree delta against its begin-round snapshot,
+        # no commit, and a short life is an aborted probe, not work.
+        started = io.parse_time(current.get("started_at"))
+        head = io.run_git(repo, "rev-parse", "--verify", "-q", "HEAD")
+        head_sha = head.stdout.strip() if head.returncode == 0 else None
+        elapsed = None
+        if started is not None:
+            elapsed = (io.parse_time(io.now_iso()) - started).total_seconds()
+        zero_work = (
+            io.worktree_change_lines(repo) == current.get("worktree_baseline")
+            and head_sha == current.get("start_sha")
+            and elapsed is not None and elapsed < 600
+        )
+
+        if zero_work:
+            tokens, billed = 0, None
+        else:
+            tokens, billed = _resolve_tokens(args, repo, st)
         if getattr(args, "dry_run", False):
             print(
-                "[DRY-RUN] Would cancel round {}: {}.".format(current["round"], args.reason or ""),
+                "[DRY-RUN] Would cancel round {}{}: {}.".format(
+                    current["round"],
+                    " as aborted (zero work)" if zero_work else "",
+                    args.reason or "",
+                ),
                 file=sys.stderr,
             )
             return 0
+        if zero_work:
+            _close_round(
+                repo, st, current,
+                status="aborted",
+                counter_key=None,
+                tokens=0,
+                history_entry={
+                    "round": current["round"],
+                    "status": "aborted",
+                    "title": args.title or current.get("title"),
+                    "reason": args.reason or "",
+                    "candidate_id": current.get("candidate_id"),
+                },
+                candidate_status="pending",
+                seed_outcome="cancelled",
+            )
+            io.append_log(
+                repo, "cancel-round", "success", round=current["round"],
+                reason=args.reason, zero_work=True,
+            )
+            return emit_result(
+                args, True,
+                "[OK] Round aborted (zero work): no changes, no commit, under 10 minutes "
+                "— no round budget or token base consumed.",
+            )
         _close_round(
             repo, st, current,
             status="cancelled",
@@ -630,6 +717,7 @@ def cmd_cancel_round(args):
             },
             candidate_status="pending",
             seed_outcome="cancelled",
+            billed=billed,
         )
         io.append_log(repo, "cancel-round", "success", round=current["round"], reason=args.reason)
         return emit_result(args, True, "[OK] Round cancelled.")
@@ -1795,13 +1883,8 @@ def cmd_undo_round(args):
                 "manually, then record the round with commit/complete-round.",
             )
         revert_sha = io.run_git(repo, "rev-parse", "HEAD").stdout.strip()
-        round_number = (
-            st.get("completed_rounds", 0)
-            + st.get("blocked_rounds", 0)
-            + st.get("cancelled_rounds", 0)
-            + st.get("reverted_rounds", 0)
-            + 1
-        )
+        # Round numbers come from the same monotonic sequence as begin-round.
+        round_number = st.get("round_seq", 0) + 1
         st["reverted_rounds"] = st.get("reverted_rounds", 0) + 1
         st["last_activity_at"] = io.now_iso()
         state.append_history(
@@ -1816,6 +1899,8 @@ def cmd_undo_round(args):
                 "candidate_id": None,
             },
         )
+        st["round"] = round_number
+        st["round_seq"] = round_number
         state.save_state(repo, st)
         io.append_log(repo, "undo-round", "success", round=round_number, commit_sha=revert_sha, reverted_sha=full_sha)
         return emit_result(
@@ -1968,6 +2053,16 @@ def cmd_check(args):
         remotes = io.run_git(repo, "remote")
         if remotes.returncode == 0 and not remotes.stdout.strip():
             warnings.append("push is true but no git remote is configured; complete-round will warn on every push attempt.")
+
+    blocked_streak = state.count_consecutive_blocked(st)
+    max_blocked = cfg.get("max_blocked_in_a_row")
+    if max_blocked is not None and 1 <= blocked_streak < max_blocked:
+        warnings.append(
+            "blocked streak {}/{}: one more blocked round stops the run; a quality-failed "
+            "round can complete instead via complete-round --below-threshold".format(
+                blocked_streak, max_blocked
+            )
+        )
 
     if (
         cfg.get("review_threshold") is None
@@ -2154,14 +2249,39 @@ def cmd_check(args):
         + st.get("reverted_rounds", 0)
     )
     current_number = completed_total + (1 if st.get("current_round") else 0)
+    # Boundary math: round k itself IS a boundary when k % every == 0, so the
+    # next boundary after round k is computed from k-1 (round 5 with
+    # commit_every_rounds 5 reports next_commit_round 5, not 10).
+    anchor = max(1, current_number)
     verify_every = cfg.get("verify_every_rounds") or 1
     commit_every = cfg.get("commit_every_rounds") or 1
-    payload["next_verify_round"] = ((current_number // verify_every) + 1) * verify_every
-    payload["next_commit_round"] = ((current_number // commit_every) + 1) * commit_every
+    payload["next_verify_round"] = ((anchor - 1) // verify_every + 1) * verify_every
+    payload["next_commit_round"] = ((anchor - 1) // commit_every + 1) * commit_every
     checkpoint_every = cfg.get("checkpoint_every")
     payload["next_checkpoint_round"] = (
-        ((current_number // checkpoint_every) + 1) * checkpoint_every if checkpoint_every else None
+        ((anchor - 1) // checkpoint_every + 1) * checkpoint_every if checkpoint_every else None
     )
+    payload["blocked_streak"] = blocked_streak
+
+    # Budget observability: max_minutes measures wall-clock since the last
+    # round activity (pausing burns it), deadline is an absolute moment.
+    max_minutes = cfg.get("max_minutes")
+    remaining_minutes = None
+    if max_minutes is not None:
+        last_activity = io.parse_time(st.get("last_activity_at") or st.get("started_at"))
+        if last_activity is not None:
+            elapsed = (datetime.now(timezone.utc) - last_activity).total_seconds() / 60
+            remaining_minutes = round(max(0.0, max_minutes - elapsed), 1)
+    deadline_remaining = None
+    deadline_at = io.parse_time(cfg.get("deadline"))
+    if deadline_at is not None:
+        deadline_remaining = round((deadline_at - datetime.now(timezone.utc)).total_seconds() / 60, 1)
+    payload["budget"] = {
+        "max_minutes": max_minutes,
+        "last_activity_at": st.get("last_activity_at"),
+        "remaining_minutes": remaining_minutes,
+        "deadline_remaining_minutes": deadline_remaining,
+    }
     if not getattr(args, "brief", False):
         payload["state"] = st
         payload["config"] = cfg

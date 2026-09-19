@@ -473,31 +473,38 @@ def _parse_numstat(stdout):
     return text, binary
 
 
-def estimate_tokens_for_round(repo, start_sha, worktree_baseline=None):
-    """Single authority for round token estimation: committed diff since the round's
-    start SHA, plus the working-tree/index delta measured against the snapshot taken
-    at begin-round (so deferred batched commits never double count earlier rounds'
-    uncommitted lines). Binary files are charged a flat cost because line counts are
-    meaningless for them."""
-    text = 0
-    binary = 0
-    base = start_sha or EMPTY_TREE
+def estimate_tokens_for_round(repo, run_start_sha, billed_text, billed_binary):
+    """Run-level monotonic accounting: each line is billed exactly once.
+
+    The run's total changed units are the committed diff from the run's start
+    SHA to HEAD plus the current working-tree/index delta against HEAD. The
+    two measurements are disjoint (committed lines left the worktree diff when
+    they were committed), so their sum is the run's true total and
+    re-measuring it after a commit can never double count lines an earlier
+    round already billed while they were still uncommitted. The round is
+    charged only the delta above the run's monotonic high-water marks
+    (billed_text / billed_binary, persisted in state by _close_round); the
+    TOKEN_BASE is charged every round that closes with real work. Binary files
+    are charged a flat cost because line counts are meaningless for them.
+    Returns (tokens, total_text, total_binary)."""
+    committed_t = committed_b = 0
+    base = run_start_sha or EMPTY_TREE
     if has_commits(repo):
         result = run_git(repo, "diff", "--numstat", base, "HEAD")
         if result.returncode == 0:
-            t, b = _parse_numstat(result.stdout)
-            text += t
-            binary += b
-    if worktree_baseline is not None:
-        text += max(0, worktree_change_lines(repo) - worktree_baseline)
-    return TOKEN_BASE + text * TOKENS_PER_TEXT_LINE + binary * TOKENS_PER_BINARY_FILE
+            committed_t, committed_b = _parse_numstat(result.stdout)
+    worktree_t, worktree_b = worktree_units(repo)
+    total_text = committed_t + worktree_t
+    total_binary = committed_b + worktree_b
+    delta_text = max(0, total_text - (billed_text or 0))
+    delta_binary = max(0, total_binary - (billed_binary or 0))
+    tokens = TOKEN_BASE + delta_text * TOKENS_PER_TEXT_LINE + delta_binary * TOKENS_PER_BINARY_FILE
+    return tokens, total_text, total_binary
 
 
-def worktree_change_lines(repo):
-    """Total changed units (text lines + binary files) in the working tree and the
-    index combined. Used to measure how much a batched round actually added on top
-    of the snapshot taken at begin-round, so deferred commits do not double count
-    earlier rounds' still-uncommitted lines in token accounting."""
+def worktree_units(repo):
+    """(text_lines, binary_files) changed in the working tree and the index
+    combined, measured against HEAD. Tuple form of worktree_change_lines."""
     text = 0
     binary = 0
     for diff_args in (("diff", "--numstat"), ("diff", "--cached", "--numstat")):
@@ -506,6 +513,15 @@ def worktree_change_lines(repo):
             t, b = _parse_numstat(result.stdout)
             text += t
             binary += b
+    return text, binary
+
+
+def worktree_change_lines(repo):
+    """Total changed units (text lines + binary files) in the working tree and the
+    index combined, measured against HEAD. Used by the zero-work cancel
+    threshold and the round's worktree snapshot; the tuple form
+    (worktree_units) feeds run-level token accounting."""
+    text, binary = worktree_units(repo)
     return text + binary
 
 
