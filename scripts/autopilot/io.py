@@ -150,13 +150,17 @@ def load_json(path, default=None):
 
 
 def save_json(path, data):
-    """Atomically write JSON via a temp file in the same directory."""
+    """Atomically write JSON via a temp file in the same directory, flushed and
+    fsynced before the rename (allow_nan=False also fail-closes on NaN/inf
+    payloads instead of writing JSON other parsers reject)."""
     path.parent.mkdir(parents=True, exist_ok=True)
-    payload = json.dumps(data, indent=2, ensure_ascii=False) + "\n"
+    payload = json.dumps(data, indent=2, ensure_ascii=False, allow_nan=False) + "\n"
     fd, tmp_name = tempfile.mkstemp(dir=str(path.parent), prefix=".tmp-")
     try:
         with os.fdopen(fd, "w", encoding="utf-8") as handle:
             handle.write(payload)
+            handle.flush()
+            os.fsync(handle.fileno())
         os.replace(tmp_name, str(path))
     except BaseException:
         try:
@@ -342,6 +346,11 @@ def _pid_alive(pid):
         return False
     try:
         os.kill(pid, 0)
+        return True
+    except PermissionError:
+        # EPERM means the process exists but belongs to another user: treating
+        # it as dead would delete a live run's lock. Windows already fails
+        # closed on tasklist trouble; align the POSIX branch.
         return True
     except OSError:
         return False

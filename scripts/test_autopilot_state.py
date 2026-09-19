@@ -1333,6 +1333,129 @@ class BudgetAccountingTests(RepoTest):
         self.assertEqual(data["next_checkpoint_round"], 2)
 
 
+class RobustnessTests(RepoTest):
+    """P2 hardening: config validation mirrors (QA-1/2/6), binary staged-diff
+    findings (QA-5), goal-text normalization (QA-7/8), and IO fail-closed
+    behaviors (QA-9/10)."""
+
+    def _write_config(self, payload):
+        config_path = self.repo / ".autopilot" / "config.json"
+        config_path.parent.mkdir(exist_ok=True)
+        config_path.write_text(json.dumps(payload), encoding="utf-8")
+
+    def _assert_load_config_exits(self, repo, expected_fragment):
+        from autopilot import config as config_module
+        with self.assertRaises(SystemExit) as ctx:
+            config_module.load_config(repo)
+        self.assertEqual(ctx.exception.code, 2)
+        self.assertIn(expected_fragment, ctx.exception.__class__.__name__ + str(ctx.exception))
+
+    def test_negative_blocked_and_retries_rejected(self):
+        self.run_state("init")
+        self._write_config({"max_blocked_in_a_row": -1})
+        from autopilot import config as config_module
+        with self.assertRaises(SystemExit) as ctx:
+            config_module.load_config(self.repo)
+        self.assertEqual(ctx.exception.code, 2)
+        # The error prints to stderr; capture the message via save of stderr.
+        result = self.run_state("check")
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("'max_blocked_in_a_row'", result.stderr)
+        self._write_config({"retries_per_round": -1})
+        result = self.run_state("check")
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("'retries_per_round'", result.stderr)
+
+    def test_nan_budget_rejected(self):
+        result = self.run_state("init", "--force", "--max-minutes", "nan")
+        self.assertEqual(result.returncode, 2)
+        self.assertIn("finite", result.stderr)
+        self.run_state("init", "--force")
+        self._write_config({"max_minutes": 1e999})
+        from autopilot import config as config_module
+        with self.assertRaises(SystemExit) as ctx:
+            config_module.load_config(self.repo)
+        self.assertEqual(ctx.exception.code, 2)
+        result = self.run_state("check")
+        self.assertIn("finite", result.stderr)
+
+    def test_binary_staged_produces_finding(self):
+        self.run_state("init")
+        self.run_state("begin-round", "--title", "r", "--reason", "x")
+        # A real binary blob whose (unscannable) content carries a token shape.
+        payload = b"\x00\x01\x02ghp_" + b"A" * 36 + b"\xff\xfe"
+        (self.repo / "keystore.bin").write_bytes(payload)
+        self.git("add", "keystore.bin")
+        from autopilot import secrets as secrets_module
+        findings = secrets_module.scan_staged_diff(self.repo)
+        binary = [f for f in findings if f.get("pattern") == "binary-staged"]
+        self.assertEqual(len(binary), 1)
+        self.assertEqual(binary[0]["file"], "keystore.bin")
+        self.assertIn("not scannable", binary[0]["text"])
+        # The commit helper refuses without --allow-secrets.
+        refused = self.run_state("commit", "--summary", "add keystore")
+        self.assertNotEqual(refused.returncode, 0)
+        self.assertIn("secret", refused.stderr.lower())
+        allowed = self.run_state("commit", "--summary", "add keystore", "--allow-secrets")
+        self.assertEqual(allowed.returncode, 0, allowed.stderr)
+
+    def test_init_force_rebuilds_config_fresh(self):
+        self.run_state("init")
+        self._write_config({"ranking_mode": "bogus"})
+        # init without --force still inherits and refuses to save; with --force
+        # the defaults + CLI win and the config becomes loadable again.
+        inherited = self.run_state("init", "--force")  # sanity: force is accepted
+        self.assertEqual(inherited.returncode, 0, inherited.stderr)
+        self._write_config({"ranking_mode": "bogus", "max_rounds": 3})
+        result = self.run_state("init", "--force")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(self.read_json("config.json")["ranking_mode"], "expected")
+        self.assertEqual(self.read_json("config.json")["max_rounds"], 10)
+        self.assertEqual(self.run_state("check").returncode, 0)
+
+    def test_split_goals_keeps_version_numbers(self):
+        self.assertEqual(
+            ap_state.split_goals("升级到 v1.3.3 并修复崩溃"),
+            ["升级到 v1.3.3 并修复崩溃"],
+        )
+        self.assertEqual(ap_state.split_goals("支持 3.5 版本"), ["支持 3.5 版本"])
+        # Sentence dots still split.
+        self.assertEqual(ap_state.split_goals("修复崩溃.加测试"), ["修复崩溃", "加测试"])
+
+    def test_report_goal_checkbox_normalizes(self):
+        self.run_state("init", "--force", "--goal", "发布 v1.3.3")
+        state_path = self.repo / ".autopilot" / "state.json"
+        state = json.loads(state_path.read_text(encoding="utf-8"))
+        state["completed_goals"] = ["发布 v1.3.3"]
+        state_path.write_text(json.dumps(state), encoding="utf-8")
+        cfg_path = self.repo / ".autopilot" / "config.json"
+        cfg = json.loads(cfg_path.read_text(encoding="utf-8"))
+        cfg["goals"] = ["发布 v1.3.3\u200b"]
+        cfg_path.write_text(json.dumps(cfg), encoding="utf-8")
+        # all_goals_met normalizes; the report checkbox must agree with it.
+        self.assertTrue(ap_state.all_goals_met(self.read_json("config.json"), state))
+        report = self.run_state("report")
+        self.assertEqual(report.returncode, 0, report.stderr)
+        self.assertIn("- [x]", report.stdout)
+
+    def test_pid_alive_permission_error_is_alive(self):
+        import autopilot.io as ap_io_module
+        original_run = ap_io_module.subprocess.run
+
+        def refuse(*args, **kwargs):
+            raise PermissionError("EPERM: operation not permitted")
+
+        try:
+            ap_io_module.subprocess.run = refuse
+            # PermissionError (EPERM) means the holder EXISTS: on POSIX os.kill
+            # raises it, on Windows the tasklist probe surfaces the same error
+            # class — both must fail closed to "alive" so a cross-user live
+            # lock is never deleted.
+            self.assertTrue(ap_io_module._pid_alive(12345))
+        finally:
+            ap_io_module.subprocess.run = original_run
+
+
 class OrphanCommitTests(RepoTest):
     def test_commit_refuses_without_open_round(self):
         self.run_state("init")
@@ -3184,7 +3307,12 @@ class OptimizationTests(RepoTest):
         config_path.write_text(json.dumps(config), encoding="utf-8")
         (self.repo / "blob.bin").write_bytes(b"\x00\x01\x02")
         self.git("add", "blob.bin")
-        result = self.run_state("commit", "--summary", "bin")
+        # The unscannable binary first trips the secret scan (binary-staged);
+        # --allow-secrets passes it so the scope guard can do its own refusal.
+        blocked = self.run_state("commit", "--summary", "bin")
+        self.assertNotEqual(blocked.returncode, 0)
+        self.assertIn("binary file staged", blocked.stderr)
+        result = self.run_state("commit", "--summary", "bin", "--allow-secrets")
         self.assertNotEqual(result.returncode, 0)
         self.assertIn("max_round_scope", result.stderr)
 

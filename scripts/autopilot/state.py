@@ -608,11 +608,12 @@ _GOAL_CONNECTORS = ("并且", "以及", "同时", "另外", "还有")
 
 def split_goals(text):
     """Split a natural-language request into concrete goals by sentence and comma
-    delimiters, stripping leading connectors like 以及/并且."""
+    delimiters, stripping leading connectors like 以及/并且. A dot between two
+    digits is a decimal point (v1.3.3 / 3.5), not a sentence break."""
     if not text:
         return []
     goals = []
-    for part in re.split(r"[。．；;\n\r，,、.]+", text):
+    for part in re.split(r"(?:(?<![0-9])\.(?![0-9])|[。．；;\n\r，,、])+", text):
         goal = part.strip(" \t\u3000")
         for conn in _GOAL_CONNECTORS:
             if goal.startswith(conn) and len(goal) > len(conn):
@@ -1529,14 +1530,16 @@ def build_report(repo, state, cfg, lang="en"):
     out.append("")
 
     goals = cfg.get("goals") or state.get("goals") or []
-    completed = set(state.get("completed_goals") or [])
+    # Same normalization as all_goals_met: a goal recorded with (or without)
+    # zero-width characters must not make the report contradict the stop logic.
+    completed = {normalize_goal_text(goal) for goal in state.get("completed_goals") or []}
     out.append("## {}".format(L["goals"]))
     out.append("")
     if not goals:
         out.append("- {}".format(L["none"]))
     else:
         for goal in goals:
-            mark = "x" if goal in completed else " "
+            mark = "x" if normalize_goal_text(goal) in completed else " "
             out.append("- [{}] {}".format(mark, goal))
     out.append("")
 

@@ -5,6 +5,7 @@ Orchestration only: secret scanning lives in ``secrets``, path guarding in
 ``io.estimate_tokens_for_round``."""
 
 import json
+import math
 import sys
 import uuid
 from datetime import datetime, timezone
@@ -46,9 +47,14 @@ def cmd_init(args):
             return 0
 
         cfg = config.default_config(repo)
-        existing_config = io.load_json(config.config_path_for(repo), None)
-        if existing_config is not None:
-            cfg.update(existing_config)
+        # Inherit the existing config only WITHOUT --force: with --force the
+        # defaults plus this command line are the single source of truth, so
+        # `init --force` is a real recovery exit for a corrupt config (it used
+        # to carry the broken values over and re-create the same dead state).
+        if not args.force:
+            existing_config = io.load_json(config.config_path_for(repo), None)
+            if existing_config is not None:
+                cfg.update(existing_config)
         cfg["repo"] = str(repo)
 
         if args.goal:
@@ -64,7 +70,17 @@ def cmd_init(args):
                      "--max-round-scope", "--retries-per-round",
                      "--max-blocked-in-a-row", "--max-expansion-per-round"):
             value = getattr(args, knob.lstrip("-").replace("-", "_"), None)
-            if value is not None and value < 0:
+            if value is None:
+                continue
+            # `--max-minutes nan` passes every comparison, fakes a successful
+            # init, and writes a literal NaN into config.json.
+            if isinstance(value, float) and not math.isfinite(value):
+                io.append_log(repo, "init", "error", reason="{} not finite".format(knob))
+                return emit_result(
+                    args, False,
+                    "[ERROR] {} must be a finite number (NaN/inf budgets never trigger).".format(knob),
+                )
+            if value < 0:
                 io.append_log(repo, "init", "error", reason="{} out of range".format(knob))
                 return emit_result(
                     args, False,
@@ -192,6 +208,9 @@ def cmd_init(args):
             )
             return 0
 
+        # Same validation the next load_config would apply — an init that
+        # writes a config it could never re-load is a bricked run.
+        config.validate_config(cfg)
         config.save_config(repo, cfg)
         started_at = io.now_iso()
         run_id = uuid.uuid4().hex[:io.RUN_ID_LENGTH]

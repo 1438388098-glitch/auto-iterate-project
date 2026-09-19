@@ -3,8 +3,10 @@
 This module is the single source of truth for field defaults (default_config);
 references/config.md and README.md mirror it."""
 
+import math
 import re
 import sys
+from pathlib import Path
 
 from . import io
 
@@ -87,19 +89,34 @@ def load_config(repo):
     merged = dict(defaults)
     merged.update(config)
     merged["repo"] = str(repo)
+    validate_config(merged)
+    return merged
+
+
+def validate_config(merged):
+    """Validate one fully merged config dict (defaults included). Raises
+    SystemExit(2) via _config_error on the first violation. Pure function:
+    load_config runs it after reading disk, and cmd_init runs it on the
+    command-line-built config BEFORE save_config, so an invalid init can never
+    write a config the next load would reject."""
+    path = config_path_for(Path(merged.get("repo") or "."))
 
     if not isinstance(merged["goals"], list):
-        _config_error(config_path_for(repo), "'goals' must be an array of strings")
+        _config_error(path, "'goals' must be an array of strings")
     for key in ("max_rounds", "max_minutes", "max_tokens", "max_round_scope"):
         value = merged.get(key)
         if value is not None and not isinstance(value, (int, float)):
-            _config_error(config_path_for(repo), "'{}' must be a number or null".format(key))
+            _config_error(path, "'{}' must be a number or null".format(key))
+        if isinstance(value, (int, float)) and not isinstance(value, bool) and not math.isfinite(value):
+            # JSON's NaN/Infinity literals (e.g. a hand-edited 1e999) parse as
+            # float inf and would make every budget comparison meaningless.
+            _config_error(path, "'{}' must be a finite number or null".format(key))
         if isinstance(value, bool) or (isinstance(value, (int, float)) and value < 0):
-            _config_error(config_path_for(repo), "'{}' must be a non-negative number or null".format(key))
+            _config_error(path, "'{}' must be a non-negative number or null".format(key))
     deadline = merged.get("deadline")
     if deadline is not None:
         if not isinstance(deadline, str):
-            _config_error(config_path_for(repo), "'deadline' must be an ISO-8601 timestamp string or null")
+            _config_error(path, "'deadline' must be an ISO-8601 timestamp string or null")
         elif io.parse_time(deadline) is None:
             _config_error(
                 config_path_for(repo),
@@ -107,66 +124,75 @@ def load_config(repo):
                 "'2026-08-10T08:00:00'). Use init --deadline to resolve relative "
                 "expressions like '+8h' or '08:00'.",
             )
-    if merged.get("max_blocked_in_a_row") is not None and not isinstance(merged["max_blocked_in_a_row"], int):
-        _config_error(config_path_for(repo), "'max_blocked_in_a_row' must be an integer or null")
-    if merged.get("retries_per_round") is not None and not isinstance(merged["retries_per_round"], int):
-        _config_error(config_path_for(repo), "'retries_per_round' must be an integer or null")
+    if merged.get("max_blocked_in_a_row") is not None and (
+        not isinstance(merged["max_blocked_in_a_row"], int) or isinstance(merged["max_blocked_in_a_row"], bool)
+    ):
+        _config_error(path, "'max_blocked_in_a_row' must be an integer or null")
+    if isinstance(merged.get("max_blocked_in_a_row"), int) and merged["max_blocked_in_a_row"] < 0:
+        # Negative silently stops the loop with zero rounds (0/-1 comparisons
+        # are always true); 0 is a legal "stop after any blocked round" value.
+        _config_error(path, "'max_blocked_in_a_row' must be a non-negative integer or null")
+    if merged.get("retries_per_round") is not None and (
+        not isinstance(merged["retries_per_round"], int) or isinstance(merged["retries_per_round"], bool)
+    ):
+        _config_error(path, "'retries_per_round' must be an integer or null")
+    if isinstance(merged.get("retries_per_round"), int) and merged["retries_per_round"] < 0:
+        _config_error(path, "'retries_per_round' must be a non-negative integer or null")
     cpr = merged.get("candidates_per_round")
     if cpr is not None and (not isinstance(cpr, int) or isinstance(cpr, bool) or cpr < 1):
-        _config_error(config_path_for(repo), "'candidates_per_round' must be a positive integer")
+        _config_error(path, "'candidates_per_round' must be a positive integer")
     for key in ("commit_every_rounds", "verify_every_rounds"):
         value = merged.get(key)
         if value is not None and (not isinstance(value, int) or isinstance(value, bool) or value < 1):
-            _config_error(config_path_for(repo), "'{}' must be a positive integer".format(key))
+            _config_error(path, "'{}' must be a positive integer".format(key))
     checkpoint = merged.get("checkpoint_every")
     if checkpoint is not None and (not isinstance(checkpoint, int) or isinstance(checkpoint, bool) or checkpoint < 1):
-        _config_error(config_path_for(repo), "'checkpoint_every' must be a positive integer or null")
+        _config_error(path, "'checkpoint_every' must be a positive integer or null")
     review = merged.get("review_threshold")
     if review is not None and (not isinstance(review, int) or isinstance(review, bool) or review < 1 or review > 5):
-        _config_error(config_path_for(repo), "'review_threshold' must be an integer 1-5 or null")
+        _config_error(path, "'review_threshold' must be an integer 1-5 or null")
     threshold = merged.get("type_saturation_threshold")
     if threshold is not None and (not isinstance(threshold, int) or isinstance(threshold, bool) or threshold < 0):
-        _config_error(config_path_for(repo), "'type_saturation_threshold' must be a non-negative integer")
+        _config_error(path, "'type_saturation_threshold' must be a non-negative integer")
     if merged.get("ranking_mode") not in ("expected", "classic"):
-        _config_error(config_path_for(repo), "'ranking_mode' must be 'expected' or 'classic'")
+        _config_error(path, "'ranking_mode' must be 'expected' or 'classic'")
     mcv = merged.get("min_candidate_value")
     if mcv is not None and (not isinstance(mcv, int) or isinstance(mcv, bool) or mcv < 1 or mcv > 5):
-        _config_error(config_path_for(repo), "'min_candidate_value' must be an integer 1-5 or null")
+        _config_error(path, "'min_candidate_value' must be an integer 1-5 or null")
     mst = merged.get("max_same_type_per_round")
     if mst is not None and (not isinstance(mst, int) or isinstance(mst, bool) or mst < 1):
-        _config_error(config_path_for(repo), "'max_same_type_per_round' must be a positive integer or null")
+        _config_error(path, "'max_same_type_per_round' must be a positive integer or null")
     mpc = merged.get("min_pending_candidates")
     if mpc is not None and (not isinstance(mpc, int) or isinstance(mpc, bool) or mpc < 0):
-        _config_error(config_path_for(repo), "'min_pending_candidates' must be a non-negative integer or null")
+        _config_error(path, "'min_pending_candidates' must be a non-negative integer or null")
     mpp = merged.get("max_predicted_per_round")
     if mpp is not None and (not isinstance(mpp, int) or isinstance(mpp, bool) or mpp < 0):
-        _config_error(config_path_for(repo), "'max_predicted_per_round' must be a non-negative integer or null")
+        _config_error(path, "'max_predicted_per_round' must be a non-negative integer or null")
     mer = merged.get("max_expansion_per_round")
     if mer is not None and (not isinstance(mer, int) or isinstance(mer, bool) or mer < 0):
-        _config_error(config_path_for(repo), "'max_expansion_per_round' must be a non-negative integer or null")
+        _config_error(path, "'max_expansion_per_round' must be a non-negative integer or null")
     if not isinstance(merged["check_commands"], list) or not all(isinstance(c, str) for c in merged["check_commands"]):
-        _config_error(config_path_for(repo), "'check_commands' must be an array of strings")
+        _config_error(path, "'check_commands' must be an array of strings")
     for key in ("allow_paths", "deny_paths", "secret_patterns"):
         if not isinstance(merged[key], list) or not all(isinstance(p, str) for p in merged[key]):
-            _config_error(config_path_for(repo), "'{}' must be an array of strings".format(key))
+            _config_error(path, "'{}' must be an array of strings".format(key))
     for pattern in merged["secret_patterns"]:
         try:
             re.compile(pattern)
         except re.error as exc:
             _config_error(
-                config_path_for(repo),
+                path,
                 "'secret_patterns' contains an invalid regex ({}): {}".format(pattern, exc),
             )
     if merged.get("report_lang") not in ("zh", "en"):
-        _config_error(config_path_for(repo), "'report_lang' must be 'zh' or 'en'")
+        _config_error(path, "'report_lang' must be 'zh' or 'en'")
     if merged.get("branch_mode") not in ("current", "feature"):
-        _config_error(config_path_for(repo), "'branch_mode' must be 'current' or 'feature'")
+        _config_error(path, "'branch_mode' must be 'current' or 'feature'")
     for key in ("push", "allow_uncommitted_changes", "track_state", "scan_secrets", "expand_after_goals"):
         if not isinstance(merged[key], bool):
-            _config_error(config_path_for(repo), "'{}' must be true or false".format(key))
+            _config_error(path, "'{}' must be true or false".format(key))
     if not isinstance(merged["commit_message_prefix"], str):
-        _config_error(config_path_for(repo), "'commit_message_prefix' must be a string")
-    return merged
+        _config_error(path, "'commit_message_prefix' must be a string")
 
 
 def save_config(repo, config):
