@@ -46,6 +46,27 @@ helper now enforces honest finishing in code instead of trusting the prompt.
 
 ### Added
 
+- Config/IO/scanner hardening from the QA audit (all reproduced on this repo
+  before fixing):
+  - `max_blocked_in_a_row`/`retries_per_round` reject negatives at load time
+    (a hand-edited `-1` used to produce `max_blocked_in_a_row reached (0/-1)`
+    — a permanently stopped run); `0` stays legal and is now documented.
+  - Budget knobs reject NaN/±inf: `init --max-minutes nan` used to succeed
+    (rc 0, literal `NaN` written to config.json, every `check` continuing
+    forever); a hand-edited `1e999` is rejected at load.
+  - `init` validates the merged config with the same `validate_config` the
+    next `load_config` applies, and `init --force` no longer inherits the
+    existing config — it rebuilds from defaults + CLI flags, a real recovery
+    exit for a config that could never be loaded again.
+  - Staged BINARY files produce a `binary-staged` finding (content is not
+    scannable), so committing one requires the same explicit
+    `--allow-secrets`; the fail-closed promise of the scan now covers blobs.
+  - `split_goals` no longer splits on decimal points ("升级到 v1.3.3" stayed
+    one goal); the report's goal checkboxes use the same goal-text
+    normalization as `all_goals_met` (no more `[ ]` contradicting a stopped
+    run); `save_json` fsyncs before the atomic rename and refuses NaN/inf
+    payloads; `_pid_alive` treats a PermissionError (EPERM, POSIX) as
+    "alive", aligning the fail-closed behavior with the Windows branch.
 - Budget & round accounting fixes from the QA/ES audit:
   - Zero-work cancels no longer consume the run: a cancel with no working-tree
     delta against the round's snapshot, no commit, and a life under 10 minutes

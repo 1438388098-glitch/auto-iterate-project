@@ -86,7 +86,7 @@ String. Default `"autopilot"`. The `commit` helper builds messages as `<prefix>(
 
 ### retries_per_round
 
-Integer. Default `3`. Maximum fix-and-retry attempts within one round before the round is marked blocked. This is an **agent-side convention**: the helper does not count retries, so the agent enforces the budget itself and switches to `block-round` when exhausted.
+Integer. Default `3`. Maximum fix-and-retry attempts within one round before the round is marked blocked. `0` disables retrying entirely (block on the first failure); a negative value is rejected by validation. This is an **agent-side convention**: the helper does not count retries, so the agent enforces the budget itself and switches to `block-round` when exhausted.
 
 ### candidates_per_round
 
@@ -163,7 +163,7 @@ Non-negative integer or `null`, default `null` (uncapped). Quota for `expansion`
 
 ### max_blocked_in_a_row
 
-Integer. Default `2`. Hard stop after this many consecutive blocked rounds, checked by the state helper rather than only by agent judgment.
+Integer. Default `2`. Hard stop after this many consecutive blocked rounds, checked by the state helper rather than only by agent judgment. `0` means the run stops on the FIRST blocked round (a legal but harsh choice — the configurator owns that); a negative value is rejected by validation.
 
 ### check_commands
 

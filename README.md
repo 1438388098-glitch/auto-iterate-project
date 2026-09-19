@@ -65,6 +65,8 @@ python <skill-dir>/scripts/autopilot_state.py backlog-add --repo <repo> --title 
 python <skill-dir>/scripts/autopilot_state.py begin-round --repo <repo> --title "..." --reason "..." --candidate-id candidate-001
 python <skill-dir>/scripts/autopilot_state.py commit --repo <repo> --summary "..."
 python <skill-dir>/scripts/autopilot_state.py complete-round --repo <repo> --summary "..." --commit-sha <sha>
+python <skill-dir>/scripts/autopilot_state.py expansion-record --repo <repo> --lens tests --lens performance
+python <skill-dir>/scripts/autopilot_state.py config-set --repo <repo> --expand-after-goals
 python <skill-dir>/scripts/autopilot_state.py finish --repo <repo> --reason "goal met"
 ```
 
