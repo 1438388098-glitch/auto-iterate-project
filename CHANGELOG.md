@@ -130,6 +130,21 @@ helper now enforces honest finishing in code instead of trusting the prompt.
 
 ### Fixed
 
+- A state file migrated from a pre-v1.4 version had no `run_start_sha` anchor,
+  and token estimation silently fell back to `EMPTY_TREE`: the next
+  complete/block/cancel-round billed the entire `EMPTY_TREE..HEAD` diff as one
+  round (12 tokens/line) and could fake-trigger `max_tokens` — an early stop
+  of exactly the kind this release set out to kill. `load_state` now anchors
+  such a state at the current `HEAD` on first load (work committed before the
+  upgrade stays unbilled on purpose; an existing `EMPTY_TREE` value is left
+  alone so an unborn repo does not churn the file). Guard test:
+  `test_migrated_state_anchors_tokens_at_load_not_empty_tree`.
+- `references/config.md` still documented the removed `0.7 ** (completed -
+  threshold)` saturation decay and the `÷ log2(1 + effort)` effort divisor;
+  synced to the shipped formulas (logarithmic saturation with a 0.35 floor,
+  batch-width-aware linear effort cost) and the calibration cold-start global
+  fallback. `SKILL.md` default `candidates_per_round` 3 -> 4, and
+  `--max-expansion-per-round` added to both flag lists.
 - Two test classes shared the name `ImportUnitTests`; discovery collected only
   the second, so the first class's 14 cases (among them the sequential-id
   truncation test) never ran while the suite stayed green. Renamed to
