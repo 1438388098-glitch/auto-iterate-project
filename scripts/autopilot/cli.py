@@ -52,7 +52,7 @@ def build_parser():
     init_parser.add_argument("--push", action="store_true")
     init_parser.add_argument("--commit-message-prefix", default=None)
     init_parser.add_argument("--retries-per-round", type=int, default=None)
-    init_parser.add_argument("--candidates-per-round", type=int, default=None, help="Backlog candidates to work per round (default 3)")
+    init_parser.add_argument("--candidates-per-round", type=int, default=None, help="Backlog candidates to work per round (default 4)")
     init_parser.add_argument("--max-blocked-in-a-row", type=int, default=None)
     init_parser.add_argument("--commit-every-rounds", type=int, default=None,
                              help="Commit accumulated changes once per this many rounds (default 5)")
@@ -82,6 +82,8 @@ def build_parser():
                              help="check action_hint=expand when pending backlog falls below this (default 3)")
     init_parser.add_argument("--max-predicted-per-round", type=int, default=None,
                              help="Anti-noise quota: at most this many predicted-origin candidates per recommended round (default 1; null disables)")
+    init_parser.add_argument("--max-expansion-per-round", type=int, default=None,
+                             help="Quota for expansion-origin candidates per recommended round (default null = uncapped; expansion work already passed the main agent's value gate)")
     init_parser.add_argument("--allow-path", action="append", default=None, help="Glob of paths allowed in commits (repeatable)")
     init_parser.add_argument("--deny-path", action="append", default=None, help="Glob of paths never allowed in commits (repeatable)")
     init_parser.add_argument("--report-lang", choices=["zh", "en"], default=None)

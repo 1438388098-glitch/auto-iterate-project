@@ -728,8 +728,16 @@ def compute_type_stats(backlog):
     VALID_CANDIDATE_TYPES list are grouped under their own key.
     Predicted-origin candidates (`origin: "predicted"`) are excluded here — they
     are accounted in compute_predicted_account, so a failed prediction never
-    drags down the success rate of observed work in the same type."""
+    drags down the success rate of observed work in the same type.
+    Calibration cold start: a type with fewer than three reviewed candidates
+    borrows the run-wide review/value ratio (clamped 0.6-1.5) once at least
+    three completed candidates anywhere carry a review score — early reviews
+    then already shape ranking instead of every type starting neutral."""
     stats = {}
+    global_review_sum = 0.0
+    global_review_n = 0
+    global_value_sum = 0
+    global_value_n = 0
     for candidate in backlog.get("candidates", []):
         if candidate.get("origin") == "predicted":
             continue
@@ -744,17 +752,25 @@ def compute_type_stats(backlog):
             entry["total"] += 1
             if status == "completed":
                 entry["completed"] += 1
+                parsed_value = 0
                 try:
+                    parsed_value = int(candidate.get("value") or 0)
                     entry["effort_sum"] += int(candidate.get("effort") or 0)
-                    entry["value_sum"] += int(candidate.get("value") or 0)
+                    entry["value_sum"] += parsed_value
                 except (TypeError, ValueError):
                     pass
+                # Global calibration samples accumulate here, BEFORE the per-type
+                # sums are popped below — the fallback needs the same evidence.
+                global_value_sum += parsed_value
+                global_value_n += 1
                 review = candidate.get("review_score")
                 # `review == review` rejects NaN, which would poison the average
                 # and the calibration factor.
                 if isinstance(review, (int, float)) and not isinstance(review, bool) and review == review:
                     entry["review_sum"] += review
                     entry["review_n"] += 1
+                    global_review_sum += review
+                    global_review_n += 1
             else:
                 entry["blocked"] += 1
     for entry in stats.values():
@@ -769,6 +785,16 @@ def compute_type_stats(backlog):
         entry["review_avg"] = review_avg
         if entry["review_n"] >= 3 and avg_value > 0 and review_avg is not None:
             entry["calibration"] = round(max(0.6, min(1.5, review_avg / avg_value)), 2)
+        elif (
+            entry["review_n"] < 3
+            and global_review_n >= 3
+            and global_value_n > 0
+            and global_value_sum > 0
+        ):
+            entry["calibration"] = round(
+                max(0.6, min(1.5, (global_review_sum / global_review_n) / (global_value_sum / global_value_n))),
+                2,
+            )
         else:
             entry["calibration"] = 1.0
         entry.pop("effort_sum", None)
@@ -867,7 +893,7 @@ def _score_classic(candidate, type_stats=None, saturation_threshold=2):
 
 def _score_expected(candidate, type_stats=None, saturation_threshold=2,
                     unlocks=0, pending_mix=0.0, risk_weight=0.08,
-                    completed_goals=None, predicted_account=None):
+                    completed_goals=None, predicted_account=None, batch_width=3):
     """Expected-value-per-round scoring (ranking_mode: expected, default).
 
     The scarce resource in an autopilot run is rounds, not effort — per-round
@@ -882,9 +908,14 @@ def _score_expected(candidate, type_stats=None, saturation_threshold=2,
                                                        than half a real unlock
         x dependency unlock bonus                   <- foundational work pays
         x budget-aware risk factor                  <- take swings early, play safe late
-        x completed-type saturation                 <- stop grinding one area
+        x completed-type saturation                 <- stop grinding one area (floored
+                                                       at 0.35: it dents the diversity
+                                                       signal, never vetoes value)
         x prospective backlog-mix penalty           <- diversify BEFORE over-grinding
-        / log2(1 + effort)                          <- sublinear effort cost, tie-break only
+        / effort cost                               <- free within one round's batch
+                                                       width, linear beyond it (the
+                                                       formula's premise is that
+                                                       per-round overhead dominates)
 
     Predicted-origin candidates draw their success rate from the predicted
     sub-account once it has PREDICTED_SAMPLE_FLOOR resolved samples; before that
@@ -943,12 +974,24 @@ def _score_expected(candidate, type_stats=None, saturation_threshold=2,
         threshold = max(0, int(saturation_threshold or 0))
     except (TypeError, ValueError):
         threshold = 2
-    saturation_factor = 0.7 ** max(0, completed_n - threshold)
+    # Logarithmic decay with a hard floor (0.7**k reaches 0.045 at k=9 and
+    # 4.6e-05 at k=28): saturation dents the diversity signal but must never
+    # veto a genuinely valuable candidate of the dominant type.
+    over = max(0, completed_n - threshold)
+    saturation_factor = max(0.35, 1.0 - 0.12 * math.log2(1 + over))
 
     mix_penalty = 1.0 - 0.3 * max(0.0, min(1.0, pending_mix))
 
     effort = _resolved_effort(candidate)
-    effort_cost = math.log2(1 + effort)
+    try:
+        width = int(batch_width)
+    except (TypeError, ValueError, OverflowError):
+        width = 3
+    # Effort is free within one round's batch width (per-round overhead
+    # dominates anyway) and linear beyond it — the score ranks value per round,
+    # so a candidate that still fits this round's batch must not lose to a
+    # lighter one that would leave the batch idle.
+    effort_cost = 1.0 + 0.15 * max(0, effort - max(1, width))
 
     expected_value = value * success_rate * calibration
     score = (expected_value * unlock_bonus * risk_factor * saturation_factor * mix_penalty
@@ -975,16 +1018,19 @@ def _score_expected(candidate, type_stats=None, saturation_threshold=2,
 
 def candidate_adjusted_score(candidate, type_stats=None, saturation_threshold=2,
                              cfg=None, unlocks=0, pending_mix=0.0, risk_weight=0.08,
-                             completed_goals=None, predicted_account=None):
+                             completed_goals=None, predicted_account=None, batch_width=None):
     """Adjusted score for one candidate. Dispatches on cfg ranking_mode:
     'expected' (default) or 'classic'. Returns (score, breakdown). The
     prediction factors (completed_goals / predicted_account) only apply in
-    expected mode — classic stays the legacy value/effort ratio."""
+    expected mode — classic stays the legacy value/effort ratio. `batch_width`
+    feeds the effort cost (falls back to _score_expected's default when None)."""
     if (cfg or {}).get("ranking_mode", "expected") == "classic":
         return _score_classic(candidate, type_stats, saturation_threshold)
+    kwargs = {} if batch_width is None else {"batch_width": batch_width}
     return _score_expected(candidate, type_stats, saturation_threshold,
                            unlocks=unlocks, pending_mix=pending_mix, risk_weight=risk_weight,
-                           completed_goals=completed_goals, predicted_account=predicted_account)
+                           completed_goals=completed_goals, predicted_account=predicted_account,
+                           **kwargs)
 
 
 def _unlocks_map(backlog):
@@ -1010,23 +1056,35 @@ def _mark_selection(entries, cfg, progress=None):
     """Mark the recommended round batch (`selected: true`). Selection is a
     constrained pick over the ranked list, separate from scoring:
       - only pending + ready candidates are eligible
-      - value below min_candidate_value is demoted (below_floor) and at most one
-        such quick-win fills a remaining slot
+      - value below min_candidate_value is demoted (below_floor); such
+        quick-wins only fill slots the main pool left open
       - at most max_same_type_per_round candidates of the same type per round
-      - at most max_predicted_per_round (default 1) predicted/expansion-origin
-        candidates per batch (刀 B anti-noise quota); observed wins score ties
-      - late run (progress > 0.7): predicted work is cut entirely while observed
-        candidates are still ready
-      - batch cutoff: stop once the score drops below 40% of the best eligible
+      - origin quotas are separate (刀 B anti-noise): predicted candidates are
+        capped by max_predicted_per_round (default 1, unproven hypotheses),
+        expansion candidates by max_expansion_per_round (None = uncapped,
+        they already passed the main agent's value gate); observed wins ties
+      - late run (progress > 0.7): predicted work is cut entirely while
+        observed candidates are still ready; expansion is not cut
+      - the 40% score cutoff uses the FIRST SELECTED entry as its base (the
+        top-ranked entry may be quota-cut, which would raise the bar for
+        everything else) and only prunes below-floor entries — above-floor
+        candidates are always eligible until the batch is full
+      - ready above-floor entries skipped by a constraint get `cut_reason`:
+        'late_run' | 'quota' | 'type' | 'cutoff', or 'batch_full' when the
+        batch is already full (so consumers can tell why nothing was picked)
     """
     n = cfg.get("candidates_per_round") or 3
     max_per_type = cfg.get("max_same_type_per_round") or 2
     max_predicted = cfg.get("max_predicted_per_round")
     if max_predicted is None:
         max_predicted = len(entries)
+    max_expansion = cfg.get("max_expansion_per_round")
+    if max_expansion is None:
+        max_expansion = len(entries)
     late_run = progress is not None and progress > 0.7
     for entry in entries:
         entry["selected"] = False
+        entry.pop("cut_reason", None)
     pool = [e for e in entries if e.get("status") == "pending" and e.get("ready") and not e.get("below_floor")]
     below = [e for e in entries if e.get("status") == "pending" and e.get("ready") and e.get("below_floor")]
     observed_ready = any((e.get("origin") or "observed") == "observed" for e in pool)
@@ -1034,32 +1092,59 @@ def _mark_selection(entries, cfg, progress=None):
     selected = []
     type_counts = {}
     predicted_count = 0
-    top_score = pool[0]["score"] if pool else None
+    expansion_count = 0
+    cutoff_base = None
     for entry in pool:
+        origin = entry.get("origin") or "observed"
         if len(selected) >= n:
-            break
-        candidate_type = entry.get("type") or "feature"
-        if (entry.get("origin") or "observed") != "observed":
-            if predicted_count >= predicted_quota:
-                continue
-        if type_counts.get(candidate_type, 0) >= max_per_type:
+            entry["cut_reason"] = "batch_full"
             continue
-        if top_score is not None and entry["score"] < 0.4 * top_score:
+        if origin == "predicted" and late_run and observed_ready:
+            entry["cut_reason"] = "late_run"
+            continue
+        if origin == "predicted" and predicted_count >= predicted_quota:
+            entry["cut_reason"] = "quota"
+            continue
+        if origin == "expansion" and expansion_count >= max_expansion:
+            entry["cut_reason"] = "quota"
+            continue
+        candidate_type = entry.get("type") or "feature"
+        if type_counts.get(candidate_type, 0) >= max_per_type:
+            entry["cut_reason"] = "type"
+            continue
+        if cutoff_base is not None and entry["score"] < 0.4 * cutoff_base and entry.get("below_floor"):
+            entry["cut_reason"] = "cutoff"
             break
         selected.append(entry)
+        if cutoff_base is None:
+            cutoff_base = entry["score"]
         type_counts[candidate_type] = type_counts.get(candidate_type, 0) + 1
-        if (entry.get("origin") or "observed") != "observed":
+        if origin == "predicted":
             predicted_count += 1
+        elif origin == "expansion":
+            expansion_count += 1
     if len(selected) < n and below:
-        # The quick-win fallback obeys the same predicted quota / late-run cut as
-        # the main loop, or a below-floor predicted candidate would bypass both.
-        entry = below[0]
-        if (entry.get("origin") or "observed") != "observed":
-            if predicted_count < predicted_quota:
-                selected.append(entry)
-                predicted_count += 1
-        else:
+        # The quick-win fallback fills the slots the main pool left open. It
+        # obeys the same origin quotas / late-run cut (a below-floor predicted
+        # candidate must not bypass either) and the 40% cutoff against the
+        # batch's base — a quick-win far below it is noise, not work.
+        for entry in below:
+            if len(selected) >= n:
+                break
+            origin = entry.get("origin") or "observed"
+            if origin == "predicted" and late_run and observed_ready:
+                continue
+            if origin == "predicted" and predicted_count >= predicted_quota:
+                continue
+            if origin == "expansion" and expansion_count >= max_expansion:
+                continue
+            if cutoff_base is not None and entry["score"] < 0.4 * cutoff_base and entry.get("below_floor"):
+                break
             selected.append(entry)
+            if origin == "predicted":
+                predicted_count += 1
+            elif origin == "expansion":
+                expansion_count += 1
     for entry in selected:
         entry["selected"] = True
 
@@ -1111,6 +1196,7 @@ def rank_candidates(backlog, cfg, progress=None, completed_goals=None):
             risk_weight=risk_weight,
             completed_goals=completed_goals,
             predicted_account=predicted_account,
+            batch_width=cfg.get("candidates_per_round") or 1,
         )
         entry["score"] = round(score, 3)
         entry["score_breakdown"] = breakdown

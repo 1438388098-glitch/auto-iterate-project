@@ -26,7 +26,7 @@ def default_config(repo):
         "branch_mode": "current",
         "commit_message_prefix": "autopilot",
         "retries_per_round": 3,
-        "candidates_per_round": 3,
+        "candidates_per_round": 4,
         "commit_every_rounds": 5,
         "verify_every_rounds": 3,
         "checkpoint_every": None,
@@ -46,6 +46,7 @@ def default_config(repo):
         "max_same_type_per_round": 2,
         "min_pending_candidates": 3,
         "max_predicted_per_round": 1,
+        "max_expansion_per_round": None,
     }
 
 
@@ -140,6 +141,9 @@ def load_config(repo):
     mpp = merged.get("max_predicted_per_round")
     if mpp is not None and (not isinstance(mpp, int) or isinstance(mpp, bool) or mpp < 0):
         _config_error(config_path_for(repo), "'max_predicted_per_round' must be a non-negative integer or null")
+    mer = merged.get("max_expansion_per_round")
+    if mer is not None and (not isinstance(mer, int) or isinstance(mer, bool) or mer < 0):
+        _config_error(config_path_for(repo), "'max_expansion_per_round' must be a non-negative integer or null")
     if not isinstance(merged["check_commands"], list) or not all(isinstance(c, str) for c in merged["check_commands"]):
         _config_error(config_path_for(repo), "'check_commands' must be an array of strings")
     for key in ("allow_paths", "deny_paths", "secret_patterns"):

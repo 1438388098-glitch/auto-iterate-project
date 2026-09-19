@@ -19,6 +19,7 @@ SCRIPT = Path(__file__).resolve().parent / "autopilot_state.py"
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 from autopilot import state as ap_state  # noqa: E402
 from autopilot import io as ap_io  # noqa: E402
+from autopilot import commands as commands_module  # noqa: E402
 from autopilot.cli import build_parser  # noqa: E402
 from autopilot.guard import path_allowed  # noqa: E402
 from autopilot.secrets import SECRET_PATTERNS  # noqa: E402
@@ -156,7 +157,7 @@ class InitTests(RepoTest):
         self.assertEqual(config["max_rounds"], 10)
         self.assertFalse(config["track_state"])
         self.assertEqual(config["check_commands"], [])
-        self.assertEqual(config["candidates_per_round"], 3)
+        self.assertEqual(config["candidates_per_round"], 4)
         self.assertEqual(config["commit_every_rounds"], 5)
         self.assertEqual(config["verify_every_rounds"], 3)
         self.assertTrue(config["scan_secrets"])
@@ -654,6 +655,338 @@ class GoalEvidenceTests(RepoTest):
         self.assertEqual(state["completed_goals"], [])
 
 
+class RankingBatchTests(unittest.TestCase):
+    """Direct tests of the rewritten batch selection and scoring factors
+    (expansion quota split, late-run scope, cutoff base, calibration cold start)."""
+
+    @staticmethod
+    def _entry(entry_id, origin=None, below=False, score=5.0, ctype="refactor"):
+        entry = {"id": entry_id, "title": entry_id, "type": ctype, "status": "pending",
+                 "ready": True, "score": score, "below_floor": below}
+        if origin:
+            entry["origin"] = origin
+        return entry
+
+    @staticmethod
+    def _cfg(**overrides):
+        cfg = {"candidates_per_round": 3, "max_same_type_per_round": 2,
+               "max_predicted_per_round": 1, "max_expansion_per_round": None}
+        cfg.update(overrides)
+        return cfg
+
+    def test_expansion_origin_not_capped_by_predicted_quota(self):
+        entries = [
+            self._entry("p", origin="predicted", score=5.0, ctype="refactor"),
+            self._entry("x", origin="expansion", score=4.0, ctype="bugfix"),
+            self._entry("o", score=3.0, ctype="perf"),
+        ]
+        ap_state._mark_selection(entries, self._cfg(max_predicted_per_round=1))
+        self.assertEqual([(e["id"], e["selected"]) for e in entries],
+                         [("p", True), ("x", True), ("o", True)])
+
+    def test_expansion_quota_zero_still_blocks_expansion(self):
+        entries = [
+            self._entry("x", origin="expansion", score=4.0, ctype="bugfix"),
+            self._entry("o", score=3.0, ctype="perf"),
+        ]
+        ap_state._mark_selection(entries, self._cfg(max_predicted_per_round=1,
+                                                    max_expansion_per_round=0))
+        by_id = {e["id"]: e for e in entries}
+        self.assertFalse(by_id["x"].get("selected"))
+        self.assertEqual(by_id["x"].get("cut_reason"), "quota")
+        self.assertTrue(by_id["o"].get("selected"))
+
+    def test_late_run_cuts_predicted_not_expansion(self):
+        entries = [
+            self._entry("p1", origin="predicted", score=5.0, ctype="refactor"),
+            self._entry("p2", origin="predicted", score=4.0, ctype="bugfix"),
+            self._entry("o", score=3.0, ctype="perf"),
+            self._entry("x", origin="expansion", score=2.0, ctype="docs"),
+        ]
+        ap_state._mark_selection(entries, self._cfg(), progress=0.8)
+        by_id = {e["id"]: e for e in entries}
+        self.assertEqual(by_id["p1"].get("cut_reason"), "late_run")
+        self.assertEqual(by_id["p2"].get("cut_reason"), "late_run")
+        self.assertFalse(by_id["p1"].get("selected"))
+        self.assertFalse(by_id["p2"].get("selected"))
+        self.assertTrue(by_id["o"].get("selected"))
+        self.assertTrue(by_id["x"].get("selected"))
+
+    def test_cutoff_only_prunes_below_floor(self):
+        # ES-4 scenario, hardened: the top entry sets the cutoff base; an
+        # above-floor entry below the 40% line stays eligible (only the batch
+        # width can stop it), while a below-floor entry under the line is
+        # pruned from the quick-win fallback.
+        entries = [
+            self._entry("top", score=4.25, ctype="refactor"),
+            self._entry("above", score=1.5, ctype="bugfix"),
+            self._entry("floorish", below=True, score=1.609, ctype="perf"),
+        ]
+        ap_state._mark_selection(entries, self._cfg())
+        by_id = {e["id"]: e for e in entries}
+        self.assertTrue(by_id["top"].get("selected"))
+        self.assertTrue(by_id["above"].get("selected"))
+        self.assertFalse(by_id["floorish"].get("selected"))
+
+        # All-below-floor pool with the predicted quota at zero: the fallback
+        # loop must still fill the batch from observed quick-wins.
+        entries = [
+            self._entry("bp", origin="predicted", below=True, score=2.0, ctype="refactor"),
+            self._entry("bo1", below=True, score=1.5, ctype="bugfix"),
+            self._entry("bo2", below=True, score=1.2, ctype="perf"),
+        ]
+        ap_state._mark_selection(entries, self._cfg(max_predicted_per_round=0))
+        selected = [e["id"] for e in entries if e.get("selected")]
+        self.assertEqual(selected, ["bo1", "bo2"])
+
+    def test_saturation_factor_floor(self):
+        score, breakdown = ap_state._score_expected(
+            {"id": "c", "title": "t", "value": 4, "effort": 2, "type": "feature"},
+            type_stats={"feature": {"completed": 30, "blocked": 0, "blocked_rate": 0.0,
+                                    "calibration": 1.0}},
+            saturation_threshold=2,
+        )
+        # 1 - 0.12*log2(1+28) = 0.417 (the old 0.7**28 was 4.6e-05).
+        self.assertEqual(breakdown["saturation_factor"], 0.417)
+
+    def test_effort_cost_batch_width(self):
+        for effort, expected in ((1, 1.0), (2, 1.0), (3, 1.0), (4, 1.0), (5, 1.15)):
+            _, breakdown = ap_state._score_expected(
+                {"id": "c", "title": "t", "value": 5, "effort": effort},
+                type_stats={}, batch_width=4,
+            )
+            self.assertEqual(breakdown["effort_cost"], expected, effort)
+        # rank_candidates feeds cfg's candidates_per_round as the batch width.
+        backlog = {"candidates": [{"id": "c1", "title": "t", "status": "pending",
+                                   "value": 5, "effort": 5}]}
+        ranked = ap_state.rank_candidates(backlog, {"candidates_per_round": 4})
+        self.assertEqual(ranked[0]["score_breakdown"]["effort_cost"], 1.15)
+        ranked = ap_state.rank_candidates(backlog, {"candidates_per_round": 3})
+        self.assertEqual(ranked[0]["score_breakdown"]["effort_cost"], 1.3)
+
+    def test_score_breakdown_table(self):
+        # mix_penalty: clamped to [0, 1] on the pending_mix input.
+        for mix, expected in ((0.0, 1.0), (1.0, 0.7), (1.7, 0.7)):
+            _, breakdown = ap_state._score_expected(
+                {"id": "c", "title": "t", "value": 3, "effort": 1},
+                type_stats={}, pending_mix=mix,
+            )
+            self.assertEqual(breakdown["mix_penalty"], expected, mix)
+        # Predicted sub-account: below PREDICTED_SAMPLE_FLOOR the type rate is
+        # discounted (x0.75); at/above it the sub-account value is used as-is.
+        type_stats = {"perf": {"completed": 3, "blocked": 1, "blocked_rate": 0.25,
+                               "calibration": 1.0}}
+        _, warm = ap_state._score_expected(
+            {"id": "c", "title": "t", "value": 3, "effort": 1, "origin": "predicted",
+             "type": "perf"},
+            type_stats=type_stats,
+            predicted_account={"done": 2, "success_rate": 0.9},
+        )
+        self.assertEqual(warm["success_rate"], round(0.75 * 0.75, 3))
+        _, mature = ap_state._score_expected(
+            {"id": "c", "title": "t", "value": 3, "effort": 1, "origin": "predicted",
+             "type": "perf"},
+            type_stats=type_stats,
+            predicted_account={"done": 3, "success_rate": 0.9},
+        )
+        self.assertEqual(mature["success_rate"], 0.9)
+        # Risk weights: flat when progress is unknown, then 0.05 + 0.10*progress.
+        for progress, expected in ((None, 0.08), (0.0, 0.05), (0.5, 0.10), (1.0, 0.15)):
+            self.assertAlmostEqual(ap_state._risk_weight_for({}, progress), expected, places=3)
+        # A late run punishes risk=5 harder than an early one.
+        _, early = ap_state._score_expected(
+            {"id": "c", "title": "t", "value": 3, "effort": 1, "risk": 5},
+            type_stats={}, risk_weight=0.05,
+        )
+        _, late = ap_state._score_expected(
+            {"id": "c", "title": "t", "value": 3, "effort": 1, "risk": 5},
+            type_stats={}, risk_weight=0.15,
+        )
+        self.assertEqual(early["risk_factor"], 0.8)
+        self.assertEqual(late["risk_factor"], 0.4)
+        # The goal-chain bonus requires the based_on goal to actually be met.
+        _, unmet = ap_state._score_expected(
+            {"id": "c", "title": "t", "value": 3, "effort": 1, "based_on": "unmet goal"},
+            type_stats={}, completed_goals=["met goal"],
+        )
+        self.assertEqual(unmet["goal_chain_factor"], 1.0)
+
+    def test_calibration_falls_back_to_global(self):
+        backlog = {"candidates": [
+            {"type": "docs", "status": "completed", "value": 4, "review_score": 5},
+            {"type": "docs", "status": "completed", "value": 4, "review_score": 5},
+            {"type": "perf", "status": "completed", "value": 5, "review_score": 2},
+            {"type": "perf", "status": "completed", "value": 5, "review_score": 2},
+            {"type": "perf", "status": "completed", "value": 5, "review_score": 2},
+        ]}
+        stats = ap_state.compute_type_stats(backlog)
+        # docs has only 2 reviews of its own, but the run-wide ratio exists:
+        # global review avg 3.2 / global value avg 4.6 = 0.6957 -> 0.7.
+        self.assertEqual(stats["docs"]["review_n"], 2)
+        self.assertEqual(stats["docs"]["calibration"], 0.7)
+        # perf has 3 reviews of its own and keeps its own (clamped) ratio.
+        self.assertEqual(stats["perf"]["calibration"], 0.6)
+
+    def test_stop_reason_precedence(self):
+        base_state = {
+            "finished_at": None, "stop_reason": None, "goals": [], "completed_goals": [],
+            "goal_events": [], "completed_rounds": 0, "blocked_rounds": 0,
+            "cancelled_rounds": 0, "reverted_rounds": 0, "history": [],
+            "estimated_tokens_used": 0, "last_activity_at": None, "started_at": None,
+        }
+        base_cfg = {"goals": [], "max_rounds": None, "max_minutes": None, "max_tokens": None,
+                    "max_blocked_in_a_row": None, "deadline": None, "expand_after_goals": False}
+        # finished_at wins over everything.
+        st = dict(base_state, finished_at="T", completed_goals=["A"], completed_rounds=5)
+        cfg = dict(base_cfg, goals=["A"], max_rounds=1)
+        self.assertEqual(ap_state.compute_stop_reason(st, cfg), "already finished")
+        # Verified goals beat max_rounds and a blocked streak.
+        st = dict(base_state, completed_goals=["A"], completed_rounds=5,
+                  blocked_rounds=2, history=[{"round": 1, "status": "blocked"}])
+        cfg = dict(base_cfg, goals=["A"], max_rounds=1, max_blocked_in_a_row=1)
+        self.assertEqual(ap_state.compute_stop_reason(st, cfg), "all goals met")
+        # max_rounds beats a blocked streak.
+        st = dict(base_state, completed_rounds=5, blocked_rounds=2,
+                  history=[{"round": 1, "status": "blocked"}])
+        cfg = dict(base_cfg, max_rounds=1, max_blocked_in_a_row=1)
+        self.assertEqual(ap_state.compute_stop_reason(st, cfg), "max_rounds reached")
+        # A blocked streak beats max_minutes.
+        st = dict(base_state, blocked_rounds=2,
+                  history=[{"round": 1, "status": "blocked"},
+                           {"round": 2, "status": "blocked"}],
+                  last_activity_at="2020-01-01T00:00:00+00:00",
+                  started_at="2020-01-01T00:00:00+00:00")
+        cfg = dict(base_cfg, max_blocked_in_a_row=2, max_minutes=1)
+        self.assertIn("max_blocked_in_a_row", ap_state.compute_stop_reason(st, cfg))
+        # max_minutes beats deadline.
+        st = dict(base_state, last_activity_at="2020-01-01T00:00:00+00:00",
+                  started_at="2020-01-01T00:00:00+00:00")
+        cfg = dict(base_cfg, max_minutes=1, deadline="2000-01-01T00:00:00+00:00")
+        self.assertIn("max_minutes", ap_state.compute_stop_reason(st, cfg))
+
+
+class BatchContractTests(RepoTest):
+    """CLI-level contracts tying check's hints to what ranking actually picks."""
+
+    def _configure(self, **overrides):
+        cfg_path = self.repo / ".autopilot" / "config.json"
+        cfg = json.loads(cfg_path.read_text(encoding="utf-8"))
+        cfg.update(overrides)
+        cfg_path.write_text(json.dumps(cfg), encoding="utf-8")
+
+    def test_selected_empty_reason_surfaced(self):
+        # TG-3 hardened: every ready above-floor candidate is predicted and the
+        # predicted quota is 0 -> the batch is empty. min_pending_candidates=0
+        # keeps needs_expansion false, so ONLY the batch contract can turn the
+        # hint away from "work".
+        self.run_state("init", "--min-pending-candidates", "0")
+        self._configure(max_predicted_per_round=0)
+        self.run_state("backlog-add", "--title", "pred-a", "--reason", "r", "--value", "5",
+                       "--effort", "1", "--origin", "predicted", "--confidence", "0.9",
+                       "--type", "refactor")
+        self.run_state("backlog-add", "--title", "pred-b", "--reason", "r", "--value", "4",
+                       "--effort", "2", "--origin", "predicted", "--confidence", "0.9",
+                       "--type", "perf")
+        data = json.loads(self.run_state("check", "--brief").stdout)
+        self.assertEqual(data["action_hint"], "expand")
+        self.assertEqual(data["selected_count"], 0)
+        self.assertEqual(data["selected_empty_reason"], "quota")
+        self.assertEqual(data["backlog"]["ready"], 2)
+
+        # TG-3's original shape, now fixed: a value>=floor observed candidate is
+        # always eligible until the batch is full, quota or not.
+        self._configure(max_predicted_per_round=0)
+        self.run_state("backlog-add", "--title", "obs", "--reason", "r", "--value", "3",
+                       "--effort", "5", "--type", "bugfix")
+        data = json.loads(self.run_state("check", "--brief").stdout)
+        self.assertEqual(data["selected_count"], 1)
+        self.assertIsNone(data["selected_empty_reason"])
+
+    def test_type_stats_consistent_after_backlog_update(self):
+        self.run_state("init")
+        self.run_state("backlog-add", "--title", "A", "--reason", "r", "--value", "4",
+                       "--effort", "2", "--type", "docs")
+        self.run_state("backlog-add", "--title", "B", "--reason", "r", "--value", "4",
+                       "--effort", "2", "--type", "docs")
+        ids = [c["id"] for c in self.read_json("backlog.json")["candidates"]]
+        result = self.run_state("backlog-update", "--id", ids[0], "--status", "completed")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        expected = ap_state.compute_type_stats(self.read_json("backlog.json"))
+        self.assertEqual(self.read_json("state.json")["type_stats"], expected)
+        result = self.run_state("backlog-remove", "--id", ids[1])
+        self.assertEqual(result.returncode, 0, result.stderr)
+        expected = ap_state.compute_type_stats(self.read_json("backlog.json"))
+        self.assertEqual(self.read_json("state.json")["type_stats"], expected)
+
+    def test_expansion_brief_content(self):
+        self.run_state("init", "--goal", "G", "--expand-after-goals",
+                       "--type-saturation-threshold", "2")
+        for i in range(3):
+            self.run_state("backlog-add", "--title", "d{}".format(i), "--reason", "r",
+                           "--value", "4", "--effort", "2", "--type", "docs")
+        backlog_path = self.repo / ".autopilot" / "backlog.json"
+        backlog = json.loads(backlog_path.read_text(encoding="utf-8"))
+        for c in backlog["candidates"]:
+            c["status"] = "completed"
+        backlog_path.write_text(json.dumps(backlog), encoding="utf-8")
+        # backlog-update refreshes state.type_stats from the backlog.
+        ids = [c["id"] for c in self.read_json("backlog.json")["candidates"]]
+        self.run_state("backlog-update", "--id", ids[0], "--title", "d0")
+        self.run_state("begin-round", "--title", "r", "--reason", "x")
+        self.add_file()
+        self.run_state("commit", "--summary", "add feature")
+        sha = self.git("rev-parse", "HEAD").stdout.strip()
+        self.run_state("complete-round", "--summary", "done", "--commit-sha", sha)
+        self.run_state("goal-met", "--goal", "G", "--round", "1")
+        data = json.loads(self.run_state("check", "--brief").stdout)
+        self.assertEqual(data["phase"], "expand")
+        self.assertEqual(data["expansion"]["saturated_types"], ["docs"])
+
+    def test_suggested_themes_content(self):
+        self.run_state("init", "--goal", "G", "--expand-after-goals")
+        self.add_file()
+        self.git("add", "feature.py")
+        self.git("commit", "-q", "-m", "add feature")
+        self.run_state("goal-met", "--goal", "G")
+        self.run_state("goal-met", "--goal", "G")
+        data = json.loads(self.run_state("check", "--brief").stdout)
+        self.assertEqual(
+            data["expansion"]["suggested_themes"],
+            ["follow up on goal: G", "initial", "add feature"],
+        )
+
+    def test_begin_round_error_names_below_floor_pool(self):
+        self.run_state("init")
+        self.run_state("backlog-add", "--title", "Chore", "--reason", "r",
+                       "--value", "2", "--effort", "1")
+        result = self.run_state("begin-round", "--title", "r", "--reason", "x")
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("below-floor", result.stderr)
+        self.assertIn("Deep Expansion", result.stderr)
+        self.assertIn("--candidate-id", result.stderr)
+
+    def test_default_seed_type_skips_bugfix(self):
+        self.assertEqual(ap_state.VALID_CANDIDATE_TYPES[0], "bugfix")  # order sanity
+        self.assertEqual(commands_module._default_seed_type([]), "feature")
+        self.assertEqual(commands_module._default_seed_type(["bugfix"]), "feature")
+        self.assertEqual(
+            commands_module._default_seed_type(["bugfix", "feature", "refactor", "perf", "test"]),
+            "docs",
+        )
+        # Everything saturated -> the feature fallback.
+        self.assertEqual(
+            commands_module._default_seed_type(list(ap_state.VALID_CANDIDATE_TYPES)),
+            "feature",
+        )
+
+    def test_seed_defaults_risk_two(self):
+        self.run_state("init", "--goal", "G")
+        result = self.run_state("goal-met", "--goal", "G", "--next-step", "N")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        state = self.read_json("state.json")
+        self.assertEqual(state["goal_seeds"][0]["risk"], 2)
+
+
 class ConfigSetTests(RepoTest):
     """config-set reopens an 'all goals met' stop and re-fingerprints state so
     the deliberate change is not flagged as config-drift."""
@@ -819,8 +1152,10 @@ class PredictedOriginTests(RepoTest):
 
     def test_consecutive_blocked_predictions_sink_without_contaminating_observed(self):
         """Three blocked predictions: the next predicted sinks via its sub-account;
-        the observed candidate of the same type keeps a clean success rate."""
-        self.run_state("init")
+        the observed candidate of the same type keeps a clean success rate. With a
+        one-slot batch the sunk predicted no longer competes with the observed
+        candidate (above-floor candidates only fill slots until the batch is full)."""
+        self.run_state("init", "--candidates-per-round", "1")
         for i in range(3):
             self._add("--title", "p{}".format(i), "--value", "5", "--effort", "1",
                       "--origin", "predicted", "--confidence", "0.9", "--type", "refactor")
@@ -838,6 +1173,7 @@ class PredictedOriginTests(RepoTest):
         self.assertEqual(by_id[pred4]["score_breakdown"]["success_rate"], 0.0)
         self.assertEqual(by_id[obs]["score_breakdown"]["success_rate"], 1.0)
         self.assertFalse(by_id[pred4].get("selected"))
+        self.assertEqual(by_id[pred4].get("cut_reason"), "batch_full")
         self.assertTrue(by_id[obs].get("selected"))
 
     def test_late_run_cuts_predicted_when_observed_ready(self):
@@ -2198,8 +2534,10 @@ class PureHelperUnitTests(unittest.TestCase):
             {"docs": {"completed": 3, "blocked": 0}},
             2,
         )
-        self.assertAlmostEqual(score, 5.0 * 0.7, places=3)
-        self.assertAlmostEqual(breakdown["saturation_factor"], 0.7, places=3)
+        # Logarithmic decay, floored at 0.35: one completed over threshold
+        # costs 0.12 (1 - 0.12*log2(2) = 0.88), not the old exponential 0.7.
+        self.assertAlmostEqual(score, 5.0 * 0.88, places=3)
+        self.assertAlmostEqual(breakdown["saturation_factor"], 0.88, places=3)
 
     def test_candidate_adjusted_score_blocked_history(self):
         ap = self.ap
@@ -3465,7 +3803,7 @@ class ContractTests(RepoTest):
             {
                 "continue", "stop_reason", "warnings", "goals_met", "goals_unverified",
                 "phase", "next_verify_round", "next_commit_round", "next_checkpoint_round",
-                "backlog", "action_hint",
+                "backlog", "action_hint", "selected_count", "selected_empty_reason",
             },
         )
         self.assertEqual(

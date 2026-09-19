@@ -61,7 +61,7 @@ def cmd_init(args):
         # max_blocked_in_a_row < 0 silently stopped the loop with zero rounds.
         for knob in ("--max-rounds", "--max-minutes", "--max-tokens",
                      "--max-round-scope", "--retries-per-round",
-                     "--max-blocked-in-a-row"):
+                     "--max-blocked-in-a-row", "--max-expansion-per-round"):
             value = getattr(args, knob.lstrip("-").replace("-", "_"), None)
             if value is not None and value < 0:
                 io.append_log(repo, "init", "error", reason="{} out of range".format(knob))
@@ -163,6 +163,9 @@ def cmd_init(args):
                 io.append_log(repo, "init", "error", reason="max_predicted_per_round out of range")
                 return emit_result(args, False, "[ERROR] --max-predicted-per-round must be a non-negative integer.")
             cfg["max_predicted_per_round"] = args.max_predicted_per_round
+        # Negative values are already rejected by the knob gate above.
+        if getattr(args, "max_expansion_per_round", None) is not None:
+            cfg["max_expansion_per_round"] = args.max_expansion_per_round
         if args.allow_path:
             cfg["allow_paths"] = list(args.allow_path)
         if args.deny_path:
@@ -248,22 +251,37 @@ def cmd_begin_round(args):
             return 0
         candidate_ids = list(args.candidate_id) if args.candidate_id else []
         backlog = state.load_backlog(repo)
-        ready_pending = []
+        floor = cfg.get("min_candidate_value")
+        ready_above = []
+        ready_below = []
         for candidate in backlog.get("candidates") or []:
             if candidate.get("status") != "pending":
                 continue
             missing, is_ready = state.candidate_deps_status(backlog, candidate)
-            if is_ready:
-                ready_pending.append(candidate)
+            if not is_ready:
+                continue
+            below = floor is not None and state._resolved_value(candidate) < floor
+            (ready_below if below else ready_above).append(candidate)
         if not candidate_ids:
-            if ready_pending:
+            if ready_above:
                 io.append_log(repo, "begin-round", "error", reason="no candidate ids while ready backlog exists")
                 return emit_result(
                     args, False,
                     "[ERROR] begin-round requires at least one --candidate-id when the backlog "
                     "has ready pending candidates (found {}). Pick with backlog-rank, or clear/"
                     "complete those candidates first. Empty rounds on a stocked backlog are refused "
-                    "to prevent churn.".format(len(ready_pending)),
+                    "to prevent churn.".format(len(ready_above)),
+                )
+            if ready_below:
+                io.append_log(
+                    repo, "begin-round", "error",
+                    reason="only below-floor candidates ready",
+                    ready=len(ready_below),
+                )
+                return emit_result(
+                    args, False,
+                    "[ERROR] Only below-floor candidates are ready ({}). Run Deep Expansion first, "
+                    "or pass --candidate-id explicitly to accept a quick win.".format(len(ready_below)),
                 )
             print(
                 "[WARN] begin-round without --candidate-id and no ready pending backlog items; "
@@ -293,7 +311,6 @@ def cmd_begin_round(args):
                     )
             state.update_candidates_status(repo, candidate_ids, "picked", round_number, backlog=backlog)
 
-        floor = cfg.get("min_candidate_value")
         if floor is not None:
             low_value_ids = [
                 cid for cid in candidate_ids
@@ -660,9 +677,10 @@ def _last_completed_candidate_ids(st):
 
 def _default_seed_type(saturated):
     """First candidate type that is not yet saturated (seed defaults avoid piling
-    onto a saturated type); falls back to feature."""
+    onto a saturated type), skipping bugfix: a passive repair is not a
+    "because we shipped A, B is next" prediction shape. Falls back to feature."""
     for candidate_type in state.VALID_CANDIDATE_TYPES:
-        if candidate_type not in saturated:
+        if candidate_type != "bugfix" and candidate_type not in saturated:
             return candidate_type
     return "feature"
 
@@ -761,7 +779,9 @@ def cmd_goal_met(args):
                     "type": default_type,
                     "value": args.seed_value if args.seed_value is not None else 4,
                     "effort": args.seed_effort if args.seed_effort is not None else 2,
-                    "risk": 1,
+                    # 2 not 1: a prediction is inherently less certain than
+                    # observed work — an unearned low risk inflates its rank.
+                    "risk": 2,
                     "status": "open",
                 })
                 seeds.append(seed)
@@ -1005,7 +1025,13 @@ def cmd_backlog_add(args):
             confidence = 1.0
         else:
             if confidence is None:
-                confidence = 0.75
+                if origin == "expansion" and getattr(args, "evidence", None):
+                    # Expansion work already survived the main agent's value gate,
+                    # and a stated evidence trail justifies a milder discount than
+                    # unproven predictions get.
+                    confidence = 0.9
+                else:
+                    confidence = 0.75
             # Chained comparison: NaN fails it too (NaN < 0.5 is False, so a
             # naive `confidence < 0.5 or confidence > 1.0` would let NaN through).
             if not (0.5 <= confidence <= 1.0):
@@ -1184,6 +1210,13 @@ def cmd_backlog_update(args):
             )
         candidate["updated_at"] = io.now_iso()
         state.save_backlog(repo, backlog)
+        # Keep state.type_stats in sync with the backlog: check's expansion
+        # payload reads the state snapshot, and a stale snapshot (e.g. after
+        # hand-flipping a status to completed) would contradict what
+        # rank_candidates computes fresh from the backlog on the same state.
+        st = state.load_state(repo)
+        _refresh_type_stats(repo, st)
+        state.save_state(repo, st)
         io.append_log(repo, "backlog-update", "success", candidate_id=args.id, fields=changed)
         return emit_result(args, True, "[OK] Updated candidate {}: {}".format(args.id, ", ".join(changed)))
 
@@ -1204,6 +1237,10 @@ def cmd_backlog_remove(args):
             return 0
         backlog["candidates"] = updated
         state.save_backlog(repo, backlog)
+        # Same sync as backlog-update: state.type_stats must not go stale.
+        st = state.load_state(repo)
+        _refresh_type_stats(repo, st)
+        state.save_state(repo, st)
         io.append_log(repo, "backlog-remove", "success", candidate_id=args.id)
         return emit_result(args, True, "[OK] Removed candidate {}.".format(args.id))
 
@@ -1879,8 +1916,24 @@ def cmd_check(args):
         if remotes.returncode == 0 and not remotes.stdout.strip():
             warnings.append("push is true but no git remote is configured; complete-round will warn on every push attempt.")
 
+    if (
+        cfg.get("review_threshold") is None
+        and st.get("completed_rounds", 0) >= 3
+        and all((entry.get("review_n") or 0) == 0 for entry in (st.get("type_stats") or {}).values())
+    ):
+        warnings.append(
+            "价值校准未激活，候选 value 自评未经验证；每轮 complete-round 传 --review-score"
+        )
+
     backlog = state.load_backlog(repo)
     backlog_watch = _backlog_watch(backlog, cfg)
+    candidates_per_round = cfg.get("candidates_per_round") or 1
+    if backlog_watch["pending"] >= 2 * candidates_per_round:
+        warnings.append(
+            "Backlog pending ({}) is at least twice the batch width ({}); consider raising "
+            "candidates_per_round to amortize the per-round fixed cost (verify, commit) over "
+            "more work.".format(backlog_watch["pending"], candidates_per_round)
+        )
     goals_unverified = state.unverified_goals(st, cfg)
     ready_floor = _ready_valuable_count(backlog, cfg.get("min_candidate_value"))
     if goals_unverified and ready_floor > 0:
@@ -1889,6 +1942,28 @@ def cmd_check(args):
                 ", ".join(goals_unverified), ready_floor
             )
         )
+    ranking_expected = cfg.get("ranking_mode", "expected") == "expected"
+    ranked = None
+    selected_entries = []
+    selected_empty_reason = None
+    if ranking_expected:
+        # One rank pass shared with the batch contract: check must never say
+        # "work" while rank_candidates would mark an empty selection — the two
+        # answers come from the same computation, not two drifted ones.
+        ranked = state.rank_candidates(
+            backlog, cfg, progress=state.progress_from_state(st, cfg),
+            completed_goals=list(st.get("completed_goals") or []),
+        )
+        selected_entries = [e for e in ranked if e.get("selected")]
+        if not selected_entries:
+            ready_pool = [e for e in ranked
+                          if e.get("status") == "pending" and e.get("ready") and not e.get("below_floor")]
+            ready_below = [e for e in ranked
+                           if e.get("status") == "pending" and e.get("ready") and e.get("below_floor")]
+            if ready_pool:
+                selected_empty_reason = ready_pool[0].get("cut_reason") or "quota"
+            elif ready_below:
+                selected_empty_reason = "floor"
     open_seed_list = state.open_seeds(st)
     seed_hint = ""
     if open_seed_list:
@@ -1925,6 +2000,17 @@ def cmd_check(args):
     action_hint = "expand" if (stop_reason is None and backlog_watch["needs_expansion"]) else (
         "stop" if stop_reason is not None else "work"
     )
+    if (
+        action_hint == "work"
+        and ranking_expected
+        and not selected_entries
+        and backlog_watch["ready"] > 0
+    ):
+        # Contract: action_hint=work must imply a non-empty recommended batch.
+        # Quota/type/cutoff cuts emptied the batch while ready candidates sit
+        # in the pool — expanding (new candidates or quota relief) is the
+        # honest move, not grinding a pool rank refused to select.
+        action_hint = "expand"
 
     payload = {
         "continue": stop_reason is None,
@@ -1932,6 +2018,8 @@ def cmd_check(args):
         "warnings": warnings,
         "backlog": backlog_watch,
         "action_hint": action_hint,
+        "selected_count": len(selected_entries) if ranking_expected else None,
+        "selected_empty_reason": selected_empty_reason,
     }
     goals_met = state.all_goals_met(cfg, st)
     payload["goals_met"] = goals_met
