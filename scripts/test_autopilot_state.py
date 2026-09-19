@@ -392,7 +392,7 @@ class RoundFlowTests(RepoTest):
         self.run_state("commit", "--summary", "add feature")
         sha = self.git("rev-parse", "HEAD").stdout.strip()
         self.run_state("complete-round", "--summary", "done", "--commit-sha", sha)
-        self.run_state("goal-met", "--goal", "Ship feature")
+        self.run_state("goal-met", "--goal", "Ship feature", "--round", "1")
         result = self.run_state("check")
         data = json.loads(result.stdout)
         self.assertFalse(data["continue"])
@@ -501,13 +501,13 @@ class BranchTests(RepoTest):
         self.assertEqual(state["origin_branch"], self.initial_branch)
         current = self.git("rev-parse", "--abbrev-ref", "HEAD").stdout.strip()
         self.assertNotEqual(current, self.initial_branch)
-        self.run_state("finish")
+        self.run_state("finish", "--force")
         current = self.git("rev-parse", "--abbrev-ref", "HEAD").stdout.strip()
         self.assertEqual(current, self.initial_branch)
 
     def test_finish_stay_keeps_branch(self):
         self.run_state("init", "--branch-mode", "feature")
-        self.run_state("finish", "--stay")
+        self.run_state("finish", "--force", "--stay")
         current = self.git("rev-parse", "--abbrev-ref", "HEAD").stdout.strip()
         self.assertNotEqual(current, self.initial_branch)
 
@@ -530,7 +530,7 @@ class BeginRoundStopTests(RepoTest):
     def test_refuses_after_goals_met(self):
         self.run_state("init", "--goal", "Ship")
         self._complete_one_round()
-        self.run_state("goal-met", "--goal", "Ship")
+        self.run_state("goal-met", "--goal", "Ship", "--round", "1")
         result = self.run_state("begin-round", "--title", "r2", "--reason", "y")
         self.assertNotEqual(result.returncode, 0)
         self.assertIn("stopped", result.stderr.lower())
@@ -546,9 +546,158 @@ class BeginRoundStopTests(RepoTest):
 
     def test_refuses_when_already_finished(self):
         self.run_state("init")
-        self.run_state("finish", "--reason", "done")
+        self.run_state("finish", "--force", "--reason", "done")
         result = self.run_state("begin-round", "--title", "r", "--reason", "x")
         self.assertNotEqual(result.returncode, 0)
+
+
+class FinishGateTests(RepoTest):
+    """P0 anti-early-stop gate: finish is refused while no stop condition is
+    reached and work remains; --force overrides; a real stop still finishes."""
+
+    def _add_candidate(self):
+        result = self.run_state("backlog-add", "--title", "A", "--reason", "r",
+                                "--value", "3", "--effort", "2")
+        self.assertEqual(result.returncode, 0, result.stderr)
+
+    def _log_events(self):
+        log_path = self.repo / ".autopilot" / "log.jsonl"
+        return [json.loads(line) for line in log_path.read_text(encoding="utf-8").splitlines()
+                if line.strip()]
+
+    def test_finish_refuses_while_ready_work_and_no_stop_condition(self):
+        self.run_state("init")
+        self._add_candidate()
+        result = self.run_state("finish", "--reason", "x")
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("Refusing to finish", result.stderr)
+        self.assertIn("value>=floor ready candidates", result.stderr)
+        self.assertIn("pass --force", result.stderr)
+        state = self.read_json("state.json")
+        self.assertIsNone(state["finished_at"])
+        data = json.loads(self.run_state("check", "--brief").stdout)
+        self.assertTrue(data["continue"])
+
+    def test_finish_force_overrides_gate(self):
+        self.run_state("init")
+        self._add_candidate()
+        result = self.run_state("finish", "--force", "--reason", "user asked to stop")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        state = self.read_json("state.json")
+        self.assertIsNotNone(state["finished_at"])
+        forced = [e for e in self._log_events() if e.get("event") == "finish-forced"]
+        self.assertEqual(len(forced), 1)
+        self.assertEqual(forced[-1].get("reason"), "user asked to stop")
+        self.assertEqual(forced[-1].get("ready"), 1)
+
+    def test_finish_allowed_after_stop_condition(self):
+        self.run_state("init", "--max-rounds", "1")
+        self.run_state("begin-round", "--title", "r", "--reason", "x")
+        self.add_file()
+        self.run_state("commit", "--summary", "add feature")
+        sha = self.git("rev-parse", "HEAD").stdout.strip()
+        self.run_state("complete-round", "--summary", "done", "--commit-sha", sha)
+        result = self.run_state("finish", "--reason", "max rounds reached")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        state = self.read_json("state.json")
+        self.assertIsNotNone(state["finished_at"])
+        self.assertEqual([e for e in self._log_events() if e.get("event") == "finish-forced"], [])
+
+
+class GoalEvidenceTests(RepoTest):
+    """goal-met without --round is an unevidenced claim: recorded, but unverified
+    goals withhold the 'all goals met' stop until evidence lands."""
+
+    def _complete_one_round(self):
+        self.run_state("begin-round", "--title", "r", "--reason", "x")
+        self.add_file()
+        self.run_state("commit", "--summary", "add feature")
+        sha = self.git("rev-parse", "HEAD").stdout.strip()
+        self.run_state("complete-round", "--summary", "done", "--commit-sha", sha)
+
+    def test_goal_met_without_round_marks_unverified(self):
+        self.run_state("init", "--goal", "G")
+        result = self.run_state("goal-met", "--goal", "G")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        state = self.read_json("state.json")
+        self.assertTrue(state["goal_events"][-1]["unverified"])
+        data = json.loads(self.run_state("check", "--brief").stdout)
+        self.assertIn("G", data["goals_unverified"])
+        self.assertTrue(data["goals_met"])
+        self.assertIsNone(data["stop_reason"])
+        self.assertTrue(data["continue"])
+        # With valuable ready work left, the warning names the unverified goal.
+        self.run_state("backlog-add", "--title", "A", "--reason", "r", "--value", "3", "--effort", "2")
+        data = json.loads(self.run_state("check", "--brief").stdout)
+        self.assertTrue(any("G" in w and "不得 finish" in w for w in data["warnings"]))
+
+    def test_goal_met_with_round_verifies(self):
+        self.run_state("init", "--goal", "G")
+        self._complete_one_round()
+        result = self.run_state("goal-met", "--goal", "G", "--round", "1")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        state = self.read_json("state.json")
+        self.assertFalse(state["goal_events"][-1]["unverified"])
+        self.assertEqual(state["goal_events"][-1]["round"], 1)
+        data = json.loads(self.run_state("check", "--brief").stdout)
+        self.assertEqual(data["goals_unverified"], [])
+        self.assertIn("all goals met", data["stop_reason"])
+        self.assertFalse(data["continue"])
+
+    def test_goal_met_round_without_completed_history_refused(self):
+        self.run_state("init", "--goal", "G")
+        result = self.run_state("goal-met", "--goal", "G", "--round", "2")
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("--round 2", result.stderr)
+        self.assertIn("completed round", result.stderr)
+        state = self.read_json("state.json")
+        self.assertEqual(state["completed_goals"], [])
+
+
+class ConfigSetTests(RepoTest):
+    """config-set reopens an 'all goals met' stop and re-fingerprints state so
+    the deliberate change is not flagged as config-drift."""
+
+    def _complete_one_round(self):
+        self.run_state("begin-round", "--title", "r", "--reason", "x")
+        self.add_file()
+        self.run_state("commit", "--summary", "add feature")
+        sha = self.git("rev-parse", "HEAD").stdout.strip()
+        self.run_state("complete-round", "--summary", "done", "--commit-sha", sha)
+
+    def test_config_set_expands_after_goals(self):
+        self.run_state("init", "--goal", "G")
+        self._complete_one_round()
+        self.run_state("goal-met", "--goal", "G", "--round", "1")
+        refused = self.run_state("begin-round", "--title", "r2", "--reason", "y")
+        self.assertNotEqual(refused.returncode, 0)
+        self.assertIn("all goals met", refused.stderr)
+        self.assertIn("config-set --expand-after-goals", refused.stderr)
+        result = self.run_state("config-set", "--expand-after-goals")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        config = self.read_json("config.json")
+        self.assertTrue(config["expand_after_goals"])
+        opened = self.run_state("begin-round", "--title", "r2", "--reason", "y")
+        self.assertEqual(opened.returncode, 0, opened.stderr)
+
+    def test_config_set_refreshes_fingerprint(self):
+        self.run_state("init")
+        config_path = self.repo / ".autopilot" / "config.json"
+        config = json.loads(config_path.read_text(encoding="utf-8"))
+        config["min_pending_candidates"] = 5
+        config_path.write_text(json.dumps(config), encoding="utf-8")
+        drifted = json.loads(self.run_state("check", "--brief").stdout)
+        self.assertTrue(any("config.json changed since init" in w for w in drifted["warnings"]))
+        result = self.run_state("config-set", "--expand-after-goals")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        state = self.read_json("state.json")
+        self.assertEqual(
+            state["config_fingerprint"],
+            ap_io.file_sha256(self.repo / ".autopilot" / "config.json"),
+        )
+        data = json.loads(self.run_state("check", "--brief").stdout)
+        self.assertFalse(any("config.json changed since init" in w for w in data["warnings"]))
+        self.assertEqual(self.read_json("config.json")["min_pending_candidates"], 5)
 
 
 class OrphanCommitTests(RepoTest):
@@ -764,7 +913,7 @@ class PredictedOriginTests(RepoTest):
         self.assertIn("受阻 1", output)
 
 
-class ImportUnitTests(unittest.TestCase):
+class SeedScoringHelperTests(unittest.TestCase):
     """Adversarial direct tests of pure helpers (no subprocess, no temp repo)."""
 
     # -- resolve_seed state machine ------------------------------------------
@@ -845,12 +994,15 @@ class ImportUnitTests(unittest.TestCase):
         self.assertEqual(ap_state._resolved_value({"value": float("inf")}), 3)
         self.assertEqual(ap_state._resolved_effort({"effort": float("inf")}), 3)
 
-    # -- _next_sequential_id monotonic after truncation -----------------------
+    # -- _next_sequential_id: fresh ids survive head truncation ----------------
     def test_sequential_id_never_reuses_truncated_ids(self):
         st = {"goal_seeds": [{"id": "seed-{:03d}".format(i), "title": str(i)} for i in range(1, 51)]}
         self.assertEqual(ap_state._next_sequential_id(st, "goal_seeds", "seed-"), "seed-051")
         st["goal_seeds"] = st["goal_seeds"][1:]  # seed-001 truncated away
-        self.assertEqual(ap_state._next_sequential_id(st, "goal_seeds", "seed-"), "seed-052")
+        # Numbering is max(existing suffix) + 1 and the bounded lists only
+        # truncate from the head, so the maximum suffix always survives: the
+        # next id is again seed-051 — fresh, never a reuse of seed-001.
+        self.assertEqual(ap_state._next_sequential_id(st, "goal_seeds", "seed-"), "seed-051")
 
     # -- _mark_selection quota edges ------------------------------------------
     @staticmethod
@@ -1041,7 +1193,12 @@ class PredictedHardeningTests(RepoTest):
 
     def test_goal_invisible_chars_cannot_fake_success(self):
         self.run_state("init", "--goal", "提升测试质量", "--max-rounds", "5")
-        result = self.run_state("goal-met", "--goal", "提升测试质量\u200b")
+        self.run_state("begin-round", "--title", "r", "--reason", "x")
+        self.add_file()
+        self.run_state("commit", "--summary", "add feature")
+        sha = self.git("rev-parse", "HEAD").stdout.strip()
+        self.run_state("complete-round", "--summary", "done", "--commit-sha", sha)
+        result = self.run_state("goal-met", "--goal", "提升测试质量\u200b", "--round", "1")
         self.assertEqual(result.returncode, 0, result.stderr)
         # The near-duplicate must not leave the run unable to stop.
         data = json.loads(self.run_state("check", "--brief").stdout)
@@ -1903,7 +2060,7 @@ class DetectAgentTests(unittest.TestCase):
         self.assertEqual(data["agent"], "generic")
 
 
-class ImportUnitTests(unittest.TestCase):
+class PureHelperUnitTests(unittest.TestCase):
     """Direct unit tests for pure helpers (import the module, no subprocess/git setup)."""
 
     script = SCRIPT
@@ -2317,7 +2474,7 @@ class OptimizationTests(RepoTest):
     def test_finish_auto_cancels_open_round(self):
         self.run_state("init")
         self.run_state("begin-round", "--title", "r", "--reason", "x")
-        result = self.run_state("finish", "--reason", "done")
+        result = self.run_state("finish", "--force", "--reason", "done")
         self.assertEqual(result.returncode, 0, result.stderr)
         state = self.read_json("state.json")
         self.assertIsNone(state["current_round"])
@@ -2846,7 +3003,7 @@ class RetrospectiveTests(RepoTest):
         sha = self.git("rev-parse", "HEAD").stdout.strip()
         self.run_state("commit", "--summary", "add feature")
         self.run_state("complete-round", "--summary", "done", "--commit-sha", sha)
-        result = self.run_state("finish", "--reason", "done", "--json")
+        result = self.run_state("finish", "--force", "--reason", "done", "--json")
         data = json.loads(result.stdout)
         self.assertTrue(data["ok"])
         self.assertTrue((self.repo / ".autopilot" / "retrospective.md").exists())
@@ -2873,7 +3030,7 @@ class ExpandPhaseTests(RepoTest):
         self.run_state("commit", "--summary", "add feature")
         sha = self.git("rev-parse", "HEAD").stdout.strip()
         self.run_state("complete-round", "--summary", "done", "--commit-sha", sha)
-        self.run_state("goal-met", "--goal", "G")
+        self.run_state("goal-met", "--goal", "G", "--round", "1")
 
     def test_default_stops_after_goals_met(self):
         self.run_state("init", "--goal", "G")
@@ -3212,7 +3369,7 @@ class FailurePathTests(RepoTest):
 
     def test_ensure_branch_refuses_tracked_changes(self):
         self.run_state("init", "--branch-mode", "feature")
-        self.run_state("finish")
+        self.run_state("finish", "--force")
         (self.repo / "README.md").write_text("# changed by user\n", encoding="utf-8")
         result = self.run_state("ensure-branch")
         self.assertNotEqual(result.returncode, 0)
@@ -3306,8 +3463,8 @@ class ContractTests(RepoTest):
         self.assertEqual(
             set(data),
             {
-                "continue", "stop_reason", "warnings", "goals_met", "phase",
-                "next_verify_round", "next_commit_round", "next_checkpoint_round",
+                "continue", "stop_reason", "warnings", "goals_met", "goals_unverified",
+                "phase", "next_verify_round", "next_commit_round", "next_checkpoint_round",
                 "backlog", "action_hint",
             },
         )
@@ -3636,6 +3793,27 @@ class HistoryBoundTests(unittest.TestCase):
         self.assertEqual(st["history"][-1]["round"], 104)
         self.assertEqual(st["history"][0]["round"], 105 - self.apstate.io.HISTORY_LIMIT)
         self.assertEqual(len(st["history"][0]["title"]), self.apstate.io.HISTORY_TEXT_LIMIT)
+
+
+class SuiteIntegrityTests(unittest.TestCase):
+    """Meta-guard: discovery must collect every test method defined in this
+    file. Two classes once shared the name ImportUnitTests and the second
+    silently shadowed the first — 14 cases ran zero times while the suite
+    stayed green. A duplicate class name or any other collection drift now
+    fails the build."""
+
+    def test_suite_collects_every_defined_test(self):
+        suite = unittest.defaultTestLoader.discover(
+            str(SCRIPT.parent), pattern=SCRIPT.name, top_level_dir=str(SCRIPT.parent),
+        )
+        collected = suite.countTestCases()
+        # Line-anchored: the counting expression itself must not be counted.
+        defined = len(re.findall(r"(?m)^\s*def test_", SCRIPT.read_text(encoding="utf-8")))
+        self.assertEqual(
+            collected, defined,
+            "unittest discover collected {} tests but the source defines {} test methods "
+            "(duplicate class name shadows cases?)".format(collected, defined),
+        )
 
 
 if __name__ == "__main__":

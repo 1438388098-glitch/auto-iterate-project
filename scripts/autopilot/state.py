@@ -357,11 +357,13 @@ def saturated_types(state, threshold=2):
 
 
 def _next_sequential_id(state, key, prefix):
-    """Next zero-padded id (`ge-003` / `seed-011`). The counter is MONOTONIC:
-    it starts past the highest suffix ever issued (not just past existing
-    entries), so ids truncated away by the bounded lists are never reused —
-    a stale candidate.from_seed can never come to point at a newer, unrelated
-    seed."""
+    """Next zero-padded id (`ge-003` / `seed-011`). Numbering is simply the
+    highest suffix among existing entries + 1 — there is no persistent counter.
+    Ids are still never reused in the normal flow: the append helpers number
+    before appending, and the bounded lists only truncate from the head
+    (``del events[:n]`` / ``del seeds[:n]``), so the maximum suffix survives
+    every truncation and the next id is always fresh — a stale
+    candidate.from_seed can never come to point at a newer, unrelated seed."""
     existing = set()
     max_counter = 0
     for item in state.get(key) or []:
@@ -572,7 +574,11 @@ def compute_stop_reason(state, cfg):
         stop_reason = state["stop_reason"]
 
     if stop_reason is None:
-        if all_goals_met(cfg, state) and not cfg.get("expand_after_goals"):
+        if (
+            all_goals_met(cfg, state)
+            and not cfg.get("expand_after_goals")
+            and not unverified_goals(state, cfg)
+        ):
             stop_reason = "all goals met"
 
     if stop_reason is None:
@@ -634,6 +640,33 @@ def all_goals_met(cfg, state):
         return False
     completed = {normalize_goal_text(goal) for goal in state.get("completed_goals") or []}
     return all(normalize_goal_text(goal) in completed for goal in goals)
+
+
+def unverified_goals(state, cfg):
+    """Configured goals recorded in completed_goals whose latest matching
+    goal_event was written without evidence (goal-met ran without --round).
+    compute_stop_reason withholds "all goals met" while this list is non-empty:
+    a goal-met claim not anchored to a completed round is an assertion, not
+    evidence. Goals with no surviving goal_event (event list truncation,
+    --no-auto-context) stay verified — blocking on absent data would brick
+    migrated/truncated runs; only a positive unverified marker withholds the
+    stop."""
+    completed = {normalize_goal_text(goal) for goal in state.get("completed_goals") or []}
+    if not completed:
+        return []
+    events = [event for event in state.get("goal_events") or [] if isinstance(event, dict)]
+    result = []
+    for goal in cfg.get("goals") or state.get("goals") or []:
+        normalized = normalize_goal_text(goal)
+        if normalized not in completed:
+            continue
+        latest = None
+        for event in events:
+            if normalize_goal_text(event.get("goal") or "") == normalized:
+                latest = event
+        if latest is not None and latest.get("unverified"):
+            result.append(goal)
+    return result
 
 
 def _candidate_score(candidate):

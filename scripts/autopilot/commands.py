@@ -221,6 +221,16 @@ def cmd_begin_round(args):
         stop_reason = state.compute_stop_reason(st, cfg)
         if stop_reason is not None:
             io.append_log(repo, "begin-round", "error", reason=stop_reason)
+            if stop_reason == "all goals met":
+                # The stop-reason string itself stays untouched (priority tests
+                # pin it); only the refusal message explains the way back in.
+                n = _ready_valuable_count(state.load_backlog(repo), cfg.get("min_candidate_value"))
+                return emit_result(
+                    args, False,
+                    "[ERROR] Autopilot is stopped: all goals met (expand_after_goals=false)。"
+                    "backlog 尚有 {} 条 value>=min_candidate_value 的 ready 候选；"
+                    "要继续探索请运行 config-set --expand-after-goals 或修改 .autopilot/config.json。".format(n),
+                )
             return emit_result(args, False, "[ERROR] Autopilot is stopped: {}. Finish or adjust the config before opening a new round.".format(stop_reason))
 
         round_number = (
@@ -700,6 +710,24 @@ def cmd_goal_met(args):
                 io.append_log(repo, "goal-met", "error", reason="{} out of range".format(name))
                 return emit_result(args, False, "[ERROR] {} must be between 1 and 5.".format(name))
 
+        goal_round = getattr(args, "round", None)
+        if goal_round is not None:
+            # Verification anchor: --round must point at a round that actually
+            # completed. Without it the claim stays unverified and cannot stop
+            # the run (state.unverified_goals).
+            completed_rounds = {
+                entry.get("round")
+                for entry in st.get("history") or []
+                if isinstance(entry, dict) and entry.get("status") == "completed"
+            }
+            if goal_round not in completed_rounds:
+                io.append_log(repo, "goal-met", "error", reason="round not completed")
+                return emit_result(
+                    args, False,
+                    "[ERROR] --round {} does not match a completed round in history; a goal can only "
+                    "be verified against a round that actually completed.".format(goal_round),
+                )
+
         if getattr(args, "dry_run", False):
             print("[DRY-RUN] Would mark goal as met: {} ({} direction seeds).".format(goal, len(next_steps)), file=sys.stderr)
             return 0
@@ -747,7 +775,12 @@ def cmd_goal_met(args):
             goal_event = state.append_goal_event(st, {
                 "goal": goal,
                 "met_at": io.now_iso(),
-                "round": st.get("round") or 0,
+                "round": goal_round if goal_round is not None else (st.get("round") or 0),
+                "evidence": getattr(args, "evidence", None) or "",
+                # No completed-round anchor -> the claim stays unverified and
+                # compute_stop_reason withholds "all goals met" until a
+                # goal-met --round <completed round> lands.
+                "unverified": goal_round is None,
                 "commit_shas": _last_completed_round_shas(st) if not args.no_auto_context else [],
                 "candidate_ids": round_candidate_ids,
                 "unlocked_capabilities": unlocked,
@@ -819,6 +852,28 @@ def cmd_finish(args):
                 file=sys.stderr,
             )
             return 0
+
+        # P0 anti-early-stop gate: an honest finish needs a reached stop
+        # condition or an explicit --force. Budgets remaining plus actionable
+        # (or expansion-needing) backlog is exactly the premature stop this
+        # skill exists to prevent — refuse before any state mutation, so a
+        # refused finish leaves the run (and any open round) untouched.
+        backlog = state.load_backlog(repo)
+        watch = _backlog_watch(backlog, cfg)
+        ready_floor = _ready_valuable_count(backlog, cfg.get("min_candidate_value"))
+        gate_blocks = (
+            state.compute_stop_reason(st, cfg) is None
+            and (watch["needs_expansion"] or ready_floor > 0)
+        )
+        if gate_blocks:
+            if not getattr(args, "force", False):
+                io.append_log(repo, "finish", "error", reason="gate: work remains")
+                return emit_result(
+                    args, False,
+                    "[ERROR] Refusing to finish: no stop condition reached and {} value>=floor ready "
+                    "candidates remain. Run Deep Expansion, or pass --force to override.".format(ready_floor),
+                )
+            io.append_log(repo, "finish-forced", "success", reason=args.reason, ready=ready_floor)
 
         open_round = st.get("current_round")
         if open_round is not None:
@@ -1503,6 +1558,48 @@ def cmd_analysis_load(args):
     return 0
 
 
+def cmd_config_set(args):
+    """Runtime config adjustment (currently only --expand-after-goals). Rewrites
+    .autopilot/config.json and refreshes state's config_fingerprint, so the
+    deliberate change is not flagged as config-drift — and an "all goals met"
+    stop can be reopened for the expansion phase without touching files by hand."""
+    repo = Path(args.repo).resolve()
+    with io.run_lock(repo):
+        if not config.state_path_for(repo).exists():
+            return emit_result(args, False, "[ERROR] Autopilot not initialized. Run init first.")
+        if not getattr(args, "expand_after_goals", False):
+            io.append_log(repo, "config-set", "error", reason="nothing to set")
+            return emit_result(
+                args, False,
+                "[ERROR] config-set requires at least one field to set (currently only --expand-after-goals).",
+            )
+        # load_config validates the on-disk file; the single mutation is the
+        # literal True, so the merged result cannot fail validation — but the
+        # reload below re-runs the full validator over what we actually wrote.
+        cfg = config.load_config(repo)
+        if getattr(args, "dry_run", False):
+            print(
+                "[DRY-RUN] Would set expand_after_goals=true in .autopilot/config.json "
+                "and refresh the state config fingerprint.",
+                file=sys.stderr,
+            )
+            return 0
+        cfg["expand_after_goals"] = True
+        config.save_config(repo, cfg)
+        reloaded = config.load_config(repo)
+        if not reloaded.get("expand_after_goals"):
+            io.append_log(repo, "config-set", "error", reason="reload mismatch")
+            return emit_result(args, False, "[ERROR] config-set could not persist expand_after_goals=true.")
+        st = state.load_state(repo)
+        st["config_fingerprint"] = io.file_sha256(config.config_path_for(repo))
+        state.save_state(repo, st)
+        io.append_log(repo, "config-set", "success", expand_after_goals=True)
+        return emit_result(
+            args, True,
+            "[OK] Config updated: expand_after_goals=true; config fingerprint refreshed (no config-drift warning).",
+        )
+
+
 def cmd_directive_add(args):
     repo = Path(args.repo).resolve()
     with io.run_lock(repo):
@@ -1704,6 +1801,21 @@ def _backlog_watch(backlog, cfg):
     }
 
 
+def _ready_valuable_count(backlog, floor):
+    """Pending candidates that are dependency-ready and at or above the value
+    floor (``floor: null`` disables the filter). Shared by the finish gate,
+    check's unverified-goal warning, and begin-round's goals-met refusal —
+    "work remains" must mean the same thing in all three."""
+    count = 0
+    for candidate in backlog.get("candidates") or []:
+        if candidate.get("status") != "pending":
+            continue
+        _, is_ready = state.candidate_deps_status(backlog, candidate)
+        if is_ready and (floor is None or state._resolved_value(candidate) >= floor):
+            count += 1
+    return count
+
+
 def cmd_check(args):
     repo = Path(args.repo).resolve()
     st = state.load_state(repo)
@@ -1769,6 +1881,14 @@ def cmd_check(args):
 
     backlog = state.load_backlog(repo)
     backlog_watch = _backlog_watch(backlog, cfg)
+    goals_unverified = state.unverified_goals(st, cfg)
+    ready_floor = _ready_valuable_count(backlog, cfg.get("min_candidate_value"))
+    if goals_unverified and ready_floor > 0:
+        warnings.append(
+            "goal {} 未提供完成证据；尚有 {} 条 value>=floor 的 ready 候选，不得 finish".format(
+                ", ".join(goals_unverified), ready_floor
+            )
+        )
     open_seed_list = state.open_seeds(st)
     seed_hint = ""
     if open_seed_list:
@@ -1815,6 +1935,7 @@ def cmd_check(args):
     }
     goals_met = state.all_goals_met(cfg, st)
     payload["goals_met"] = goals_met
+    payload["goals_unverified"] = goals_unverified
     payload["phase"] = "expand" if (goals_met and cfg.get("expand_after_goals")) else "iterate"
     if payload["phase"] == "expand":
         # Expansion context for Wave 0 (seed wave). Key set is stable even when

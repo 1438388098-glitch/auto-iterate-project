@@ -170,6 +170,11 @@ def build_parser():
                              help="Type for created seeds (default: first non-saturated type)")
     goal_parser.add_argument("--seed-value", type=int, default=None, help="Seed value 1-5 (default 4)")
     goal_parser.add_argument("--seed-effort", type=int, default=None, help="Seed effort 1-5 (default 2)")
+    goal_parser.add_argument("--round", type=int, default=None,
+                             help="Round number that completed this goal (must match a completed history entry); "
+                                  "omitting it marks the goal unverified and withholds the 'all goals met' stop")
+    goal_parser.add_argument("--evidence", default=None,
+                             help="Audit-only note on the evidence that the goal is met (recorded on the goal event)")
     goal_parser.add_argument("--no-auto-context", action="store_true",
                              help="Skip the automatic commit-topic/type-stats snapshot for the goal event")
     add_json(goal_parser)
@@ -191,6 +196,8 @@ def build_parser():
     finish_parser.add_argument("--repo", default=".")
     finish_parser.add_argument("--reason")
     finish_parser.add_argument("--stay", action="store_true", help="Stay on the autopilot branch instead of returning to origin")
+    finish_parser.add_argument("--force", action="store_true",
+                               help="Finish even while no stop condition is reached and ready work remains (user-approved early stop)")
     add_json(finish_parser)
     add_dry_run(finish_parser)
     finish_parser.set_defaults(func=commands.cmd_finish)
@@ -258,6 +265,17 @@ def build_parser():
     add_json(detect_verify_parser)
     add_dry_run(detect_verify_parser)
     detect_verify_parser.set_defaults(func=commands.cmd_detect_verify)
+
+    config_set_parser = subparsers.add_parser(
+        "config-set",
+        help="Update .autopilot/config.json at runtime and re-fingerprint state",
+    )
+    config_set_parser.add_argument("--repo", default=".")
+    config_set_parser.add_argument("--expand-after-goals", action="store_true",
+                                   help="Keep iterating after all goals are met (scout new candidates instead of stopping)")
+    add_json(config_set_parser)
+    add_dry_run(config_set_parser)
+    config_set_parser.set_defaults(func=commands.cmd_config_set)
 
     backlog_add_parser = subparsers.add_parser("backlog-add", help="Add a backlog candidate")
     backlog_add_parser.add_argument("--repo", default=".")
