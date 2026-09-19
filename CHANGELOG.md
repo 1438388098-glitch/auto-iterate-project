@@ -2,6 +2,46 @@
 
 All notable changes to auto-iterate-project are documented here.
 
+## Unreleased
+
+P0 anti-early-stop hardening: an autonomous run once finished ~5 hours before
+its deadline with a "backlog exhausted" reason and zero helper pushback. The
+helper now enforces honest finishing in code instead of trusting the prompt.
+
+### Added
+
+- `finish --force`: `finish` without it is refused (exit 2) while no stop
+  condition is reached and value>=floor ready candidates remain (or the
+  backlog needs expansion); the refusal mutates nothing, so an open round
+  survives a refused finish. A forced finish logs a `finish-forced` event with
+  the reason and ready count.
+- `goal-met --round <n>` / `--evidence`: `--round` must match a completed
+  round in history and marks the claim verified; without it the goal event is
+  `unverified: true` and the "all goals met" stop is withheld.
+  `unverified_goals()` backs `check`'s new `goals_unverified` payload, plus a
+  warning naming the goal while valuable ready candidates remain.
+- `config-set --expand-after-goals`: runtime config adjustment that reloads
+  and re-validates the config, saves it, and refreshes state's
+  `config_fingerprint` (no config-drift false alarm); reopens an "all goals
+  met" stop for the expansion phase. `begin-round`'s all-goals-met refusal now
+  points at it and reports the remaining ready candidates.
+- Test-suite integrity guard: `unittest discover` count must equal the count
+  of test methods defined in the source — a duplicate class name that silently
+  shadows tests now fails the build.
+
+### Fixed
+
+- Two test classes shared the name `ImportUnitTests`; discovery collected only
+  the second, so the first class's 14 cases (among them the sequential-id
+  truncation test) never ran while the suite stayed green. Renamed to
+  `SeedScoringHelperTests` / `PureHelperUnitTests` (280 -> 303 collected).
+- `test_sequential_id_never_reuses_truncated_ids` asserted an unreachable
+  scenario: `_next_sequential_id` numbers from the max surviving suffix + 1
+  and the bounded lists truncate only from the head, so the maximum suffix
+  always survives and no id is ever reused in the normal flow. The assertion,
+  and the `_next_sequential_id` docstring that overclaimed a persistent
+  "monotonic counter", now describe the actual (and still safe) mechanism.
+
 ## 1.3.3 (2026-09-18)
 
 Second autonomous iteration: fourth scout wave (CLI surface / test blind-spot

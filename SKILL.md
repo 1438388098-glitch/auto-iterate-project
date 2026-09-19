@@ -188,12 +188,12 @@ Do not push unless config sets `push: true`; when it does, `complete-round` push
 
 ### 9. Mark Goals
 
-If the round satisfies one of the configured goals, run `goal-met --goal "<exact goal text>"`.
+If the round satisfies one of the configured goals, run `goal-met --goal "<exact goal text>" --round <the round that completed it>`. The `--round` must match a completed round in history — it is the evidence that the claim is real; a `goal-met` without `--round` is recorded as **unverified** and withholds the "all goals met" stop (check lists such goals under `goals_unverified` and warns not to finish). Optionally add `--evidence "<how you know it is met>"` for the audit trail.
 
 Record the follow-on direction in the same call while it is fresh — every `--next-step` creates one **direction seed** (a predicted "because we shipped A, B is next" hypothesis) in `state.json`:
 
 ```powershell
-python <this-skill>/scripts/autopilot_state.py goal-met --repo <repo> --goal "<goal>" --next-step "<predicted follow-up>" --unlocked-capability "<capability unlocked>"
+python <this-skill>/scripts/autopilot_state.py goal-met --repo <repo> --goal "<goal>" --round <n> --next-step "<predicted follow-up>" --unlocked-capability "<capability unlocked>"
 ```
 
 `goal-met` also snapshots the context of the completion (recent commit topics, saturated types, the round's candidates) into a goal event, so the expansion phase can reason from what was just delivered instead of rescanning the repo. `completed_goals` stays a plain string array; old state files are migrated automatically.
@@ -301,7 +301,7 @@ When `check` returns `action_hint: "expand"`, the backlog is empty, or local ana
    - Wave 2: lower `min_candidate_value` floor temporarily (accept 2s), look at adjacent modules, user-facing polish, test debt.
    - Wave 3+: change *depth* — read the hardest/most-used paths end-to-end; trace a real user journey; audit every public symbol; re-scan after `git log -p` for regressions the history already hints at.
    - Wave 4+: change *scope* — sibling packages, scripts, CI workflows, generated files, docs site, examples, packaging metadata.
-   - Keep spawning until you have `min_pending_candidates` ready pending items or a budget stop fires. **Never finish with reason "expansion exhausted" while budgets remain.**
+   - Keep spawning until you have `min_pending_candidates` ready pending items or a budget stop fires. **Never finish with reason "expansion exhausted" while budgets remain** — this is now enforced in code: while the budgets (`max_rounds`/`max_minutes`/`deadline`/`max_tokens`) are not exhausted and `check` still returns `continue: true`, a `finish` without `--force` is refused. The only honest finish reasons are "a stop condition fired" or "the user explicitly asked (finish --force)".
 4. **No-subagent runtime fallback**: if the host has no Task/Agent/explore tool, run the same lenses **serially in-process**: one lens per pass, `analysis-save` between passes, `git log -p` archaeology, end-to-end traces of public entry points. Do not claim "cannot expand" and do not re-read the same three files hoping for new ideas.
 5. **After goals are met** (especially with `expand_after_goals: true`), treat every subsequent thin backlog the same way: expand outward via subagents instead of finishing early.
 
@@ -333,7 +333,7 @@ If you catch yourself about to idle, run Deep Expansion immediately.
 
 Stop when any of these is true:
 
-- All configured goals are met **and** `expand_after_goals` is false (when it is true, enter the Expansion Phase instead of stopping).
+- All configured goals are met **and** `expand_after_goals` is false (when it is true, enter the Expansion Phase instead of stopping). A goal marked met without `goal-met --round <completed round>` counts as unverified and withholds this stop.
 - `max_rounds` is reached (counted as completed + blocked + cancelled + reverted rounds, matching the round-number counter).
 - `max_minutes` is reached. This is wall-clock time since the most recent round activity (`init`/`begin-round`/`complete-round`/`block-round`/`cancel-round`/`goal-met`/`backlog-add`). Pausing the run does not pause the clock: if the pause is longer than the remaining budget, the resumed run stops on the first `check`. Set `max_minutes` to `null` for unlimited.
 - `deadline` is reached. The timer (定时器) stops the run at an **absolute** wall-clock moment (for example "iterate until tomorrow morning"), independent of round activity. It complements `max_minutes`: the countdown (倒计时) measures duration since the last round; the deadline is a fixed point in time. Set it with `init --deadline <expr>`; a deadline already in the past stops the run on the first `check`. Set `deadline` to `null` to disable.
@@ -360,7 +360,7 @@ An empty or thin backlog is **never** an escalation. Keep running Deep Expansion
 When the loop stops:
 
 1. If `commit_every_rounds` is enabled and the last round did not commit, **flush the pending changes** with a final `commit --round <n> --summary "flush accumulated changes"` (or commit within the open round) so no verified work is left uncommitted.
-2. Run `finish --reason "<stop reason>"`. It auto-cancels any still-open round (returning its candidate to pending), writes `.autopilot/retrospective.md` (per-type completion/blocked stats, blocked rounds, verification commands, next likely improvement), and in `feature` mode returns to the branch you started on; pass `--stay` to remain on the autopilot branch.
+2. Run `finish --reason "<stop reason>"`. The finish gate refuses while no stop condition is reached and value>=floor ready candidates remain (or the backlog needs expansion) — in that case run Deep Expansion instead; pass `--force` only when the user explicitly asked to stop. `finish` auto-cancels any still-open round (returning its candidate to pending), writes `.autopilot/retrospective.md` (per-type completion/blocked stats, blocked rounds, verification commands, next likely improvement), and in `feature` mode returns to the branch you started on; pass `--stay` to remain on the autopilot branch.
 3. Write `.autopilot/last-summary.md` with completed rounds, blocked rounds, commit SHAs, active branch, remaining goals, backlog status, and the next likely improvement. Write it in the user's language when you know it (the default English trigger suggests English output; the Chinese trigger suggests Chinese). You can generate the underlying data deterministically with `python <this-skill>/scripts/autopilot_state.py report --repo <repo> [--lang zh|en] [--output <file>]`.
 4. Report a short summary to the user.
 
@@ -396,7 +396,7 @@ When the loop stops:
 | `commit` fails with "exceeds max_round_scope" | The accumulated batch is too large | Stage a subset, commit, then stage the rest and commit again within the same round |
 | `commit` fails with "Secret-like content detected" | The staged diff matches a secret pattern | Remove the secret, or commit with `--allow-secrets` / set `scan_secrets: false` after verifying it is not sensitive |
 | `begin-round` says a round is open | A previous round was interrupted | `read` the state, then `complete-round`, `block-round`, or `cancel-round` |
-| `begin-round` fails with "Autopilot is stopped" | A stop condition is already reached | Run `check`, resolve the stop reason (e.g. raise `max_rounds`) or run `finish` |
+| `begin-round` fails with "Autopilot is stopped" | A stop condition is already reached | Run `check`, resolve the stop reason (e.g. raise `max_rounds`, or `config-set --expand-after-goals` when all goals are met) or run `finish`; note `finish` without `--force` is itself refused while a stop condition is unmet and ready candidates remain — pass `--force` only on explicit user request |
 | `commit` fails with "No round is open" | Nothing began the current round | Run `begin-round` first, or pass `--round <n>` for an intentional orphan commit |
 | "Another autopilot run appears active" | Stale `.autopilot/lock` or a real concurrent run | Wait for the other run, or delete `.autopilot/lock` if that process is dead; the helper now also removes corrupt lock files and locks left by other hosts automatically |
 | `check` reports `max_minutes` right after resume | Budget measures wall-clock since last activity, and the pause consumed it | Expected behavior; raise `max_minutes` or set it to `null` |
