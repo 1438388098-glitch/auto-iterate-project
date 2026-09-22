@@ -116,6 +116,15 @@ Boolean, default `false`. When `true`, reaching all configured goals does **not*
 
 Independent of this flag, a thin backlog (`pending` < `min_pending_candidates`) is always an expansion trigger while the run continues — see Deep Expansion Protocol in `SKILL.md`.
 
+Toggle at runtime without a config-drift warning:
+
+```powershell
+python <this-skill>/scripts/autopilot_state.py config-set --repo <repo> --expand-after-goals
+python <this-skill>/scripts/autopilot_state.py config-set --repo <repo> --no-expand-after-goals
+```
+
+Exactly one of those two flags is required (`config-set` refuses when neither is passed).
+
 ### review_threshold
 
 Integer 1-5, default `null`. When set, `complete-round` requires a `--review-score` (self-assessment on the same 1-5 scale) at least as high, and records the score plus optional `--review-notes` in the round history. A score below the threshold is refused with an error — the round must be reworked or blocked. This turns the pre-commit self-review into a hard quality red line. `null` disables the gate.
@@ -299,7 +308,7 @@ Anti-noise scoring (刀 B): a promoted candidate carries `origin: "predicted"`, 
 - `begin-round`, `complete-round`, `block-round`, `cancel-round` — round lifecycle. `begin-round` enforces the clean-tree rule, refuses to pick candidates with unresolved `depends_on`, and refuses to reuse round numbers; `--candidate-id` is repeatable so one round can pick multiple backlog candidates (`candidates_per_round`). `complete-round` accepts an optional `--commit-sha` (omit it on deferred commit rounds when `commit_every_rounds > 1`), an optional `--review-score`/`--review-notes` (pass a score every round — it feeds the value calibration; enforced only when `review_threshold` is set) and `--below-threshold` (records a below-threshold round as completed with its low score, without counting blocked — the only in-run exit once `max_blocked_in_a_row` fires), auto-writes a Chinese phase report (`.autopilot/phase-report-round-<N>.md`) every 10 completed rounds, and refreshes `state.type_stats`. A `cancel-round` with zero work (no tree delta, no commit, under 10 minutes) records an `aborted` round that consumes no round budget and no token base.
 - `commit` — staged-change check, git identity check, path whitelist check (`allow_paths`/`deny_paths`), secret scan (`scan_secrets`, bypassable with `--allow-secrets`), scope guard (including binary files), open-round requirement (always enforced unless `--round <n>` is passed explicitly; what batched mode skips is only the dirty-start check), and prefix message building.
 - `undo-round` — `git revert` a bad commit (never rewriting history), record a `revert` history entry, and advance the round counter.
-- `goal-met`, `finish` — goals and run closure. `goal-met` accepts `--round`/`--evidence` (verification anchor; omitting `--round` marks the goal unverified) and `--next-step`/`--unlocked-capability`/`--seed-*` to record direction seeds (see Direction Seeds above). `finish` auto-cancels any still-open round, writes `.autopilot/retrospective.md`, and returns to the origin branch in feature mode; while no stop condition is reached and value>=floor ready candidates remain it is refused unless `--force` is passed (a forced finish logs `finish-forced`). `config-set --expand-after-goals` rewrites the config and refreshes the state config fingerprint.
+- `goal-met`, `finish` — goals and run closure. `goal-met` accepts `--round`/`--evidence` (verification anchor; omitting `--round` marks the goal unverified) and `--next-step`/`--unlocked-capability`/`--seed-*` to record direction seeds (see Direction Seeds above). `finish` auto-cancels any still-open round, writes `.autopilot/retrospective.md`, and returns to the origin branch in feature mode; while no stop condition is reached and value>=floor ready candidates remain it is refused unless `--force` is passed (a forced finish logs `finish-forced`). `config-set --expand-after-goals` / `config-set --no-expand-after-goals` rewrites `expand_after_goals` and refreshes the state config fingerprint.
 - `report` — print (or write with `--output`) a deterministic markdown run report; `--lang zh|en` overrides `report_lang`.
 - `retrospective` — print (or write with `--output`) the run-level retrospective: per-type stats, blocked rounds, verification commands, and the next ready candidate.
 - `detect-verify` — scan repo entry points and recommend `check_commands` (including `gitleaks`/`detect-secrets` when installed); `--apply` writes them into the config.

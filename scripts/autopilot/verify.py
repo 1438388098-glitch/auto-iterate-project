@@ -2,7 +2,33 @@
 
 import re
 import shutil
+import subprocess
 from pathlib import Path
+
+
+def _gitleaks_command():
+    """Return a gitleaks command line that this install actually understands,
+    or None. Newer builds use `detect`; older ones only expose `git`."""
+    if not shutil.which("gitleaks"):
+        return None
+    for candidate in (
+        ["gitleaks", "detect", "--no-banner"],
+        ["gitleaks", "detect"],
+        ["gitleaks", "git", "--no-banner", "."],
+        ["gitleaks", "git", "."],
+    ):
+        try:
+            probe = subprocess.run(
+                candidate + ["--help"],
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+                timeout=5,
+            )
+        except (OSError, subprocess.SubprocessError):
+            continue
+        if probe.returncode == 0:
+            return " ".join(candidate)
+    return None
 
 
 def detect_verify_commands(repo):
@@ -27,8 +53,9 @@ def detect_verify_commands(repo):
                 signals.append(("make", "make test"))
         except OSError:
             pass
-    if shutil.which("gitleaks"):
-        signals.append(("secrets", "gitleaks git --no-banner ."))
+    gitleaks = _gitleaks_command()
+    if gitleaks:
+        signals.append(("secrets", gitleaks))
     if shutil.which("detect-secrets"):
         signals.append(("secrets", "detect-secrets scan"))
     return signals

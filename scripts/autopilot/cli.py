@@ -13,12 +13,21 @@ from . import agent, commands
 def _force_utf8_stdio():
     """Windows pipes inherit the ANSI code page on py3.6: a zh report or a
     seed title with non-GBK characters would crash the loop mid-print with
-    UnicodeEncodeError. Force UTF-8 with replacement on both streams."""
+    UnicodeEncodeError. Force UTF-8 with replacement on both streams.
+    Idempotent: skip streams already wrapped as UTF-8 text."""
     for name in ("stdout", "stderr"):
         stream = getattr(sys, name)
         buffer = getattr(stream, "buffer", None)
-        if buffer is not None:
-            setattr(sys, name, io.TextIOWrapper(buffer, encoding="utf-8", errors="replace"))
+        if buffer is None:
+            continue
+        encoding = getattr(stream, "encoding", None)
+        if encoding and encoding.lower().replace("-", "") == "utf8":
+            continue
+        setattr(
+            sys,
+            name,
+            io.TextIOWrapper(buffer, encoding="utf-8", errors="replace", line_buffering=True),
+        )
 
 
 def build_parser():
@@ -60,8 +69,13 @@ def build_parser():
                              help="Run full verification once per this many rounds (default 3)")
     init_parser.add_argument("--checkpoint-every", type=int, default=None,
                              help="Pause and ask the user once per this many rounds (default off)")
-    init_parser.add_argument("--expand-after-goals", action="store_true", default=None,
-                             help="Keep iterating after all goals are met (scout new candidates instead of stopping)")
+    init_expand_group = init_parser.add_mutually_exclusive_group()
+    init_expand_group.add_argument("--expand-after-goals", dest="expand_after_goals",
+                                   action="store_true", default=None,
+                                   help="Keep iterating after all goals are met (scout new candidates instead of stopping)")
+    init_expand_group.add_argument("--no-expand-after-goals", dest="expand_after_goals",
+                                   action="store_false", default=None,
+                                   help="Stop when all goals are met (disable the expansion phase)")
     init_parser.add_argument("--review-threshold", type=int, default=None,
                              help="complete-round requires --review-score >= this (1-5) to pass")
     scan_group = init_parser.add_mutually_exclusive_group()
@@ -276,8 +290,13 @@ def build_parser():
         help="Update .autopilot/config.json at runtime and re-fingerprint state",
     )
     config_set_parser.add_argument("--repo", default=".")
-    config_set_parser.add_argument("--expand-after-goals", action="store_true",
-                                   help="Keep iterating after all goals are met (scout new candidates instead of stopping)")
+    expand_group = config_set_parser.add_mutually_exclusive_group()
+    expand_group.add_argument("--expand-after-goals", dest="expand_after_goals",
+                              action="store_true", default=None,
+                              help="Keep iterating after all goals are met (scout new candidates instead of stopping)")
+    expand_group.add_argument("--no-expand-after-goals", dest="expand_after_goals",
+                              action="store_false", default=None,
+                              help="Stop when all goals are met (disable the expansion phase)")
     add_json(config_set_parser)
     add_dry_run(config_set_parser)
     config_set_parser.set_defaults(func=commands.cmd_config_set)
@@ -398,5 +417,10 @@ def main():
         # Malformed paths (e.g. shell-mangled \\?\ device paths) used to escape
         # as raw tracebacks from ~30 entry points; the contract is [ERROR]+2.
         print("[ERROR] OS-level failure: {}".format(exc), file=sys.stderr)
+        code = 2
+    except (ValueError, KeyError, TypeError) as exc:
+        # Corrupt state payloads / bad numeric fields should also honor the
+        # [ERROR]+2 contract instead of dumping a traceback into the loop.
+        print("[ERROR] Invalid input or state: {}".format(exc), file=sys.stderr)
         code = 2
     sys.exit(code)

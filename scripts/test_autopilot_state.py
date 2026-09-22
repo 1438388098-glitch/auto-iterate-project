@@ -1212,7 +1212,9 @@ class BudgetAccountingTests(RepoTest):
     def test_token_accounting_monotonic(self):
         # QA-3: two staged rounds committed in round 3 used to bill the same
         # 20 lines twice ([620, 620, 740] = 1980); the run-level water marks
-        # bill them once ([620, 620, 500] = 1740).
+        # bill them once. A commit-only batch flush with zero new units is free
+        # (no TOKEN_BASE) so max_tokens is not drained by re-committing already
+        # billed work ([620, 620, 0] = 1240).
         self.run_state("init")
         self.run_state("begin-round", "--title", "r1", "--reason", "x")
         self._touch_staged("w1.py")
@@ -1226,8 +1228,8 @@ class BudgetAccountingTests(RepoTest):
         self.run_state("complete-round", "--summary", "r3", "--commit-sha", sha)
         state = self.read_json("state.json")
         tokens = [entry["estimated_tokens"] for entry in state["history"]]
-        self.assertEqual(tokens, [620, 620, 500])
-        self.assertEqual(state["estimated_tokens_used"], 1740)
+        self.assertEqual(tokens, [620, 620, 0])
+        self.assertEqual(state["estimated_tokens_used"], 1240)
 
     def test_check_reports_blocked_streak(self):
         self.run_state("init")
@@ -2043,8 +2045,10 @@ class PredictedHardeningTests(RepoTest):
 
     def test_version_consistency_across_files(self):
         """Single version authority (scripts/autopilot/__init__.py __version__)
-        must match SKILL.md frontmatter, agents/openai.yaml, README.md, and the
-        newest CHANGELOG section — drift fails here instead of at release time."""
+        must match SKILL.md frontmatter, agents/openai.yaml, references/overview.md,
+        and the newest CHANGELOG section — drift fails here instead of at release
+        time. (Root README.md is intentionally absent: skill folders must not
+        ship one; overview lives under references/.)"""
         import autopilot
 
         repo_root = Path(__file__).resolve().parent.parent
@@ -2053,10 +2057,11 @@ class PredictedHardeningTests(RepoTest):
         self.assertIn("version: {}".format(version), skill)
         yaml_text = (repo_root / "agents" / "openai.yaml").read_text(encoding="utf-8")
         self.assertIn("version: {}".format(version), yaml_text)
-        readme = (repo_root / "README.md").read_text(encoding="utf-8")
-        self.assertIn("Version {}".format(version), readme)
+        overview = (repo_root / "references" / "overview.md").read_text(encoding="utf-8")
+        self.assertIn("Version {}".format(version), overview)
         changelog = (repo_root / "CHANGELOG.md").read_text(encoding="utf-8")
         self.assertIn("## {} (".format(version), changelog)
+        self.assertFalse((repo_root / "README.md").exists(), "skill folders must not ship a root README.md")
 
     def test_parse_deadline_overflow_returns_none(self):
         from autopilot import io as ap_io
@@ -4583,6 +4588,96 @@ class HistoryBoundTests(unittest.TestCase):
         self.assertEqual(st["history"][-1]["round"], 104)
         self.assertEqual(st["history"][0]["round"], 105 - self.apstate.io.HISTORY_LIMIT)
         self.assertEqual(len(st["history"][0]["title"]), self.apstate.io.HISTORY_TEXT_LIMIT)
+
+
+class ReviewFixRegressionTests(RepoTest):
+    """Lock the 1.4.0 review fixes: token base only on real work, config-set can
+    disable expand_after_goals, parse_time trailing-Z only, dir/** path guard,
+    and the 16-lens catalog stays in lockstep with SKILL.md / references."""
+
+    def test_token_base_skipped_without_new_units(self):
+        self.run_state("init")
+        # Anchor on HEAD so the fixture's initial commit is not billed as run work.
+        head = self.git("rev-parse", "HEAD").stdout.strip()
+        tokens, total_text, total_binary = ap_io.estimate_tokens_for_round(self.repo, head, 0, 0)
+        self.assertEqual(tokens, 0, "no changed units must not charge TOKEN_BASE")
+        self.assertEqual((total_text, total_binary), (0, 0))
+
+        self.add_file("a.py", "1\n2\n3\n")
+        tokens, total_text, total_binary = ap_io.estimate_tokens_for_round(self.repo, head, 0, 0)
+        self.assertGreaterEqual(tokens, ap_io.TOKEN_BASE)
+        self.assertEqual(total_text, 3)
+
+        # Re-billing the same units (water marks already at the totals) is free.
+        tokens, _, _ = ap_io.estimate_tokens_for_round(self.repo, head, total_text, total_binary)
+        self.assertEqual(tokens, 0)
+
+    def test_config_set_disables_expand_after_goals(self):
+        self.run_state("init", "--goal", "G", "--expand-after-goals")
+        config = self.read_json("config.json")
+        self.assertTrue(config["expand_after_goals"])
+        result = self.run_state("config-set", "--no-expand-after-goals")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertFalse(self.read_json("config.json")["expand_after_goals"])
+        none = self.run_state("config-set")
+        self.assertNotEqual(none.returncode, 0)
+        self.assertIn("expand-after-goals", none.stderr)
+        both = self.run_state("config-set", "--expand-after-goals", "--no-expand-after-goals")
+        self.assertNotEqual(both.returncode, 0)
+
+    def test_parse_time_only_rewrites_trailing_z(self):
+        self.assertIsNotNone(ap_io.parse_time("2026-08-10T08:00:00Z"))
+        self.assertIsNotNone(ap_io.parse_time("2026-08-10T08:00:00+08:00"))
+        # A mid-string Z is not the UTC designator and must not be rewritten.
+        self.assertIsNone(ap_io.parse_time("2026-08-10T08:00:00Z+08:00"))
+        self.assertIsNone(ap_io.parse_time("not-a-timestamp"))
+
+    def test_guard_doublestar_directory_subtree(self):
+        self.assertTrue(path_allowed("docs/a.md", ["docs/**"], []))
+        self.assertTrue(path_allowed("docs/a/b.md", ["docs/**"], []))
+        self.assertTrue(path_allowed("docs", ["docs/**"], []))
+        self.assertFalse(path_allowed("src/a.py", ["docs/**"], []))
+        self.assertFalse(path_allowed("docs/a.md", [], ["docs/**"]))
+        self.assertTrue(path_allowed("src/a.py", ["src/**/*.py"], []))
+        self.assertTrue(path_allowed("src/nested/a.py", ["src/**/*.py"], []))
+        self.assertFalse(path_allowed("other/a.py", ["src/**/*.py"], []))
+
+    def test_expansion_lenses_match_skill_docs(self):
+        self.assertEqual(len(ap_state.EXPANSION_LENSES), 16)
+        self.assertEqual(len(set(ap_state.EXPANSION_LENSES)), 16)
+        repo_root = Path(__file__).resolve().parent.parent
+        skill = (repo_root / "SKILL.md").read_text(encoding="utf-8")
+        lenses_doc = (repo_root / "references" / "expansion-lenses.md").read_text(encoding="utf-8")
+        self.assertIn("16", skill)
+        for lens in ap_state.EXPANSION_LENSES:
+            self.assertIn(lens, lenses_doc, "references/expansion-lenses.md missing lens " + lens)
+        # Merged legacy aliases must stay gone or expansion-record will reject them.
+        self.assertNotIn("docs / ux-copy", skill)
+        self.assertNotIn("| docs / ux-copy |", lenses_doc)
+
+    def test_skill_ship_surface_has_no_root_readme(self):
+        repo_root = Path(__file__).resolve().parent.parent
+        self.assertFalse((repo_root / "README.md").exists())
+        for name in (
+            "overview.md",
+            "config.md",
+            "expansion-lenses.md",
+            "wave0-prediction.md",
+            "troubleshooting.md",
+        ):
+            self.assertTrue((repo_root / "references" / name).exists(), name)
+
+    def test_log_rotation_keeps_generations(self):
+        self.run_state("init")
+        log_path = self.repo / ".autopilot" / "log.jsonl"
+        log_path.write_text("x" * (ap_io.LOG_ROTATE_BYTES + 1), encoding="utf-8")
+        ap_io.append_log(self.repo, "rotate-probe", "ok")
+        self.assertTrue(log_path.exists())
+        self.assertTrue(Path(str(log_path) + ".1").exists())
+        # Second rotation shifts .1 -> .2 instead of overwriting history.
+        log_path.write_text("y" * (ap_io.LOG_ROTATE_BYTES + 1), encoding="utf-8")
+        ap_io.append_log(self.repo, "rotate-probe", "ok")
+        self.assertTrue(Path(str(log_path) + ".2").exists())
 
 
 class SuiteIntegrityTests(unittest.TestCase):

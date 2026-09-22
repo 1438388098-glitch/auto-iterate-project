@@ -22,7 +22,9 @@ SECRET_PATTERNS = [
     # \b: without it every long hyphenated word ending in "sk-" (task-, risk-,
     # disk-) blocked commits, training users to reach for --allow-secrets.
     r"\bsk-[A-Za-z0-9_-]{20,}",
-    r"(?i)api[_-]?key\s*[:=]\s*[\"']?[A-Za-z0-9+/]{20,}[\"']?",
+    # Scoped inline flag keeps this valid on Python 3.11+ where a bare (?i)
+    # mid-pattern is rejected; the rest of the table stays case-sensitive.
+    r"(?i:api[_-]?key\s*[:=]\s*[\"']?[A-Za-z0-9+/]{20,}[\"']?)",
     r"\beyJ[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{5,}",
 ]
 
@@ -83,8 +85,14 @@ def scan_staged_diff(repo, extra_patterns=None):
     seen = set()
     current_file = None
     for line in diff.stdout.splitlines():
-        if line.startswith("+++ b/"):
-            current_file = line[6:]
+        if line.startswith("+++ "):
+            target = line[4:].strip()
+            if target == "/dev/null":
+                current_file = None
+            else:
+                if target.startswith("b/"):
+                    target = target[2:]
+                current_file = io._unquote_git_path(target) if target.startswith('"') else target
             continue
         if line.startswith("+++"):
             continue

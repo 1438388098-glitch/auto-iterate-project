@@ -1,3 +1,6 @@
 __pycache__/
 *.pyc
 test_out.txt
+.pytest_cache/
+.zcode/
+.autopilot/

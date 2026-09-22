@@ -45,6 +45,7 @@ HISTORY_TEXT_LIMIT = 2000
 PHASE_REPORT_INTERVAL = 10
 PHASE_REPORT_KEEP = 3
 LOG_ROTATE_BYTES = 5 * 1024 * 1024
+LOG_ROTATE_KEEP = 3
 TASKLIST_TIMEOUT = 3
 
 # Token estimation (single authority; consumed by io.estimate_tokens_for_round).
@@ -62,7 +63,10 @@ def parse_time(value):
     and of the colon form written by now_iso(). Returns None when unparseable."""
     if not value:
         return None
-    normalized = value.replace("Z", "+00:00")
+    normalized = value
+    # Only a trailing Z is the UTC designator; a mid-string Z must not be rewritten.
+    if normalized.endswith("Z"):
+        normalized = normalized[:-1] + "+00:00"
     if len(normalized) >= 6:
         tail = normalized[-6:]
         if (
@@ -460,6 +464,11 @@ def append_log(repo, event, status, **fields):
     try:
         path.parent.mkdir(parents=True, exist_ok=True)
         if path.exists() and path.stat().st_size > LOG_ROTATE_BYTES:
+            for index in range(LOG_ROTATE_KEEP - 1, 0, -1):
+                older = Path(str(path) + ".{}".format(index))
+                newer = Path(str(path) + ".{}".format(index + 1))
+                if older.exists():
+                    os.replace(str(older), str(newer))
             os.replace(str(path), str(path) + ".1")
         with path.open("a", encoding="utf-8") as handle:
             handle.write(json.dumps(entry, ensure_ascii=False) + "\n")
@@ -507,7 +516,12 @@ def estimate_tokens_for_round(repo, run_start_sha, billed_text, billed_binary):
     total_binary = committed_b + worktree_b
     delta_text = max(0, total_text - (billed_text or 0))
     delta_binary = max(0, total_binary - (billed_binary or 0))
-    tokens = TOKEN_BASE + delta_text * TOKENS_PER_TEXT_LINE + delta_binary * TOKENS_PER_BINARY_FILE
+    # TOKEN_BASE only applies to rounds that actually introduce new units.
+    # A verify-only / commit-only close with delta 0 must not drain max_tokens.
+    if delta_text or delta_binary:
+        tokens = TOKEN_BASE + delta_text * TOKENS_PER_TEXT_LINE + delta_binary * TOKENS_PER_BINARY_FILE
+    else:
+        tokens = 0
     return tokens, total_text, total_binary
 
 

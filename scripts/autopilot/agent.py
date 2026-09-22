@@ -19,8 +19,9 @@ AGENT_ENV_SIGNALS = [
     ("codex", ("CODEX",)),
 ]
 
-# Global config markers that identify a runtime when env vars are absent.
-AGENT_HOME_MARKERS = [
+# Global/cwd config markers that identify a runtime when env vars are absent.
+# Checked in the target repo first, then the agent home directory.
+AGENT_MARKER_FILES = [
     ("opencode", ("opencode.json",)),
     ("claude-code", ("CLAUDE.md",)),
     ("codex", ("AGENTS.md",)),
@@ -89,14 +90,14 @@ def detect_agent(cwd=None, home=None):
                 return agent, "env:{}".format(name)
 
     # cwd project markers beat home markers (a project is usually configured for one agent)
-    for agent, names in AGENT_HOME_MARKERS:
+    for agent, names in AGENT_MARKER_FILES:
         for name in names:
             if (cwd / name).exists():
                 return agent, "cwd:{}".format(name)
             if (cwd / ".opencode" / name).exists() and agent == "opencode":
                 return agent, "cwd:.opencode/{}".format(name)
 
-    for agent, names in AGENT_HOME_MARKERS:
+    for agent, names in AGENT_MARKER_FILES:
         for name in names:
             marker = home / name
             if marker.exists() or (home / ("." + name)).exists():

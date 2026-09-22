@@ -142,8 +142,8 @@ def cmd_init(args):
                 io.append_log(repo, "init", "error", reason="checkpoint_every out of range")
                 return emit_result(args, False, "[ERROR] --checkpoint-every must be a positive integer.")
             cfg["checkpoint_every"] = args.checkpoint_every
-        if args.expand_after_goals:
-            cfg["expand_after_goals"] = True
+        if args.expand_after_goals is not None:
+            cfg["expand_after_goals"] = bool(args.expand_after_goals)
         if args.review_threshold is not None:
             if args.review_threshold < 1 or args.review_threshold > 5:
                 io.append_log(repo, "init", "error", reason="review_threshold out of range")
@@ -1703,44 +1703,52 @@ def cmd_analysis_load(args):
 
 
 def cmd_config_set(args):
-    """Runtime config adjustment (currently only --expand-after-goals). Rewrites
-    .autopilot/config.json and refreshes state's config_fingerprint, so the
-    deliberate change is not flagged as config-drift — and an "all goals met"
-    stop can be reopened for the expansion phase without touching files by hand."""
+    """Runtime config adjustment (currently --expand-after-goals /
+    --no-expand-after-goals). Rewrites .autopilot/config.json and refreshes
+    state's config_fingerprint, so the deliberate change is not flagged as
+    config-drift — and an "all goals met" stop can be reopened for the
+    expansion phase (or closed again) without touching files by hand."""
     repo = Path(args.repo).resolve()
     with io.run_lock(repo):
         if not config.state_path_for(repo).exists():
             return emit_result(args, False, "[ERROR] Autopilot not initialized. Run init first.")
-        if not getattr(args, "expand_after_goals", False):
+        if getattr(args, "expand_after_goals", None) is None:
             io.append_log(repo, "config-set", "error", reason="nothing to set")
             return emit_result(
                 args, False,
-                "[ERROR] config-set requires at least one field to set (currently only --expand-after-goals).",
+                "[ERROR] config-set requires at least one field to set "
+                "(currently --expand-after-goals or --no-expand-after-goals).",
             )
-        # load_config validates the on-disk file; the single mutation is the
-        # literal True, so the merged result cannot fail validation — but the
+        desired = bool(args.expand_after_goals)
+        # load_config validates the on-disk file; the single mutation is a
+        # literal bool, so the merged result cannot fail validation — but the
         # reload below re-runs the full validator over what we actually wrote.
         cfg = config.load_config(repo)
         if getattr(args, "dry_run", False):
             print(
-                "[DRY-RUN] Would set expand_after_goals=true in .autopilot/config.json "
-                "and refresh the state config fingerprint.",
+                "[DRY-RUN] Would set expand_after_goals={} in .autopilot/config.json "
+                "and refresh the state config fingerprint.".format(str(desired).lower()),
                 file=sys.stderr,
             )
             return 0
-        cfg["expand_after_goals"] = True
+        cfg["expand_after_goals"] = desired
         config.save_config(repo, cfg)
         reloaded = config.load_config(repo)
-        if not reloaded.get("expand_after_goals"):
-            io.append_log(repo, "config-set", "error", reason="reload mismatch")
-            return emit_result(args, False, "[ERROR] config-set could not persist expand_after_goals=true.")
+        if bool(reloaded.get("expand_after_goals")) != desired:
+            io.append_log(repo, "config-set", "error", reason="reload mismatch", desired=desired)
+            return emit_result(
+                args, False,
+                "[ERROR] config-set could not persist expand_after_goals={}.".format(str(desired).lower()),
+            )
         st = state.load_state(repo)
         st["config_fingerprint"] = io.file_sha256(config.config_path_for(repo))
         state.save_state(repo, st)
-        io.append_log(repo, "config-set", "success", expand_after_goals=True)
+        io.append_log(repo, "config-set", "success", expand_after_goals=desired)
         return emit_result(
             args, True,
-            "[OK] Config updated: expand_after_goals=true; config fingerprint refreshed (no config-drift warning).",
+            "[OK] Config updated: expand_after_goals={}; config fingerprint refreshed (no config-drift warning).".format(
+                str(desired).lower()
+            ),
         )
 
 

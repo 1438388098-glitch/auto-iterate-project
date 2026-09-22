@@ -1,0 +1,35 @@
+# Troubleshooting
+
+| Symptom | Cause | Fix |
+|---|---|---|
+| `commit` fails with "Git identity is not configured" | `user.name`/`user.email` unset | Run `git config user.name ...` and `git config user.email ...`, then retry |
+| `commit` fails after hooks | pre-commit hook rejects the change | Fix the hook failure; never bypass with `--no-verify` unless the user approves |
+| `commit` fails with "exceeds max_round_scope" | The accumulated batch is too large | Stage a subset, commit, then stage the rest and commit again within the same round |
+| `commit` fails with "Secret-like content detected" | The staged diff matches a secret pattern | Remove the secret, or commit with `--allow-secrets` / set `scan_secrets: false` after verifying it is not sensitive |
+| `begin-round` says a round is open | A previous round was interrupted | `read` the state, then `complete-round`, `block-round`, or `cancel-round` |
+| `begin-round` fails with "Autopilot is stopped" | A stop condition is already reached | Run `check`, resolve the stop reason (e.g. raise `max_rounds`, or `config-set --expand-after-goals` when all goals are met) or run `finish`; note `finish` without `--force` is itself refused while a stop condition is unmet and ready candidates remain — pass `--force` only on explicit user request |
+| `commit` fails with "No round is open" | Nothing began the current round | Run `begin-round` first, or pass `--round <n>` for an intentional orphan commit |
+| "Another autopilot run appears active" | Stale `.autopilot/lock` or a real concurrent run | Wait for the other run, or delete `.autopilot/lock` if that process is dead; the helper now also removes corrupt lock files and locks left by other hosts automatically |
+| `check` reports `max_minutes` right after resume | Budget measures wall-clock since last activity, and the pause consumed it | Expected behavior; raise `max_minutes` or set it to `null`. Real exits: any `backlog-add`/`goal-met`/`begin-round` refreshes the activity clock, or edit `max_minutes`/`deadline` in `.autopilot/config.json` — `check`'s `budget` payload (`remaining_minutes`, `deadline_remaining_minutes`) shows exactly how much is left |
+| `check` reports `deadline reached` right after resume | The absolute `deadline` moment has already passed | Expected behavior; raise it with `init --force --deadline <expr>` or set `deadline` to `null` in config |
+| `git log` fails during analysis | Repo has no commits yet | Skip log analysis; the first round creates the initial commit |
+| `begin-round` refuses with "Working tree is dirty" | Dirty tree on the first round with `allow_uncommitted_changes: false` | Commit/stash user changes, or set `allow_uncommitted_changes: true` (or run `init --force` to override) |
+| `begin-round` refuses with "depends on unfinished work" | The candidate's `depends_on` prereq is not completed | Complete and record the prereq first, or pick a dependency-ready candidate (`backlog-rank` marks `"ready": false`) |
+| `complete-round` refuses with "review score" | `review_threshold` is set and `--review-score` is missing or below it | Self-review the round on 1-5 and pass `--review-score` (>= threshold), `block-round` and rework, or `complete-round --below-threshold` to record the low score as a completed round (it does not count blocked, so a legitimate-but-imperfect round no longer burns the blocked streak) |
+| `goal-met` reports expansion instead of stopping | `expand_after_goals: true` | Expected; the loop keeps improving until a budget stops it. Disable with `config-set --no-expand-after-goals` (or set `expand_after_goals: false` in config) to stop at the goal |
+| `config-set` says "requires at least one field" | Neither `--expand-after-goals` nor `--no-expand-after-goals` was passed | Pass exactly one of those flags |
+| `check` reports `action_hint: expand` / empty pending backlog | Pending candidates < `min_pending_candidates` | Run Deep Expansion (spawn explore subagents, `backlog-add`) — do not idle or treat this as a stop |
+| Run idles until deadline with no new commits | Agent skipped expansion or waited out the clock | Protocol violation; follow Anti-Idle Discipline: every continue=true check must begin-round or expand |
+| `push` refuses with "push is disabled" | `push: false` in config | Only push when the config enables it; set `push: true` to allow pushing |
+| `complete-round` without a commit SHA | Deferred commit round (default `commit_every_rounds: 5`) | Expected; the round is recorded and changes stay in the working tree until the boundary round commits them. Flush pending changes before `finish` |
+| `complete-round` fails with "commit-sha does not resolve" | The SHA recorded by `commit` was not passed through | Use the exact SHA the `commit` helper printed |
+| `init` refuses with "Working tree is dirty" | Pre-existing uncommitted changes at run start | Commit/stash them, or pass `--allow-uncommitted-changes` / `--force` |
+| `ensure-branch`/`finish` fails with branch errors | `state.json` was hand-edited or the origin branch was deleted | Reset `.autopilot/state.json` and re-run; `finish` only warns when the origin branch is gone |
+| `commit` fails with "violate allow_paths/deny_paths" | A staged file is outside the path whitelist | Only stage files the whitelist permits, or adjust `allow_paths`/`deny_paths` |
+| `undo-round` fails with "revert failed" | The revert conflicts with later commits | Resolve the conflict manually, commit, then record the round with `commit`/`complete-round` |
+| `detect-verify` reports nothing | No recognized build/test config | Set `check_commands` manually or pass `--check-commands` on init |
+| `backlog-add --from-seed` says "only 'open' seeds can be promoted" | The seed already moved on (promoted/verified/refuted/rejected) | Read `goal_seeds` statuses via `read`; only `open` seeds promote |
+| `seed-reject` says "only 'open' seeds can be rejected" or "not found" | Terminal states are immutable; the id must exist | List open ids from `check --brief` → `expansion.seeds` or `read` |
+| `directive-remove` says "--index must be between ..." | The index comes from `directive-list` output | Run `directive-list`; every entry carries its 1-based `index` field |
+| Tests fail under `python` but not `python3` | Mixed Python installations | Use `py`/`python3` consistently via the Environment note |
+| Skill dir is a git junction/symlink and behavior changed after `git checkout` | Installed skill follows the clone's checked-out branch | Keep the clone on a stable branch/tag, or copy instead of linking |

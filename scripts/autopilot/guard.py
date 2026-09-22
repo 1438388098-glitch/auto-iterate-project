@@ -38,6 +38,16 @@ def path_allowed(path, allow_paths, deny_paths):
         if pattern.endswith("/"):
             if p_norm.startswith(pattern) or p_norm.lower().startswith(pattern.lower()):
                 return True
+        elif pattern.endswith("/**"):
+            # gitignore-like subtree: `docs/**` matches `docs` and everything under it.
+            prefix = pattern[:-3].rstrip("/")
+            if prefix:
+                low = p_norm.lower()
+                prefix_low = prefix.lower()
+                if p_norm == prefix or low == prefix_low:
+                    return True
+                if p_norm.startswith(prefix + "/") or low.startswith(prefix_low + "/"):
+                    return True
         elif not any(ch in pattern for ch in _GLOB_CHARS):
             low = p_norm.lower()
             if p_norm == pattern or low.startswith(pattern.lower() + "/"):

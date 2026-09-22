@@ -2,6 +2,29 @@
 
 All notable changes to auto-iterate-project are documented here.
 
+## 1.4.0 (2026-07-18)
+
+Skill-packaging and correctness fixes from a full review pass.
+
+### Fixed
+
+- Skill folder no longer ships a root `README.md` (skill-creator ERROR); install/overview lives in `references/overview.md`.
+- `SKILL.md` slimmed under the 5000-word guidance; expansion lenses, Wave 0, and the full troubleshooting table moved to `references/`.
+- Deep Expansion lens names in docs now match `EXPANSION_LENSES` exactly (16 names; `docs` and `ux-copy` are separate — the old merged `docs / ux-copy` row was rejected by `expansion-record`).
+- `config-set --no-expand-after-goals` can turn the expansion phase off again (previously only `--expand-after-goals` existed).
+- `TOKEN_BASE` is only charged when a round introduces new text/binary units; verify-only / commit-only closes no longer drain `max_tokens`.
+- `parse_time` only rewrites a trailing `Z` as UTC (mid-string `Z` is left alone).
+- Secret scan: `api_key` pattern uses a scoped `(?i:...)` group (Python 3.11+ safe); `+++` path parsing handles quoted paths and `/dev/null`.
+- Path guard: `dir/**` now matches the directory itself and its whole subtree (gitignore-like).
+- `detect-verify` probes the installed `gitleaks` subcommand (`detect` vs `git`) instead of assuming `gitleaks git`.
+- CLI honors the `[ERROR]+2` contract for `ValueError`/`KeyError`/`TypeError`, and UTF-8 stdio wrapping is idempotent with line buffering.
+- Log rotation keeps 3 generations (`.1`–`.3`) instead of overwriting a single `.1`.
+
+### Changed
+
+- Audit notes and proposal archive moved under `docs/`; version authority and the consistency test now reference `references/overview.md`.
+- `config-set` help and troubleshooting document both expand flags.
+
 ## Unreleased
 
 P0 anti-early-stop hardening: an autonomous run once finished ~5 hours before
