@@ -1,6 +1,6 @@
 # Auto Iterate Project
 
-Version 1.5.0 — see [../CHANGELOG.md](../CHANGELOG.md) for release history.
+Version 1.6.0 — see [../CHANGELOG.md](../CHANGELOG.md) for release history.
 
 Automatically iterate any git project inside an agent session: analyze the repository, pick the next high-value improvement, implement small changes, verify, commit, and loop until a goal is met or configurable round/time/token limits are reached.
 
