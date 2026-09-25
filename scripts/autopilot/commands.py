@@ -2552,16 +2552,18 @@ def cmd_check(args):
         warnings.append("current_round is open; complete, block, or cancel it before starting a new round.")
 
     repo_has_commits = io.has_commits(repo)
+    # Probed once and shared by the detached-HEAD check and the feature-mode
+    # branch-drift warning below: check is the loop's hottest command.
+    head_branch = io.current_branch(repo) if repo_has_commits else None
     if not repo_has_commits:
         warnings.append("Repository has no commits yet; git log is unavailable and the first round creates the initial commit.")
-    elif io.current_branch(repo) == "HEAD":
+    elif head_branch == "HEAD":
         warnings.append("Detached HEAD; consider checking out a branch before starting.")
 
     # Branch drift in feature mode: the round commands will refuse (commit/
     # begin-round/complete-round), so say so here — check is the pre-flight.
     if cfg.get("branch_mode") == "feature" and st.get("branch"):
         expected = st["branch"]
-        head_branch = io.current_branch(repo)
         if head_branch == "HEAD":
             warnings.append(_check_text(
                 cfg,
