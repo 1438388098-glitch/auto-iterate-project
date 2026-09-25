@@ -123,7 +123,18 @@ python <this-skill>/scripts/autopilot_state.py config-set --repo <repo> --expand
 python <this-skill>/scripts/autopilot_state.py config-set --repo <repo> --no-expand-after-goals
 ```
 
-Exactly one of those two flags is required (`config-set` refuses when neither is passed).
+`config-set` accepts several field flags in one call; every invocation rewrites
+`.autopilot/config.json` and refreshes the state config fingerprint (no
+config-drift warning). Settable fields: `--expand-after-goals`/`--no-expand-after-goals`,
+`--candidates-per-round N`, `--commit-every-rounds N`, `--verify-every-rounds N`,
+`--checkpoint-every N`, `--max-rounds N`/`--clear-max-rounds`,
+`--max-minutes N`/`--clear-max-minutes`, `--max-tokens N`/`--clear-max-tokens`,
+`--deadline EXPR`/`--clear-deadline` (same expression parser as init),
+`--push`/`--no-push`, `--scan-secrets`/`--no-scan-secrets`, `--report-lang zh|en`.
+Guard-rail fields (`branch_mode`, `allow_uncommitted_changes`, `allow_paths`/
+`deny_paths`, `secret_patterns`, `track_state`, `check_commands`) are deliberately
+not settable at runtime — changing those mid-run requires editing the file by
+hand, which surfaces the config-drift warning on the next `check`.
 
 ### review_threshold
 
@@ -310,7 +321,7 @@ Anti-noise scoring (刀 B): a promoted candidate carries `origin: "predicted"`, 
 - `begin-round`, `complete-round`, `block-round`, `cancel-round` — round lifecycle. `begin-round` enforces the clean-tree rule, refuses to pick candidates with unresolved `depends_on`, and refuses to reuse round numbers; `--candidate-id` is repeatable so one round can pick multiple backlog candidates (`candidates_per_round`). `complete-round` accepts an optional `--commit-sha` (omit it on deferred commit rounds when `commit_every_rounds > 1`), an optional `--review-score`/`--review-notes` (pass a score every round — it feeds the value calibration; enforced only when `review_threshold` is set) and `--below-threshold` (records a below-threshold round as completed with its low score, without counting blocked — the only in-run exit once `max_blocked_in_a_row` fires), auto-writes a Chinese phase report (`.autopilot/phase-report-round-<N>.md`) every 10 completed rounds, and refreshes `state.type_stats`. A `cancel-round` with zero work (no tree delta, no commit, under 10 minutes) records an `aborted` round that consumes no round budget and no token base.
 - `commit` — staged-change check, git identity check, path whitelist check (`allow_paths`/`deny_paths`), secret scan (`scan_secrets`, bypassable with `--allow-secrets`), scope guard (including binary files), open-round requirement (always enforced unless `--round <n>` is passed explicitly; what batched mode skips is only the dirty-start check), and prefix message building.
 - `undo-round` — `git revert` a bad commit (never rewriting history), record a `revert` history entry, and advance the round counter.
-- `goal-met`, `finish` — goals and run closure. `goal-met` accepts `--round`/`--evidence` (verification anchor; omitting `--round` marks the goal unverified) and `--next-step`/`--unlocked-capability`/`--seed-*` to record direction seeds (see Direction Seeds above). `finish` auto-cancels any still-open round, writes `.autopilot/retrospective.md`, and returns to the origin branch in feature mode; while no stop condition is reached and value>=floor ready candidates remain it is refused unless `--force` is passed (a forced finish logs `finish-forced`). `config-set --expand-after-goals` / `config-set --no-expand-after-goals` rewrites `expand_after_goals` and refreshes the state config fingerprint.
+- `goal-met`, `finish` — goals and run closure. `goal-met` accepts `--round`/`--evidence` (verification anchor; omitting `--round` marks the goal unverified) and `--next-step`/`--unlocked-capability`/`--seed-*` to record direction seeds (see Direction Seeds above). `finish` auto-cancels any still-open round, writes `.autopilot/retrospective.md`, and returns to the origin branch in feature mode; while no stop condition is reached and value>=floor ready candidates remain it is refused unless `--force` is passed (a forced finish logs `finish-forced`). `config-set` rewrites any settable config field (cadence, budgets with `--clear-*` twins, deadline, push, secret scan, report language — see the config-set example above) and refreshes the state config fingerprint.
 - `report` — print (or write with `--output`) a deterministic markdown run report; `--lang zh|en` overrides `report_lang`.
 - `retrospective` — print (or write with `--output`) the run-level retrospective: per-type stats, blocked rounds, verification commands, and the next ready candidate.
 - `detect-verify` — scan repo entry points and recommend `check_commands` (including `gitleaks`/`detect-secrets` when installed); `--apply` writes them into the config.

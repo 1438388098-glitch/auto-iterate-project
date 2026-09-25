@@ -286,4 +286,4 @@ Full table: `references/troubleshooting.md`. Common ones:
 | All goals met, loop continues | `expand_after_goals: true` → `config-set --no-expand-after-goals` to stop at goal |
 | `action_hint: mine` | Run `mine --apply` now — do not idle |
 | `action_hint: expand` | Mine is fresh; Deep Expansion now |
-| `config-set` requires a field | Pass `--expand-after-goals` or `--no-expand-after-goals` |
+| `config-set` requires a field | Pass at least one field flag | e.g. `--expand-after-goals`, `--candidates-per-round N`, `--max-rounds N`/`--clear-max-rounds`, `--deadline EXPR`; see `references/config.md` |
