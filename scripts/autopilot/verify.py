@@ -47,6 +47,8 @@ def detect_verify_commands(repo):
         signals.append(("cmake", "ctest"))
     makefile = root / "Makefile"
     if makefile.exists():
+        # Probe only: an unreadable Makefile means "no make signal", not a
+        # broken repo — detection must not turn into a failure here.
         try:
             content = makefile.read_text(encoding="utf-8", errors="replace")
             if re.search(r"(?m)^\s*test\s*:", content):

@@ -143,11 +143,13 @@ _STATE_INT_KEYS = (
 
 def _state_type_error(path, message):
     # The integrity trail outlives this process's stderr: log before dying so
-    # the first detection of corrupted state is findable after the fact.
+    # the first detection of corrupted state is findable after the fact. The
+    # log write itself is best-effort (best it can be on a corrupted install);
+    # the report+exit below must survive a failing append_log.
     try:
         io.append_log(path.parent.parent, "integrity", "error",
                       file=str(path), message=message)
-    except Exception:
+    except OSError:
         pass
     print(
         "[ERROR] Invalid .autopilot/state.json: {}. Fix or delete it and run init again.".format(message),
@@ -272,9 +274,11 @@ def _validate_backlog(repo, backlog):
     path = config.backlog_path_for(repo)
 
     def fail(message):
+        # Best-effort integrity trail (see _state_type_error): the clear
+        # report+exit below must survive a failing append_log.
         try:
             io.append_log(repo, "integrity", "error", file=str(path), message=message)
-        except Exception:
+        except OSError:
             pass
         print(
             "[ERROR] Invalid .autopilot/backlog.json: {}. Fix or delete it and run init again.".format(message),
@@ -836,6 +840,9 @@ def compute_type_stats(backlog):
             if status == "completed":
                 entry["completed"] += 1
                 parsed_value = 0
+                # Type stats are a read-only display layer over an already
+                # validated backlog: a hand-tampered value degrades to 0
+                # instead of killing the whole aggregation.
                 try:
                     parsed_value = int(candidate.get("value") or 0)
                     entry["effort_sum"] += int(candidate.get("effort") or 0)
@@ -1707,6 +1714,8 @@ def write_phase_report(repo, state, cfg):
                 reports.append((int(suffix), old))
         reports.sort()
         for _, old in reports[:-io.PHASE_REPORT_KEEP]:
+            # Retention cleanup: failing to trim an old report must not fail
+            # the run over a file the next phase report will retry anyway.
             try:
                 old.unlink()
             except OSError:
