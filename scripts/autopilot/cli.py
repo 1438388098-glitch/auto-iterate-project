@@ -253,7 +253,7 @@ def build_parser():
 
     directive_add_parser = subparsers.add_parser("directive-add", help="Add a standing directive the loop must honor in every future round")
     directive_add_parser.add_argument("--repo", default=".")
-    directive_add_parser.add_argument("--text", required=True)
+    directive_add_parser.add_argument("--text", "--directive", dest="text", required=True)
     add_json(directive_add_parser)
     add_dry_run(directive_add_parser)
     directive_add_parser.set_defaults(func=commands.cmd_directive_add)
@@ -426,7 +426,7 @@ def build_parser():
 
     backlog_remove_parser = subparsers.add_parser("backlog-remove", help="Remove a backlog candidate")
     backlog_remove_parser.add_argument("--repo", default=".")
-    backlog_remove_parser.add_argument("--id", required=True)
+    backlog_remove_parser.add_argument("--id", "--candidate-id", dest="id", required=True)
     add_json(backlog_remove_parser)
     add_dry_run(backlog_remove_parser)
     backlog_remove_parser.set_defaults(func=commands.cmd_backlog_remove)

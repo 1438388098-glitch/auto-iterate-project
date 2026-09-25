@@ -5906,6 +5906,39 @@ class IoFoundationUnitTests(unittest.TestCase):
         self.assertEqual(email, "t@x")
 
 
+class ApiConsistencyFixTests(RepoTest):
+    """Round-9 usability fixes: CLI flag aliases for natural agent phrasings,
+    init-time config errors that point at the flag (not a nonexistent file),
+    and a grace retry before stealing a just-created (empty) lock file."""
+
+    def test_directive_add_and_backlog_remove_accept_aliases(self):
+        self.run_state("init")
+        ok = self.run_state("directive-add", "--directive", "rule via alias")
+        self.assertEqual(ok.returncode, 0, ok.stderr)
+        listed = json.loads(self.run_state("directive-list").stdout)
+        self.assertTrue(any("rule via alias" in d["text"] for d in listed["directives"]))
+        added = self.run_state("backlog-add", "--title", "t", "--reason", "r")
+        self.assertEqual(added.returncode, 0, added.stderr)
+        removed = self.run_state("backlog-remove", "--candidate-id", "candidate-001")
+        self.assertEqual(removed.returncode, 0, removed.stderr)
+
+    def test_init_secret_pattern_error_points_at_flag_not_file(self):
+        bad = self.run_state("init", "--secret-pattern", "[")
+        self.assertNotEqual(bad.returncode, 0)
+        self.assertIn("values from init flags", bad.stderr)
+        self.assertNotIn("delete the file", bad.stderr)
+
+    def test_acquire_lock_grace_retries_before_stealing_fresh_lock(self):
+        lock = ap_io.lock_path_for(self.repo)
+        lock.parent.mkdir(parents=True, exist_ok=True)
+        lock.write_text("", encoding="utf-8")  # mid-creation shape: no payload yet
+        sleeps = []
+        with mock.patch.object(ap_io, "_sleep", side_effect=sleeps.append):
+            with ap_io.run_lock(self.repo):
+                self.assertEqual(sleeps, [0.1])
+        self.assertFalse(lock.exists(), "lock released after the run")
+
+
 class SuiteIntegrityTests(unittest.TestCase):
     """Meta-guard: discovery must collect every test method defined in this
     file. Two classes once shared the name ImportUnitTests and the second

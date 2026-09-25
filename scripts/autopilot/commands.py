@@ -253,8 +253,10 @@ def cmd_init(args):
                 "[WARN] state.json already exists. Resume with read/check instead of reinitializing.",
             )
         # Same validation the next load_config would apply — an init that
-        # writes a config it could never re-load is a bricked run.
-        config.validate_config(cfg)
+        # writes a config it could never re-load is a bricked run. The source
+        # label keeps the error pointing at the init flag, not at a config
+        # file that does not exist yet.
+        config.validate_config(cfg, source="values from init flags")
         config.save_config(repo, cfg)
         started_at = io.now_iso()
         run_id = uuid.uuid4().hex[:io.RUN_ID_LENGTH]
