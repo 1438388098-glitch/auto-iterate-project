@@ -2344,10 +2344,13 @@ def cmd_detect_verify(args):
     return 0
 
 
-def _append_mining_run(st, findings_count, new_count, applied_count, kinds):
+def _append_mining_run(st, findings_count, new_count, applied_count, kinds, apply_mode=False):
     """Record one mine attempt (bounded). Used by the finish gate to tell
     'mining exhausted' from 'mining never tried'. Exhaustion counts NEW
-    findings: the raw count never reaches zero on repos with resident ones."""
+    findings: the raw count never reaches zero on repos with resident ones.
+    Read-only probes (no --apply) never touch the backlog, so their new-count
+    degenerates to the raw count and they are excluded from the exhaustion
+    sequence via the `apply` flag."""
     runs = st.setdefault("mining_runs", [])
     runs.append(
         {
@@ -2355,6 +2358,7 @@ def _append_mining_run(st, findings_count, new_count, applied_count, kinds):
             "findings": int(findings_count or 0),
             "new": int(new_count or 0),
             "applied": int(applied_count or 0),
+            "apply": bool(apply_mode),
             "kinds": list(kinds or []),
         }
     )
@@ -2373,8 +2377,15 @@ def _mining_run_new(run):
 def mining_exhausted(st):
     """True only after two consecutive mine runs added nothing new AND
     (when expansion waves exist) the last two waves added nothing either.
-    Never-mined is NOT exhausted — the supply side has not been tried."""
-    runs = [r for r in (st.get("mining_runs") or []) if isinstance(r, dict)]
+    Never-mined is NOT exhausted — the supply side has not been tried.
+    Read-only probes (no --apply) don't mutate the backlog, so when findings
+    exist their new-count degenerates to the raw count and misreads as churn;
+    such runs are excluded. A zero-finding probe IS real zero-new evidence and
+    still counts."""
+    runs = [
+        r for r in (st.get("mining_runs") or [])
+        if isinstance(r, dict) and (r.get("apply", True) or not int(r.get("findings") or 0))
+    ]
     if len(runs) < 2:
         return False
     if any(_mining_run_new(r) > 0 for r in runs[-2:]):
@@ -2474,11 +2485,12 @@ def cmd_mine(args):
                 )
             state.save_backlog(repo, backlog)
             st["last_activity_at"] = io.now_iso()
-            _append_mining_run(st, result["count"], len(new_findings), len(applied), result["kinds"])
+            _append_mining_run(st, result["count"], len(new_findings), len(applied), result["kinds"], apply_mode=True)
             state.save_state(repo, st)
         else:
             st = state.load_state(repo)
-            _append_mining_run(st, result["count"], len(new_findings), 0, result["kinds"])
+            _append_mining_run(st, result["count"], len(new_findings), 0, result["kinds"], apply_mode=False)
+            state.save_state(repo, st)
             state.save_state(repo, st)
 
         payload = {

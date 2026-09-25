@@ -4799,6 +4799,30 @@ class MiningAndFinishGateTests(RepoTest):
         self.assertEqual(third["new"], 0)
         self.assertTrue(third["exhausted"], "two consecutive zero-new runs are exhaustion")
 
+    def test_mine_exhaustion_ignores_readonly_probes(self):
+        """A read-only mine (no --apply) never touches the backlog, so its
+        new-count is always the raw count — it must not reset the exhaustion
+        sequence the way an applying run would."""
+        (self.repo / "app.py").write_text("# TODO: resident\n", encoding="utf-8")
+        self.git("add", "app.py")
+        self.git("commit", "-q", "-m", "add app")
+        self.run_state("init")
+        first = json.loads(self.run_state("mine", "--kind", "markers", "--apply", "--json").stdout)
+        self.assertGreaterEqual(first["applied"], 1)
+        self.assertFalse(first["exhausted"])
+        second = json.loads(self.run_state("mine", "--kind", "markers", "--apply", "--json").stdout)
+        self.assertEqual(second["new"], 0)
+        self.assertFalse(second["exhausted"])
+        # Two read-only probes in between: without the apply-run filter these
+        # would show new > 0 and reset the two-consecutive-zero-new sequence.
+        probe_a = json.loads(self.run_state("mine", "--kind", "markers", "--json").stdout)
+        self.assertGreaterEqual(probe_a["new"], 0)
+        probe_b = json.loads(self.run_state("mine", "--kind", "markers", "--json").stdout)
+        self.assertFalse(probe_b["exhausted"])
+        third = json.loads(self.run_state("mine", "--kind", "markers", "--apply", "--json").stdout)
+        self.assertEqual(third["new"], 0)
+        self.assertTrue(third["exhausted"], "read-only probes must not reset the exhaustion sequence")
+
     def test_finish_refuses_below_floor_ready_work(self):
         """The proven early-stop hole: ready work below min_candidate_value used
         to leave the finish gate open while check still said work."""
