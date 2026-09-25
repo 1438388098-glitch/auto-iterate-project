@@ -5841,6 +5841,71 @@ class AgentModuleUnitTests(unittest.TestCase):
         self.assertTrue((expected / "SKILL.md").exists())
 
 
+class IoFoundationUnitTests(unittest.TestCase):
+    """Direct unit coverage for the io.py foundation helpers (JSON atomic
+    write/read, git state probes, identity check). CLI-level tests cover them
+    indirectly; these pinpoint regressions to the IO layer itself."""
+
+    def setUp(self):
+        self.tmp = Path(tempfile.mkdtemp(prefix="io-unit-"))
+
+    def _git_repo(self):
+        repo = self.tmp / "repo"
+        repo.mkdir()
+        for args in (["init", "-q"], ["config", "user.name", "t"], ["config", "user.email", "t@x"]):
+            subprocess.run(["git", "-C", str(repo)] + args, capture_output=True)
+        (repo / "f.txt").write_text("x\n", encoding="utf-8")
+        subprocess.run(["git", "-C", str(repo), "add", "-A"], capture_output=True)
+        subprocess.run(["git", "-C", str(repo), "commit", "-q", "-m", "init"], capture_output=True)
+        return repo
+
+    def test_load_json_missing_returns_default(self):
+        self.assertIsNone(ap_io.load_json(self.tmp / "nope.json"))
+        sentinel = {"a": 1}
+        self.assertEqual(ap_io.load_json(self.tmp / "nope.json", default=sentinel), sentinel)
+
+    def test_load_json_dies_clean_on_corruption(self):
+        path = self.tmp / "bad.json"
+        path.write_text("{truncated", encoding="utf-8")
+        with self.assertRaises(SystemExit) as ctx:
+            ap_io.load_json(path)
+        self.assertEqual(ctx.exception.code, 2)
+
+    def test_save_json_roundtrip_and_bom_tolerance(self):
+        path = self.tmp / "dir" / "data.json"
+        payload = {"zh": "中文", "n": 3, "nested": [1, 2]}
+        ap_io.save_json(path, payload)
+        self.assertEqual(ap_io.load_json(path), payload)
+
+    def test_save_json_fails_closed_on_nan(self):
+        path = self.tmp / "nan.json"
+        with self.assertRaises(ValueError):
+            ap_io.save_json(path, {"x": float("nan")})
+        self.assertFalse(path.exists())
+
+    def test_working_tree_dirty_and_uncommitted_paths(self):
+        repo = self._git_repo()
+        self.assertFalse(ap_io.working_tree_dirty(repo))
+        (repo / "mod.txt").write_text("changed\n", encoding="utf-8")
+        (repo / "new.txt").write_text("new\n", encoding="utf-8")
+        self.assertTrue(ap_io.working_tree_dirty(repo))
+        paths = ap_io.uncommitted_paths(repo)
+        self.assertIn("mod.txt", paths)
+        self.assertIn("new.txt", paths)
+
+    def test_branch_exists_and_current_branch(self):
+        repo = self._git_repo()
+        self.assertTrue(ap_io.branch_exists(repo, "master") or ap_io.branch_exists(repo, "main"))
+        self.assertFalse(ap_io.branch_exists(repo, "no-such-branch"))
+
+    def test_git_identity_ok_reads_repo_local_config(self):
+        repo = self._git_repo()
+        ok, name, email = ap_io.git_identity_ok(repo)
+        self.assertTrue(ok)
+        self.assertEqual(name, "t")
+        self.assertEqual(email, "t@x")
+
+
 class SuiteIntegrityTests(unittest.TestCase):
     """Meta-guard: discovery must collect every test method defined in this
     file. Two classes once shared the name ImportUnitTests and the second
