@@ -364,6 +364,12 @@ def build_parser():
                        help="Scan staged diffs for secret-like content on commit")
     scans.add_argument("--no-scan-secrets", dest="scan_secrets", action="store_false", default=None,
                        help="Disable the staged-diff secret scan")
+    config_set_parser.add_argument("--check-commands", dest="check_commands",
+                                   action="append", metavar="CMD",
+                                   help="Verification command (repeatable; replaces the previous list)")
+    config_set_parser.add_argument("--clear-check-commands", dest="clear_check_commands",
+                                   action="store_true", default=False,
+                                   help="Remove all verification commands")
     config_set_parser.add_argument("--report-lang", dest="report_lang", choices=["zh", "en"],
                                    help="Language for phase reports and check warnings")
     add_json(config_set_parser)

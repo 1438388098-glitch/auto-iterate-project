@@ -5931,6 +5931,18 @@ class ApiConsistencyFixTests(RepoTest):
         self.assertEqual(restored["round"], 0)
         self.assertEqual(before, backup_path.read_bytes())
 
+    def test_config_set_check_commands_roundtrip(self):
+        self.run_state("init", "--check-commands", "old-cmd")
+        result = self.run_state("config-set", "--check-commands", "pytest -q", "--check-commands", "npm test")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(self.read_json("config.json")["check_commands"], ["pytest -q", "npm test"])
+        cleared = self.run_state("config-set", "--clear-check-commands")
+        self.assertEqual(cleared.returncode, 0, cleared.stderr)
+        self.assertEqual(self.read_json("config.json")["check_commands"], [])
+        conflict = self.run_state("config-set", "--check-commands", "x", "--clear-check-commands")
+        self.assertNotEqual(conflict.returncode, 0)
+        self.assertIn("mutually exclusive", conflict.stderr)
+
     def test_directive_add_and_backlog_remove_accept_aliases(self):
         self.run_state("init")
         ok = self.run_state("directive-add", "--directive", "rule via alias")

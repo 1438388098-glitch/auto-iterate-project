@@ -2047,6 +2047,15 @@ def cmd_config_set(args):
             requested[name] = value
     if args.expand_after_goals is not None:
         requested["expand_after_goals"] = bool(args.expand_after_goals)
+    if getattr(args, "clear_check_commands", False):
+        if args.check_commands:
+            return emit_result(
+                args, False,
+                "[ERROR] --check-commands and --clear-check-commands are mutually exclusive.",
+            )
+        requested["check_commands"] = []
+    elif args.check_commands:
+        requested["check_commands"] = list(args.check_commands)
 
     if not requested:
         io.append_log(repo, "config-set", "error", reason="nothing to set")
