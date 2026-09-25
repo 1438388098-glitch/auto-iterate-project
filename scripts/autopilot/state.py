@@ -308,22 +308,6 @@ def find_candidate(backlog, candidate_id):
     return None
 
 
-def update_candidate_status(repo, candidate_id, status, round_number=None):
-    """Update one candidate (loads and saves the backlog itself)."""
-    if not candidate_id:
-        return
-    backlog = load_backlog(repo)
-    candidate = find_candidate(backlog, candidate_id)
-    if candidate is None:
-        print("[WARN] Candidate not found in backlog: {}".format(candidate_id), file=sys.stderr)
-        return
-    candidate["status"] = status
-    candidate["updated_at"] = io.now_iso()
-    if round_number is not None:
-        candidate["round"] = round_number
-    save_backlog(repo, backlog)
-
-
 def update_candidates_status(repo, candidate_ids, status, round_number=None, backlog=None, extra_fields=None):
     """Update many candidates with a single backlog read/write cycle. When a
     preloaded backlog is passed it is mutated here; otherwise the backlog is

@@ -167,6 +167,8 @@ def save_json(path, data):
             os.fsync(handle.fileno())
         os.replace(tmp_name, str(path))
     except BaseException:
+        # Best-effort temp cleanup: a failed unlink here must not mask the
+        # original error that triggered it (re-raised below).
         try:
             os.unlink(tmp_name)
         except OSError:
@@ -221,10 +223,6 @@ def branch_exists(repo, branch):
 
 def has_commits(repo):
     return run_git(repo, "rev-parse", "--verify", "-q", "HEAD").returncode == 0
-
-
-def is_detached_head(repo):
-    return has_commits(repo) and current_branch(repo) == "HEAD"
 
 
 def _is_autopilot_path(path):
