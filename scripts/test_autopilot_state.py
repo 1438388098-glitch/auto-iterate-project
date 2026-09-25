@@ -6019,6 +6019,16 @@ class PureFunctionUnitTests(unittest.TestCase):
         backlog = config_module.default_backlog()
         self.assertEqual(backlog.get("candidates"), [])
 
+    def test_save_config_roundtrips_through_load(self):
+        repo = Path(tempfile.mkdtemp(prefix="pure-fn-"))
+        cfg = config_module.default_config(repo)
+        cfg["candidates_per_round"] = 7
+        cfg["goals"] = ["g1"]
+        config_module.save_config(repo, cfg)
+        loaded = config_module.load_config(repo)
+        self.assertEqual(loaded["candidates_per_round"], 7)
+        self.assertEqual(loaded["goals"], ["g1"])
+
     def test_any_ready_candidates_counts_dependency_ready_pending(self):
         backlog = {"candidates": [
             {"id": "a", "status": "pending", "depends_on": []},
