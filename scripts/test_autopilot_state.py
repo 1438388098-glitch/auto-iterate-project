@@ -4971,6 +4971,73 @@ class MiningAndFinishGateTests(RepoTest):
         result = json.loads(self.run_state("mine", "--kind", "markers", "--json").stdout)
         self.assertEqual(result["found"], 0)
 
+    def test_mine_test_gap_skips_cli_dispatch_handlers(self):
+        pkg = self.repo / "pkg"
+        pkg.mkdir()
+        (pkg / "cli.py").write_text(
+            "def register(sub):\n"
+            "    sub.set_defaults(func=handlers.cmd_greet)\n"
+            "    sub.set_defaults(func=cmd_bye)\n",
+            encoding="utf-8",
+        )
+        (pkg / "handlers.py").write_text(
+            "def cmd_greet():\n    pass\n",
+            encoding="utf-8",
+        )
+        (pkg / "other.py").write_text(
+            "def plain_function():\n    pass\n",
+            encoding="utf-8",
+        )
+        (self.repo / "test_cli_pkg.py").write_text("import pkg\n", encoding="utf-8")
+        self.git("add", "-A")
+        self.git("commit", "-q", "-m", "pkg")
+        self.run_state("init")
+        result = json.loads(self.run_state("mine", "--kind", "test-gap", "--json").stdout)
+        names = [f["title"] for f in result["findings"]]
+        self.assertFalse(any("cmd_greet" in n or "cmd_bye" in n for n in names),
+                         "CLI dispatch handlers must not be reported as test gaps")
+        self.assertTrue(any("plain_function" in n for n in names))
+
+    def test_mine_dead_export_skips_testcase_subclasses(self):
+        pkg = self.repo / "pkg"
+        pkg.mkdir()
+        (pkg / "tests_a.py").write_text(
+            "import unittest\n"
+            "class Base(unittest.TestCase):\n    pass\n"
+            "class Middle(Base):\n    pass\n"
+            "class Covered(Middle):\n    pass\n",
+            encoding="utf-8",
+        )
+        (pkg / "lib.py").write_text(
+            "def really_dead():\n    pass\n",
+            encoding="utf-8",
+        )
+        (self.repo / "test_pkg.py").write_text("import pkg\n", encoding="utf-8")
+        self.git("add", "-A")
+        self.git("commit", "-q", "-m", "pkg")
+        self.run_state("init")
+        result = json.loads(self.run_state("mine", "--kind", "dead-export", "--json").stdout)
+        names = [f["title"] for f in result["findings"]]
+        self.assertFalse(any("Covered" in n or "Middle" in n or "Base" in n for n in names),
+                         "TestCase subclasses (incl. via intermediate bases) are not dead code")
+        self.assertTrue(any("really_dead" in n for n in names))
+
+    def test_mine_hotspot_skips_deleted_paths(self):
+        (self.repo / "gone.py").write_text("x = 1\n", encoding="utf-8")
+        self.git("add", "gone.py")
+        self.git("commit", "-q", "-m", "add gone")
+        (self.repo / "gone.py").unlink()
+        self.git("add", "-A")
+        self.git("commit", "-q", "-m", "delete gone")
+        (self.repo / "keep.py").write_text("y = 2\n", encoding="utf-8")
+        self.git("add", "keep.py")
+        self.git("commit", "-q", "-m", "add keep")
+        self.run_state("init")
+        result = json.loads(self.run_state("mine", "--kind", "hotspot", "--json").stdout)
+        titles = [f["title"] for f in result["findings"]]
+        self.assertFalse(any("gone.py" in t for t in titles),
+                         "deleted files must not be suggested as hotspots")
+
 
 class LifecycleStateFixTests(RepoTest):
     """Regression pack for the 1.5.1 lifecycle/state/IO fixes: refused commands
@@ -5601,6 +5668,105 @@ class CommitCadenceWarnTests(RepoTest):
         result = self.run_state("commit", "--round", "1", "--summary", "flush r1")
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
         self.assertNotIn("not a flush round", result.stderr)
+
+
+class AgentModuleUnitTests(unittest.TestCase):
+    """Direct unit coverage for scripts/autopilot/agent.py public helpers
+    (detect_python / agent_profile / cmd_detect_agent). The detect_agent
+    selection logic itself is covered end-to-end by DetectAgentTests."""
+
+    def _load_agent(self):
+        from autopilot import agent as ap_agent
+        return ap_agent
+
+    def test_detect_python_returns_first_runnable_launcher(self):
+        ap_agent = self._load_agent()
+        completed = mock.Mock(returncode=0)
+        with mock.patch.object(ap_agent.shutil, "which", return_value="C:/bin/python.exe"), \
+                mock.patch.object(ap_agent.subprocess, "run", return_value=completed) as run:
+            self.assertEqual(ap_agent.detect_python(), "python")
+        run.assert_called_once()
+        self.assertEqual(run.call_args[0][0], ["python", "-V"])
+
+    def test_detect_python_skips_dead_shims_in_fallback_order(self):
+        ap_agent = self._load_agent()
+
+        def fake_which(name):
+            return "shim" if name in ("python", "py") else None
+
+        def fake_run(argv, **kwargs):
+            if argv[0] == "python":
+                raise OSError("cannot execute shim")
+            return mock.Mock(returncode=0)
+
+        with mock.patch.object(ap_agent.shutil, "which", side_effect=fake_which), \
+                mock.patch.object(ap_agent.subprocess, "run", side_effect=fake_run):
+            self.assertEqual(ap_agent.detect_python(), "py")
+
+    def test_detect_python_rejects_nonzero_probe(self):
+        ap_agent = self._load_agent()
+
+        def fake_run(argv, **kwargs):
+            return mock.Mock(returncode=1 if argv[0] == "python" else 0)
+
+        with mock.patch.object(ap_agent.shutil, "which", return_value="x"), \
+                mock.patch.object(ap_agent.subprocess, "run", side_effect=fake_run):
+            self.assertEqual(ap_agent.detect_python(), "python3")
+
+    def test_detect_python_falls_back_to_python_when_nothing_probes(self):
+        ap_agent = self._load_agent()
+        with mock.patch.object(ap_agent.shutil, "which", return_value=None):
+            self.assertEqual(ap_agent.detect_python(), "python")
+
+    def test_agent_profile_known_and_unknown(self):
+        ap_agent = self._load_agent()
+        profile = ap_agent.agent_profile("claude-code")
+        self.assertEqual(profile["label"], "Claude Code")
+        self.assertEqual(profile["project_marker"], "CLAUDE.md")
+        self.assertIs(ap_agent.agent_profile("nope"), ap_agent.AGENT_PROFILES["generic"])
+
+    def _run_cmd_detect_agent(self, env_overrides):
+        ap_agent = self._load_agent()
+        env = dict(os.environ)
+        env.pop("SKILL_DIR", None)
+        env.update(env_overrides)
+        args = mock.Mock(repo=os.path.join(tempfile.gettempdir(), "detect-agent-repo"), home=None)
+        buf = StringIO()
+        with mock.patch.dict(os.environ, env, clear=True), \
+                mock.patch.object(ap_agent, "detect_agent", return_value=("codex", "test")), \
+                mock.patch.object(ap_agent, "detect_python", return_value="py"), \
+                mock.patch("sys.stdout", buf):
+            rc = ap_agent.cmd_detect_agent(args)
+        return rc, json.loads(buf.getvalue())
+
+    def test_cmd_detect_agent_payload_keys_and_adaptation(self):
+        rc, payload = self._run_cmd_detect_agent({})
+        self.assertEqual(rc, 0)
+        self.assertEqual(
+            set(payload),
+            {"agent", "label", "detected_by", "shell", "python_cmd", "skill_dir",
+             "project_marker", "agent_config", "adaptation"},
+        )
+        self.assertEqual(payload["agent"], "codex")
+        self.assertEqual(payload["detected_by"], "test")
+        self.assertEqual(payload["python_cmd"], "py")
+        self.assertEqual(
+            payload["adaptation"],
+            {"use_python": "py", "shell_syntax": "bash", "command_style": "bash"},
+        )
+
+    def test_cmd_detect_agent_skill_dir_env_override_wins(self):
+        rc, payload = self._run_cmd_detect_agent({"SKILL_DIR": "S:/custom-skills"})
+        self.assertEqual(rc, 0)
+        self.assertEqual(payload["skill_dir"], "S:/custom-skills")
+
+    def test_cmd_detect_agent_skill_dir_defaults_to_package_root(self):
+        ap_agent = self._load_agent()
+        rc, payload = self._run_cmd_detect_agent({})
+        self.assertEqual(rc, 0)
+        expected = Path(ap_agent.__file__).resolve().parents[2]
+        self.assertEqual(Path(payload["skill_dir"]), expected)
+        self.assertTrue((expected / "SKILL.md").exists())
 
 
 class SuiteIntegrityTests(unittest.TestCase):

@@ -274,6 +274,68 @@ def _python_top_level_defs(path):
     return out
 
 
+def _iter_parsable_source_trees(repo, include_tests=False):
+    for path in _iter_source_files(repo, suffixes={".py"}):
+        if not include_tests and _is_test_path(_rel(repo, path)):
+            continue
+        try:
+            yield ast.parse(path.read_text(encoding="utf-8", errors="replace"))
+        except (OSError, SyntaxError, ValueError):
+            continue
+
+
+def _cli_handler_names(repo):
+    """Symbols registered as CLI dispatch handlers via ``set_defaults(func=...)``.
+    Their coverage lives in CLI-level (subprocess) tests, which the
+    direct-symbol-reference checks in scan_test_gap cannot see — reporting them
+    as test gaps is systematic false positive noise."""
+    names = set()
+    for tree in _iter_parsable_source_trees(repo):
+        for node in ast.walk(tree):
+            if not isinstance(node, ast.Call):
+                continue
+            for keyword in node.keywords:
+                if keyword.arg != "func":
+                    continue
+                # Both `func=cmd_init` and `func=commands.cmd_init` styles
+                # register a dispatch handler.
+                if isinstance(keyword.value, ast.Name):
+                    names.add(keyword.value.id)
+                elif isinstance(keyword.value, ast.Attribute):
+                    names.add(keyword.value.attr)
+    return names
+
+
+def _unittest_subclass_names(repo):
+    """Class names inheriting from (unittest.)TestCase: instantiated by the
+    test loader, so "defined but never referenced" does not apply. Subclasses
+    live in test modules and usually reach TestCase through local intermediate
+    base classes (RepoTest -> AutopilotTestBase -> TestCase), so the relation
+    is closed transitively over the repo's own class graph."""
+    bases_of = {}  # class name -> simple names of its bases
+    for tree in _iter_parsable_source_trees(repo, include_tests=True):
+        for node in ast.walk(tree):
+            if not isinstance(node, ast.ClassDef):
+                continue
+            for base in node.bases:
+                base_name = base.attr if isinstance(base, ast.Attribute) else (
+                    base.id if isinstance(base, ast.Name) else None
+                )
+                if base_name:
+                    bases_of.setdefault(node.name, []).append(base_name)
+    names = {
+        name for name, bases in bases_of.items() if any(b.endswith("TestCase") for b in bases)
+    }
+    changed = True
+    while changed:
+        changed = False
+        for name, bases in bases_of.items():
+            if name not in names and any(b in names for b in bases):
+                names.add(name)
+                changed = True
+    return names
+
+
 def scan_test_gap(repo, limit=25):
     """Public Python defs/classes with no obvious test reference."""
     root = Path(repo)
@@ -305,12 +367,15 @@ def scan_test_gap(repo, limit=25):
         return []
 
     corpus = "\n".join(test_blob)
+    cli_handlers = _cli_handler_names(repo)
     findings = []
     for path in _iter_source_files(repo, suffixes={".py"}):
         rel = _rel(repo, path)
         if _is_test_path(rel):
             continue
         for _kind, name, lineno in _python_top_level_defs(path):
+            if name in cli_handlers:
+                continue
             if name not in corpus:
                 findings.append(_finding(
                     "test-gap",
@@ -330,7 +395,11 @@ def scan_test_gap(repo, limit=25):
 
 def scan_hotspot(repo, limit=10):
     """Files with the most recent commit churn — where bugs hide."""
-    result = io.run_git(repo, "-c", "core.quotepath=false", "log", "--name-only", "--pretty=format:", "-50")
+    # --name-status so deletions (D) can be skipped: suggesting a review of a
+    # file that no longer exists is noise.
+    result = io.run_git(
+        repo, "-c", "core.quotepath=false", "log", "--name-status", "--pretty=format:", "-50"
+    )
     if result.returncode != 0:
         return []
     counts = Counter()
@@ -338,9 +407,15 @@ def scan_hotspot(repo, limit=10):
         line = line.strip()
         if not line or line.startswith(" "):
             continue
-        if any(part.casefold() in SKIP_DIRS_FOLD for part in Path(line).parts):
+        parts = line.split("\t")
+        if not parts or parts[0].startswith("D"):
             continue
-        counts[line] += 1
+        rel = parts[-1].strip()
+        if not rel:
+            continue
+        if any(part.casefold() in SKIP_DIRS_FOLD for part in Path(rel).parts):
+            continue
+        counts[rel] += 1
     findings = []
     for rel, n in counts.most_common():
         if n < 2:
@@ -375,8 +450,11 @@ def scan_dead_export(repo, limit=15):
                 continue
             defs.append((name, rel, lineno))
     corpus = "\n".join(chunks)
+    test_cases = _unittest_subclass_names(repo)
     findings = []
     for name, rel, lineno in defs:
+        if name in test_cases:
+            continue
         # Count occurrences outside the defining line.
         occurrences = len(re.findall(r"\b" + re.escape(name) + r"\b", corpus))
         if occurrences <= 1:
