@@ -259,7 +259,18 @@ def load_state(repo):
 
 
 def save_state(repo, state):
-    io.save_json(config.state_path_for(repo), state)
+    path = config.state_path_for(repo)
+    # Keep the last known-good copy before overwriting: save_json's atomic
+    # rename protects against torn writes, but not against a state file that
+    # was corrupted outside this process. A one-generation .bak turns
+    # "state is unrecoverable, delete and re-init" into "restore the backup".
+    if path.exists():
+        try:
+            backup = path.with_suffix(path.suffix + ".bak")
+            backup.write_bytes(path.read_bytes())
+        except OSError:
+            pass  # backup is best-effort; the write below must still proceed
+    io.save_json(path, state)
 
 
 def load_backlog(repo):

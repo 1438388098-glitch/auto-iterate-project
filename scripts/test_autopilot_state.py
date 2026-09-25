@@ -5913,6 +5913,24 @@ class ApiConsistencyFixTests(RepoTest):
     init-time config errors that point at the flag (not a nonexistent file),
     and a grace retry before stealing a just-created (empty) lock file."""
 
+    def test_save_state_keeps_last_good_backup(self):
+        self.run_state("init")
+        state_path = self.repo / ".autopilot" / "state.json"
+        backup_path = self.repo / ".autopilot" / "state.json.bak"
+        self.assertFalse(backup_path.exists())  # first write: nothing to back up
+        before = state_path.read_bytes()
+        # A second save keeps the first generation as the backup.
+        st = json.loads(state_path.read_text(encoding="utf-8"))
+        st["round"] = 9
+        ap_state.save_state(self.repo, st)
+        self.assertTrue(backup_path.exists())
+        self.assertEqual(json.loads(backup_path.read_text(encoding="utf-8"))["round"], 0)
+        # Corrupting the live file leaves a restorable copy behind.
+        state_path.write_text("{truncated", encoding="utf-8")
+        restored = json.loads(backup_path.read_text(encoding="utf-8"))
+        self.assertEqual(restored["round"], 0)
+        self.assertEqual(before, backup_path.read_bytes())
+
     def test_directive_add_and_backlog_remove_accept_aliases(self):
         self.run_state("init")
         ok = self.run_state("directive-add", "--directive", "rule via alias")
