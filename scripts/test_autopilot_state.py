@@ -9,6 +9,7 @@ import subprocess
 import sys
 import tempfile
 import unittest
+from datetime import datetime, timedelta
 from io import StringIO
 from unittest import mock
 from pathlib import Path
@@ -5987,6 +5988,46 @@ class PureFunctionUnitTests(unittest.TestCase):
         self.assertIn("goals", cfg)
         backlog = config_module.default_backlog()
         self.assertEqual(backlog.get("candidates"), [])
+
+    def test_any_ready_candidates_counts_dependency_ready_pending(self):
+        backlog = {"candidates": [
+            {"id": "a", "status": "pending", "depends_on": []},
+            {"id": "b", "status": "pending", "depends_on": ["ghost"]},
+            {"id": "c", "status": "completed", "depends_on": []},
+        ]}
+        self.assertEqual(commands_module.any_ready_candidates(backlog), 1)
+
+    def test_validate_config_source_labels_error_and_clean_config_passes(self):
+        repo = Path(tempfile.mkdtemp(prefix="pure-fn-"))
+        cfg = config_module.default_config(repo)
+        cfg["secret_patterns"] = ["["]
+        with self.assertRaises(SystemExit):
+            config_module.validate_config(cfg, source="values from init flags")
+        config_module.validate_config(config_module.default_config(repo))  # clean: no raise
+
+    def test_now_iso_is_utc_isoformat(self):
+        stamp = ap_io.now_iso()
+        parsed = datetime.fromisoformat(stamp)
+        self.assertIsNotNone(parsed.tzinfo)
+        self.assertEqual(parsed.utcoffset(), timedelta(0))
+
+    def test_git_dir_for_accepts_repo_and_dies_on_non_git(self):
+        repo = self._git_repo()
+        git_dir = ap_io.git_dir_for(repo)
+        self.assertTrue(Path(git_dir).exists())
+        plain = Path(tempfile.mkdtemp(prefix="pure-fn-plain"))
+        with self.assertRaises(SystemExit) as ctx:
+            ap_io.git_dir_for(plain)
+        self.assertEqual(ctx.exception.code, 2)
+
+    def _git_repo(self):
+        repo = Path(tempfile.mkdtemp(prefix="pure-fn-git-"))
+        for args in (["init", "-q"], ["config", "user.name", "t"], ["config", "user.email", "t@x"]):
+            subprocess.run(["git", "-C", str(repo)] + args, capture_output=True)
+        (repo / "f.txt").write_text("x\n", encoding="utf-8")
+        subprocess.run(["git", "-C", str(repo), "add", "-A"], capture_output=True)
+        subprocess.run(["git", "-C", str(repo), "commit", "-q", "-m", "init"], capture_output=True)
+        return repo
 
 
 class SuiteIntegrityTests(unittest.TestCase):
