@@ -572,7 +572,8 @@ class FinishGateTests(RepoTest):
         result = self.run_state("finish", "--reason", "x")
         self.assertNotEqual(result.returncode, 0)
         self.assertIn("Refusing to finish", result.stderr)
-        self.assertIn("value>=floor ready candidates", result.stderr)
+        self.assertIn("Refusing to finish", result.stderr)
+        self.assertIn("ready_floor=1", result.stderr)
         self.assertIn("pass --force", result.stderr)
         state = self.read_json("state.json")
         self.assertIsNone(state["finished_at"])
@@ -888,6 +889,7 @@ class BatchContractTests(RepoTest):
                        "--effort", "2", "--origin", "predicted", "--confidence", "0.9",
                        "--type", "perf")
         data = json.loads(self.run_state("check", "--brief").stdout)
+        # Quota-cut with a ready pool stays expand (not mine) — diversity problem.
         self.assertEqual(data["action_hint"], "expand")
         self.assertEqual(data["selected_count"], 0)
         self.assertEqual(data["selected_empty_reason"], "quota")
@@ -1075,8 +1077,8 @@ class ExpansionWaveTests(RepoTest):
         data = json.loads(self.run_state("check", "--brief").stdout)
         self.assertEqual(data["analysis"]["status"], "missing")
         self.assertIsNone(data["analysis"]["commits_behind"])
-        # A missing cache must not downgrade the loop's action hint.
-        self.assertEqual(data["action_hint"], "expand")
+        # A missing cache must not stop the loop; never-mined empty backlog → mine.
+        self.assertEqual(data["action_hint"], "mine")
         self.assertTrue(data["continue"])
 
     def test_analysis_staleness_tracks_each_commit(self):
@@ -4256,7 +4258,7 @@ class ContractTests(RepoTest):
                 "continue", "stop_reason", "warnings", "goals_met", "goals_unverified",
                 "phase", "next_verify_round", "next_commit_round", "next_checkpoint_round",
                 "backlog", "action_hint", "selected_count", "selected_empty_reason",
-                "wave_no", "lenses_used", "lenses_unused", "analysis",
+                "wave_no", "lenses_used", "lenses_unused", "analysis", "mining",
                 "blocked_streak", "budget",
             },
         )
@@ -4264,7 +4266,7 @@ class ContractTests(RepoTest):
             set(data["backlog"]),
             {"pending", "ready", "min_pending_candidates", "needs_expansion"},
         )
-        self.assertIn(data["action_hint"], ("work", "expand", "stop"))
+        self.assertIn(data["action_hint"], ("work", "expand", "mine", "stop"))
 
     def test_detect_agent_contract_with_autopilot_state(self):
         """Cross-contract (seed-001): detect-agent's key set must not drift when
@@ -4432,11 +4434,12 @@ class ExpansionWatchTests(RepoTest):
         data = json.loads(self.run_state("check", "--brief").stdout)
         self.assertTrue(data["continue"])
         self.assertIsNone(data["stop_reason"])
-        self.assertEqual(data["action_hint"], "expand")
+        # Never-mined empty backlog: deterministic mining is the first supply.
+        self.assertEqual(data["action_hint"], "mine")
         self.assertTrue(data["backlog"]["needs_expansion"])
         self.assertEqual(data["backlog"]["pending"], 0)
         joined = " ".join(data["warnings"]).lower()
-        self.assertIn("deep expansion", joined)
+        self.assertIn("mine --apply", joined)
         self.assertIn("do not idle", joined)
 
     def test_thin_backlog_warns_below_min_pending(self):
@@ -4444,7 +4447,8 @@ class ExpansionWatchTests(RepoTest):
         self.run_state("backlog-add", "--title", "A", "--reason", "r", "--value", "4", "--effort", "2")
         data = json.loads(self.run_state("check", "--brief").stdout)
         self.assertTrue(data["continue"])
-        self.assertEqual(data["action_hint"], "expand")
+        # Thin + never mined → mine first (then expand if still thin).
+        self.assertEqual(data["action_hint"], "mine")
         self.assertEqual(data["backlog"]["pending"], 1)
         self.assertTrue(any("min_pending_candidates" in w for w in data["warnings"]))
 
@@ -4488,8 +4492,9 @@ class ExpansionWatchTests(RepoTest):
         data = json.loads(self.run_state("check", "--brief").stdout)
         self.assertEqual(data["backlog"]["pending"], 2)
         self.assertEqual(data["backlog"]["ready"], 0)
-        self.assertEqual(data["action_hint"], "expand")
-        self.assertTrue(any("dependency-ready" in w or "Deep Expansion" in w for w in data["warnings"]))
+        # ready==0 + never mined → mine independent supply first.
+        self.assertEqual(data["action_hint"], "mine")
+        self.assertTrue(any("dependency-ready" in w or "mine --apply" in w or "Deep Expansion" in w for w in data["warnings"]))
 
     def test_begin_round_refuses_empty_when_ready_backlog_exists(self):
         self.run_state("init")
@@ -4678,6 +4683,103 @@ class ReviewFixRegressionTests(RepoTest):
         log_path.write_text("y" * (ap_io.LOG_ROTATE_BYTES + 1), encoding="utf-8")
         ap_io.append_log(self.repo, "rotate-probe", "ok")
         self.assertTrue(Path(str(log_path) + ".2").exists())
+
+
+class MiningAndFinishGateTests(RepoTest):
+    """P0: deterministic mining supplies candidates; the finish gate refuses
+    while below-floor ready work or untried mining remains (the old gate only
+    counted value>=floor and let runs stop with a full selected batch)."""
+
+    def test_mine_finds_markers_and_applies(self):
+        (self.repo / "app.py").write_text(
+            "def main():\n    # TODO: handle empty input\n    return 1\n",
+            encoding="utf-8",
+        )
+        self.git("add", "app.py")
+        self.git("commit", "-q", "-m", "add app")
+        self.run_state("init")
+        result = self.run_state("mine", "--kind", "markers", "--apply", "--json")
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        data = json.loads(result.stdout)
+        self.assertGreaterEqual(data["found"], 1)
+        self.assertGreaterEqual(data["applied"], 1)
+        backlog = self.read_json("backlog.json")
+        titles = [c["title"] for c in backlog["candidates"]]
+        self.assertTrue(any("TODO" in t for t in titles), titles)
+        # Second mine must dedup against existing evidence.
+        again = json.loads(self.run_state("mine", "--kind", "markers", "--apply", "--json").stdout)
+        self.assertEqual(again["new"], 0)
+        self.assertEqual(again["applied"], 0)
+
+    def test_mine_records_mining_runs_for_exhaustion(self):
+        self.run_state("init")
+        first = json.loads(self.run_state("mine", "--kind", "docs-drift", "--json").stdout)
+        self.assertIn("exhausted", first)
+        self.assertFalse(first["exhausted"], "one empty mine is not exhaustion")
+        second = json.loads(self.run_state("mine", "--kind", "docs-drift", "--json").stdout)
+        # Two zero-finding runs in a row (docs-drift on a clean README) → exhausted.
+        self.assertTrue(second["exhausted"] or second["found"] > 0)
+
+    def test_finish_refuses_below_floor_ready_work(self):
+        """The proven early-stop hole: ready work below min_candidate_value used
+        to leave the finish gate open while check still said work."""
+        self.run_state("init", "--min-candidate-value", "3", "--min-pending-candidates", "3")
+        for i in range(3):
+            self.run_state(
+                "backlog-add", "--title", "low{}".format(i), "--reason", "r",
+                "--value", "2", "--effort", "1", "--type", "docs",
+            )
+        # Isolate from max_rounds so only the gate is under test.
+        cfg_path = self.repo / ".autopilot" / "config.json"
+        cfg = json.loads(cfg_path.read_text(encoding="utf-8"))
+        cfg["max_rounds"] = None
+        cfg_path.write_text(json.dumps(cfg), encoding="utf-8")
+        st = self.read_json("state.json")
+        st["config_fingerprint"] = ap_io.file_sha256(cfg_path)
+        (self.repo / ".autopilot" / "state.json").write_text(json.dumps(st), encoding="utf-8")
+
+        result = self.run_state("finish", "--reason", "premature")
+        self.assertNotEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertTrue(
+            "Refusing to finish" in (result.stdout + result.stderr),
+            result.stdout + result.stderr,
+        )
+        forced = self.run_state("finish", "--reason", "user-stop", "--force")
+        self.assertEqual(forced.returncode, 0, forced.stderr)
+
+    def test_finish_refuses_when_mining_untried(self):
+        self.run_state("init")
+        cfg_path = self.repo / ".autopilot" / "config.json"
+        cfg = json.loads(cfg_path.read_text(encoding="utf-8"))
+        cfg["max_rounds"] = None
+        cfg_path.write_text(json.dumps(cfg), encoding="utf-8")
+        st = self.read_json("state.json")
+        st["config_fingerprint"] = ap_io.file_sha256(cfg_path)
+        (self.repo / ".autopilot" / "state.json").write_text(json.dumps(st), encoding="utf-8")
+        result = self.run_state("finish", "--reason", "skip-mine")
+        self.assertNotEqual(result.returncode, 0)
+        combined = result.stdout + result.stderr
+        self.assertTrue("Refusing to finish" in combined, combined)
+        self.assertTrue("mining_exhausted=False" in combined or "mine" in combined.lower(), combined)
+
+    def test_check_action_hint_mine_when_thin(self):
+        self.run_state("init")
+        data = json.loads(self.run_state("check", "--brief").stdout)
+        self.assertEqual(data["action_hint"], "mine")
+        self.assertIn("mining", data)
+        self.assertTrue(any("mine --apply" in w for w in data["warnings"]))
+
+    def test_mine_dry_run_touches_nothing(self):
+        (self.repo / "app.py").write_text("# TODO: x\n", encoding="utf-8")
+        self.git("add", "app.py")
+        self.git("commit", "-q", "-m", "add app")
+        self.run_state("init")
+        self.run_state("backlog-add", "--title", "seed-candidate", "--reason", "r", "--value", "3", "--effort", "1")
+        before = self.read_json("backlog.json")
+        result = self.run_state("mine", "--kind", "markers", "--apply", "--dry-run", "--json")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        after = self.read_json("backlog.json")
+        self.assertEqual(before["candidates"], after["candidates"])
 
 
 class SuiteIntegrityTests(unittest.TestCase):

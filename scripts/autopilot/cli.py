@@ -7,7 +7,7 @@ import argparse
 import io
 import sys
 
-from . import agent, commands
+from . import agent, commands, miner
 
 
 def _force_utf8_stdio():
@@ -284,6 +284,28 @@ def build_parser():
     add_json(detect_verify_parser)
     add_dry_run(detect_verify_parser)
     detect_verify_parser.set_defaults(func=commands.cmd_detect_verify)
+
+    mine_parser = subparsers.add_parser(
+        "mine",
+        help="Deterministic repo scan that yields backlog candidates (markers, swallowed, syntax, test-gap, hotspot, dead-export, docs-drift)",
+    )
+    mine_parser.add_argument("--repo", default=".")
+    mine_parser.add_argument(
+        "--kind",
+        action="append",
+        default=None,
+        choices=list(miner.MINE_KINDS),
+        help="Limit to one or more scanners (repeatable; default: all)",
+    )
+    mine_parser.add_argument("--limit", type=int, default=20, help="Max findings per scanner (default 20)")
+    mine_parser.add_argument(
+        "--apply",
+        action="store_true",
+        help="Write new findings into the backlog as candidates (deduped against existing evidence)",
+    )
+    add_json(mine_parser)
+    add_dry_run(mine_parser)
+    mine_parser.set_defaults(func=commands.cmd_mine)
 
     config_set_parser = subparsers.add_parser(
         "config-set",

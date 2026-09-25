@@ -10,6 +10,7 @@ maintain:
 - ``secrets``  staged-diff secret scanning (pattern table + masking)
 - ``guard``    allow_paths/deny_paths commit path matching
 - ``verify``   verification command discovery from repo entry points
+- ``miner``    deterministic repo mining into backlog candidates
 - ``commands`` all CLI command handlers
 - ``cli``      argument parsing and dispatch
 
@@ -24,12 +25,13 @@ from . import agent
 from . import secrets
 from . import guard
 from . import verify
+from . import miner
 from . import commands
 from . import cli
 
 # Single version authority: SKILL.md, agents/openai.yaml, references/overview.md,
 # and the CHANGELOG's newest section must all carry this value (asserted by the
 # suite's version-consistency test so drift turns CI red instead of relying on memory).
-__version__ = "1.4.0"
+__version__ = "1.5.0"
 
-__all__ = ["io", "config", "state", "agent", "secrets", "guard", "verify", "commands", "cli", "__version__"]
+__all__ = ["io", "config", "state", "agent", "secrets", "guard", "verify", "miner", "commands", "cli", "__version__"]

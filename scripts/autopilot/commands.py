@@ -14,6 +14,7 @@ from pathlib import Path
 from . import config, io, state
 from .guard import path_allowed
 from .secrets import scan_staged_diff
+from . import miner
 from .verify import detect_verify_commands
 
 
@@ -988,19 +989,54 @@ def cmd_finish(args):
         backlog = state.load_backlog(repo)
         watch = _backlog_watch(backlog, cfg)
         ready_floor = _ready_valuable_count(backlog, cfg.get("min_candidate_value"))
+        ready_any = any_ready_candidates(backlog)
+        selected_count = 0
+        selected_empty_reason = None
+        if (cfg.get("ranking_mode", "expected") or "expected") != "classic":
+            ranked = state.rank_candidates(
+                backlog, cfg, progress=state.progress_from_state(st, cfg),
+                completed_goals=list(st.get("completed_goals") or []),
+            )
+            selected_count = len([e for e in ranked if e.get("selected")])
+        # P0 anti-early-stop gate: an honest finish needs a reached stop
+        # condition or an explicit --force. Refuse while ANY of the following
+        # remains true — including below-floor ready work (the old gate only
+        # counted value>=floor and let a run finish with a full selected batch
+        # of quick-wins still on the table):
+        #   - thin/empty backlog that still needs expansion or mining
+        #   - any ready candidate (above or below floor)
+        #   - a non-empty recommended batch
+        #   - mining has not been exhausted (never-mined is NOT exhausted)
+        mining_ok = mining_exhausted(st)
         gate_blocks = (
             state.compute_stop_reason(st, cfg) is None
-            and (watch["needs_expansion"] or ready_floor > 0)
+            and (
+                watch["needs_expansion"]
+                or ready_floor > 0
+                or ready_any > 0
+                or selected_count > 0
+                or not mining_ok
+            )
         )
         if gate_blocks:
             if not getattr(args, "force", False):
-                io.append_log(repo, "finish", "error", reason="gate: work remains")
+                io.append_log(
+                    repo, "finish", "error",
+                    reason="gate: work remains",
+                    ready_any=ready_any,
+                    ready_floor=ready_floor,
+                    selected=selected_count,
+                    mining_exhausted=mining_ok,
+                )
                 return emit_result(
                     args, False,
-                    "[ERROR] Refusing to finish: no stop condition reached and {} value>=floor ready "
-                    "candidates remain. Run Deep Expansion, or pass --force to override.".format(ready_floor),
+                    "[ERROR] Refusing to finish: no stop condition reached; work remains "
+                    "(ready_any={}, ready_floor={}, selected={}, mining_exhausted={}). "
+                    "Run `mine --apply` / Deep Expansion, or pass --force to override.".format(
+                        ready_any, ready_floor, selected_count, mining_ok
+                    ),
                 )
-            io.append_log(repo, "finish-forced", "success", reason=args.reason, ready=ready_floor)
+            io.append_log(repo, "finish-forced", "success", reason=args.reason, ready=ready_floor, ready_any=ready_any)
 
         open_round = st.get("current_round")
         if open_round is not None:
@@ -1978,6 +2014,148 @@ def cmd_detect_verify(args):
     return 0
 
 
+def _append_mining_run(st, findings_count, applied_count, kinds):
+    """Record one mine attempt (bounded). Used by the finish gate to tell
+    'mining exhausted' from 'mining never tried'."""
+    runs = st.setdefault("mining_runs", [])
+    runs.append(
+        {
+            "at": io.now_iso(),
+            "findings": int(findings_count or 0),
+            "applied": int(applied_count or 0),
+            "kinds": list(kinds or []),
+        }
+    )
+    if len(runs) > 20:
+        del runs[: len(runs) - 20]
+
+
+def mining_exhausted(st):
+    """True only after two consecutive mine runs produced zero findings AND
+    (when expansion waves exist) the last two waves added nothing either.
+    Never-mined is NOT exhausted — the supply side has not been tried."""
+    runs = [r for r in (st.get("mining_runs") or []) if isinstance(r, dict)]
+    if len(runs) < 2:
+        return False
+    if any((r.get("findings") or 0) > 0 for r in runs[-2:]):
+        return False
+    waves = [w for w in (st.get("expansion_waves") or []) if isinstance(w, dict)]
+    if waves and any((w.get("added") or 0) > 0 for w in waves[-2:]):
+        return False
+    return True
+
+
+def any_ready_candidates(backlog):
+    """Dependency-ready pending candidates regardless of value floor."""
+    count = 0
+    for candidate in backlog.get("candidates") or []:
+        if candidate.get("status") != "pending":
+            continue
+        _, is_ready = state.candidate_deps_status(backlog, candidate)
+        if is_ready:
+            count += 1
+    return count
+
+
+def cmd_mine(args):
+    """Run deterministic scanners and optionally promote findings to backlog."""
+    repo = Path(args.repo).resolve()
+    with io.run_lock(repo):
+        if not config.state_path_for(repo).exists():
+            return emit_result(args, False, "[ERROR] Autopilot not initialized. Run init first.")
+        kinds = list(args.kind) if getattr(args, "kind", None) else None
+        try:
+            result = miner.mine_repo(repo, kinds=kinds, per_kind_limit=getattr(args, "limit", 20) or 20)
+        except ValueError as exc:
+            return emit_result(args, False, "[ERROR] {}".format(exc))
+        backlog = state.load_backlog(repo)
+        new_findings = miner.filter_new_findings(result["findings"], backlog.get("candidates"))
+        applied = []
+        if getattr(args, "dry_run", False):
+            payload = {
+                "ok": True,
+                "kinds": result["kinds"],
+                "by_kind": result["by_kind"],
+                "found": result["count"],
+                "new": len(new_findings),
+                "applied": 0,
+                "candidate_ids": [],
+                "findings": new_findings[:50],
+            }
+            print(
+                "[DRY-RUN] Would record mining run: {} findings, {} new, apply={}".format(
+                    result["count"], len(new_findings), bool(getattr(args, "apply", False))
+                ),
+                file=sys.stderr,
+            )
+            if getattr(args, "json", False):
+                print(json.dumps(payload, indent=2, ensure_ascii=False))
+            else:
+                for finding in new_findings[:10]:
+                    print("  [{}] {}".format(finding.get("kind"), finding.get("title")))
+            return 0
+        if getattr(args, "apply", False):
+            st = state.load_state(repo)
+            now = io.now_iso()
+            for finding in new_findings:
+                fields = miner.finding_to_candidate_fields(finding)
+                candidate_id = "candidate-{:03d}".format(backlog["next_id"])
+                candidate = {
+                    "id": candidate_id,
+                    "title": fields["title"],
+                    "reason": fields["reason"],
+                    "type": fields["type"] if fields["type"] in state.VALID_CANDIDATE_TYPES else "bugfix",
+                    "risk": fields.get("risk", 1),
+                    "depends_on": [],
+                    "impact": "high" if fields["value"] >= 4 else "medium" if fields["value"] == 3 else "low",
+                    "value": fields["value"],
+                    "effort": fields["effort"],
+                    "status": "pending",
+                    "round": None,
+                    "created_at": now,
+                    "updated_at": now,
+                    "origin": "observed",
+                    "confidence": 1.0,
+                    "based_on": "",
+                    "evidence": fields["evidence"],
+                    "from_mine": finding.get("kind"),
+                }
+                backlog["candidates"].append(candidate)
+                backlog["next_id"] += 1
+                applied.append(candidate_id)
+                io.append_log(
+                    repo, "backlog-add", "success",
+                    candidate_id=candidate_id, title=candidate["title"], via="mine",
+                )
+            state.save_backlog(repo, backlog)
+            st["last_activity_at"] = io.now_iso()
+            _append_mining_run(st, result["count"], len(applied), result["kinds"])
+            state.save_state(repo, st)
+        else:
+            st = state.load_state(repo)
+            _append_mining_run(st, result["count"], 0, result["kinds"])
+            state.save_state(repo, st)
+
+        payload = {
+            "ok": True,
+            "kinds": result["kinds"],
+            "by_kind": result["by_kind"],
+            "found": result["count"],
+            "new": len(new_findings),
+            "applied": len(applied),
+            "candidate_ids": applied,
+            "findings": new_findings[:50],
+            "exhausted": mining_exhausted(state.load_state(repo)),
+        }
+        if getattr(args, "json", False):
+            print(json.dumps(payload, indent=2, ensure_ascii=False))
+            return 0
+        message = "[OK] Mine: {} findings ({} new, {} applied).".format(
+            result["count"], len(new_findings), len(applied)
+        )
+        return emit_result(args, True, message, data=payload)
+
+
 def _backlog_watch(backlog, cfg):
     """Summarize pending backlog health for check. Empty/thin/unready backlog is an
     expansion trigger, never an automatic stop."""
@@ -2205,6 +2383,36 @@ def cmd_check(args):
         # honest move, not grinding a pool rank refused to select.
         action_hint = "expand"
 
+    # Deterministic mining comes BEFORE judgment expansion: when the supply
+    # side is thin/empty and `mine` is stale, the next step is `mine --apply`.
+    # A non-empty ready pool that was quota/type-cut is an expansion problem
+    # (diversity / origin limits), not a mining problem — leave those as expand.
+    mining_runs = [r for r in (st.get("mining_runs") or []) if isinstance(r, dict)]
+    last_mine = mining_runs[-1] if mining_runs else None
+    mine_stale = (
+        last_mine is None
+        or (last_mine.get("findings") or 0) > (last_mine.get("applied") or 0)
+    )
+    if stop_reason is None and mine_stale and action_hint in ("expand", "work"):
+        min_pending = backlog_watch.get("min_pending_candidates")
+        if min_pending is None:
+            min_pending = 3
+        supply_thin = (
+            backlog_watch["pending"] == 0
+            or backlog_watch["ready"] == 0
+            or backlog_watch["pending"] < min_pending
+        )
+        quota_cut = bool(selected_empty_reason) and backlog_watch["ready"] > 0
+        if supply_thin and not quota_cut:
+            action_hint = "mine"
+
+    if action_hint == "mine":
+        warnings.append(
+            "Run deterministic mining first: `mine --apply` (then backlog-rank). "
+            "Deep Expansion lenses come after mine if the backlog is still thin. "
+            "Do not idle and do not finish — mining is the supply side."
+        )
+
     payload = {
         "continue": stop_reason is None,
         "stop_reason": stop_reason,
@@ -2216,6 +2424,12 @@ def cmd_check(args):
         "wave_no": len(waves),
         "lenses_used": lenses_used,
         "lenses_unused": [lens for lens in state.EXPANSION_LENSES if lens not in lenses_used],
+        "mining": {
+            "runs": len(mining_runs),
+            "last_findings": (last_mine or {}).get("findings"),
+            "last_applied": (last_mine or {}).get("applied"),
+            "exhausted": mining_exhausted(st),
+        },
         "analysis": {
             "status": analysis_status,
             "reason": analysis_reason,

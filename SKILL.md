@@ -1,6 +1,6 @@
 ---
 name: auto-iterate-project
-version: 1.4.0
+version: 1.5.0
 description: Automatically iterate any git project inside the current agent session by analyzing the repository, choosing the next high-value improvement, implementing small changes, verifying, committing, and looping until a goal is met or configurable round/time/token limits are reached. Use when the user asks for autonomous project iteration, continuous self-improvement, auto-improve, keep improving this project, full-auto development, or wants the agent to keep making and committing improvements without per-step approval. Also use for Chinese requests like 全自动迭代这个项目, 自动改进并提交这个仓库, 连续自动开发, or 自动推进项目改进. Do NOT use for one-off bugfixes, single-file edits, doc-only changes, or when the user wants step-by-step approval of each change.
 ---
 
@@ -12,15 +12,16 @@ description: Automatically iterate any git project inside the current agent sess
 2. Never push unless `push: true` in config.
 3. Commit only after verification passes.
 4. Never run without a stop condition (goals, `max_rounds`, `max_minutes`, `max_tokens`, `deadline`, or `max_blocked_in_a_row`).
-5. Never idle: while `check` says continue, begin a round or Deep Expansion immediately.
+5. Never idle: while `check` says continue, `mine` / begin a round / Deep Expansion immediately.
 6. Touching this skill's own scripts requires `python scripts/test_autopilot_state.py` green before you finish.
+7. **Mining before invention**: when you do not know what to do, run `mine --apply` first; lens-scan Deep Expansion is the second wave, not the first.
 
 ## Operating Contract
 
 - Operate in the current working directory unless the user names a different git repository path.
 - Batch by default. Each round works on `candidates_per_round` backlog candidates (default `4`); each candidate is implemented and verified as its own unit. Full regression verification runs once every `verify_every_rounds` rounds (default `3`). Commits are deferred and flushed once every `commit_every_rounds` rounds (default `5`). Set any of these to `1` for the original one-change-per-round contract.
 - Maintain a visible improvement backlog in `.autopilot/backlog.json`.
-- When `check` reports `action_hint: "expand"`, run Deep Expansion immediately (spawn explore subagents). Empty backlog is not a stop.
+- When `check` reports `action_hint: "mine"`, run `python <this-skill>/scripts/autopilot_state.py mine --repo <repo> --apply` immediately, then `backlog-rank` and open a round. When it reports `action_hint: "expand"`, mine is already fresh — run Deep Expansion. Empty backlog is not a stop.
 - Use `branch_mode: feature` when autonomous work should be isolated from the current branch.
 - Resume unfinished state from `.autopilot/state.json` instead of starting over.
 - Do not rely on host-specific goal tools. This skill owns its loop and state through `.autopilot/`.
@@ -119,6 +120,7 @@ When nothing matches, run `detect-verify --repo <repo>` (`--apply` writes `check
 
 ### 3. Maintain the Backlog
 
+- **Supply first**: if the backlog is thin/empty or `action_hint` is `mine`, run `mine --repo <repo> --apply` (scanners: markers, swallowed, syntax, test-gap, hotspot, dead-export, docs-drift). It writes deduped, evidence-backed candidates. Judgment invention is the fallback, not the default.
 - `backlog-add` with title, reason, `value` (1-5), `effort` (1-5), `type` (`bugfix|feature|refactor|perf|test|docs`), optional `risk` (1-5), optional `depends-on`.
 - `backlog-rank` sorts by expected value per round (`ranking_mode: expected` is **not** value/effort). Read `score_breakdown`, `selected`, `below_floor`, `cut_reason`, `unlocks`, `ready`/`blocked_by`. `classic` is the legacy ratio.
 - Pick the `selected` batch (`candidates_per_round`, default 4). Diversity quota `max_same_type_per_round` (default 2), value floor `min_candidate_value` (default 3). Empty batch while ready entries exist → read `selected_empty_reason` (`quota`/`late_run`/`cutoff`/`floor`) and choose Deep Expansion vs an explicit `--candidate-id` round.
@@ -206,7 +208,9 @@ Expansion is still bounded by normal stop conditions. Keep at least one budget c
 
 ## Deep Expansion Protocol
 
-When `action_hint: "expand"`, the backlog is empty, or local analysis cannot justify the next round, run Deep Expansion **immediately**. Failed waves escalate *effort* (lenses, depth, scope, more subagents), never the conversation. Hard stops are only the normal budgets and true external blockers.
+Order of supply when you need work: **(1) `mine --apply` (deterministic) → (2) Wave 0 seeds after goals → (3) lens-scan Deep Expansion (this section)**. Never start here while mine is stale.
+
+When `action_hint: "expand"` (mine already fresh), the backlog is empty after mine, or local analysis cannot justify the next round, run Deep Expansion **immediately**. Failed waves escalate *effort* (lenses, depth, scope, more subagents), never the conversation. Hard stops are only the normal budgets and true external blockers.
 
 ### Wave shape
 
@@ -218,7 +222,7 @@ When `action_hint: "expand"`, the backlog is empty, or local analysis cannot jus
 
 ## Anti-Idle Discipline
 
-Every `check` with `"continue": true` must be followed by `begin-round`, Deep Expansion, or a scheduled human checkpoint. Forbidden: waiting out the deadline; re-reading without adding work; sitting on "nothing to do"; placeholder/churn rounds; declaring done while pending < `min_pending_candidates` without an expansion attempt; skipping Wave 0 when open seeds exist; hypotheses without causal evidence; seeds that are never value-gated; idling for user confirmation of predicted directions.
+Every `check` with `"continue": true` must be followed by `mine --apply` (when `action_hint` is `mine`), `begin-round`, Deep Expansion, or a scheduled human checkpoint. Forbidden: waiting out the deadline; re-reading without adding work; sitting on "nothing to do"; placeholder/churn rounds; declaring done while pending < `min_pending_candidates` without mine+expansion; skipping Wave 0 when open seeds exist; hypotheses without causal evidence; seeds that are never value-gated; idling for user confirmation of predicted directions.
 
 ## Stop Conditions
 
@@ -242,7 +246,7 @@ An empty or thin backlog is **never** an escalation.
 ## Finish
 
 1. If commits are batched and the last round did not commit, flush with `commit --round <n> --summary "flush accumulated changes"`.
-2. `finish --reason "<stop reason>"` (add `--stay` to remain on the feature branch). The gate refuses while no stop condition is reached and ready value>=floor work remains; `--force` only when the user explicitly asked to stop. Auto-cancels any open round, writes `.autopilot/retrospective.md`, and in `feature` mode returns to the origin branch.
+2. `finish --reason "<stop reason>"` (add `--stay` to remain on the feature branch). The gate refuses while no stop condition is reached and any of these remains: thin backlog needing expand/mine, any ready candidate (above **or below** `min_candidate_value`), a non-empty recommended batch, or mining not yet exhausted (never-mined ≠ exhausted). `--force` only when the user explicitly asked to stop. Auto-cancels any open round, writes `.autopilot/retrospective.md`, and in `feature` mode returns to the origin branch.
 3. Write `.autopilot/last-summary.md` in the user's language (completed/blocked rounds, commits, branch, remaining goals, backlog, next likely improvement). Data: `report --repo <repo> [--lang zh|en] [--output <file>]`.
 4. Report a short summary to the user.
 
@@ -253,6 +257,7 @@ An empty or thin backlog is **never** an escalation.
 - `secret-scan` — staged-diff secret scan (also automatic on `commit`).
 - `directive-add` / `directive-list` / `directive-remove` — standing rules.
 - `detect-verify` — recommend `check_commands` (`--apply` writes them).
+- `mine [--apply] [--kind K]` — deterministic repo mining into backlog candidates (first move when you do not know what to do).
 - Every state-changing command accepts `--dry-run`.
 
 ## Safety Rules
@@ -277,5 +282,6 @@ Full table: `references/troubleshooting.md`. Common ones:
 | Git identity missing | `git config user.name` / `user.email`, retry |
 | Dirty tree at `init`/first `begin-round` | Commit/stash, or `allow_uncommitted_changes: true` / `init --force` |
 | All goals met, loop continues | `expand_after_goals: true` → `config-set --no-expand-after-goals` to stop at goal |
-| `action_hint: expand` | Deep Expansion now — do not idle |
+| `action_hint: mine` | Run `mine --apply` now — do not idle |
+| `action_hint: expand` | Mine is fresh; Deep Expansion now |
 | `config-set` requires a field | Pass `--expand-after-goals` or `--no-expand-after-goals` |

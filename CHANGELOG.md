@@ -2,6 +2,31 @@
 
 All notable changes to auto-iterate-project are documented here.
 
+## 1.5.0 (2026-07-18)
+
+Mining supply side + early-stop gate hardening (user-reported: weak discovery, still early-stopping).
+
+### Added
+
+- `mine` command (`scripts/autopilot/miner.py`): deterministic scanners —
+  `markers`, `swallowed`, `syntax`, `test-gap`, `hotspot`, `dead-export`,
+  `docs-drift`. `--apply` writes deduped findings into the backlog
+  (`from_mine`, evidence `kind | file:line`); `--dry-run` never mutates.
+- `check.action_hint: "mine"` when the backlog is thin/empty and mining is
+  stale or never ran — the loop always has a next command before lens expansion.
+- `check.mining` payload (`runs` / `last_findings` / `last_applied` / `exhausted`)
+  and `state.mining_runs` (bounded at 20) so "mining exhausted" is evidence-based.
+- `mining_exhausted()`: only two consecutive zero-finding mine runs (plus empty
+  expansion waves when present) count as exhaustion; never-mined is not exhausted.
+
+### Fixed
+
+- Finish gate no longer early-stops with below-floor ready work or a non-empty
+  selected batch on the table (the old gate only counted `value >= floor`).
+  Finish without `--force` now also requires mining exhaustion when no stop
+  condition has been reached.
+- `mine --dry-run` does not write `mining_runs` or backlog entries.
+
 ## 1.4.0 (2026-07-18)
 
 Skill-packaging and correctness fixes from a full review pass.
