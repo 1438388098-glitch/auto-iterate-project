@@ -319,6 +319,53 @@ def build_parser():
     expand_group.add_argument("--no-expand-after-goals", dest="expand_after_goals",
                               action="store_false", default=None,
                               help="Stop when all goals are met (disable the expansion phase)")
+    cadence = config_set_parser.add_argument_group("cadence fields")
+    cadence.add_argument("--candidates-per-round", dest="candidates_per_round",
+                         type=int, metavar="N",
+                         help="Candidates worked per round (positive integer)")
+    cadence.add_argument("--commit-every-rounds", dest="commit_every_rounds",
+                         type=int, metavar="N",
+                         help="Commit flush cadence in rounds (positive integer)")
+    cadence.add_argument("--verify-every-rounds", dest="verify_every_rounds",
+                         type=int, metavar="N",
+                         help="Full verification cadence in rounds (positive integer)")
+    cadence.add_argument("--checkpoint-every", dest="checkpoint_every",
+                         type=int, metavar="N",
+                         help="Human checkpoint cadence in rounds (positive integer)")
+    budgets = config_set_parser.add_argument_group("budget fields")
+    budgets.add_argument("--max-rounds", dest="max_rounds", type=int, metavar="N",
+                         help="Round budget (positive integer)")
+    budgets.add_argument("--clear-max-rounds", dest="clear_max_rounds",
+                         action="store_true", default=False,
+                         help="Remove the round budget")
+    budgets.add_argument("--max-minutes", dest="max_minutes", type=int, metavar="N",
+                         help="Idle-clock minute budget (positive integer)")
+    budgets.add_argument("--clear-max-minutes", dest="clear_max_minutes",
+                         action="store_true", default=False,
+                         help="Remove the minute budget")
+    budgets.add_argument("--max-tokens", dest="max_tokens", type=int, metavar="N",
+                         help="Token budget (positive integer)")
+    budgets.add_argument("--clear-max-tokens", dest="clear_max_tokens",
+                         action="store_true", default=False,
+                         help="Remove the token budget")
+    deadline = config_set_parser.add_mutually_exclusive_group()
+    deadline.add_argument("--deadline", dest="deadline", metavar="EXPR",
+                          help="Absolute stop time (ISO timestamp, +8h duration, or HH:MM)")
+    deadline.add_argument("--clear-deadline", dest="clear_deadline",
+                          action="store_true", default=False,
+                          help="Remove the deadline")
+    pushes = config_set_parser.add_mutually_exclusive_group()
+    pushes.add_argument("--push", dest="push", action="store_true", default=None,
+                        help="Allow complete-round to push the run branch")
+    pushes.add_argument("--no-push", dest="push", action="store_false", default=None,
+                        help="Forbid pushing (default)")
+    scans = config_set_parser.add_mutually_exclusive_group()
+    scans.add_argument("--scan-secrets", dest="scan_secrets", action="store_true", default=None,
+                       help="Scan staged diffs for secret-like content on commit")
+    scans.add_argument("--no-scan-secrets", dest="scan_secrets", action="store_false", default=None,
+                       help="Disable the staged-diff secret scan")
+    config_set_parser.add_argument("--report-lang", dest="report_lang", choices=["zh", "en"],
+                                   help="Language for phase reports and check warnings")
     add_json(config_set_parser)
     add_dry_run(config_set_parser)
     config_set_parser.set_defaults(func=commands.cmd_config_set)

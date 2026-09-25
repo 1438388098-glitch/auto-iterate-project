@@ -1985,53 +1985,119 @@ def cmd_analysis_load(args):
 
 
 def cmd_config_set(args):
-    """Runtime config adjustment (currently --expand-after-goals /
-    --no-expand-after-goals). Rewrites .autopilot/config.json and refreshes
+    """Runtime config adjustment. Rewrites .autopilot/config.json and refreshes
     state's config_fingerprint, so the deliberate change is not flagged as
-    config-drift — and an "all goals met" stop can be reopened for the
-    expansion phase (or closed again) without touching files by hand."""
+    config-drift. Numeric budgets accept a --clear-* twin that stores null;
+    --deadline resolves relative expressions (same parser as init) into an
+    absolute timestamp. Guard-rail fields (branch_mode, allow_uncommitted_changes,
+    path whitelists) are deliberately not settable at runtime."""
     repo = Path(args.repo).resolve()
     refused = _require_initialized(args, repo, message="[ERROR] Autopilot not initialized. Run init first.")
     if refused is not None:
         return refused
-    with io.run_lock(repo):
-        if getattr(args, "expand_after_goals", None) is None:
-            io.append_log(repo, "config-set", "error", reason="nothing to set")
+
+    positive_int_fields = (
+        ("candidates_per_round", args.candidates_per_round),
+        ("commit_every_rounds", args.commit_every_rounds),
+        ("verify_every_rounds", args.verify_every_rounds),
+        ("checkpoint_every", args.checkpoint_every),
+        ("max_rounds", args.max_rounds),
+        ("max_minutes", args.max_minutes),
+        ("max_tokens", args.max_tokens),
+    )
+    requested = {name: value for name, value in positive_int_fields if value is not None}
+    for name, value in requested.items():
+        if value < 1:
+            io.append_log(repo, "config-set", "error", reason="non-positive value", field=name, value=value)
             return emit_result(
                 args, False,
-                "[ERROR] config-set requires at least one field to set "
-                "(currently --expand-after-goals or --no-expand-after-goals).",
+                "[ERROR] --{} must be a positive integer (got {}).".format(name.replace("_", "-"), value),
             )
-        desired = bool(args.expand_after_goals)
-        # load_config validates the on-disk file; the single mutation is a
-        # literal bool, so the merged result cannot fail validation — but the
-        # reload below re-runs the full validator over what we actually wrote.
+    for value_name, clear_name in (
+        ("max_rounds", "clear_max_rounds"),
+        ("max_minutes", "clear_max_minutes"),
+        ("max_tokens", "clear_max_tokens"),
+        ("deadline", "clear_deadline"),
+    ):
+        if getattr(args, clear_name):
+            if value_name in requested:
+                return emit_result(
+                    args, False,
+                    "[ERROR] --{} and --{} are mutually exclusive.".format(
+                        value_name.replace("_", "-"), clear_name.replace("_", "-")
+                    ),
+                )
+            requested[value_name] = None
+    if args.deadline is not None:
+        resolved = io.parse_deadline(args.deadline)
+        if resolved is None:
+            io.append_log(repo, "config-set", "error", reason="unparsable deadline", value=args.deadline)
+            return emit_result(
+                args, False,
+                "[ERROR] Could not parse --deadline '{}'. Use an ISO timestamp "
+                "(2026-08-10T08:00:00), a relative duration (+8h / +30min / +1d), "
+                "or a local HH:MM wall-clock time.".format(args.deadline),
+            )
+        requested["deadline"] = resolved
+    for name in ("push", "scan_secrets", "report_lang"):
+        value = getattr(args, name)
+        if value is not None:
+            requested[name] = value
+    if args.expand_after_goals is not None:
+        requested["expand_after_goals"] = bool(args.expand_after_goals)
+
+    if not requested:
+        io.append_log(repo, "config-set", "error", reason="nothing to set")
+        return emit_result(
+            args, False,
+            "[ERROR] config-set requires at least one field to set "
+            "(--expand-after-goals/--no-expand-after-goals, --candidates-per-round, "
+            "--commit-every-rounds, --verify-every-rounds, --checkpoint-every, "
+            "--max-rounds/--clear-max-rounds, --max-minutes/--clear-max-minutes, "
+            "--max-tokens/--clear-max-tokens, --deadline/--clear-deadline, "
+            "--push/--no-push, --scan-secrets/--no-scan-secrets, --report-lang).",
+        )
+
+    with io.run_lock(repo):
+        # load_config validates the on-disk file; values above were parsed and
+        # range-checked already, and the reload below re-runs the full
+        # validator over what we actually wrote.
         cfg = config.load_config(repo)
         if getattr(args, "dry_run", False):
+            preview = ", ".join(
+                "{}={}".format(name, str(value).lower() if isinstance(value, bool) else value)
+                for name, value in sorted(requested.items())
+            )
             print(
-                "[DRY-RUN] Would set expand_after_goals={} in .autopilot/config.json "
-                "and refresh the state config fingerprint.".format(str(desired).lower()),
+                "[DRY-RUN] Would set {} in .autopilot/config.json and refresh the "
+                "state config fingerprint.".format(preview),
                 file=sys.stderr,
             )
             return 0
-        cfg["expand_after_goals"] = desired
+        cfg.update(requested)
         config.save_config(repo, cfg)
         reloaded = config.load_config(repo)
-        if bool(reloaded.get("expand_after_goals")) != desired:
-            io.append_log(repo, "config-set", "error", reason="reload mismatch", desired=desired)
+        mismatched = [
+            name for name, value in requested.items()
+            if reloaded.get(name) != value
+        ]
+        if mismatched:
+            io.append_log(repo, "config-set", "error", reason="reload mismatch", fields=mismatched)
             return emit_result(
                 args, False,
-                "[ERROR] config-set could not persist expand_after_goals={}.".format(str(desired).lower()),
+                "[ERROR] config-set could not persist: {}.".format(", ".join(mismatched)),
             )
         st = state.load_state(repo)
         st["config_fingerprint"] = io.file_sha256(config.config_path_for(repo))
         state.save_state(repo, st)
-        io.append_log(repo, "config-set", "success", expand_after_goals=desired)
+        summary = ", ".join(
+            "{}={}".format(name, str(value).lower() if isinstance(value, bool) else value)
+            for name, value in sorted(requested.items())
+        )
+        io.append_log(repo, "config-set", "success", fields={k: v for k, v in requested.items()})
         return emit_result(
             args, True,
-            "[OK] Config updated: expand_after_goals={}; config fingerprint refreshed (no config-drift warning).".format(
-                str(desired).lower()
-            ),
+            "[OK] Config updated: {}; config fingerprint refreshed (no config-drift warning).".format(summary),
         )
 
 

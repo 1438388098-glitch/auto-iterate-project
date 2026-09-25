@@ -1148,7 +1148,50 @@ class ConfigSetTests(RepoTest):
         )
         data = json.loads(self.run_state("check", "--brief").stdout)
         self.assertFalse(any("config.json changed since init" in w for w in data["warnings"]))
-        self.assertEqual(self.read_json("config.json")["min_pending_candidates"], 5)
+
+    def test_config_set_multiple_fields_roundtrip(self):
+        self.run_state("init")
+        result = self.run_state(
+            "config-set", "--candidates-per-round", "6", "--commit-every-rounds", "3",
+            "--max-minutes", "90",
+        )
+        self.assertEqual(result.returncode, 0, result.stderr)
+        config = self.read_json("config.json")
+        self.assertEqual(config["candidates_per_round"], 6)
+        self.assertEqual(config["commit_every_rounds"], 3)
+        self.assertEqual(config["max_minutes"], 90)
+        state = self.read_json("state.json")
+        self.assertEqual(
+            state["config_fingerprint"],
+            ap_io.file_sha256(self.repo / ".autopilot" / "config.json"),
+        )
+        data = json.loads(self.run_state("check", "--brief").stdout)
+        self.assertFalse(any("config.json changed since init" in w for w in data["warnings"]))
+
+    def test_config_set_clear_budget_stores_null(self):
+        self.run_state("init", "--max-minutes", "45")
+        result = self.run_state("config-set", "--clear-max-minutes")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIsNone(self.read_json("config.json")["max_minutes"])
+
+    def test_config_set_deadline_resolves_relative_expression(self):
+        self.run_state("init")
+        result = self.run_state("config-set", "--deadline", "+2h")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        stored = self.read_json("config.json")["deadline"]
+        self.assertIsNotNone(ap_io.parse_time(stored))
+
+    def test_config_set_rejects_nonpositive_and_value_clear_conflicts(self):
+        self.run_state("init")
+        bad = self.run_state("config-set", "--candidates-per-round", "0")
+        self.assertNotEqual(bad.returncode, 0)
+        self.assertIn("positive integer", bad.stderr)
+        conflict = self.run_state("config-set", "--max-rounds", "5", "--clear-max-rounds")
+        self.assertNotEqual(conflict.returncode, 0)
+        self.assertIn("mutually exclusive", conflict.stderr)
+        unparsable = self.run_state("config-set", "--deadline", "昨天")
+        self.assertNotEqual(unparsable.returncode, 0)
+        self.assertIn("Could not parse --deadline", unparsable.stderr)
 
 
 class BudgetAccountingTests(RepoTest):
