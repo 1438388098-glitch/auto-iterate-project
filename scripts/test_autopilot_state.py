@@ -21,6 +21,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 from autopilot import state as ap_state  # noqa: E402
 from autopilot import io as ap_io  # noqa: E402
 from autopilot import commands as commands_module  # noqa: E402
+from autopilot import config as config_module  # noqa: E402
 from autopilot.cli import build_parser  # noqa: E402
 from autopilot.guard import path_allowed  # noqa: E402
 from autopilot.secrets import SECRET_PATTERNS  # noqa: E402
@@ -5937,6 +5938,55 @@ class ApiConsistencyFixTests(RepoTest):
             with ap_io.run_lock(self.repo):
                 self.assertEqual(sleeps, [0.1])
         self.assertFalse(lock.exists(), "lock released after the run")
+
+
+class PureFunctionUnitTests(unittest.TestCase):
+    """Direct unit coverage for pure helpers: commands.emit_result's output
+    contract and config's path/default functions."""
+
+    def _args(self, json_mode=False):
+        return mock.Mock(json=json_mode)
+
+    def test_emit_result_json_mode_object_and_exit_code(self):
+        buf = StringIO()
+        with mock.patch("sys.stdout", buf):
+            rc = commands_module.emit_result(self._args(json_mode=True), False, "boom", data={"x": 1})
+        self.assertEqual(rc, 2)
+        payload = json.loads(buf.getvalue())
+        self.assertEqual(payload, {"ok": False, "message": "boom", "x": 1})
+
+    def test_emit_result_text_mode_ok_goes_to_stdout_only(self):
+        out, err = StringIO(), StringIO()
+        with mock.patch("sys.stdout", out), mock.patch("sys.stderr", err):
+            rc = commands_module.emit_result(self._args(), True, "fine")
+        self.assertEqual(rc, 0)
+        self.assertIn("fine", out.getvalue())
+        self.assertEqual(err.getvalue(), "")
+
+    def test_emit_result_text_mode_error_goes_to_stderr_only(self):
+        out, err = StringIO(), StringIO()
+        with mock.patch("sys.stdout", out), mock.patch("sys.stderr", err):
+            rc = commands_module.emit_result(self._args(), False, "bad")
+        self.assertEqual(rc, 2)
+        self.assertIn("bad", err.getvalue())
+        self.assertEqual(out.getvalue(), "")
+
+    def test_config_path_helpers_lay_under_autopilot_dir(self):
+        repo = Path(tempfile.mkdtemp(prefix="pure-fn-"))
+        for helper in (config_module.config_path_for, config_module.state_path_for,
+                       config_module.backlog_path_for):
+            path = helper(repo)
+            self.assertEqual(path.parent, repo / ".autopilot")
+
+    def test_default_config_and_backlog_shapes(self):
+        repo = Path(tempfile.mkdtemp(prefix="pure-fn-"))
+        cfg = config_module.default_config(repo)
+        self.assertEqual(cfg["repo"], str(repo))
+        self.assertTrue(cfg["scan_secrets"])
+        self.assertFalse(cfg["push"])
+        self.assertIn("goals", cfg)
+        backlog = config_module.default_backlog()
+        self.assertEqual(backlog.get("candidates"), [])
 
 
 class SuiteIntegrityTests(unittest.TestCase):
