@@ -150,6 +150,10 @@ def scan_markers(repo, limit=30):
     for path in _iter_source_files(repo):
         if path.suffix.lower() == ".md":
             continue
+        # Test-fixture markers are sample data, not tech debt: on this repo
+        # every single marker finding lived inside a fixture string.
+        if _is_test_path(_rel(repo, path)):
+            continue
         try:
             text = path.read_text(encoding="utf-8", errors="replace")
         except OSError:
@@ -187,6 +191,11 @@ def scan_swallowed(repo, limit=20):
     """except Exception: pass / bare except: pass swallow failures silently."""
     findings = []
     for path in _iter_source_files(repo, suffixes={".py"}):
+        # except-pass in test files is usually a mocked-shape fixture; audit
+        # product code only (test paths are already excluded from test-gap's
+        # corpus and dead-export's defs for the same reason).
+        if _is_test_path(_rel(repo, path)):
+            continue
         try:
             text = path.read_text(encoding="utf-8", errors="replace")
         except OSError:

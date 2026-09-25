@@ -2929,11 +2929,13 @@ def cmd_check(args):
 
 def cmd_diagnose(args):
     repo = Path(args.repo).resolve()
-    try:
-        git_dir = io.git_dir_for(repo)
-    except SystemExit:
-        print(json.dumps({"is_git_repo": False}, indent=2, ensure_ascii=False))
+    # Quiet probe: git_dir_for would print "[ERROR] Not a git repository" and
+    # exit 2, but diagnose is a health report — non-git is a *finding* here,
+    # reported as data with exit 0, not an error.
+    if io.run_git(repo, "rev-parse", "--is-inside-work-tree").returncode != 0:
+        print(json.dumps({"is_git_repo": False, "repo": str(repo)}, indent=2, ensure_ascii=False))
         return 0
+    git_dir = io.git_dir_for(repo)
 
     identity_ok, name, email = io.git_identity_ok(repo)
     has_commits = io.has_commits(repo)

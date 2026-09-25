@@ -5081,6 +5081,35 @@ class MiningAndFinishGateTests(RepoTest):
         self.assertFalse(any("gone.py" in t for t in titles),
                          "deleted files must not be suggested as hotspots")
 
+    def test_mine_markers_and_swallowed_skip_test_fixtures(self):
+        (self.repo / "app.py").write_text(
+            "# TODO: real debt in product code\n"
+            "def f():\n    pass\n",
+            encoding="utf-8",
+        )
+        (self.repo / "test_app.py").write_text(
+            "# TODO: fixture sample string\n"
+            "try:\n    run()\nexcept Exception:\n    pass\n",
+            encoding="utf-8",
+        )
+        self.git("add", "-A")
+        self.git("commit", "-q", "-m", "seed")
+        self.run_state("init")
+        markers = json.loads(self.run_state("mine", "--kind", "markers", "--json").stdout)
+        marker_files = [f["file"] for f in markers["findings"]]
+        self.assertEqual(marker_files, ["app.py"])
+        swallowed = json.loads(self.run_state("mine", "--kind", "swallowed", "--json").stdout)
+        self.assertEqual(swallowed["findings"], [])
+
+    def test_diagnose_non_git_reports_finding_not_error(self):
+        plain = Path(self.tmp) / "plain"
+        plain.mkdir()
+        result = self.run_state("diagnose", "--repo", str(plain))
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertNotIn("[ERROR]", result.stderr)
+        payload = json.loads(result.stdout)
+        self.assertFalse(payload["is_git_repo"])
+
 
 class LifecycleStateFixTests(RepoTest):
     """Regression pack for the 1.5.1 lifecycle/state/IO fixes: refused commands
