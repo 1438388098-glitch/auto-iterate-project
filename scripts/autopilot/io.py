@@ -290,6 +290,13 @@ def working_tree_dirty(repo, ignore_autopilot=True):
     return False
 
 
+def uncommitted_paths(repo):
+    """Repo-relative paths with uncommitted changes, same filter as
+    working_tree_dirty (.autopilot/ ignored). Callers that only need a boolean
+    should use working_tree_dirty; this is for WARN output that names files."""
+    return [path for code, path in _porcelain_entries(repo) if not _is_autopilot_path(path)]
+
+
 def tracked_changes(repo):
     """True when tracked files are modified/staged/deleted (untracked files and
     .autopilot/ are ignored). Used to refuse branch switches that would carry

@@ -3,6 +3,7 @@
 import json
 import os
 import shutil
+import subprocess
 import sys
 from pathlib import Path
 
@@ -107,15 +108,38 @@ def detect_agent(cwd=None, home=None):
 
 
 def detect_python():
-    """Return the first available python launcher: python, python3, then py."""
+    """Return the first python launcher that actually runs (-V), trying the
+    SKILL.md fallback order python -> python3 -> py. shutil.which alone is not
+    enough: a stale shim (e.g. the Windows Store alias) resolves on PATH but
+    cannot execute, and a dead python_cmd would poison every downstream
+    command. Falls back to "python" when nothing can be probed."""
     for candidate in ("python", "python3", "py"):
-        if shutil.which(candidate):
+        if not shutil.which(candidate):
+            continue
+        try:
+            probe = subprocess.run(
+                [candidate, "-V"],
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                timeout=15,
+            )
+        except (OSError, subprocess.SubprocessError):
+            continue
+        if probe.returncode == 0:
             return candidate
     return "python"
 
 
 def agent_profile(agent):
     return AGENT_PROFILES.get(agent, AGENT_PROFILES["generic"])
+
+
+def skill_root():
+    """Directory of the installed skill (the one holding SKILL.md). This file
+    lives at <skill_root>/scripts/autopilot/agent.py, so the root is exactly
+    three levels up — a home-relative guess pointed at the skills PARENT
+    directory, and paths built from it did not exist."""
+    return Path(__file__).resolve().parents[2]
 
 
 def cmd_detect_agent(args):
@@ -128,7 +152,10 @@ def cmd_detect_agent(args):
         "detected_by": detected_by,
         "shell": profile["default_shell"],
         "python_cmd": python_cmd,
-        "skill_dir": os.environ.get("SKILL_DIR") or (str(io.home_dir() / profile["skill_dir"]) if not args.home else str(Path(args.home) / profile["skill_dir"])),
+        # SKILL_DIR stays an explicit override; otherwise report where this
+        # skill is actually installed (derived from the package location),
+        # regardless of the --home detection override.
+        "skill_dir": os.environ.get("SKILL_DIR") or str(skill_root()),
         "project_marker": profile["project_marker"],
         "agent_config": profile["agent_config"],
         "adaptation": {

@@ -27,6 +27,61 @@ Mining supply side + early-stop gate hardening (user-reported: weak discovery, s
   condition has been reached.
 - `mine --dry-run` does not write `mining_runs` or backlog entries.
 
+### Fixed (usage-review pass: 6 simulated-user debug agents, 32 issues)
+
+Safety & guardrails:
+- **Branch guard (P0)**: in feature mode `begin-round`/`commit`/`complete-round`
+  now refuse when the repo left the autopilot branch or is on a detached HEAD
+  (previously a manual `git checkout main` let commits — and pushes — land on
+  the wrong branch silently); `check` warns on branch drift.
+- Secret scan no longer skips added lines that start with `++` (they looked
+  like diff file headers); commit refusals now name the matched pattern; staged
+  `.autopilot/**` is refused when `track_state` is false even via `git add -f`;
+  fail-closed paths for unreadable staged diffs got test coverage.
+- Pre-existing user changes can no longer be absorbed into autopilot commits:
+  rounds record their dirty-start snapshot (`start_dirty_files`) and `commit`
+  refuses staged files from that set unless `allow_uncommitted_changes` is true
+  (batch mode included). `commit --round <n>` validates the round exists in the
+  completed history instead of acting as an unchecked escape hatch.
+
+Miner:
+- Dedup keys no longer embed line numbers or churn counts, so line drift and
+  hotspot churn no longer duplicate candidates; hotspots require >=2 commits.
+- `mining_runs` records the **new**-findings count and exhaustion means two
+  consecutive zero-new runs — resident-finding repos no longer lock the finish
+  gate behind `--force` forever.
+- Test-file detection requires real test names/paths (`contest.py` no longer
+  counts); swallowed-exception scan catches trailing-comment and one-line
+  forms; non-ASCII paths print unescaped (`core.quotepath=false`); null-bytes
+  files report as encoding problems, not `line 0` syntax errors; TODO/XXX in
+  code files rank as `refactor`, not `docs`; `SKIP_DIRS` matching is
+  case-insensitive; `--limit 0` means zero instead of falling back to 20.
+
+Lifecycle & state:
+- `begin-round` validates everything (dirty tree, branch, candidate
+  availability) before any state mutation — refusals no longer leak candidates
+  into `picked`.
+- `init` validates the git repo before touching the filesystem and `--dry-run`
+  is side-effect free everywhere; refusals on uninitialized repos no longer
+  create `.autopilot/`.
+- Future state schemas are refused instead of silently misread; a null
+  `state.json` reports "not a valid JSON object" instead of "not found";
+  duplicate `init` exits non-zero; `check`/`read` report "Not a git repository"
+  instead of a misleading missing-state error.
+- `finish` warns with the list of uncommitted files and, in feature mode, says
+  explicitly that commits remain on the autopilot branch (output and
+  retrospective, zh/en); reports fall back to the real current branch when the
+  state records none.
+- `goal-met` without `--round` now says the goal is unverified; check warnings
+  no longer contradict each other on thin backlogs (single mine-first path) and
+  the dirty-tree warning only appears when it applies.
+- `detect-agent` derives `skill_dir` from its own location and probes the
+  returned `python_cmd` before recommending it.
+
+Batch cadence:
+- `commit` on a non-flush round warns with the next flush round
+  (`commit_every_rounds` contract is now observable instead of silent).
+
 ## 1.4.0 (2026-07-18)
 
 Skill-packaging and correctness fixes from a full review pass.

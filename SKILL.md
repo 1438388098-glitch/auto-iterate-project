@@ -93,7 +93,7 @@ Repeat until `check` reports `"continue": false`.
 python <this-skill>/scripts/autopilot_state.py check --repo <repo> --brief
 ```
 
-`--brief` returns loop-driving fields only (`continue`, `stop_reason`, `warnings`, `goals_met`, `phase`, `backlog`, `action_hint`, next verify/commit/checkpoint rounds). Stop if it says no. Resolve actionable `warnings` (dirty tree, empty goals, missing remotes when pushing, missing stop conditions, detached HEAD, thin backlog, config drift).
+`--brief` returns loop-driving fields only (`continue`, `stop_reason`, `warnings`, `goals_met`, `phase`, `backlog`, `action_hint`, next verify/commit/checkpoint rounds). Stop if it says no. Resolve actionable `warnings` (dirty tree, empty goals, missing remotes when pushing, missing stop conditions, detached HEAD, branch drift in feature mode, secret scanning disabled, thin backlog, config drift).
 
 ### 2. Analyze
 
@@ -123,7 +123,7 @@ When nothing matches, run `detect-verify --repo <repo>` (`--apply` writes `check
 - **Supply first**: if the backlog is thin/empty or `action_hint` is `mine`, run `mine --repo <repo> --apply` (scanners: markers, swallowed, syntax, test-gap, hotspot, dead-export, docs-drift). It writes deduped, evidence-backed candidates. Judgment invention is the fallback, not the default.
 - `backlog-add` with title, reason, `value` (1-5), `effort` (1-5), `type` (`bugfix|feature|refactor|perf|test|docs`), optional `risk` (1-5), optional `depends-on`.
 - `backlog-rank` sorts by expected value per round (`ranking_mode: expected` is **not** value/effort). Read `score_breakdown`, `selected`, `below_floor`, `cut_reason`, `unlocks`, `ready`/`blocked_by`. `classic` is the legacy ratio.
-- Pick the `selected` batch (`candidates_per_round`, default 4). Diversity quota `max_same_type_per_round` (default 2), value floor `min_candidate_value` (default 3). Empty batch while ready entries exist → read `selected_empty_reason` (`quota`/`late_run`/`cutoff`/`floor`) and choose Deep Expansion vs an explicit `--candidate-id` round.
+- Pick the `selected` batch (`candidates_per_round`, default 4). Diversity quota `max_same_type_per_round` (default 2), value floor `min_candidate_value` (default 3). Empty batch while ready entries exist → read `selected_empty_reason` (`quota`/`late_run`/`cutoff`/`floor`/`batch_full`/`type`) and choose Deep Expansion vs an explicit `--candidate-id` round.
 - Do not combine unrelated candidates into one change; each is its own unit inside the round.
 - **Thin-backlog rule**: when `action_hint` is `"expand"`, run Deep Expansion **in parallel with** any ready work. Never start a round with zero ready candidates on an empty backlog.
 - Quality gate: every candidate needs one concrete user sentence of value. If the best candidate has none, Deep Expansion — do not stop or idle.
@@ -134,7 +134,7 @@ When nothing matches, run `detect-verify --repo <repo>` (`--apply` writes `check
 python <this-skill>/scripts/autopilot_state.py begin-round --repo <repo> --title "<title>" --reason "<reason>" --candidate-id <id> [--candidate-id <id2> ...]
 ```
 
-`begin-round` refuses when a stop condition is already reached, when the first round opens on a dirty tree (and `allow_uncommitted_changes` is false), when the stocked backlog has ready above-floor candidates but no `--candidate-id`, or when only below-floor candidates are ready (pass an explicit `--candidate-id` to accept a quick win). Cancelled rounds advance the round counter; a zero-work cancel records `aborted` and burns no round budget / token base.
+`begin-round` refuses when a stop condition is already reached, when the repo is off the run branch in feature mode or on a detached HEAD, when the first round opens on a dirty tree (and `allow_uncommitted_changes` is false), when the stocked backlog has ready above-floor candidates but no `--candidate-id`, or when only below-floor candidates are ready (pass an explicit `--candidate-id` to accept a quick win). Cancelled rounds advance the round counter; a zero-work cancel records `aborted` and burns no round budget / token base.
 
 ### 5. Implement & Self-Review
 
@@ -150,21 +150,21 @@ On a verification round: run each `check_commands` entry (or the project's test/
 
 ### 7. Commit
 
-Commits flush every `commit_every_rounds` rounds (default 5) as one batch. On stop mid-batch, flush before `finish`. Never stage `.autopilot/` unless `track_state: true`.
+Commits flush every `commit_every_rounds` rounds (default 5) as one batch — `commit` on a non-flush round prints a WARN naming the next flush round; committing early is allowed, but later rounds must not assume the batch was flushed. On stop mid-batch, flush before `finish`. Never stage `.autopilot/` unless `track_state: true` (staged `.autopilot/**` is refused even via `git add -f`).
 
 1. `git status` and review scope.
 2. `git add <intentionally changed files>` for the whole batch.
-3. Helper verifies staged scope, git identity, `max_round_scope`, `allow_paths`/`deny_paths`, and scans for secrets (AWS keys, private keys, GitHub/Slack/Google tokens, `sk-*`, JWTs). On match it refuses — remove the secret or use `--allow-secrets` / `scan_secrets: false` only when certain. Then:
+3. Helper verifies staged scope, git identity, the run branch (feature mode refuses after the repo left the autopilot branch), `max_round_scope`, `allow_paths`/`deny_paths`, and scans for secrets (AWS keys, private keys, GitHub/Slack/Google tokens, `sk-*`, JWTs). On match it refuses — remove the secret or use `--allow-secrets` / `scan_secrets: false` only when certain. Then:
 
 ```powershell
 python <this-skill>/scripts/autopilot_state.py commit --repo <repo> --summary "<summary>"
 ```
 
-`commit` requires an open round unless you pass `--round <n>` (use for the final flush after the last `complete-round`). Over `max_round_scope`: stage subset → commit → rest → commit (same round). Do not push unless `push: true`; `complete-round` then pushes (explicit `branch:branch` refspec, never force). Every state-changing action is logged to `.autopilot/log.jsonl`.
+`commit` requires an open round unless you pass `--round <n>` (use for the final flush after the last `complete-round`; `<n>` must exist in the completed history). Over `max_round_scope`: stage subset → commit → rest → commit (same round). Do not push unless `push: true`; `complete-round` then pushes (explicit `branch:branch` refspec, never force). Every state-changing action is logged to `.autopilot/log.jsonl`.
 
 ### 8. Record the Round
 
-- Success: `complete-round --summary ... [--commit-sha <sha>] --review-score <1-5> [--review-notes ...]`. Omit `--commit-sha` on deferred rounds. `--review-score` is always required in spirit (feeds ranking calibration); `review_threshold` only decides enforcement. `--below-threshold` records a low score as completed (not blocked). Tokens are estimated from the round's own diff unless `--tokens` is passed.
+- Success: `complete-round --summary ... [--commit-sha <sha>] --review-score <1-5> [--review-notes ...]`. Omit `--commit-sha` on deferred rounds. `--review-score` is always required in spirit (feeds ranking calibration); `review_threshold` only decides enforcement. `--below-threshold` records a low score as completed (not blocked). Tokens are estimated incrementally against the run's waterline (see `references/config.md` → `max_tokens`) unless `--tokens` is passed.
 - Blocked: `block-round --title ... --reason ...` (do not commit).
 - Abandon without blocked count: `cancel-round` (candidates return to `pending`).
 - Every 10 completed rounds the helper writes a phase report to `.autopilot/phase-report-round-<N>.md` (`report_lang`, default `zh`). Read it, report the summary, continue.
@@ -246,7 +246,7 @@ An empty or thin backlog is **never** an escalation.
 ## Finish
 
 1. If commits are batched and the last round did not commit, flush with `commit --round <n> --summary "flush accumulated changes"`.
-2. `finish --reason "<stop reason>"` (add `--stay` to remain on the feature branch). The gate refuses while no stop condition is reached and any of these remains: thin backlog needing expand/mine, any ready candidate (above **or below** `min_candidate_value`), a non-empty recommended batch, or mining not yet exhausted (never-mined ≠ exhausted). `--force` only when the user explicitly asked to stop. Auto-cancels any open round, writes `.autopilot/retrospective.md`, and in `feature` mode returns to the origin branch.
+2. `finish --reason "<stop reason>"` (add `--stay` to remain on the feature branch). The gate refuses while no stop condition is reached and any of these remains: thin backlog needing expand/mine, any ready candidate (above **or below** `min_candidate_value`), a non-empty recommended batch, or mining not yet exhausted (never-mined ≠ exhausted). `--force` only when the user explicitly asked to stop. Auto-cancels any open round, writes `.autopilot/retrospective.md`, and in `feature` mode returns to the origin branch (commits remain on the autopilot branch, unmerged — the finish output and the retrospective say so).
 3. Write `.autopilot/last-summary.md` in the user's language (completed/blocked rounds, commits, branch, remaining goals, backlog, next likely improvement). Data: `report --repo <repo> [--lang zh|en] [--output <file>]`.
 4. Report a short summary to the user.
 
@@ -255,9 +255,11 @@ An empty or thin backlog is **never** an escalation.
 - `report` / `retrospective` — deterministic markdown (goals, rounds, backlog, commits, next improvement / type stats).
 - `analysis-load` / `analysis-save` — repo analysis cache.
 - `secret-scan` — staged-diff secret scan (also automatic on `commit`).
+- `push` — manual push of the run branch via an explicit non-force refspec (refuses while `push: false`).
+- `backlog-list` / `backlog-update` / `backlog-remove` / `backlog-pick` — backlog housekeeping (see `references/config.md`).
 - `directive-add` / `directive-list` / `directive-remove` — standing rules.
 - `detect-verify` — recommend `check_commands` (`--apply` writes them).
-- `mine [--apply] [--kind K]` — deterministic repo mining into backlog candidates (first move when you do not know what to do).
+- `mine [--apply] [--kind K] [--limit N]` — deterministic repo mining into backlog candidates (first move when you do not know what to do). Every non-dry-run invocation appends to `state.mining_runs`; exhaustion = two consecutive runs with zero new findings.
 - Every state-changing command accepts `--dry-run`.
 
 ## Safety Rules
@@ -270,7 +272,7 @@ An empty or thin backlog is **never** an escalation.
 - Never run without a stop condition.
 - Never idle until the deadline.
 - Never delete files outside the current round's change unless tests prove it safe.
-- Never switch away from or delete the autopilot feature branch while a run is active.
+- Never switch away from or delete the autopilot feature branch while a run is active. `begin-round`/`commit`/`complete-round` refuse until you switch back or run `ensure-branch`.
 - Undo bad commits with `undo-round --sha <sha> --summary "<why>"` only — never hand-rewrite history.
 
 ## Troubleshooting

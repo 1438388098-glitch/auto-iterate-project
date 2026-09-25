@@ -36,6 +36,9 @@ SKIP_DIRS = {
     ".vscode",
 }
 
+# Casefolded once: pruning must also catch Node_Modules / NodeModules spellings.
+SKIP_DIRS_FOLD = {d.casefold() for d in SKIP_DIRS}
+
 SOURCE_SUFFIXES = {
     ".py",
     ".js",
@@ -60,11 +63,25 @@ SOURCE_SUFFIXES = {
 }
 
 MARKER_RE = re.compile(r"\b(TODO|FIXME|HACK|XXX)\b[:\s-]*(.*)$", re.I)
-SWALLOW_RE = re.compile(r"except\s*(Exception\s*)?:\s*(?:#.*)?$", re.I)
+
+# Doc extensions whose TODO markers are docs work, not code refactoring.
+DOC_SUFFIXES = {".md", ".rst", ".txt"}
+
+# Compile failures with no meaningful line: null bytes, undecodable source.
+ENCODING_ERROR_RE = re.compile(r"null bytes|codec|decod", re.I)
+
+# Swallowed exceptions: the pass may share the except line or a later one,
+# and the except header may carry a trailing comment (blank/comment-only
+# lines in between are allowed, as before).
 SWALLOW_PASS_RE = re.compile(
-    r"except\s*(Exception\s*)?:\s*\n\s+pass\b",
+    r"\bexcept\b[^:\n]*:(?:[ \t]*(?:#[^\n]*)?\n)+[ \t]+pass\b"
+    r"|\bexcept\b[^:\n]*:[ \t]*pass\b",
     re.I,
 )
+
+# Test modules by basename; names merely containing "test" (contest.py) do not count.
+TEST_MODULE_RE = re.compile(r"(?:^|/)(?:test_[^/]*|[^/]*_test|test)\.py$", re.I)
+TEST_DIR_NAMES = ("test", "tests")
 
 MINE_KINDS = (
     "markers",
@@ -80,16 +97,28 @@ MINE_KINDS = (
 def _iter_source_files(repo, suffixes=None):
     root = Path(repo)
     for dirpath, dirnames, filenames in os.walk(root):
-        dirnames[:] = [d for d in dirnames if d not in SKIP_DIRS and not d.startswith(".egg")]
+        dirnames[:] = [
+            d for d in dirnames
+            if d.casefold() not in SKIP_DIRS_FOLD and not d.startswith(".egg")
+        ]
         for name in filenames:
             path = Path(dirpath) / name
             if suffixes is not None and path.suffix.lower() not in suffixes:
                 continue
             if suffixes is None and path.suffix.lower() not in SOURCE_SUFFIXES:
                 continue
-            if any(part in SKIP_DIRS for part in path.parts):
+            if any(part.casefold() in SKIP_DIRS_FOLD for part in path.parts):
                 continue
             yield path
+
+
+def _is_test_path(rel):
+    """True for test modules (test_*.py / *_test.py / test.py) and anything
+    under a tests/ or test/ directory component."""
+    norm = rel.replace("\\", "/").lower()
+    if TEST_MODULE_RE.search(norm):
+        return True
+    return any(part in TEST_DIR_NAMES for part in norm.split("/")[:-1])
 
 
 def _rel(repo, path):
@@ -131,14 +160,21 @@ def scan_markers(repo, limit=30):
                 continue
             note = match.group(2).strip() or line.strip()
             rel = _rel(repo, path)
+            marker = match.group(1).upper()
+            if marker in ("FIXME", "HACK"):
+                suggested = "bugfix"
+            elif path.suffix.lower() in DOC_SUFFIXES:
+                suggested = "docs"
+            else:
+                suggested = "refactor"
             findings.append(_finding(
                 "markers",
-                "Resolve {} at {}:{}".format(match.group(1).upper(), rel, lineno),
+                "Resolve {} at {}:{}".format(marker, rel, lineno),
                 "Unfinished marker in source; resolve, document, or delete it.",
                 "{}:{}: {}".format(rel, lineno, note[:120]),
                 file=rel,
                 line=lineno,
-                suggested_type="bugfix" if match.group(1).upper() in ("FIXME", "HACK") else "docs",
+                suggested_type=suggested,
                 value=3,
                 effort=2,
             ))
@@ -184,19 +220,39 @@ def scan_syntax(repo, limit=20):
             continue
         try:
             compile(source, str(path), "exec")
-        except SyntaxError as exc:
+        except (SyntaxError, ValueError) as exc:
             rel = _rel(repo, path)
-            findings.append(_finding(
-                "syntax",
-                "Fix syntax error in {}".format(rel),
-                "File does not compile; the package cannot be imported safely.",
-                "{}:{}: {}".format(rel, exc.lineno or 0, (exc.msg or "syntax error")[:120]),
-                file=rel,
-                line=exc.lineno or 0,
-                suggested_type="bugfix",
-                value=5,
-                effort=2,
-            ))
+            if isinstance(exc, SyntaxError):
+                msg = exc.msg or "syntax error"
+                lineno = exc.lineno
+            else:  # undecodable source: null bytes, bad codec
+                msg = str(exc) or "source cannot be decoded"
+                lineno = None
+            if ENCODING_ERROR_RE.search(msg):
+                # Encoding failures have no real line — none is fabricated.
+                findings.append(_finding(
+                    "syntax",
+                    "Fix encoding problem in {}".format(rel),
+                    "File is not decodable as Python source (null bytes or wrong codec); it cannot compile.",
+                    "{}: {}".format(rel, msg[:120]),
+                    file=rel,
+                    line=None,
+                    suggested_type="bugfix",
+                    value=5,
+                    effort=2,
+                ))
+            else:
+                findings.append(_finding(
+                    "syntax",
+                    "Fix syntax error in {}".format(rel),
+                    "File does not compile; the package cannot be imported safely.",
+                    "{}:{}: {}".format(rel, lineno or 0, msg[:120]),
+                    file=rel,
+                    line=lineno or 0,
+                    suggested_type="bugfix",
+                    value=5,
+                    effort=2,
+                ))
             if len(findings) >= limit:
                 return findings
     return findings
@@ -225,8 +281,7 @@ def scan_test_gap(repo, limit=25):
     test_files = []
     for path in _iter_source_files(repo, suffixes={".py"}):
         rel = _rel(repo, path)
-        name_l = path.name.lower()
-        if "test" in name_l or rel.startswith("tests/") or "/tests/" in rel:
+        if _is_test_path(rel):
             try:
                 test_blob.append(path.read_text(encoding="utf-8", errors="replace"))
             except OSError:
@@ -253,7 +308,7 @@ def scan_test_gap(repo, limit=25):
     findings = []
     for path in _iter_source_files(repo, suffixes={".py"}):
         rel = _rel(repo, path)
-        if "test" in path.name.lower() or rel.startswith("tests/") or "/tests/" in rel:
+        if _is_test_path(rel):
             continue
         for _kind, name, lineno in _python_top_level_defs(path):
             if name not in corpus:
@@ -275,7 +330,7 @@ def scan_test_gap(repo, limit=25):
 
 def scan_hotspot(repo, limit=10):
     """Files with the most recent commit churn — where bugs hide."""
-    result = io.run_git(repo, "log", "--name-only", "--pretty=format:", "-50")
+    result = io.run_git(repo, "-c", "core.quotepath=false", "log", "--name-only", "--pretty=format:", "-50")
     if result.returncode != 0:
         return []
     counts = Counter()
@@ -283,11 +338,13 @@ def scan_hotspot(repo, limit=10):
         line = line.strip()
         if not line or line.startswith(" "):
             continue
-        if any(part in SKIP_DIRS for part in Path(line).parts):
+        if any(part.casefold() in SKIP_DIRS_FOLD for part in Path(line).parts):
             continue
         counts[line] += 1
     findings = []
-    for rel, n in counts.most_common(limit):
+    for rel, n in counts.most_common():
+        if n < 2:
+            break  # descending order: a single commit is churn noise, not a hotspot
         findings.append(_finding(
             "hotspot",
             "Review hotspot {} ({} recent commits)".format(rel, n),
@@ -395,7 +452,8 @@ def mine_repo(repo, kinds=None, per_kind_limit=20):
     by_kind = {}
     for kind in selected:
         try:
-            got = SCANNERS[kind](repo, limit=per_kind_limit)
+            # An explicit 0 (or negative) limit yields 0 findings — honored as given.
+            got = SCANNERS[kind](repo, limit=per_kind_limit) if per_kind_limit and per_kind_limit > 0 else []
         except OSError:
             got = []
         by_kind[kind] = len(got)
@@ -408,29 +466,97 @@ def mine_repo(repo, kinds=None, per_kind_limit=20):
     }
 
 
+def _evidence_body(finding):
+    """Scanner evidence minus its leading 'file:line: ' prefix."""
+    prefix = "{}:{}: ".format(finding.get("file"), finding.get("line"))
+    body = finding.get("evidence") or ""
+    if body.startswith(prefix):
+        return body[len(prefix):].strip()
+    return body.strip()
+
+
 def _dedup_key(finding):
-    return (
-        finding.get("kind"),
-        finding.get("file"),
-        finding.get("line"),
-        (finding.get("title") or "")[:80],
-    )
+    """Line-stable identity for a finding, prefixed ('mine', ...) to keep the
+    key space disjoint from title/file:line matches. Line numbers drift as
+    files are edited, so markers/swallowed key on the marker text,
+    hotspot/syntax/docs-drift on the file, and test-gap/dead-export on the
+    symbol. Unknown kinds keep the old line-anchored identity."""
+    kind = finding.get("kind")
+    file = finding.get("file")
+    if kind in ("markers", "swallowed"):
+        return ("mine", kind, file, _evidence_body(finding)[:120])
+    if kind in ("hotspot", "syntax", "docs-drift"):
+        return ("mine", kind, file)
+    if kind in ("test-gap", "dead-export"):
+        match = re.search(r"`([^`]+)`", finding.get("title") or "")
+        symbol = match.group(1) if match else (finding.get("title") or "")[:80]
+        return ("mine", kind, file, symbol)
+    return ("mine", kind, file, finding.get("line"), (finding.get("title") or "")[:80])
+
+
+def _candidate_dedup_keys(candidate):
+    """Mirror of _dedup_key rebuilt from a stored backlog candidate. Mine
+    candidates carry file/line; older ones are recovered from the evidence
+    text, whose leading formats are scanner-owned constants."""
+    keys = set()
+    kind = candidate.get("from_mine")
+    evidence = candidate.get("evidence") or ""
+    if not kind and " | " in evidence:
+        head = evidence.split(" | ", 1)[0]
+        if head in MINE_KINDS:
+            kind = head
+    if kind not in MINE_KINDS:
+        return keys
+    body = evidence.split(" | ", 1)[1] if " | " in evidence else ""
+    file = candidate.get("file")
+    if kind in ("markers", "swallowed", "syntax", "test-gap", "dead-export"):
+        lead = re.match(r"([\w./-]+):(\d+): ", body)
+        if lead:
+            file = file or lead.group(1)
+            if kind in ("markers", "swallowed"):
+                body = body[lead.end():]
+        if kind in ("markers", "swallowed"):
+            keys.add(("mine", kind, file, body.strip()[:120]))
+        elif kind == "syntax":
+            keys.add(("mine", kind, file))
+        else:  # test-gap / dead-export: symbol from the backticked title
+            match = re.search(r"`([^`]+)`", candidate.get("title") or "")
+            symbol = match.group(1) if match else (candidate.get("title") or "")[:80]
+            keys.add(("mine", kind, file, symbol))
+    elif kind == "hotspot":
+        if file is None:
+            match = re.search(r"git log --name-only: (.+) touched \d+ of last 50 commits", body)
+            if match:
+                file = match.group(1)
+        keys.add(("mine", kind, file))
+    else:  # docs-drift: evidence reads "{readme}: references {missing}"
+        if file is None:
+            match = re.match(r"(.+): references ", body)
+            if match:
+                file = match.group(1)
+        keys.add(("mine", kind, file))
+    return keys
 
 
 def filter_new_findings(findings, existing_candidates):
-    """Drop findings that already exist in the backlog (file:line evidence match)."""
+    """Drop findings that already exist in the backlog. Identity is
+    line-stable (see _dedup_key): a marker that drifted a few lines or a
+    hotspot whose churn count changed is the same problem, not a new one.
+    markers/swallowed dedup on the marker text alone — their titles embed a
+    line number and must not shadow a changed note on the same line. Other
+    kinds also honor exact title matches (covers legacy candidates such as the
+    suite-level test gap); unknown kinds keep the old file:line identity."""
     seen = set()
     for candidate in existing_candidates or []:
-        evidence = (candidate.get("evidence") or "")
-        title = (candidate.get("title") or "")
+        seen.update(_candidate_dedup_keys(candidate))
+        if candidate.get("title"):
+            seen.add(("title", candidate["title"][:80]))
         file = candidate.get("file")
         line = candidate.get("line")
         if file and line:
-            seen.add((file, int(line)))
-        for token in re.findall(r"([\w./-]+):(\d+)", evidence):
-            seen.add((token[0], int(token[1])))
-        if title:
-            seen.add(("title", title[:80]))
+            seen.add(("pair", file, int(line)))
+        for token in re.findall(r"([\w./-]+):(\d+)", candidate.get("evidence") or ""):
+            seen.add(("pair", token[0], int(token[1])))
     out = []
     local = set()
     for finding in findings:
@@ -438,11 +564,16 @@ def filter_new_findings(findings, existing_candidates):
         if key in local:
             continue
         local.add(key)
-        if finding.get("file") and finding.get("line"):
-            if (finding["file"], int(finding["line"])) in seen:
-                continue
-        if ("title", (finding.get("title") or "")[:80]) in seen:
+        if key in seen:
             continue
+        kind = finding.get("kind")
+        if kind not in ("markers", "swallowed"):
+            title = (finding.get("title") or "")[:80]
+            if title and ("title", title) in seen:
+                continue
+            if kind not in MINE_KINDS and finding.get("file") and finding.get("line"):
+                if ("pair", finding["file"], int(finding["line"])) in seen:
+                    continue
         out.append(finding)
     return out
 

@@ -196,14 +196,37 @@ def _validate_state_types(repo, state):
 
 
 def load_state(repo):
-    state = io.load_json(config.state_path_for(repo))
-    if state is None:
+    path = config.state_path_for(repo)
+    # Sentinel default: load_json's None default cannot tell "file absent" from
+    # "file contains JSON null" — both used to report the bogus "state.json not
+    # found" for a null file and hide the actual corruption.
+    missing = object()
+    state = io.load_json(path, missing)
+    if state is missing:
         print("[ERROR] state.json not found. Run init first.", file=sys.stderr)
         raise SystemExit(2)
     if not isinstance(state, dict):
+        detail = "null" if state is None else "a JSON {}".format(type(state).__name__)
         print(
-            "[ERROR] .autopilot/state.json must be a JSON object, got {}. "
-            "Fix or delete it and run init again.".format(type(state).__name__),
+            "[ERROR] .autopilot/state.json exists but is not a valid JSON object ({}). "
+            "Fix or delete it and run init again.".format(detail),
+            file=sys.stderr,
+        )
+        raise SystemExit(2)
+    old_schema = state.get("schema", 1)
+    if not isinstance(old_schema, int):
+        # Must be caught before any comparison: a null/string schema would
+        # otherwise die with a bare TypeError on the `<` below.
+        _state_type_error(path, "'schema' must be a number, got {}".format(
+            "null" if old_schema is None else type(old_schema).__name__))
+    if old_schema > io.SCHEMA_VERSION:
+        # Written by a newer skill version: migrating down would silently drop
+        # fields this build does not know about. Fail closed and mutate nothing.
+        print(
+            "[ERROR] .autopilot/state.json was written by a newer autopilot version "
+            "(schema {} > {}). Downgrading is not supported: update this skill to the "
+            "matching version, or restore the previous state file. Do not delete the "
+            "file unless the run is abandoned.".format(old_schema, io.SCHEMA_VERSION),
             file=sys.stderr,
         )
         raise SystemExit(2)
@@ -219,7 +242,6 @@ def load_state(repo):
         state["run_start_sha"] = head.stdout.strip() if head.returncode == 0 else io.EMPTY_TREE
         changed = True
     _validate_state_types(repo, state)
-    old_schema = state.get("schema", 1)
     if old_schema < io.SCHEMA_VERSION:
         state["schema"] = io.SCHEMA_VERSION
         changed = True
@@ -1402,6 +1424,22 @@ def build_retrospective(repo, state, cfg, lang="zh"):
     zh = lang == "zh"
     backlog = load_backlog(repo)
     out = []
+    # Feature-mode honesty line: the run's commits live on the autopilot
+    # branch and finish does not merge (by design), so every report must say
+    # where the work landed instead of leaving the user to discover it.
+    feature_note = None
+    if cfg.get("branch_mode") == "feature" and state.get("branch"):
+        origin = state.get("origin_branch")
+        if origin and origin != "HEAD":
+            origin_label = "`{}`".format(origin)
+        else:
+            origin_label = "原" if zh else "the original"
+        if zh:
+            feature_note = "- 提交保留在分支 `{}`，未合并到 {} 分支".format(state["branch"], origin_label)
+        else:
+            feature_note = "- Commits remain on branch `{}`; not merged into {}.".format(
+                state["branch"], origin_label
+            )
     if zh:
         out.append("# 迭代复盘（Retrospective）")
         out.append("")
@@ -1411,6 +1449,8 @@ def build_retrospective(repo, state, cfg, lang="zh"):
         out.append("- 受阻轮次: {}".format(state.get("blocked_rounds", 0)))
         out.append("- 回滚轮次: {}".format(state.get("reverted_rounds", 0)))
         out.append("- 估算 Token: {}".format(state.get("estimated_tokens_used", 0)))
+        if feature_note:
+            out.append(feature_note)
         out.append("")
         out.append("## 按类型统计")
         out.append("")
@@ -1423,6 +1463,8 @@ def build_retrospective(repo, state, cfg, lang="zh"):
         out.append("- blocked rounds: {}".format(state.get("blocked_rounds", 0)))
         out.append("- reverted rounds: {}".format(state.get("reverted_rounds", 0)))
         out.append("- estimated tokens: {}".format(state.get("estimated_tokens_used", 0)))
+        if feature_note:
+            out.append(feature_note)
         out.append("")
         out.append("## Stats by type")
         out.append("")
@@ -1531,7 +1573,10 @@ def build_report(repo, state, cfg, lang="en"):
     out.append("")
     out.append("- {}: `{}`".format(L["repo"], state.get("repo")))
     out.append("- run_id: `{}`".format(state.get("run_id")))
-    out.append("- {}: `{}`".format(L["active"], state.get("branch") or state.get("origin_branch") or L["none"]))
+    # branch/origin_branch are only set in feature mode; in current mode both
+    # are None and the report used to show 无 despite git knowing the branch.
+    active_branch = state.get("branch") or state.get("origin_branch") or io.current_branch(repo)
+    out.append("- {}: `{}`".format(L["active"], active_branch))
     out.append("- started_at: `{}`".format(state.get("started_at")))
     out.append("- last_activity_at: `{}`".format(state.get("last_activity_at")))
     out.append("- {}: `{}`".format(L["deadline"], cfg.get("deadline") or L["none"]))

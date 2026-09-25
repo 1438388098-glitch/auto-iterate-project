@@ -84,8 +84,16 @@ def scan_staged_diff(repo, extra_patterns=None):
     findings = []
     seen = set()
     current_file = None
+    prev_line = ""
     for line in diff.stdout.splitlines():
-        if line.startswith("+++ "):
+        # File-header state machine: a real "+++ " header always directly
+        # follows a "--- " (or "diff --git ") line. An ADDED content line whose
+        # text itself starts with "++" shows up as "+++..." in the diff, so
+        # matching any "+++"-prefixed line as a header used to let those lines
+        # bypass the scan entirely.
+        if line.startswith("+++ ") and (
+            prev_line.startswith("--- ") or prev_line.startswith("diff --git ")
+        ):
             target = line[4:].strip()
             if target == "/dev/null":
                 current_file = None
@@ -93,24 +101,21 @@ def scan_staged_diff(repo, extra_patterns=None):
                 if target.startswith("b/"):
                     target = target[2:]
                 current_file = io._unquote_git_path(target) if target.startswith('"') else target
-            continue
-        if line.startswith("+++"):
-            continue
-        if not line.startswith("+"):
-            continue
-        for compiled in patterns:
-            if compiled.search(line):
-                key = (compiled.pattern, line[:80])
-                if key in seen:
-                    continue
-                seen.add(key)
-                findings.append(
-                    {
-                        "pattern": compiled.pattern,
-                        "file": current_file,
-                        "text": mask_secret_text(line[1:]),
-                    }
-                )
+        elif line.startswith("+"):
+            for compiled in patterns:
+                if compiled.search(line):
+                    key = (compiled.pattern, line[:80])
+                    if key in seen:
+                        continue
+                    seen.add(key)
+                    findings.append(
+                        {
+                            "pattern": compiled.pattern,
+                            "file": current_file,
+                            "text": mask_secret_text(line[1:]),
+                        }
+                    )
+        prev_line = line
     numstat = io.run_git(repo, "-c", "core.quotepath=false", "diff", "--cached", "--numstat")
     if numstat.returncode == 0:
         for line in numstat.stdout.splitlines():

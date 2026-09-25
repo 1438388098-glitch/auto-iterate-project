@@ -10,6 +10,7 @@ import sys
 import tempfile
 import unittest
 from io import StringIO
+from unittest import mock
 from pathlib import Path
 
 SCRIPT = Path(__file__).resolve().parent / "autopilot_state.py"
@@ -189,8 +190,9 @@ class InitTests(RepoTest):
 
     def test_init_resume_warns(self):
         self.run_state("init")
+        # Non-zero: an exit 0 used to silently drop the new init flags.
         result = self.run_state("init")
-        self.assertEqual(result.returncode, 0)
+        self.assertNotEqual(result.returncode, 0)
         self.assertIn("already exists", result.stderr)
 
     def test_init_requires_git_repo(self):
@@ -1469,12 +1471,17 @@ class OrphanCommitTests(RepoTest):
         self.assertIn("no round is open", result.stderr.lower())
 
     def test_commit_round_override_allows_orphan(self):
+        # --round flushes staged changes for an ALREADY-completed round, so the
+        # number must exist in completed history (any orphan number used to be
+        # accepted and absorbed whatever was staged).
         self.run_state("init")
+        self.run_state("begin-round", "--title", "r", "--reason", "x")
+        self.run_state("complete-round", "--summary", "done")
         self.add_file()
-        result = self.run_state("commit", "--round", "7", "--summary", "orphan")
+        result = self.run_state("commit", "--round", "1", "--summary", "orphan")
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
         log = self.git("log", "-1", "--pretty=%s").stdout.strip()
-        self.assertEqual(log, "autopilot(round-7): orphan")
+        self.assertEqual(log, "autopilot(round-1): orphan")
 
 
 class GoalBudgetTests(RepoTest):
@@ -2415,13 +2422,20 @@ class PredictedHardeningTests(RepoTest):
 
     def test_commit_round_zero_and_negative_rejected(self):
         self.run_state("init")
+        self.run_state("begin-round", "--title", "t", "--reason", "r")
+        self.run_state("complete-round", "--summary", "done")
         self.add_file("f.py")
         self.git("add", "-A")
         for bad in ("0", "-5"):
             result = self.run_state("commit", "--round", bad, "--summary", "s")
             self.assertNotEqual(result.returncode, 0, bad)
             self.assertIn("positive integer", result.stderr)
+        # --round must reference a completed round in history (any orphan
+        # number used to be accepted).
         result = self.run_state("commit", "--round", "2", "--summary", "s")
+        self.assertNotEqual(result.returncode, 0, result.stderr)
+        self.assertIn("no completed round", result.stderr)
+        result = self.run_state("commit", "--round", "1", "--summary", "s")
         self.assertEqual(result.returncode, 0, result.stderr)
 
     def test_negative_tokens_rejected(self):
@@ -4719,6 +4733,26 @@ class MiningAndFinishGateTests(RepoTest):
         second = json.loads(self.run_state("mine", "--kind", "docs-drift", "--json").stdout)
         # Two zero-finding runs in a row (docs-drift on a clean README) → exhausted.
         self.assertTrue(second["exhausted"] or second["found"] > 0)
+        runs = self.read_json("state.json").get("mining_runs") or []
+        self.assertTrue(runs and all("new" in r for r in runs), runs)
+
+    def test_mine_exhaustion_counts_new_findings_not_raw(self):
+        """Resident findings kept the recorded count above zero forever, so
+        `exhausted` was unreachable and finish always needed --force."""
+        (self.repo / "app.py").write_text("# TODO: resident\n", encoding="utf-8")
+        self.git("add", "app.py")
+        self.git("commit", "-q", "-m", "add app")
+        self.run_state("init")
+        first = json.loads(self.run_state("mine", "--kind", "markers", "--apply", "--json").stdout)
+        self.assertGreaterEqual(first["applied"], 1)
+        self.assertFalse(first["exhausted"])
+        second = json.loads(self.run_state("mine", "--kind", "markers", "--apply", "--json").stdout)
+        # Raw findings stay > 0 (the TODO is still in the file) but new == 0.
+        self.assertEqual(second["new"], 0)
+        self.assertFalse(second["exhausted"], "one zero-new run is not exhaustion")
+        third = json.loads(self.run_state("mine", "--kind", "markers", "--apply", "--json").stdout)
+        self.assertEqual(third["new"], 0)
+        self.assertTrue(third["exhausted"], "two consecutive zero-new runs are exhaustion")
 
     def test_finish_refuses_below_floor_ready_work(self):
         """The proven early-stop hole: ready work below min_candidate_value used
@@ -4780,6 +4814,793 @@ class MiningAndFinishGateTests(RepoTest):
         self.assertEqual(result.returncode, 0, result.stderr)
         after = self.read_json("backlog.json")
         self.assertEqual(before["candidates"], after["candidates"])
+
+    def test_mine_dedup_ignores_marker_line_drift(self):
+        (self.repo / "app.py").write_text(
+            "x = 1\n# TODO: handle empty input\n",
+            encoding="utf-8",
+        )
+        self.git("add", "app.py")
+        self.git("commit", "-q", "-m", "add app")
+        self.run_state("init")
+        first = json.loads(self.run_state("mine", "--kind", "markers", "--apply", "--json").stdout)
+        self.assertGreaterEqual(first["applied"], 1)
+        # The marker drifts down a file edit later: same problem, not a new one.
+        (self.repo / "app.py").write_text(
+            "x = 1\ny = 2\n# TODO: handle empty input\n",
+            encoding="utf-8",
+        )
+        self.git("add", "app.py")
+        self.git("commit", "-q", "-m", "grow app")
+        again = json.loads(self.run_state("mine", "--kind", "markers", "--apply", "--json").stdout)
+        self.assertEqual(again["new"], 0)
+        self.assertEqual(again["applied"], 0)
+
+    def test_mine_hotspot_churn_change_not_deduplicated(self):
+        """Hotspot identity is the file, not the churn count in the title."""
+        (self.repo / "app.py").write_text("x = 1\n")
+        self.git("add", "app.py")
+        self.git("commit", "-q", "-m", "one")
+        (self.repo / "app.py").write_text("x = 2\n")
+        self.git("add", "app.py")
+        self.git("commit", "-q", "-m", "two")
+        self.run_state("init")
+        first = json.loads(self.run_state("mine", "--kind", "hotspot", "--apply", "--json").stdout)
+        # README.md has a single commit: churn noise, not a hotspot.
+        self.assertEqual(first["applied"], 1, first["findings"])
+        (self.repo / "app.py").write_text("x = 3\n")
+        self.git("add", "app.py")
+        self.git("commit", "-q", "-m", "three")
+        second = json.loads(self.run_state("mine", "--kind", "hotspot", "--apply", "--json").stdout)
+        self.assertEqual(second["new"], 0)
+        self.assertEqual(second["applied"], 0)
+
+    def test_mine_hotspot_handles_non_ascii_paths(self):
+        (self.repo / "模块.py").write_text("x = 1\n", encoding="utf-8")
+        self.git("add", "模块.py")
+        self.git("commit", "-q", "-m", "one")
+        (self.repo / "模块.py").write_text("x = 2\n", encoding="utf-8")
+        self.git("add", "模块.py")
+        self.git("commit", "-q", "-m", "two")
+        self.run_state("init")
+        result = json.loads(self.run_state("mine", "--kind", "hotspot", "--apply", "--json").stdout)
+        self.assertGreaterEqual(result["applied"], 1)
+        files = [
+            c["file"] for c in self.read_json("backlog.json")["candidates"]
+            if c.get("from_mine") == "hotspot"
+        ]
+        # core.quotepath=false: no git octal escapes in mined paths.
+        self.assertTrue(any("模块" in (f or "") for f in files), files)
+
+    def test_mine_swallowed_catches_comment_and_oneline_forms(self):
+        (self.repo / "app.py").write_text(
+            "def run():\n    return 1\n"
+            "try:\n    run()\nexcept Exception:  # deliberate\n    pass\n"
+            "try:\n    run()\nexcept ValueError: pass\n"
+            "try:\n    run()\nexcept Exception:\n    pass  # keep\n"
+            "try:\n    run()\nexcept Exception:\n    return None\n",
+            encoding="utf-8",
+        )
+        self.git("add", "app.py")
+        self.git("commit", "-q", "-m", "add app")
+        self.run_state("init")
+        result = json.loads(self.run_state("mine", "--kind", "swallowed", "--json").stdout)
+        # Three swallow shapes fire; the real handler (return None) does not.
+        self.assertEqual(result["found"], 3, result["findings"])
+        evidence = " ".join(f["evidence"] for f in result["findings"])
+        self.assertIn("# deliberate", evidence)
+        self.assertIn("except ValueError: pass", evidence)
+
+    def test_mine_test_gap_does_not_mistake_test_substring_names(self):
+        (self.repo / "contest.py").write_text("def grade():\n    return 1\n", encoding="utf-8")
+        self.git("add", "contest.py")
+        self.git("commit", "-q", "-m", "add contest")
+        self.run_state("init")
+        result = json.loads(self.run_state("mine", "--kind", "test-gap", "--json").stdout)
+        # contest.py is source, not a test file: the suite-level gap must fire.
+        self.assertGreaterEqual(result["found"], 1)
+        self.assertTrue(
+            any("test suite" in f["title"] for f in result["findings"]),
+            result["findings"],
+        )
+
+    def test_mine_test_gap_reports_uncovered_symbols(self):
+        (self.repo / "contest.py").write_text("def grade():\n    return 1\n", encoding="utf-8")
+        tests = self.repo / "tests"
+        tests.mkdir()
+        (tests / "test_basic.py").write_text("x = 1\n", encoding="utf-8")
+        self.git("add", "contest.py", "tests")
+        self.git("commit", "-q", "-m", "add sources")
+        self.run_state("init")
+        result = json.loads(self.run_state("mine", "--kind", "test-gap", "--json").stdout)
+        # tests/ counts as the suite; contest.py is a source with an uncovered symbol.
+        self.assertTrue(
+            any(f["file"] == "contest.py" and "grade" in f["evidence"] for f in result["findings"]),
+            result["findings"],
+        )
+
+    def test_mine_limit_zero_returns_nothing(self):
+        (self.repo / "app.py").write_text("# TODO: x\n", encoding="utf-8")
+        self.git("add", "app.py")
+        self.git("commit", "-q", "-m", "add app")
+        self.run_state("init")
+        result = json.loads(self.run_state("mine", "--kind", "markers", "--limit", "0", "--json").stdout)
+        self.assertEqual(result["found"], 0)
+        self.assertEqual(result["by_kind"], {"markers": 0})
+
+    def test_mine_utf16_python_reported_as_encoding(self):
+        (self.repo / "broken.py").write_bytes("# comment\nx = 1\n".encode("utf-16"))
+        self.git("add", "broken.py")
+        self.git("commit", "-q", "-m", "add utf16")
+        self.run_state("init")
+        result = json.loads(self.run_state("mine", "--kind", "syntax", "--json").stdout)
+        self.assertGreaterEqual(result["found"], 1)
+        finding = result["findings"][0]
+        self.assertIn("encoding", finding["title"])
+        self.assertIsNone(finding["line"])
+        self.assertNotIn(":0:", finding["evidence"])
+
+    def test_mine_marker_types_follow_file_kind(self):
+        (self.repo / "app.py").write_text(
+            "# TODO: split module\n# FIXME: crash on empty\n",
+            encoding="utf-8",
+        )
+        self.git("add", "app.py")
+        self.git("commit", "-q", "-m", "add app")
+        self.run_state("init")
+        result = json.loads(self.run_state("mine", "--kind", "markers", "--apply", "--json").stdout)
+        self.assertEqual(result["applied"], 2, result["findings"])
+        types = {}
+        for candidate in self.read_json("backlog.json")["candidates"]:
+            if candidate.get("from_mine") != "markers":
+                continue
+            if "TODO" in candidate["title"]:
+                types["todo"] = candidate["type"]
+            elif "FIXME" in candidate["title"]:
+                types["fixme"] = candidate["type"]
+        # Code-file TODOs are refactor work, not docs; FIXME stays bugfix.
+        self.assertEqual(types, {"todo": "refactor", "fixme": "bugfix"})
+
+    def test_mine_skips_case_variants_of_ignored_dirs(self):
+        nested = self.repo / "Node_Modules"
+        nested.mkdir()
+        (nested / "dep.py").write_text("# TODO: x\n", encoding="utf-8")
+        self.git("add", "Node_Modules")
+        self.git("commit", "-q", "-m", "add deps")
+        self.run_state("init")
+        result = json.loads(self.run_state("mine", "--kind", "markers", "--json").stdout)
+        self.assertEqual(result["found"], 0)
+
+
+class LifecycleStateFixTests(RepoTest):
+    """Regression pack for the 1.5.1 lifecycle/state/IO fixes: refused commands
+    must not leak state mutations or create .autopilot/, corrupt state must be
+    named precisely, and finish/report must tell the truth about branch and
+    uncommitted work."""
+
+    def _subproc(self, *argv):
+        return subprocess.run(
+            [sys.executable, str(self.script)] + list(argv),
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            universal_newlines=True,
+            encoding="utf-8",
+            errors="replace",
+            env=self.env,
+        )
+
+    # --- begin-round validates before it mutates (candidates stay pending) ---
+    def test_begin_round_dirty_refusal_keeps_candidates_pending(self):
+        self.run_state("init")
+        self.run_state("backlog-add", "--title", "A", "--reason", "r", "--value", "4", "--effort", "2")
+        cid = self.read_json("backlog.json")["candidates"][0]["id"]
+        (self.repo / "user.txt").write_text("u\n", encoding="utf-8")
+        result = self.run_state("begin-round", "--title", "t", "--reason", "r", "--candidate-id", cid)
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("dirty", result.stderr.lower())
+        candidate = self.read_json("backlog.json")["candidates"][0]
+        self.assertEqual(candidate["status"], "pending")
+        self.assertIsNone(candidate.get("round"))
+        self.assertIsNone(self.read_json("state.json")["current_round"])
+        # The candidate never leaked to picked: after the tree is clean, the
+        # no-candidate-id guard still fires (a leaked 'picked' would silence it).
+        self.git("add", "user.txt")
+        self.git("commit", "-q", "-m", "user file")
+        result = self.run_state("begin-round", "--title", "t", "--reason", "r")
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("candidate-id", result.stderr.lower())
+
+    # --- init validates before any filesystem side effect ---
+    def test_init_dry_run_zero_filesystem_side_effects(self):
+        result = self.run_state("init", "--dry-run")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertFalse((self.repo / ".autopilot").exists())
+
+    def test_init_non_git_repo_leaves_no_autopilot_dir(self):
+        plain = Path(self.tmp) / "notgit-lifecycle"
+        plain.mkdir()
+        result = self._subproc("init", "--repo", str(plain))
+        self.assertNotEqual(result.returncode, 0)
+        self.assertFalse((plain / ".autopilot").exists())
+
+    def test_init_deadline_rejection_leaves_no_autopilot_dir(self):
+        result = self.run_state("init", "--deadline", "not-a-time")
+        self.assertNotEqual(result.returncode, 0)
+        self.assertFalse((self.repo / ".autopilot").exists())
+
+    def test_duplicate_init_exits_nonzero_json_ok_false(self):
+        self.run_state("init")
+        result = self.run_state("init", "--json")
+        self.assertNotEqual(result.returncode, 0)
+        data = json.loads(result.stdout)
+        self.assertFalse(data["ok"])
+
+    # --- state.json corruption is named precisely ---
+    def test_state_json_null_is_invalid_object_not_missing(self):
+        self.run_state("init")
+        (self.repo / ".autopilot" / "state.json").write_text("null", encoding="utf-8")
+        result = self.run_state("check")
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("not a valid JSON object", result.stderr)
+        self.assertIn("null", result.stderr)
+        self.assertNotIn("not found", result.stderr)
+        self.assertNotIn("Traceback", result.stderr)
+
+    def test_future_schema_refused_without_mutation(self):
+        self.run_state("init")
+        state_path = self.repo / ".autopilot" / "state.json"
+        state = json.loads(state_path.read_text(encoding="utf-8"))
+        state["schema"] = ap_io.SCHEMA_VERSION + 5
+        state_path.write_text(json.dumps(state), encoding="utf-8")
+        result = self.run_state("check")
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("newer autopilot version", result.stderr)
+        self.assertIn("Downgrading is not supported", result.stderr)
+        self.assertNotIn("Traceback", result.stderr)
+        # Fail-closed: the on-disk file must not be rewritten or migrated.
+        self.assertEqual(
+            json.loads(state_path.read_text(encoding="utf-8"))["schema"],
+            ap_io.SCHEMA_VERSION + 5,
+        )
+
+    # --- check/read on a non-git path blame git, not the missing state ---
+    def test_check_and_read_report_not_a_git_repository(self):
+        plain = Path(self.tmp) / "notgit-lifecycle2"
+        plain.mkdir()
+        for command in ("check", "read"):
+            result = self._subproc(command, "--repo", str(plain))
+            self.assertNotEqual(result.returncode, 0, command)
+            self.assertIn("Not a git repository", result.stderr, command)
+            self.assertNotIn("state.json not found", result.stderr, command)
+
+    # --- finish warns (never refuses) on uncommitted files ---
+    def test_finish_warns_with_uncommitted_file_list(self):
+        self.run_state("init")
+        (self.repo / "dirty1.txt").write_text("a\n", encoding="utf-8")
+        (self.repo / "dirty2.txt").write_text("b\n", encoding="utf-8")
+        result = self.run_state("finish", "--force", "--reason", "done")
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertIn("uncommitted", result.stderr)
+        self.assertIn("dirty1.txt", result.stderr)
+        self.assertIn("dirty2.txt", result.stderr)
+
+    def test_finish_ignores_autopilot_paths_in_dirty_warning(self):
+        self.run_state("init")
+        (self.repo / ".autopilot" / "stray.txt").write_text("x\n", encoding="utf-8")
+        result = self.run_state("finish", "--force", "--reason", "done")
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertNotIn("uncommitted", result.stderr)
+
+    # --- feature-mode finish says where the commits landed ---
+    def test_finish_feature_branch_reports_unmerged_commits(self):
+        self.run_state("init", "--branch-mode", "feature")
+        self.run_state("begin-round", "--title", "r", "--reason", "x")
+        self.add_file()
+        self.run_state("commit", "--summary", "add feature")
+        sha = self.git("rev-parse", "HEAD").stdout.strip()
+        self.run_state("complete-round", "--summary", "done", "--commit-sha", sha)
+        result = self.run_state("finish", "--force", "--reason", "done")
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        combined = result.stdout + result.stderr
+        self.assertIn("提交保留在分支", combined)
+        self.assertIn("未合并", combined)
+        retrospective = (self.repo / ".autopilot" / "retrospective.md").read_text(encoding="utf-8")
+        self.assertIn("提交保留在分支", retrospective)
+        self.assertIn("autopilot/", retrospective)
+
+    def test_finish_feature_branch_note_english(self):
+        self.run_state("init", "--branch-mode", "feature", "--report-lang", "en")
+        result = self.run_state("finish", "--force", "--reason", "done")
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        combined = result.stdout + result.stderr
+        self.assertIn("Commits remain on branch", combined)
+        self.assertIn("not merged into", combined)
+        retrospective = (self.repo / ".autopilot" / "retrospective.md").read_text(encoding="utf-8")
+        self.assertIn("Commits remain on branch", retrospective)
+
+    # --- check's dirty warning is scoped and correctly worded ---
+    def test_check_dirty_warning_scoped_and_worded(self):
+        self.run_state("init")
+        (self.repo / "user.txt").write_text("u\n", encoding="utf-8")
+        data = json.loads(self.run_state("check", "--brief").stdout)
+        self.assertTrue(any(
+            "first begin-round refuses a dirty tree" in w and "later rounds only warn" in w
+            for w in data["warnings"]
+        ))
+
+    def test_check_dirty_warning_absent_while_round_open(self):
+        self.run_state("init", "--allow-uncommitted-changes")
+        (self.repo / "user.txt").write_text("u\n", encoding="utf-8")
+        self.run_state("begin-round", "--title", "t", "--reason", "r")
+        data = json.loads(self.run_state("check", "--brief").stdout)
+        self.assertFalse(any("Working tree is dirty" in w for w in data["warnings"]))
+
+    # --- check names disabled secret scanning ---
+    def test_check_warns_when_secret_scanning_disabled_zh(self):
+        self.run_state("init")
+        config_path = self.repo / ".autopilot" / "config.json"
+        cfg = json.loads(config_path.read_text(encoding="utf-8"))
+        cfg["scan_secrets"] = False
+        config_path.write_text(json.dumps(cfg), encoding="utf-8")
+        data = json.loads(self.run_state("check", "--brief").stdout)
+        self.assertTrue(any("scan_secrets: false" in w for w in data["warnings"]))
+
+    def test_check_warns_when_secret_scanning_disabled_en(self):
+        self.run_state("init", "--report-lang", "en")
+        config_path = self.repo / ".autopilot" / "config.json"
+        cfg = json.loads(config_path.read_text(encoding="utf-8"))
+        cfg["scan_secrets"] = False
+        config_path.write_text(json.dumps(cfg), encoding="utf-8")
+        data = json.loads(self.run_state("check", "--brief").stdout)
+        self.assertTrue(any("Secret scanning is disabled" in w for w in data["warnings"]))
+
+    # --- report shows the real branch in current mode ---
+    def test_report_active_branch_falls_back_to_current_branch(self):
+        self.run_state("init")
+        branch = self.git("rev-parse", "--abbrev-ref", "HEAD").stdout.strip()
+        report = self.run_state("report").stdout
+        self.assertIn("`{}`".format(branch), report)
+        report_en = self.run_state("report", "--lang", "en").stdout
+        self.assertIn("`{}`".format(branch), report_en)
+
+    # --- goal-met says unverified without a --round anchor ---
+    def test_goal_met_without_round_says_unverified(self):
+        self.run_state("init", "--goal", "G")
+        result = self.run_state("goal-met", "--goal", "G")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("unverified", result.stdout)
+        self.assertIn("将阻止 all-goals-met 停止", result.stdout)
+
+    def test_check_unverified_goal_warning_blames_missing_round(self):
+        self.run_state("init", "--goal", "G")
+        self.run_state("goal-met", "--goal", "G")
+        self.run_state("backlog-add", "--title", "A", "--reason", "r", "--value", "3", "--effort", "2")
+        data = json.loads(self.run_state("check", "--brief").stdout)
+        self.assertTrue(any(
+            "G" in w and "未关联到已完成轮次" in w and "不得 finish" in w
+            for w in data["warnings"]
+        ))
+
+    # --- one actionable path for a thin backlog (no self-contradiction) ---
+    def test_check_single_supply_path_when_deterministic_side_stale(self):
+        self.run_state("init")
+        data = json.loads(self.run_state("check", "--brief").stdout)
+        self.assertEqual(data["action_hint"], "mine")
+        joined = " ".join(data["warnings"])
+        self.assertIn("mine --apply", joined)
+        self.assertIn("Do not idle", joined)
+        self.assertNotIn("run Deep Expansion now", joined)
+
+    def test_check_single_supply_path_english(self):
+        self.run_state("init", "--report-lang", "en")
+        data = json.loads(self.run_state("check", "--brief").stdout)
+        self.assertEqual(data["action_hint"], "mine")
+        joined = " ".join(data["warnings"])
+        self.assertIn("run `mine --apply` first", joined)
+        self.assertIn("only if the backlog is still thin after mining", joined)
+
+    def test_check_expansion_now_only_when_deterministic_side_fresh(self):
+        self.run_state("init")
+        # Two zero-finding deterministic runs == supply side exhausted: only
+        # then may check tell the agent to expand right away.
+        state_path = self.repo / ".autopilot" / "state.json"
+        st = json.loads(state_path.read_text(encoding="utf-8"))
+        st["mining_runs"] = [
+            {"at": "2026-01-01T00:00:00+00:00", "findings": 0, "applied": 0, "kinds": ["docs-drift"]},
+            {"at": "2026-01-01T00:01:00+00:00", "findings": 0, "applied": 0, "kinds": ["docs-drift"]},
+        ]
+        state_path.write_text(json.dumps(st), encoding="utf-8")
+        data = json.loads(self.run_state("check", "--brief").stdout)
+        self.assertEqual(data["action_hint"], "expand")
+        joined = " ".join(data["warnings"])
+        self.assertIn("run Deep Expansion now", joined)
+
+    # --- refusals on an uninitialized repo must not create .autopilot/ ---
+    def test_refusals_on_uninitialized_repo_create_no_directory(self):
+        for command, args in (
+            ("backlog-add", ("--title", "t", "--value", "3", "--effort", "1")),
+            ("backlog-list", ()),
+            ("backlog-pick", ("--id", "candidate-001")),
+            ("begin-round", ("--title", "t", "--reason", "r")),
+            ("finish", ()),
+            ("commit", ("--summary", "s")),
+            ("push", ()),
+            ("config-set", ("--expand-after-goals",)),
+            ("directive-add", ("--text", "x")),
+            ("mine", ("--kind", "markers")),
+        ):
+            result = self.run_state(command, *args)
+            self.assertNotEqual(result.returncode, 0, command)
+            self.assertNotIn("Traceback", result.stderr, command)
+            self.assertFalse((self.repo / ".autopilot").exists(), command)
+
+    # --- detect-agent reports the real skill root and a working python ---
+    def test_detect_agent_skill_dir_points_at_skill_root(self):
+        env = {k: v for k, v in os.environ.items()
+               if k not in ("OPENCODE", "CLAUDE_CODE", "CODEX", "AUTOPILOT_AGENT", "SKILL_DIR")}
+        result = self._subproc("detect-agent", "--repo", str(self.repo))
+        self.assertEqual(result.returncode, 0, result.stderr)
+        data = json.loads(result.stdout)
+        self.assertEqual(
+            Path(data["skill_dir"]).resolve(),
+            (Path(__file__).resolve().parent.parent).resolve(),
+        )
+
+    def test_detect_agent_python_cmd_actually_runs(self):
+        result = self._subproc("detect-agent", "--repo", str(self.repo))
+        data = json.loads(result.stdout)
+        probe = subprocess.run(
+            [data["python_cmd"], "-V"],
+            stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+            timeout=30,
+        )
+        self.assertEqual(probe.returncode, 0)
+
+
+class SecurityFixRegressionTests(RepoTest):
+    """Locks the security-audit fixes: branch guard in feature mode, the
+    secret-scan file-header state machine, the pre-existing-changes
+    interception (batch mode included), --round history validation, the
+    pattern name in secret refusals, and the .autopilot/ forced-add guard."""
+
+    # ---------- fix: secret-scan "++" prefix bypass ----------
+
+    def test_commit_catches_plus_prefix_secret(self):
+        # Content whose text itself starts with "++" shows up as "+++..." in
+        # the staged diff — the old header match skipped the line entirely.
+        self.run_state("init")
+        self.run_state("begin-round", "--title", "r", "--reason", "x")
+        (self.repo / "leak.py").write_text("++ghp_" + "a" * 36 + "\n", encoding="utf-8")
+        self.git("add", "leak.py")
+        result = self.run_state("commit", "--summary", "oops")
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("secret", result.stderr.lower())
+
+    def test_commit_catches_spaced_plus_prefix_secret(self):
+        # "++ ghp_..." renders as "+++ ghp_..." — the exact "+++ " header
+        # shape, which used to corrupt file attribution AND skip the scan.
+        self.run_state("init")
+        self.run_state("begin-round", "--title", "r", "--reason", "x")
+        (self.repo / "leak.py").write_text("++ ghp_" + "b" * 36 + "\n", encoding="utf-8")
+        self.git("add", "leak.py")
+        result = self.run_state("commit", "--summary", "oops")
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("secret", result.stderr.lower())
+
+    def test_secret_scan_header_attribution_intact(self):
+        # A real "+++ b/<file>" header still sets the attribution, and the
+        # header lines themselves never become findings.
+        self.run_state("init")
+        self.run_state("begin-round", "--title", "r", "--reason", "x")
+        self.add_file("creds.py", 'KEY = "ghp_' + "c" * 36 + '"\n')
+        result = self.run_state("secret-scan", "--json")
+        self.assertNotEqual(result.returncode, 0)
+        data = json.loads(result.stdout)
+        self.assertFalse(data["clean"])
+        self.assertEqual(data["findings"][0]["file"], "creds.py")
+        self.assertTrue(all("+++ b/" not in f["text"] for f in data["findings"]))
+
+    def test_commit_refusal_names_matched_pattern(self):
+        self.run_state("init")
+        self.run_state("begin-round", "--title", "r", "--reason", "x")
+        self.add_file("creds.py", 'KEY = "AKIAIOSFODNN7EXAMPLE"\n')
+        result = self.run_state("commit", "--summary", "oops")
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("(matched AKIA", result.stderr)
+
+    # ---------- fix: branch guard (feature mode) ----------
+
+    def _init_feature(self):
+        self.run_state("init", "--branch-mode", "feature")
+        return self.read_json("state.json")["branch"]
+
+    def test_commit_refuses_after_manual_branch_switch(self):
+        expected = self._init_feature()
+        self.git("checkout", "-q", self.initial_branch)
+        self.add_file()
+        result = self.run_state("commit", "--summary", "wrong branch")
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("Branch drift", result.stderr)
+        self.assertIn(self.initial_branch, result.stderr)
+        self.assertIn(expected, result.stderr)
+        self.assertIn("ensure-branch", result.stderr)
+        # Nothing was committed on the drifted branch.
+        log = self.git("log", "-1", "--pretty=%s").stdout.strip()
+        self.assertEqual(log, "initial")
+
+    def test_begin_round_refuses_after_manual_branch_switch(self):
+        self._init_feature()
+        self.git("checkout", "-q", self.initial_branch)
+        result = self.run_state("begin-round", "--title", "r", "--reason", "x")
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("Branch drift", result.stderr)
+        self.assertIsNone(self.read_json("state.json")["current_round"])
+
+    def test_complete_round_refuses_after_manual_branch_switch(self):
+        self._init_feature()
+        self.run_state("begin-round", "--title", "r", "--reason", "x")
+        self.git("checkout", "-q", self.initial_branch)
+        result = self.run_state("complete-round", "--summary", "done")
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("Branch drift", result.stderr)
+        self.assertIsNotNone(self.read_json("state.json")["current_round"])
+
+    def test_commit_refuses_on_detached_head_feature(self):
+        self._init_feature()
+        self.git("checkout", "--detach", "-q")
+        self.add_file()
+        result = self.run_state("commit", "--summary", "dangling")
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("Detached HEAD", result.stderr)
+
+    def test_current_mode_has_no_branch_guard(self):
+        self.run_state("init")
+        self.git("checkout", "-q", "-b", "side-branch")
+        self.run_state("begin-round", "--title", "r", "--reason", "x")
+        self.add_file()
+        result = self.run_state("commit", "--summary", "current mode is free")
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+
+    def test_check_warns_branch_drift_zh(self):
+        self._init_feature()
+        self.git("checkout", "-q", self.initial_branch)
+        data = json.loads(self.run_state("check", "--brief").stdout)
+        self.assertTrue(any("分支漂移" in w and "ensure-branch" in w for w in data["warnings"]))
+
+    def test_check_warns_branch_drift_en(self):
+        self.run_state("init", "--branch-mode", "feature", "--report-lang", "en")
+        self.git("checkout", "-q", self.initial_branch)
+        data = json.loads(self.run_state("check", "--brief").stdout)
+        self.assertTrue(any("Branch drift" in w for w in data["warnings"]))
+
+    def test_check_warns_detached_head_in_feature_mode(self):
+        self._init_feature()
+        self.git("checkout", "--detach", "-q")
+        data = json.loads(self.run_state("check", "--brief").stdout)
+        self.assertTrue(any("detached" in w and "ensure-branch" in w for w in data["warnings"]))
+
+    def test_ensure_branch_repairs_drift_then_commit_works(self):
+        expected = self._init_feature()
+        self.git("checkout", "-q", self.initial_branch)
+        result = self.run_state("ensure-branch")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        current = self.git("rev-parse", "--abbrev-ref", "HEAD").stdout.strip()
+        self.assertEqual(current, expected)
+        self.run_state("begin-round", "--title", "r", "--reason", "x")
+        self.add_file()
+        result = self.run_state("commit", "--summary", "back on track")
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+
+    # ---------- fix: pre-existing changes interception ----------
+
+    def test_batch_commit_refuses_user_changes_staged_between_rounds(self):
+        self.run_state("init")  # commit_every_rounds=5: batch mode by default
+        self.run_state("begin-round", "--title", "r1", "--reason", "x")
+        self.add_file("a.py")
+        self.run_state("complete-round", "--summary", "a")
+        # User stages own work between rounds; the deferred round-1 work (a.py)
+        # must stay committable, but the user file must not be swept.
+        (self.repo / "user.txt").write_text("user work\n", encoding="utf-8")
+        self.git("add", "user.txt")
+        self.run_state("begin-round", "--title", "r2", "--reason", "x")
+        self.assertEqual(
+            self.read_json("state.json")["current_round"]["start_dirty_files"], ["user.txt"]
+        )
+        self.add_file("b.py")
+        result = self.run_state("commit", "--summary", "batched")
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("user.txt", result.stderr)
+        self.assertIn("allow_uncommitted_changes", result.stderr)
+        log = self.git("log", "-1", "--pretty=%s").stdout.strip()
+        self.assertEqual(log, "initial")
+
+    def test_batch_commit_allows_own_deferred_work(self):
+        self.run_state("init")
+        self.run_state("begin-round", "--title", "r1", "--reason", "x")
+        self.add_file("a.py")
+        self.run_state("complete-round", "--summary", "a")
+        self.run_state("begin-round", "--title", "r2", "--reason", "x")
+        self.add_file("b.py")
+        result = self.run_state("commit", "--summary", "batched")
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        files = self.git("show", "--stat", "--name-only", "--pretty=", "HEAD").stdout.strip().splitlines()
+        self.assertIn("a.py", files)
+        self.assertIn("b.py", files)
+
+    def test_commit_allows_leftovers_of_blocked_round(self):
+        self.run_state("init", "--commit-every-rounds", "1")
+        self.run_state("begin-round", "--title", "r1", "--reason", "x")
+        self.add_file("a.py")
+        self.run_state("block-round", "--reason", "stuck")
+        self.run_state("begin-round", "--title", "r2", "--reason", "x")
+        self.add_file("b.py")
+        result = self.run_state("commit", "--summary", "resume work")
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+
+    def test_nonbatch_commit_intercepts_user_changes(self):
+        self.run_state("init", "--commit-every-rounds", "1")
+        self.run_state("begin-round", "--title", "r1", "--reason", "x")
+        self.add_file("a.py")
+        sha = self.git("rev-parse", "HEAD").stdout.strip()
+        result = self.run_state("commit", "--summary", "work")
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.run_state("complete-round", "--summary", "a", "--commit-sha", sha)
+        # User stages own work between rounds; round 2 begins with it dirty.
+        (self.repo / "user.txt").write_text("user work\n", encoding="utf-8")
+        self.git("add", "user.txt")
+        self.run_state("begin-round", "--title", "r2", "--reason", "x")
+        self.add_file("b.py")
+        # b.py alone is committable, but user.txt is staged alongside — refused.
+        result = self.run_state("commit", "--summary", "own work")
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("user.txt", result.stderr)
+        # Unstage the user file: the round's own work commits.
+        self.git("reset", "-q", "user.txt")
+        result = self.run_state("commit", "--summary", "own work")
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+
+    def test_commit_fails_open_without_start_dirty_files(self):
+        self.run_state("init")
+        self.run_state("begin-round", "--title", "r", "--reason", "x")
+        state_path = self.repo / ".autopilot" / "state.json"
+        state = json.loads(state_path.read_text(encoding="utf-8"))
+        del state["current_round"]["start_dirty_files"]
+        state_path.write_text(json.dumps(state), encoding="utf-8")
+        self.add_file()
+        result = self.run_state("commit", "--summary", "legacy state")
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertIn("start_dirty_files", result.stderr)
+
+    def test_commit_round_fails_open_without_start_dirty_files(self):
+        self.run_state("init")
+        self.run_state("begin-round", "--title", "r", "--reason", "x")
+        self.run_state("complete-round", "--summary", "done")
+        state_path = self.repo / ".autopilot" / "state.json"
+        state = json.loads(state_path.read_text(encoding="utf-8"))
+        del state["history"][-1]["start_dirty_files"]
+        state_path.write_text(json.dumps(state), encoding="utf-8")
+        self.add_file()
+        result = self.run_state("commit", "--round", "1", "--summary", "flush")
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertIn("start_dirty_files", result.stderr)
+
+    # ---------- fix: --round history validation ----------
+
+    def test_commit_round_unknown_refused_and_lists_available(self):
+        self.run_state("init")
+        self.add_file()
+        # No completed rounds at all: the refusal lists "none".
+        result = self.run_state("commit", "--round", "9", "--summary", "orphan")
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("no completed round", result.stderr)
+        self.assertIn("none", result.stderr)
+        # Clean the stage so the first begin-round sees a clean tree.
+        self.git("reset", "-q", "feature.py")
+        (self.repo / "feature.py").unlink()
+        self.run_state("begin-round", "--title", "t1", "--reason", "r")
+        self.run_state("complete-round", "--summary", "d1")
+        self.run_state("begin-round", "--title", "t2", "--reason", "r")
+        self.run_state("complete-round", "--summary", "d2")
+        self.add_file()
+        result = self.run_state("commit", "--round", "9", "--summary", "orphan")
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("no completed round", result.stderr)
+        self.assertIn("1, 2", result.stderr)
+        result = self.run_state("commit", "--round", "1", "--summary", "flush")
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+
+    def test_commit_round_flush_reads_history_start_dirty_files(self):
+        self.run_state("init")
+        self.run_state("begin-round", "--title", "r1", "--reason", "x")
+        self.add_file("a.py")
+        self.run_state("complete-round", "--summary", "a")
+        # User stages own work between rounds: round 2 begins with it dirty and
+        # its history entry carries that snapshot.
+        (self.repo / "user.txt").write_text("user work\n", encoding="utf-8")
+        self.git("add", "user.txt")
+        self.run_state("begin-round", "--title", "r2", "--reason", "x")
+        self.run_state("complete-round", "--summary", "b")
+        result = self.run_state("commit", "--round", "2", "--summary", "flush")
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("user.txt", result.stderr)
+        # A round that began clean flushes fine.
+        result = self.run_state("commit", "--round", "1", "--summary", "flush")
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+
+    # ---------- fix: .autopilot/ forced-add guard ----------
+
+    def test_commit_refuses_forced_autopilot_files(self):
+        self.run_state("init")
+        self.run_state("begin-round", "--title", "r", "--reason", "x")
+        self.add_file()
+        self.git("add", "-f", ".autopilot/state.json")
+        result = self.run_state("commit", "--summary", "sneaky")
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn(".autopilot/state.json", result.stderr)
+        self.assertIn("track_state", result.stderr)
+        log = self.git("log", "-1", "--pretty=%s").stdout.strip()
+        self.assertEqual(log, "initial")
+
+    def test_commit_allows_autopilot_files_with_track_state(self):
+        self.run_state("init", "--track-state")
+        self.run_state("begin-round", "--title", "r", "--reason", "x")
+        self.add_file()
+        self.git("add", ".autopilot/state.json")
+        result = self.run_state("commit", "--summary", "versioned state")
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+
+    # ---------- fail-closed paths (mocked git failures) ----------
+
+    def test_secret_scan_fails_closed_when_diff_unreadable(self):
+        self.run_state("init")
+        failing = RunResult(128, "", "fatal: bad object HEAD")
+        with mock.patch.object(ap_io, "run_git", return_value=failing):
+            findings = commands_module.scan_staged_diff(self.repo)
+        self.assertEqual(len(findings), 1)
+        self.assertEqual(findings[0]["pattern"], "git-diff-failure")
+
+    def test_staged_numstat_fails_closed(self):
+        self.run_state("init")
+        failing = RunResult(128, "", "fatal: unable to read tree")
+        with mock.patch.object(ap_io, "run_git", return_value=failing):
+            with self.assertRaises(SystemExit) as ctx:
+                commands_module._staged_numstat_lines(self.repo)
+        self.assertEqual(ctx.exception.code, 2)
+
+
+class CommitCadenceWarnTests(RepoTest):
+    def test_off_cadence_commit_warns_next_flush_round(self):
+        self.run_state("init")  # commit_every_rounds defaults to 5
+        self.run_state("begin-round", "--title", "r1", "--reason", "x")
+        self.add_file("a.py", "a = 1\n")
+        result = self.run_state("commit", "--summary", "early")
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertIn("not a flush round", result.stderr)
+        self.assertIn("next flush round is 5", result.stderr)
+
+    def test_on_cadence_commit_does_not_warn(self):
+        self.run_state("init", "--commit-every-rounds", "2")
+        self.run_state("begin-round", "--title", "r1", "--reason", "x")
+        self.add_file("a.py", "a = 1\n")
+        self.run_state("complete-round", "--summary", "a")
+        self.run_state("begin-round", "--title", "r2", "--reason", "x")
+        self.add_file("b.py", "b = 2\n")
+        result = self.run_state("commit", "--summary", "flush")
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertNotIn("not a flush round", result.stderr)
+
+    def test_round_flush_does_not_warn(self):
+        self.run_state("init")  # every=5: rounds 1/2 are both off-cadence
+        self.run_state("begin-round", "--title", "r1", "--reason", "x")
+        self.add_file("a.py", "a = 1\n")
+        self.run_state("complete-round", "--summary", "a")
+        self.run_state("begin-round", "--title", "r2", "--reason", "x")
+        self.add_file("b.py", "b = 2\n")
+        self.run_state("complete-round", "--summary", "b")
+        self.add_file("c.py", "c = 3\n")
+        result = self.run_state("commit", "--round", "1", "--summary", "flush r1")
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertNotIn("not a flush round", result.stderr)
 
 
 class SuiteIntegrityTests(unittest.TestCase):

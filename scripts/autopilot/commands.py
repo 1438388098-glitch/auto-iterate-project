@@ -34,181 +34,224 @@ def emit_result(args, ok, message, data=None):
     return 0 if ok else 2
 
 
+def _require_initialized(args, repo, message="[ERROR] state.json not found. Run init first."):
+    """Refuse an uninitialized repo BEFORE acquiring the run lock: the lock
+    mkdirs .autopilot/, so a refused command must not leave the state directory
+    behind in a repo that never opted in. The explicit guards pass their own
+    "not initialized" text; the default mirrors state.load_state's wording so
+    the two message families stay stable."""
+    if not config.state_path_for(repo).exists():
+        return emit_result(args, False, message)
+    return None
+
+
+def _feature_branch_guard(repo, st, cfg, action):
+    """Refusal message when HEAD has drifted from the run's autopilot branch,
+    or None when it is safe to proceed. feature branch_mode only: a manual
+    checkout to another branch must not let round commands commit on it (a
+    complete-round push would then publish the wrong branch), and a detached
+    HEAD would orphan the commit. current mode records no branch and gets no
+    guard; ensure-branch stays available as the repair path."""
+    if cfg.get("branch_mode") != "feature" or not st.get("branch"):
+        return None
+    expected = st["branch"]
+    current = io.current_branch(repo)
+    if current == "HEAD":
+        return (
+            "[ERROR] Detached HEAD; refusing to {} because the commit would be orphaned. "
+            "This run's branch is '{}': run 'ensure-branch' or 'git checkout {}' first.".format(
+                action, expected, expected
+            )
+        )
+    if current != expected:
+        return (
+            "[ERROR] Branch drift: HEAD is on '{}' but this run's branch is '{}'. Refusing to {} "
+            "so the run's commits do not land on (and get pushed from) the wrong branch. "
+            "Run 'ensure-branch' or 'git checkout {}' first.".format(
+                current, expected, action, expected
+            )
+        )
+    return None
+
+
 def cmd_init(args):
     repo = Path(args.repo).resolve()
-    with io.run_lock(repo):
-        git_dir = io.git_dir_for(repo)
-        state_path = config.state_path_for(repo)
+    # Validate the git repo BEFORE any filesystem side effect: acquiring the
+    # lock mkdirs .autopilot/, so a mistyped --repo must be rejected first —
+    # and --dry-run promises a run that changes no state (cli help), lock file
+    # included. Everything up to the lock is read-only.
+    git_dir = io.git_dir_for(repo)
 
-        if state_path.exists() and not args.force:
-            print(
-                "[WARN] state.json already exists. Resume with read/check instead of reinitializing.",
-                file=sys.stderr,
-            )
-            return 0
+    state_path = config.state_path_for(repo)
+    if state_path.exists() and not args.force:
+        # Answered before the dirty-tree gate: an existing run must get the
+        # "resume" hint, not a dirty-tree complaint about an init that will
+        # never happen. Non-zero exit: silently dropping the new flags behind
+        # an exit 0 made re-inits look successful while doing nothing.
+        return emit_result(
+            args, False,
+            "[WARN] state.json already exists. Resume with read/check instead of reinitializing.",
+        )
 
-        cfg = config.default_config(repo)
-        # Inherit the existing config only WITHOUT --force: with --force the
-        # defaults plus this command line are the single source of truth, so
-        # `init --force` is a real recovery exit for a corrupt config (it used
-        # to carry the broken values over and re-create the same dead state).
-        if not args.force:
-            existing_config = io.load_json(config.config_path_for(repo), None)
-            if existing_config is not None:
-                cfg.update(existing_config)
-        cfg["repo"] = str(repo)
+    cfg = config.default_config(repo)
+    # Inherit the existing config only WITHOUT --force: with --force the
+    # defaults plus this command line are the single source of truth, so
+    # `init --force` is a real recovery exit for a corrupt config (it used
+    # to carry the broken values over and re-create the same dead state).
+    if not args.force:
+        existing_config = io.load_json(config.config_path_for(repo), None)
+        if existing_config is not None:
+            cfg.update(existing_config)
+    cfg["repo"] = str(repo)
 
-        if args.goal:
-            cfg["goals"] = args.goal
-        if args.goals_from_prompt:
-            cfg["goals"] = state.split_goals(args.goals_from_prompt)
-        # Only negatives are illegal here (zero is meaningful: max_rounds 0
-        # stops immediately, retries 0 disables retrying). This mirrors the
-        # non-negative policy in load_config — before this gate, a negative
-        # knob faked a successful init and then failed on every load, and
-        # max_blocked_in_a_row < 0 silently stopped the loop with zero rounds.
-        for knob in ("--max-rounds", "--max-minutes", "--max-tokens",
-                     "--max-round-scope", "--retries-per-round",
-                     "--max-blocked-in-a-row", "--max-expansion-per-round"):
-            value = getattr(args, knob.lstrip("-").replace("-", "_"), None)
-            if value is None:
-                continue
-            # `--max-minutes nan` passes every comparison, fakes a successful
-            # init, and writes a literal NaN into config.json.
-            if isinstance(value, float) and not math.isfinite(value):
-                io.append_log(repo, "init", "error", reason="{} not finite".format(knob))
-                return emit_result(
-                    args, False,
-                    "[ERROR] {} must be a finite number (NaN/inf budgets never trigger).".format(knob),
-                )
-            if value < 0:
-                io.append_log(repo, "init", "error", reason="{} out of range".format(knob))
-                return emit_result(
-                    args, False,
-                    "[ERROR] {} must be a non-negative integer (negative values "
-                    "silently stop the loop or fail on first load).".format(knob),
-                )
-        if args.max_rounds is not None:
-            cfg["max_rounds"] = args.max_rounds
-        if args.max_minutes is not None:
-            cfg["max_minutes"] = args.max_minutes
-        if args.deadline is not None:
-            resolved = io.parse_deadline(args.deadline)
-            if resolved is None:
-                io.append_log(repo, "init", "error", reason="unparseable deadline")
-                return emit_result(
-                    args, False,
-                    "[ERROR] Could not parse --deadline '{}'. Use an ISO timestamp "
-                    "(2026-08-10T08:00:00), a relative duration (+8h / +30min / +1d), "
-                    "or a local HH:MM wall-clock time.".format(args.deadline),
-                )
-            cfg["deadline"] = resolved
-        if args.max_tokens is not None:
-            cfg["max_tokens"] = args.max_tokens
-        if args.max_round_scope is not None:
-            cfg["max_round_scope"] = args.max_round_scope
-        if args.branch_mode is not None:
-            cfg["branch_mode"] = args.branch_mode
-        if args.allow_uncommitted_changes:
-            cfg["allow_uncommitted_changes"] = True
-        if args.track_state:
-            cfg["track_state"] = True
-        if args.check_commands:
-            cfg["check_commands"] = args.check_commands
-        if args.push:
-            cfg["push"] = True
-        if args.commit_message_prefix is not None:
-            cfg["commit_message_prefix"] = args.commit_message_prefix
-        if args.retries_per_round is not None:
-            cfg["retries_per_round"] = args.retries_per_round
-        if args.candidates_per_round is not None:
-            if args.candidates_per_round < 1:
-                io.append_log(repo, "init", "error", reason="candidates_per_round out of range")
-                return emit_result(args, False, "[ERROR] --candidates-per-round must be a positive integer.")
-            cfg["candidates_per_round"] = args.candidates_per_round
-        if args.max_blocked_in_a_row is not None:
-            cfg["max_blocked_in_a_row"] = args.max_blocked_in_a_row
-        if args.commit_every_rounds is not None:
-            if args.commit_every_rounds < 1:
-                io.append_log(repo, "init", "error", reason="commit_every_rounds out of range")
-                return emit_result(args, False, "[ERROR] --commit-every-rounds must be a positive integer.")
-            cfg["commit_every_rounds"] = args.commit_every_rounds
-        if args.verify_every_rounds is not None:
-            if args.verify_every_rounds < 1:
-                io.append_log(repo, "init", "error", reason="verify_every_rounds out of range")
-                return emit_result(args, False, "[ERROR] --verify-every-rounds must be a positive integer.")
-            cfg["verify_every_rounds"] = args.verify_every_rounds
-        if args.checkpoint_every is not None:
-            if args.checkpoint_every < 1:
-                io.append_log(repo, "init", "error", reason="checkpoint_every out of range")
-                return emit_result(args, False, "[ERROR] --checkpoint-every must be a positive integer.")
-            cfg["checkpoint_every"] = args.checkpoint_every
-        if args.expand_after_goals is not None:
-            cfg["expand_after_goals"] = bool(args.expand_after_goals)
-        if args.review_threshold is not None:
-            if args.review_threshold < 1 or args.review_threshold > 5:
-                io.append_log(repo, "init", "error", reason="review_threshold out of range")
-                return emit_result(args, False, "[ERROR] --review-threshold must be an integer 1-5.")
-            cfg["review_threshold"] = args.review_threshold
-        if args.scan_secrets is not None:
-            cfg["scan_secrets"] = args.scan_secrets
-        if args.secret_pattern:
-            cfg["secret_patterns"] = list(args.secret_pattern)
-        if args.type_saturation_threshold is not None:
-            if args.type_saturation_threshold < 0:
-                io.append_log(repo, "init", "error", reason="type_saturation_threshold out of range")
-                return emit_result(args, False, "[ERROR] --type-saturation-threshold must be a non-negative integer.")
-            cfg["type_saturation_threshold"] = args.type_saturation_threshold
-        if args.ranking_mode is not None:
-            cfg["ranking_mode"] = args.ranking_mode
-        if args.min_candidate_value is not None:
-            if args.min_candidate_value < 1 or args.min_candidate_value > 5:
-                io.append_log(repo, "init", "error", reason="min_candidate_value out of range")
-                return emit_result(args, False, "[ERROR] --min-candidate-value must be an integer 1-5.")
-            cfg["min_candidate_value"] = args.min_candidate_value
-        if args.max_same_type_per_round is not None:
-            if args.max_same_type_per_round < 1:
-                io.append_log(repo, "init", "error", reason="max_same_type_per_round out of range")
-                return emit_result(args, False, "[ERROR] --max-same-type-per-round must be a positive integer.")
-            cfg["max_same_type_per_round"] = args.max_same_type_per_round
-        if getattr(args, "min_pending_candidates", None) is not None:
-            if args.min_pending_candidates < 0:
-                io.append_log(repo, "init", "error", reason="min_pending_candidates out of range")
-                return emit_result(args, False, "[ERROR] --min-pending-candidates must be a non-negative integer.")
-            cfg["min_pending_candidates"] = args.min_pending_candidates
-        if getattr(args, "max_predicted_per_round", None) is not None:
-            if args.max_predicted_per_round < 0:
-                io.append_log(repo, "init", "error", reason="max_predicted_per_round out of range")
-                return emit_result(args, False, "[ERROR] --max-predicted-per-round must be a non-negative integer.")
-            cfg["max_predicted_per_round"] = args.max_predicted_per_round
-        # Negative values are already rejected by the knob gate above.
-        if getattr(args, "max_expansion_per_round", None) is not None:
-            cfg["max_expansion_per_round"] = args.max_expansion_per_round
-        if args.allow_path:
-            cfg["allow_paths"] = list(args.allow_path)
-        if args.deny_path:
-            cfg["deny_paths"] = list(args.deny_path)
-        if args.report_lang is not None:
-            cfg["report_lang"] = args.report_lang
-
-        if not cfg.get("allow_uncommitted_changes") and not args.force and io.working_tree_dirty(repo):
-            io.append_log(repo, "init", "error", reason="dirty working tree")
+    if args.goal:
+        cfg["goals"] = args.goal
+    if args.goals_from_prompt:
+        cfg["goals"] = state.split_goals(args.goals_from_prompt)
+    # Only negatives are illegal here (zero is meaningful: max_rounds 0
+    # stops immediately, retries 0 disables retrying). This mirrors the
+    # non-negative policy in load_config — before this gate, a negative
+    # knob faked a successful init and then failed on every load, and
+    # max_blocked_in_a_row < 0 silently stopped the loop with zero rounds.
+    for knob in ("--max-rounds", "--max-minutes", "--max-tokens",
+                 "--max-round-scope", "--retries-per-round",
+                 "--max-blocked-in-a-row", "--max-expansion-per-round"):
+        value = getattr(args, knob.lstrip("-").replace("-", "_"), None)
+        if value is None:
+            continue
+        # `--max-minutes nan` passes every comparison, fakes a successful
+        # init, and writes a literal NaN into config.json.
+        if isinstance(value, float) and not math.isfinite(value):
             return emit_result(
                 args, False,
-                "[ERROR] Working tree is dirty and allow_uncommitted_changes is false. "
-                "Commit or stash user changes, or run init with --allow-uncommitted-changes "
-                "(or --force to override).",
+                "[ERROR] {} must be a finite number (NaN/inf budgets never trigger).".format(knob),
             )
-
-        if getattr(args, "dry_run", False):
-            print(
-                "[DRY-RUN] Would initialize autopilot state in {} with run_id {}, {} rounds, goals={}.".format(
-                    repo, uuid.uuid4().hex[:io.RUN_ID_LENGTH], cfg.get("max_rounds"), cfg.get("goals")
-                ),
-                file=sys.stderr,
+        if value < 0:
+            return emit_result(
+                args, False,
+                "[ERROR] {} must be a non-negative integer (negative values "
+                "silently stop the loop or fail on first load).".format(knob),
             )
-            return 0
+    if args.max_rounds is not None:
+        cfg["max_rounds"] = args.max_rounds
+    if args.max_minutes is not None:
+        cfg["max_minutes"] = args.max_minutes
+    if args.deadline is not None:
+        resolved = io.parse_deadline(args.deadline)
+        if resolved is None:
+            return emit_result(
+                args, False,
+                "[ERROR] Could not parse --deadline '{}'. Use an ISO timestamp "
+                "(2026-08-10T08:00:00), a relative duration (+8h / +30min / +1d), "
+                "or a local HH:MM wall-clock time.".format(args.deadline),
+            )
+        cfg["deadline"] = resolved
+    if args.max_tokens is not None:
+        cfg["max_tokens"] = args.max_tokens
+    if args.max_round_scope is not None:
+        cfg["max_round_scope"] = args.max_round_scope
+    if args.branch_mode is not None:
+        cfg["branch_mode"] = args.branch_mode
+    if args.allow_uncommitted_changes:
+        cfg["allow_uncommitted_changes"] = True
+    if args.track_state:
+        cfg["track_state"] = True
+    if args.check_commands:
+        cfg["check_commands"] = args.check_commands
+    if args.push:
+        cfg["push"] = True
+    if args.commit_message_prefix is not None:
+        cfg["commit_message_prefix"] = args.commit_message_prefix
+    if args.retries_per_round is not None:
+        cfg["retries_per_round"] = args.retries_per_round
+    if args.candidates_per_round is not None:
+        if args.candidates_per_round < 1:
+            return emit_result(args, False, "[ERROR] --candidates-per-round must be a positive integer.")
+        cfg["candidates_per_round"] = args.candidates_per_round
+    if args.max_blocked_in_a_row is not None:
+        cfg["max_blocked_in_a_row"] = args.max_blocked_in_a_row
+    if args.commit_every_rounds is not None:
+        if args.commit_every_rounds < 1:
+            return emit_result(args, False, "[ERROR] --commit-every-rounds must be a positive integer.")
+        cfg["commit_every_rounds"] = args.commit_every_rounds
+    if args.verify_every_rounds is not None:
+        if args.verify_every_rounds < 1:
+            return emit_result(args, False, "[ERROR] --verify-every-rounds must be a positive integer.")
+        cfg["verify_every_rounds"] = args.verify_every_rounds
+    if args.checkpoint_every is not None:
+        if args.checkpoint_every < 1:
+            return emit_result(args, False, "[ERROR] --checkpoint-every must be a positive integer.")
+        cfg["checkpoint_every"] = args.checkpoint_every
+    if args.expand_after_goals is not None:
+        cfg["expand_after_goals"] = bool(args.expand_after_goals)
+    if args.review_threshold is not None:
+        if args.review_threshold < 1 or args.review_threshold > 5:
+            return emit_result(args, False, "[ERROR] --review-threshold must be an integer 1-5.")
+        cfg["review_threshold"] = args.review_threshold
+    if args.scan_secrets is not None:
+        cfg["scan_secrets"] = args.scan_secrets
+    if args.secret_pattern:
+        cfg["secret_patterns"] = list(args.secret_pattern)
+    if args.type_saturation_threshold is not None:
+        if args.type_saturation_threshold < 0:
+            return emit_result(args, False, "[ERROR] --type-saturation-threshold must be a non-negative integer.")
+        cfg["type_saturation_threshold"] = args.type_saturation_threshold
+    if args.ranking_mode is not None:
+        cfg["ranking_mode"] = args.ranking_mode
+    if args.min_candidate_value is not None:
+        if args.min_candidate_value < 1 or args.min_candidate_value > 5:
+            return emit_result(args, False, "[ERROR] --min-candidate-value must be an integer 1-5.")
+        cfg["min_candidate_value"] = args.min_candidate_value
+    if args.max_same_type_per_round is not None:
+        if args.max_same_type_per_round < 1:
+            return emit_result(args, False, "[ERROR] --max-same-type-per-round must be a positive integer.")
+        cfg["max_same_type_per_round"] = args.max_same_type_per_round
+    if getattr(args, "min_pending_candidates", None) is not None:
+        if args.min_pending_candidates < 0:
+            return emit_result(args, False, "[ERROR] --min-pending-candidates must be a non-negative integer.")
+        cfg["min_pending_candidates"] = args.min_pending_candidates
+    if getattr(args, "max_predicted_per_round", None) is not None:
+        if args.max_predicted_per_round < 0:
+            return emit_result(args, False, "[ERROR] --max-predicted-per-round must be a non-negative integer.")
+        cfg["max_predicted_per_round"] = args.max_predicted_per_round
+    # Negative values are already rejected by the knob gate above.
+    if getattr(args, "max_expansion_per_round", None) is not None:
+        cfg["max_expansion_per_round"] = args.max_expansion_per_round
+    if args.allow_path:
+        cfg["allow_paths"] = list(args.allow_path)
+    if args.deny_path:
+        cfg["deny_paths"] = list(args.deny_path)
+    if args.report_lang is not None:
+        cfg["report_lang"] = args.report_lang
 
+    if not cfg.get("allow_uncommitted_changes") and not args.force and io.working_tree_dirty(repo):
+        return emit_result(
+            args, False,
+            "[ERROR] Working tree is dirty and allow_uncommitted_changes is false. "
+            "Commit or stash user changes, or run init with --allow-uncommitted-changes "
+            "(or --force to override).",
+        )
+
+    if getattr(args, "dry_run", False):
+        print(
+            "[DRY-RUN] Would initialize autopilot state in {} with run_id {}, {} rounds, goals={}.".format(
+                repo, uuid.uuid4().hex[:io.RUN_ID_LENGTH], cfg.get("max_rounds"), cfg.get("goals")
+            ),
+            file=sys.stderr,
+        )
+        return 0
+
+    # Rejections above all happen before this lock: the lock is the first
+    # filesystem side effect and is only taken once init is committed to
+    # writing, so a refused init never leaves a .autopilot/ behind.
+    with io.run_lock(repo):
+        # Re-check under the lock: another init may have won the race between
+        # the pre-lock check and here.
+        if state_path.exists() and not args.force:
+            return emit_result(
+                args, False,
+                "[WARN] state.json already exists. Resume with read/check instead of reinitializing.",
+            )
         # Same validation the next load_config would apply — an init that
         # writes a config it could never re-load is a bricked run.
         config.validate_config(cfg)
@@ -229,16 +272,20 @@ def cmd_init(args):
         state.ensure_branch(repo, st, cfg, to_stderr=getattr(args, "json", False))
         io.append_log(repo, "init", "success", run_id=run_id, branch_mode=cfg.get("branch_mode"))
         return emit_result(args, True, "[OK] Initialized autopilot state.", data={"run_id": run_id})
-
-
 def cmd_read(args):
     repo = Path(args.repo).resolve()
+    # Validate git first: a non-git path must fail as "Not a git repository",
+    # not as the misleading "state.json not found" that load_state would print.
+    io.git_dir_for(repo)
     print(json.dumps(state.load_state(repo), indent=2, ensure_ascii=False))
     return 0
 
 
 def cmd_begin_round(args):
     repo = Path(args.repo).resolve()
+    refused = _require_initialized(args, repo)
+    if refused is not None:
+        return refused
     with io.run_lock(repo):
         st = state.load_state(repo)
         if st["current_round"] is not None:
@@ -246,6 +293,10 @@ def cmd_begin_round(args):
             return emit_result(args, False, "[ERROR] A round is already open. Complete, block, or cancel it first.")
 
         cfg = config.load_config(repo)
+        drift = _feature_branch_guard(repo, st, cfg, "begin a round")
+        if drift is not None:
+            io.append_log(repo, "begin-round", "error", reason="branch drift")
+            return emit_result(args, False, drift)
         stop_reason = state.compute_stop_reason(st, cfg)
         if stop_reason is not None:
             io.append_log(repo, "begin-round", "error", reason=stop_reason)
@@ -331,8 +382,6 @@ def cmd_begin_round(args):
                             cid, "; ".join(missing)
                         ),
                     )
-            state.update_candidates_status(repo, candidate_ids, "picked", round_number, backlog=backlog)
-
         if floor is not None:
             low_value_ids = [
                 cid for cid in candidate_ids
@@ -347,6 +396,19 @@ def cmd_begin_round(args):
                 )
 
         dirty = io.working_tree_dirty(repo)
+        # Snapshot of what was already uncommitted when the round started (same
+        # .autopilot/ filter as working_tree_dirty), EXCLUDING the leftovers the
+        # run's own prior rounds deliberately left uncommitted (batch mode
+        # defers commits; blocked/cancelled rounds leave work behind) — commit
+        # uses what remains to refuse absorbing pre-existing user changes.
+        prior_deferred = set()
+        for entry in st.get("history") or []:
+            if isinstance(entry, dict):
+                prior_deferred.update(entry.get("deferred_dirty_files") or [])
+        start_dirty_files = (
+            [p for p in io.uncommitted_paths(repo) if p not in prior_deferred]
+            if dirty else []
+        )
         allow_dirty = cfg.get("allow_uncommitted_changes", False)
         first_round = (
             st.get("completed_rounds", 0)
@@ -374,6 +436,13 @@ def cmd_begin_round(args):
                 file=sys.stderr,
             )
 
+        # Every validation passed — only now mutate. Marking candidates picked
+        # before the dirty-tree refusal used to leak them out of the pending
+        # backlog, and a later begin-round without --candidate-id no longer
+        # hit the ready-backlog guard because nothing looked pending.
+        if candidate_ids:
+            state.update_candidates_status(repo, candidate_ids, "picked", round_number, backlog=backlog)
+
         # One rev-parse answers "has commits?" and yields the SHA together
         # (has_commits + rev-parse would be two identical-cost calls).
         head = io.run_git(repo, "rev-parse", "--verify", "-q", "HEAD")
@@ -388,6 +457,7 @@ def cmd_begin_round(args):
             "start_sha": start_sha,
             "worktree_baseline": io.worktree_change_lines(repo),
             "start_clean": not dirty,
+            "start_dirty_files": start_dirty_files,
             "started_at": io.now_iso(),
         }
         st["round"] = round_number
@@ -492,6 +562,18 @@ def _close_round(repo, st, current, status, counter_key, tokens, history_entry,
     if billed is not None:
         st["billed_text"], st["billed_binary"] = billed
     st["last_activity_at"] = io.now_iso()
+    # Attribute the round's leftovers (uncommitted at close, minus what the
+    # round inherited dirty) so the NEXT begin-round does not treat the run's
+    # own deferred work as pre-existing user changes: batch mode defers commits
+    # across rounds, and blocked/cancelled rounds leave their work behind.
+    # Zero-work aborts leave exactly the inherited set, so they carve nothing.
+    try:
+        inherited = set(current.get("start_dirty_files") or [])
+        history_entry["deferred_dirty_files"] = [
+            p for p in io.uncommitted_paths(repo) if p not in inherited
+        ]
+    except SystemExit:
+        history_entry["deferred_dirty_files"] = []
     history_entry.setdefault("status", status)
     state.append_history(st, history_entry)
     st["current_round"] = None
@@ -507,12 +589,21 @@ def _close_round(repo, st, current, status, counter_key, tokens, history_entry,
 
 def cmd_complete_round(args):
     repo = Path(args.repo).resolve()
+    refused = _require_initialized(args, repo)
+    if refused is not None:
+        return refused
     with io.run_lock(repo):
         st = state.load_state(repo)
         current = st["current_round"]
         if current is None:
             io.append_log(repo, "complete-round", "error", reason="no open round")
             return emit_result(args, False, "[ERROR] No open round to complete.")
+
+        cfg = config.load_config(repo)
+        drift = _feature_branch_guard(repo, st, cfg, "complete the round")
+        if drift is not None:
+            io.append_log(repo, "complete-round", "error", reason="branch drift")
+            return emit_result(args, False, drift)
 
         if args.commit_sha:
             verify = io.run_git(repo, "rev-parse", "--verify", "--quiet", args.commit_sha + "^{commit}")
@@ -533,7 +624,6 @@ def cmd_complete_round(args):
             )
             return 0
 
-        cfg = config.load_config(repo)
         # Range-check the score even without a configured threshold: an
         # out-of-band 99 would poison the learned value calibration (clamped,
         # but still pinned to the ceiling) for the whole run.
@@ -579,6 +669,9 @@ def cmd_complete_round(args):
                 "commit_sha": args.commit_sha,
                 "estimated_tokens": tokens,
                 "candidate_id": current.get("candidate_id"),
+                # commit --round reads this to refuse absorbing the round's
+                # pre-existing user changes into a late batch flush.
+                "start_dirty_files": current.get("start_dirty_files"),
                 "review_score": getattr(args, "review_score", None),
                 "review_notes": getattr(args, "review_notes", None) or "",
                 "below_threshold": below_threshold,
@@ -622,6 +715,9 @@ def cmd_complete_round(args):
 
 def cmd_block_round(args):
     repo = Path(args.repo).resolve()
+    refused = _require_initialized(args, repo)
+    if refused is not None:
+        return refused
     with io.run_lock(repo):
         st = state.load_state(repo)
         current = st["current_round"]
@@ -660,6 +756,9 @@ def cmd_block_round(args):
 
 def cmd_cancel_round(args):
     repo = Path(args.repo).resolve()
+    refused = _require_initialized(args, repo)
+    if refused is not None:
+        return refused
     with io.run_lock(repo):
         st = state.load_state(repo)
         current = st["current_round"]
@@ -795,6 +894,9 @@ def _default_seed_type(saturated):
 
 def cmd_goal_met(args):
     repo = Path(args.repo).resolve()
+    refused = _require_initialized(args, repo)
+    if refused is not None:
+        return refused
     with io.run_lock(repo):
         st = state.load_state(repo)
         cfg = config.load_config(repo)
@@ -928,6 +1030,10 @@ def cmd_goal_met(args):
             # Text-mode consumers need the ids: SKILL.md's Wave 0 next step is
             # `backlog-add --from-seed <id>` / `seed-reject --id <id>`.
             message += " Created direction seeds: {}.".format(", ".join(seed["id"] for seed in seeds))
+        if goal_round is None:
+            # An exit-0 with no anchor word used to read as verified evidence:
+            # say plainly that the claim will withhold the all-goals-met stop.
+            message += " unverified（未关联已完成轮次，将阻止 all-goals-met 停止）"
         data = None
         if getattr(args, "json", False):
             data = {"goal_event": goal_event, "seeds": seeds}
@@ -936,6 +1042,9 @@ def cmd_goal_met(args):
 
 def cmd_seed_reject(args):
     repo = Path(args.repo).resolve()
+    refused = _require_initialized(args, repo)
+    if refused is not None:
+        return refused
     with io.run_lock(repo):
         st = state.load_state(repo)
         seed = state.find_seed(st, args.id)
@@ -968,6 +1077,9 @@ def cmd_seed_reject(args):
 
 def cmd_finish(args):
     repo = Path(args.repo).resolve()
+    refused = _require_initialized(args, repo)
+    if refused is not None:
+        return refused
     with io.run_lock(repo):
         st = state.load_state(repo)
         cfg = config.load_config(repo)
@@ -1038,6 +1150,21 @@ def cmd_finish(args):
                 )
             io.append_log(repo, "finish-forced", "success", reason=args.reason, ready=ready_floor, ready_any=ready_any)
 
+        # Uncommitted work must be surfaced, never silently folded into "the
+        # run is finished": warn with the file list (same .autopilot/ ignore as
+        # the rest of the dirty-tree logic) but do not refuse — --force and an
+        # honest stop both stay valid.
+        if io.working_tree_dirty(repo):
+            dirty_paths = io.uncommitted_paths(repo)
+            shown = dirty_paths[:10]
+            more = "" if len(dirty_paths) <= 10 else " (+{} more)".format(len(dirty_paths) - 10)
+            print(
+                "[WARN] Finishing with uncommitted changes (not refused): {}{}".format(
+                    ", ".join(shown), more
+                ),
+                file=sys.stderr,
+            )
+
         open_round = st.get("current_round")
         if open_round is not None:
             print(
@@ -1106,6 +1233,22 @@ def cmd_finish(args):
                 file=sys.stderr,
             )
         message = "[OK] Autopilot run finished."
+        if cfg.get("branch_mode") == "feature" and st.get("branch"):
+            # The run's commits live on the autopilot branch and finish does
+            # not merge (by design): say where the work landed, in the report
+            # language, or the user discovers it only at merge time.
+            zh_msg = (cfg.get("report_lang") or "zh") == "zh"
+            origin = st.get("origin_branch")
+            if origin and origin != "HEAD":
+                origin_label = "`{}`".format(origin)
+            else:
+                origin_label = "原" if zh_msg else "the original"
+            if zh_msg:
+                message += " 提交保留在分支 `{}`，未合并到 {} 分支。".format(st["branch"], origin_label)
+            else:
+                message += " Commits remain on branch `{}`; not merged into {}.".format(
+                    st["branch"], origin_label
+                )
         data = {"returned_to": returned_to, "retrospective": retrospective_path}
         return emit_result(args, True, message, data=data)
 
@@ -1122,10 +1265,10 @@ def _seed_num(seed, name, default=None):
 
 def cmd_backlog_add(args):
     repo = Path(args.repo).resolve()
+    refused = _require_initialized(args, repo, message="[ERROR] Autopilot not initialized. Run init first.")
+    if refused is not None:
+        return refused
     with io.run_lock(repo):
-        if not config.state_path_for(repo).exists():
-            io.append_log(repo, "backlog-add", "error", reason="not initialized")
-            return emit_result(args, False, "[ERROR] Autopilot not initialized. Run init first.")
         backlog = state.load_backlog(repo)
         seed = None
         if getattr(args, "from_seed", None):
@@ -1282,9 +1425,10 @@ def cmd_backlog_add(args):
 
 def cmd_backlog_update(args):
     repo = Path(args.repo).resolve()
+    refused = _require_initialized(args, repo, message="[ERROR] Autopilot not initialized. Run init first.")
+    if refused is not None:
+        return refused
     with io.run_lock(repo):
-        if not config.state_path_for(repo).exists():
-            return emit_result(args, False, "[ERROR] Autopilot not initialized. Run init first.")
         backlog = state.load_backlog(repo)
         candidate = state.find_candidate(backlog, args.id)
         if candidate is None:
@@ -1366,9 +1510,10 @@ def cmd_backlog_update(args):
 
 def cmd_backlog_remove(args):
     repo = Path(args.repo).resolve()
+    refused = _require_initialized(args, repo, message="[ERROR] Autopilot not initialized. Run init first.")
+    if refused is not None:
+        return refused
     with io.run_lock(repo):
-        if not config.state_path_for(repo).exists():
-            return emit_result(args, False, "[ERROR] Autopilot not initialized. Run init first.")
         backlog = state.load_backlog(repo)
         candidates = backlog.get("candidates", [])
         updated = [c for c in candidates if c.get("id") != args.id]
@@ -1413,9 +1558,10 @@ def cmd_backlog_rank(args):
 
 def cmd_backlog_pick(args):
     repo = Path(args.repo).resolve()
+    refused = _require_initialized(args, repo, message="[ERROR] Autopilot not initialized. Run init first.")
+    if refused is not None:
+        return refused
     with io.run_lock(repo):
-        if not config.state_path_for(repo).exists():
-            return emit_result(args, False, "[ERROR] Autopilot not initialized. Run init first.")
         backlog = state.load_backlog(repo)
         candidate = state.find_candidate(backlog, args.id)
         if candidate is None:
@@ -1433,6 +1579,9 @@ def cmd_backlog_pick(args):
 
 def cmd_ensure_branch(args):
     repo = Path(args.repo).resolve()
+    refused = _require_initialized(args, repo)
+    if refused is not None:
+        return refused
     with io.run_lock(repo):
         st = state.load_state(repo)
         cfg = config.load_config(repo)
@@ -1451,6 +1600,9 @@ def cmd_ensure_branch(args):
 
 def cmd_push(args):
     repo = Path(args.repo).resolve()
+    refused = _require_initialized(args, repo)
+    if refused is not None:
+        return refused
     with io.run_lock(repo):
         state.load_state(repo)
         cfg = config.load_config(repo)
@@ -1474,9 +1626,17 @@ def cmd_push(args):
 
 def cmd_commit(args):
     repo = Path(args.repo).resolve()
+    refused = _require_initialized(args, repo)
+    if refused is not None:
+        return refused
     with io.run_lock(repo):
         st = state.load_state(repo)
         cfg = config.load_config(repo)
+
+        drift = _feature_branch_guard(repo, st, cfg, "commit")
+        if drift is not None:
+            io.append_log(repo, "commit", "error", reason="branch drift")
+            return emit_result(args, False, drift)
 
         identity_ok, _, _ = io.git_identity_ok(repo)
         if not identity_ok:
@@ -1494,11 +1654,31 @@ def cmd_commit(args):
 
         bypassed_secrets = bool(cfg.get("scan_secrets", True) and getattr(args, "allow_secrets", False))
 
+        # Staged paths feed three independent guards (the .autopilot/ exclusion,
+        # allow/deny_paths, the pre-existing-changes interception) — fetch once.
+        # -z + core.quotepath=false: literal NUL-separated paths, immune to
+        # quotePath escaping — deny_paths cannot be bypassed by odd file names.
+        names = io.run_git(repo, "-c", "core.quotepath=false", "diff", "--cached", "--name-only", "-z")
+        staged_paths = [p for p in names.stdout.split("\0") if p.strip()]
+
+        # .autopilot/ is run state, not product code: with track_state: false it
+        # is hidden via .git/info/exclude, so only `git add -f` can stage it.
+        # This guard runs unconditionally — the allow/deny checks below are
+        # config-gated and would miss it.
+        if not cfg.get("track_state"):
+            forced_state = [p for p in staged_paths if io._is_autopilot_path(p)]
+            if forced_state:
+                io.append_log(repo, "commit", "error", reason="autopilot state staged", paths=forced_state)
+                return emit_result(
+                    args, False,
+                    "[ERROR] Staged files under .autopilot/ are run state, not product code "
+                    "(track_state is false): {}. Unstage them ('git reset -q HEAD -- .autopilot/') "
+                    "or set track_state: true if the state should be versioned.".format(
+                        ", ".join(forced_state)
+                    ),
+                )
+
         if cfg.get("allow_paths") or cfg.get("deny_paths"):
-            # -z + core.quotepath=false: literal NUL-separated paths, immune to
-            # quotePath escaping — deny_paths cannot be bypassed by odd file names.
-            names = io.run_git(repo, "-c", "core.quotepath=false", "diff", "--cached", "--name-only", "-z")
-            staged_paths = [p for p in names.stdout.split("\0") if p.strip()]
             blocked = [
                 path for path in staged_paths
                 if not path_allowed(path, cfg.get("allow_paths"), cfg.get("deny_paths"))
@@ -1517,7 +1697,8 @@ def cmd_commit(args):
                 # never stores secret material.
                 io.append_log(repo, "commit", "error", reason="secrets detected", findings=findings)
                 detail = "; ".join(
-                    "{}: {}".format(f.get("file") or "?", f.get("text")) for f in findings[:5]
+                    "{}: {} (matched {})".format(f.get("file") or "?", f.get("text"), f.get("pattern"))
+                    for f in findings[:5]
                 )
                 return emit_result(
                     args, False,
@@ -1542,30 +1723,94 @@ def cmd_commit(args):
 
         prefix = cfg.get("commit_message_prefix", "autopilot")
         open_round = st.get("current_round")
+        warn_unverifiable = False
+        start_dirty = None
         if args.round is not None:
             if args.round < 1:
                 io.append_log(repo, "commit", "error", reason="round out of range")
                 return emit_result(args, False, "[ERROR] --round must be a positive integer (got {}).".format(args.round))
-            round_no = args.round
-        elif open_round is not None:
-            round_no = open_round.get("round")
-            batch_mode = (cfg.get("commit_every_rounds") or 1) > 1
-            if not cfg.get("allow_uncommitted_changes") and not batch_mode and not open_round.get("start_clean"):
-                io.append_log(repo, "commit", "error", reason="round started with dirty tree")
+            # --round is a batch flush for changes belonging to an
+            # ALREADY-completed round, not an arbitrary-commit escape hatch:
+            # the number must exist in the run's completed history.
+            completed_history = [
+                h for h in (st.get("history") or [])
+                if isinstance(h, dict) and h.get("status") == "completed"
+            ]
+            round_entry = next(
+                (h for h in completed_history if h.get("round") == args.round), None
+            )
+            if round_entry is None:
+                io.append_log(repo, "commit", "error", reason="round not in completed history", round=args.round)
+                known = ", ".join(
+                    str(h.get("round")) for h in completed_history if isinstance(h.get("round"), int)
+                )
                 return emit_result(
                     args, False,
-                    "[ERROR] This round began with a dirty working tree and allow_uncommitted_changes "
-                    "is false. Commit only the round's own changes, or set allow_uncommitted_changes: true. "
-                    "When commit_every_rounds > 1, uncommitted changes from earlier batched rounds are expected.",
+                    "[ERROR] --round {}: no completed round with that number (completed rounds: {}). "
+                    "--round is only for flushing staged changes that belong to already-completed "
+                    "rounds; open a round with begin-round instead.".format(
+                        args.round, known or "none"
+                    ),
                 )
+            round_no = args.round
+            start_dirty = round_entry.get("start_dirty_files")
+        elif open_round is not None:
+            round_no = open_round.get("round")
+            start_dirty = open_round.get("start_dirty_files")
         else:
             io.append_log(repo, "commit", "error", reason="no open round")
             return emit_result(
                 args, False,
-                "[ERROR] No round is open. Use begin-round first, or pass --round explicitly "
-                "to allow an orphan commit (e.g. after cancel/block).",
+                "[ERROR] No round is open. Use begin-round first, or pass --round <N> to flush "
+                "staged changes for an already-completed round (batch flush only; <N> must exist "
+                "in the run's completed history).",
             )
+
+        # Batch-mode cadence helper: with commit_every_rounds > 1 the loop is
+        # expected to commit on flush rounds only; committing earlier is legal
+        # but the agent must know the cadence slipped.
+        if open_round is not None:
+            commit_every = cfg.get("commit_every_rounds") or 1
+            if commit_every > 1 and round_no % commit_every != 0:
+                next_flush = ((round_no - 1) // commit_every + 1) * commit_every
+                print(
+                    "[WARN] Batch mode (commit_every_rounds={}): round {} is not a flush round; "
+                    "the next flush round is {}. Committing now is fine — later rounds must not "
+                    "assume this batch was already flushed.".format(commit_every, round_no, next_flush),
+                    file=sys.stderr,
+                )
+
+        # Never absorb pre-existing user changes into an autopilot commit unless
+        # allow_uncommitted_changes said so. This holds in batch mode too, where
+        # the old round-start dirty check never ran (commit_every_rounds > 1
+        # made batch_mode always true). A record without start_dirty_files
+        # (state written by an older version) fails open with a warning.
+        preexisting = []
+        if not cfg.get("allow_uncommitted_changes") and isinstance(start_dirty, list):
+            start_dirty_set = set(start_dirty)
+            preexisting = sorted(p for p in staged_paths if p in start_dirty_set)
+        if preexisting:
+            io.append_log(repo, "commit", "error", reason="pre-existing user changes staged", paths=preexisting)
+            return emit_result(
+                args, False,
+                "[ERROR] Staged files were already uncommitted when round {} started (pre-existing "
+                "user changes, allow_uncommitted_changes is false): {}. Unstage them ('git reset "
+                "HEAD -- <file>'), or set allow_uncommitted_changes: true.".format(
+                    round_no, ", ".join(preexisting)
+                ),
+            )
+        if not isinstance(start_dirty, list):
+            warn_unverifiable = True
+
         message = "{}(round-{}): {}".format(prefix, round_no, args.summary)
+
+        if warn_unverifiable:
+            print(
+                "[WARN] Cannot verify pre-existing changes for round {}: its record predates "
+                "start_dirty_files tracking, so the staged set was not checked against the "
+                "round's starting tree.".format(round_no),
+                file=sys.stderr,
+            )
 
         if getattr(args, "dry_run", False):
             print(
@@ -1689,9 +1934,10 @@ def cmd_retrospective(args):
 
 def cmd_analysis_save(args):
     repo = Path(args.repo).resolve()
+    refused = _require_initialized(args, repo, message="[ERROR] Autopilot not initialized. Run init first.")
+    if refused is not None:
+        return refused
     with io.run_lock(repo):
-        if not config.state_path_for(repo).exists():
-            return emit_result(args, False, "[ERROR] Autopilot not initialized. Run init first.")
         if not args.content:
             return emit_result(args, False, "[ERROR] --content is required.")
         try:
@@ -1745,9 +1991,10 @@ def cmd_config_set(args):
     config-drift — and an "all goals met" stop can be reopened for the
     expansion phase (or closed again) without touching files by hand."""
     repo = Path(args.repo).resolve()
+    refused = _require_initialized(args, repo, message="[ERROR] Autopilot not initialized. Run init first.")
+    if refused is not None:
+        return refused
     with io.run_lock(repo):
-        if not config.state_path_for(repo).exists():
-            return emit_result(args, False, "[ERROR] Autopilot not initialized. Run init first.")
         if getattr(args, "expand_after_goals", None) is None:
             io.append_log(repo, "config-set", "error", reason="nothing to set")
             return emit_result(
@@ -1794,9 +2041,10 @@ def cmd_expansion_record(args):
     check reports wave_no / lenses_used / lenses_unused from these records, and
     repeating the previous wave's exact set warns instead of silently passing."""
     repo = Path(args.repo).resolve()
+    refused = _require_initialized(args, repo, message="[ERROR] Autopilot not initialized. Run init first.")
+    if refused is not None:
+        return refused
     with io.run_lock(repo):
-        if not config.state_path_for(repo).exists():
-            return emit_result(args, False, "[ERROR] Autopilot not initialized. Run init first.")
         lenses = list(args.lens or [])
         unknown = [lens for lens in lenses if lens not in state.EXPANSION_LENSES]
         if unknown:
@@ -1843,9 +2091,10 @@ def cmd_expansion_record(args):
 
 def cmd_directive_add(args):
     repo = Path(args.repo).resolve()
+    refused = _require_initialized(args, repo, message="[ERROR] Autopilot not initialized. Run init first.")
+    if refused is not None:
+        return refused
     with io.run_lock(repo):
-        if not config.state_path_for(repo).exists():
-            return emit_result(args, False, "[ERROR] Autopilot not initialized. Run init first.")
         if not args.text:
             return emit_result(args, False, "[ERROR] --text is required.")
         if getattr(args, "dry_run", False):
@@ -1876,9 +2125,10 @@ def cmd_directive_list(args):
 
 def cmd_directive_remove(args):
     repo = Path(args.repo).resolve()
+    refused = _require_initialized(args, repo, message="[ERROR] Autopilot not initialized. Run init first.")
+    if refused is not None:
+        return refused
     with io.run_lock(repo):
-        if not config.state_path_for(repo).exists():
-            return emit_result(args, False, "[ERROR] Autopilot not initialized. Run init first.")
         directives = state.load_directives(repo)
         entries = directives.get("directives") or []
         index = args.index
@@ -1905,6 +2155,9 @@ def cmd_directive_remove(args):
 
 def cmd_undo_round(args):
     repo = Path(args.repo).resolve()
+    refused = _require_initialized(args, repo)
+    if refused is not None:
+        return refused
     with io.run_lock(repo):
         st = state.load_state(repo)
         config.load_config(repo)
@@ -2014,14 +2267,16 @@ def cmd_detect_verify(args):
     return 0
 
 
-def _append_mining_run(st, findings_count, applied_count, kinds):
+def _append_mining_run(st, findings_count, new_count, applied_count, kinds):
     """Record one mine attempt (bounded). Used by the finish gate to tell
-    'mining exhausted' from 'mining never tried'."""
+    'mining exhausted' from 'mining never tried'. Exhaustion counts NEW
+    findings: the raw count never reaches zero on repos with resident ones."""
     runs = st.setdefault("mining_runs", [])
     runs.append(
         {
             "at": io.now_iso(),
             "findings": int(findings_count or 0),
+            "new": int(new_count or 0),
             "applied": int(applied_count or 0),
             "kinds": list(kinds or []),
         }
@@ -2030,14 +2285,22 @@ def _append_mining_run(st, findings_count, applied_count, kinds):
         del runs[: len(runs) - 20]
 
 
+def _mining_run_new(run):
+    """New-finding count of a mining run, with the pre-1.5.1 field fallback."""
+    value = run.get("new")
+    if value is None:
+        value = run.get("findings")
+    return int(value or 0)
+
+
 def mining_exhausted(st):
-    """True only after two consecutive mine runs produced zero findings AND
+    """True only after two consecutive mine runs added nothing new AND
     (when expansion waves exist) the last two waves added nothing either.
     Never-mined is NOT exhausted — the supply side has not been tried."""
     runs = [r for r in (st.get("mining_runs") or []) if isinstance(r, dict)]
     if len(runs) < 2:
         return False
-    if any((r.get("findings") or 0) > 0 for r in runs[-2:]):
+    if any(_mining_run_new(r) > 0 for r in runs[-2:]):
         return False
     waves = [w for w in (st.get("expansion_waves") or []) if isinstance(w, dict)]
     if waves and any((w.get("added") or 0) > 0 for w in waves[-2:]):
@@ -2060,12 +2323,15 @@ def any_ready_candidates(backlog):
 def cmd_mine(args):
     """Run deterministic scanners and optionally promote findings to backlog."""
     repo = Path(args.repo).resolve()
+    refused = _require_initialized(args, repo, message="[ERROR] Autopilot not initialized. Run init first.")
+    if refused is not None:
+        return refused
     with io.run_lock(repo):
-        if not config.state_path_for(repo).exists():
-            return emit_result(args, False, "[ERROR] Autopilot not initialized. Run init first.")
         kinds = list(args.kind) if getattr(args, "kind", None) else None
+        limit = getattr(args, "limit", None)
         try:
-            result = miner.mine_repo(repo, kinds=kinds, per_kind_limit=getattr(args, "limit", 20) or 20)
+            # None takes the default; an explicit 0 is honored as 0, not as the default.
+            result = miner.mine_repo(repo, kinds=kinds, per_kind_limit=20 if limit is None else limit)
         except ValueError as exc:
             return emit_result(args, False, "[ERROR] {}".format(exc))
         backlog = state.load_backlog(repo)
@@ -2119,6 +2385,8 @@ def cmd_mine(args):
                     "based_on": "",
                     "evidence": fields["evidence"],
                     "from_mine": finding.get("kind"),
+                    "file": finding.get("file"),
+                    "line": finding.get("line"),
                 }
                 backlog["candidates"].append(candidate)
                 backlog["next_id"] += 1
@@ -2129,11 +2397,11 @@ def cmd_mine(args):
                 )
             state.save_backlog(repo, backlog)
             st["last_activity_at"] = io.now_iso()
-            _append_mining_run(st, result["count"], len(applied), result["kinds"])
+            _append_mining_run(st, result["count"], len(new_findings), len(applied), result["kinds"])
             state.save_state(repo, st)
         else:
             st = state.load_state(repo)
-            _append_mining_run(st, result["count"], 0, result["kinds"])
+            _append_mining_run(st, result["count"], len(new_findings), 0, result["kinds"])
             state.save_state(repo, st)
 
         payload = {
@@ -2196,8 +2464,17 @@ def _ready_valuable_count(backlog, floor):
     return count
 
 
+def _check_text(cfg, zh_text, en_text):
+    """check guidance follows the report language (report_lang) so zh runs read
+    zh advice; anything non-zh falls back to en."""
+    return zh_text if (cfg.get("report_lang") or "zh") == "zh" else en_text
+
+
 def cmd_check(args):
     repo = Path(args.repo).resolve()
+    # Validate git first: a non-git path must fail as "Not a git repository",
+    # not as the misleading "state.json not found" that load_state would print.
+    io.git_dir_for(repo)
     st = state.load_state(repo)
     cfg = config.load_config(repo)
     stop_reason = state.compute_stop_reason(st, cfg)
@@ -2212,6 +2489,33 @@ def cmd_check(args):
     elif io.current_branch(repo) == "HEAD":
         warnings.append("Detached HEAD; consider checking out a branch before starting.")
 
+    # Branch drift in feature mode: the round commands will refuse (commit/
+    # begin-round/complete-round), so say so here — check is the pre-flight.
+    if cfg.get("branch_mode") == "feature" and st.get("branch"):
+        expected = st["branch"]
+        head_branch = io.current_branch(repo)
+        if head_branch == "HEAD":
+            warnings.append(_check_text(
+                cfg,
+                "HEAD 处于 detached 状态，而本轮运行分支是 `{b}`；commit/begin-round/complete-round "
+                "将被拒绝（提交会悬空）。运行 ensure-branch 或 `git checkout {b}` 恢复。".format(b=expected),
+                "Detached HEAD while the run's branch is `{b}`; commit/begin-round/complete-round "
+                "will be refused (the commit would be orphaned). Run ensure-branch or "
+                "`git checkout {b}` to recover.".format(b=expected),
+            ))
+        elif head_branch != expected:
+            warnings.append(_check_text(
+                cfg,
+                "分支漂移：当前在 `{c}`，而本轮运行分支是 `{b}`；commit/begin-round/complete-round 将被拒绝，"
+                "防止把运行提交落到（并随 push 发布）错误分支。运行 ensure-branch 或 `git checkout {b}` 恢复。".format(
+                    c=head_branch, b=expected
+                ),
+                "Branch drift: HEAD is on `{c}` but the run's branch is `{b}`; "
+                "commit/begin-round/complete-round will be refused so the run's commits do not "
+                "land on (and get pushed from) the wrong branch. Run ensure-branch or "
+                "`git checkout {b}` to recover.".format(c=head_branch, b=expected),
+            ))
+
     if st.get("config_fingerprint") and io.file_sha256(config.config_path_for(repo)) != st["config_fingerprint"]:
         io.append_log(repo, "config-drift", "warn")
         warnings.append(
@@ -2219,11 +2523,15 @@ def cmd_check(args):
             "(check_commands are executed and budgets are trusted by the loop)."
         )
 
-    if io.working_tree_dirty(repo):
+    # Only the FIRST begin-round refuses a dirty tree; once a round is open
+    # this warning contradicts reality (later rounds only WARN), so it is
+    # emitted for the no-open-round case only.
+    if st.get("current_round") is None and io.working_tree_dirty(repo):
         if not cfg.get("allow_uncommitted_changes"):
             warnings.append(
-                "Working tree is dirty and allow_uncommitted_changes is false; begin-round/init "
-                "will refuse to start until the tree is clean or the config allows uncommitted changes."
+                "Working tree is dirty and allow_uncommitted_changes is false; only the first "
+                "begin-round refuses a dirty tree, later rounds only warn. Commit or stash before "
+                "starting the run, or set allow_uncommitted_changes: true."
             )
         else:
             warnings.append(
@@ -2253,6 +2561,14 @@ def cmd_check(args):
         warnings.append("expand_after_goals is true but no other stop condition is configured; the expansion phase has no automatic stopping point.")
     if cfg.get("review_threshold") is not None:
         warnings.append("review_threshold is set; complete-round will require --review-score >= {}.".format(cfg["review_threshold"]))
+
+    if not cfg.get("scan_secrets", True):
+        warnings.append(_check_text(
+            cfg,
+            "secret 扫描已关闭（scan_secrets: false）：提交时不会拦截疑似密钥，请确认这是有意配置。",
+            "Secret scanning is disabled (scan_secrets: false); secret-like content will not be "
+            "blocked on commit. Confirm this is intentional.",
+        ))
 
     if cfg.get("push"):
         remotes = io.run_git(repo, "remote")
@@ -2291,7 +2607,7 @@ def cmd_check(args):
     ready_floor = _ready_valuable_count(backlog, cfg.get("min_candidate_value"))
     if goals_unverified and ready_floor > 0:
         warnings.append(
-            "goal {} 未提供完成证据；尚有 {} 条 value>=floor 的 ready 候选，不得 finish".format(
+            "goal {} 未关联到已完成轮次（--round）；尚有 {} 条 value>=floor 的 ready 候选，不得 finish".format(
                 ", ".join(goals_unverified), ready_floor
             )
         )
@@ -2344,30 +2660,6 @@ def cmd_check(args):
                 ", ".join(seed.get("id") or "" for seed in open_seed_list[:5])
             )
         )
-    if stop_reason is None and backlog_watch["needs_expansion"]:
-        if backlog_watch["pending"] == 0:
-            warnings.append(
-                "Backlog has no pending candidates. Do NOT idle or wait for the deadline: "
-                "run Deep Expansion now (spawn explore subagents, add 3-5 candidates with "
-                "backlog-add). Empty backlog is an expansion trigger, not a reason to stop."
-                + seed_hint
-            )
-        elif backlog_watch["ready"] == 0:
-            warnings.append(
-                "Backlog has {} pending candidates but 0 are dependency-ready. "
-                "Unblock depends-on chains or Deep Expansion for independent work; "
-                "do not idle.".format(backlog_watch["pending"])
-            )
-        else:
-            warnings.append(
-                "Backlog pending candidates ({}) is below min_pending_candidates ({}). "
-                "Top up via Deep Expansion (subagent scout) before the next begin-round; "
-                "do not grind the last thin candidates or idle. You may still begin-round "
-                "with existing ready candidates while expanding in parallel.".format(
-                    backlog_watch["pending"], backlog_watch["min_pending_candidates"]
-                )
-            )
-
     action_hint = "expand" if (stop_reason is None and backlog_watch["needs_expansion"]) else (
         "stop" if stop_reason is not None else "work"
     )
@@ -2406,12 +2698,50 @@ def cmd_check(args):
         if supply_thin and not quota_cut:
             action_hint = "mine"
 
-    if action_hint == "mine":
-        warnings.append(
-            "Run deterministic mining first: `mine --apply` (then backlog-rank). "
-            "Deep Expansion lenses come after mine if the backlog is still thin. "
-            "Do not idle and do not finish — mining is the supply side."
-        )
+    if stop_reason is None and action_hint == "mine":
+        # ONE actionable path replaces the formerly contradictory pair ("run
+        # Deep Expansion now" vs "run deterministic mining first"): mine is the
+        # first supply side, Deep Expansion only tops up what mining cannot.
+        warnings.append(_check_text(
+            cfg,
+            "Backlog 供给不足（pending={p}，ready={r}，min_pending_candidates={m}）："
+            "先 `mine --apply`（再 backlog-rank）；mine 之后 backlog 仍薄才做 Deep Expansion 探索。"
+            "Do not idle and do not finish — mining is the supply side.".format(
+                p=backlog_watch["pending"], r=backlog_watch["ready"],
+                m=backlog_watch["min_pending_candidates"],
+            ),
+            "Backlog supply is thin (pending={p}, ready={r}, min_pending_candidates={m}): "
+            "run `mine --apply` first (then backlog-rank); run Deep Expansion only if the "
+            "backlog is still thin after mining. "
+            "Do not idle and do not finish — mining is the supply side.".format(
+                p=backlog_watch["pending"], r=backlog_watch["ready"],
+                m=backlog_watch["min_pending_candidates"],
+            ),
+        ) + seed_hint)
+    elif stop_reason is None and backlog_watch["needs_expansion"]:
+        if backlog_watch["pending"] == 0:
+            warnings.append(
+                "Backlog has no pending candidates and deterministic mining is already fresh. "
+                "Do NOT idle or wait for the deadline: run Deep Expansion now (spawn explore "
+                "subagents, add 3-5 candidates with backlog-add). Empty backlog is an expansion "
+                "trigger, not a reason to stop."
+                + seed_hint
+            )
+        elif backlog_watch["ready"] == 0:
+            warnings.append(
+                "Backlog has {} pending candidates but 0 are dependency-ready. "
+                "Unblock depends-on chains or Deep Expansion for independent work; "
+                "do not idle.".format(backlog_watch["pending"])
+            )
+        else:
+            warnings.append(
+                "Backlog pending candidates ({}) is below min_pending_candidates ({}). "
+                "Top up via Deep Expansion (subagent scout) before the next begin-round; "
+                "do not grind the last thin candidates or idle. You may still begin-round "
+                "with existing ready candidates while expanding in parallel.".format(
+                    backlog_watch["pending"], backlog_watch["min_pending_candidates"]
+                )
+            )
 
     payload = {
         "continue": stop_reason is None,
