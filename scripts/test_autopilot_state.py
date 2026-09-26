@@ -7220,6 +7220,24 @@ class VerifyDiscoveryUnitTests(unittest.TestCase):
         self.assertEqual(ap_verify.detect_verify_commands(repo), [])
 
 
+class FinishArchiveReportsTests(RepoTest):
+    """--archive-reports（expansion wave 2）：把 phase report 与 retrospective
+    拷进 docs/autopilot/，合并后协作者可见——.autopilot/ 本身不入库。"""
+
+    def test_finish_archives_reports_into_docs(self):
+        self.run_state("init")
+        self.run_state("begin-round", "--title", "r", "--reason", "x")
+        self.add_file("a.py", "a = 1\n")
+        self.run_state("complete-round", "--summary", "done")
+        result = self.run_state("finish", "--archive-reports", "--force",
+                                "--reason", "archive probe", "--stay")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        archived = self.repo / "docs" / "autopilot"
+        self.assertTrue((archived / "retrospective.md").exists())
+        # phase report 每 10 轮才写：单轮 run 无 report 是正确行为
+        self.assertFalse(list(archived.glob("phase-report-round-*.md")))
+
+
 class DashboardCmdTests(unittest.TestCase):
     """cmd_dashboard wiring (1.8.0 final review): config dashboard.auto_open is
     the default and --no-open forces it off; a busy --port exits with a clean
