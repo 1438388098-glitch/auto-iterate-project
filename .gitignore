@@ -4,3 +4,4 @@ test_out.txt
 .pytest_cache/
 .zcode/
 .autopilot/
+.superpowers/
