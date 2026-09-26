@@ -126,6 +126,10 @@
         <div class="goalbar"><i id="goal-fill"></i></div>
         <span id="goal-side" class="mono" style="font-size:10.5px;color:var(--txt3)">—</span>
       </div>
+      <div class="goalrow" style="display:block">
+        <h3 style="margin-bottom:8px">运行事件</h3>
+        <div id="events-log" class="mono" style="font-size:10.5px;color:var(--txt2);line-height:1.8"></div>
+      </div>
       <div class="goalrow" id="retro-block" style="display:none">
         <h3 style="margin-bottom:8px">回顾</h3>
         <div id="retro-excerpt" class="mono" style="font-size:11px;color:var(--txt2);white-space:pre-wrap;line-height:1.6"></div>
@@ -279,7 +283,21 @@
     $("play").style.opacity = "0.4";   // 无运行：回放不可用（与降级口径一致）
   }
 
-  function renderAll() { renderStats(); renderTree(); renderEvents(); renderDirections(); renderTrend(); renderRetro(); }
+  function renderAll() { renderStats(); renderTree(); renderEvents(); renderDirections(); renderTrend(); renderLog(); renderRetro(); }
+
+  // ---- 运行事件流：log.jsonl 尾部（可观测性）----
+  function renderLog() {
+    var host = $("events-log");
+    if (!host) return;
+    var log = (snapshot && snapshot.narrative && snapshot.narrative.recent_events) || [];
+    if (!log.length) { host.textContent = "—"; return; }
+    host.innerHTML = log.slice().reverse().map(function (e) {
+      var color = e.status === "error" ? "var(--warm)" : "var(--txt3)";
+      return '<div><span style="color:' + color + '">' + escapeHtml(e.event || "?")
+        + '</span> <span style="color:var(--txt3)">' + escapeHtml(e.status || "")
+        + " " + escapeHtml((e.ts || "").replace("T", " ").slice(0, 19)) + "</span></div>";
+    }).join("");
+  }
 
   // ---- 成果回顾趋势：score / 文件数随轮次折线（样张「趋势」板块）----
   function renderTrend() {
