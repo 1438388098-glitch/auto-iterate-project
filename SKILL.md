@@ -90,14 +90,16 @@ Repeat until `check` reports `"continue": false`.
 ### 1. Check State
 
 ```powershell
-python <this-skill>/scripts/autopilot_state.py check --repo <repo> --brief
+python <this-skill>/scripts/autopilot_state.py round-prep --repo <repo>
 ```
 
-`--brief` returns loop-driving fields only (`continue`, `stop_reason`, `warnings`, `goals_met`, `phase`, `backlog`, `action_hint`, next verify/commit/checkpoint rounds). Stop if it says no. Resolve actionable `warnings` (dirty tree, empty goals, missing remotes when pushing, missing stop conditions, detached HEAD, branch drift in feature mode, secret scanning disabled, thin backlog, config drift).
+`round-prep` is check's loop-driving payload **plus** the suggested candidates (brief, `candidates_per_round + 1` of them), the fresh cached analysis, the standing directives and the round number `begin-round` would open — one call and one JSON instead of four (check + analysis-load + backlog-rank + directive-list). Use `check --brief` alone when you only need the stop condition (for example inside a loop you are already driving).
+
+Stop if `continue` is false. The payload carries `stop_reason`, `warnings`, `goals_met`, `phase`, `backlog`, `action_hint`, the next verify/commit/checkpoint rounds, `blocked_streak` and the budget with `remaining_minutes`. Resolve actionable `warnings` (dirty tree, empty goals, missing remotes when pushing, missing stop conditions, detached HEAD, branch drift in feature mode, secret scanning disabled, thin backlog, config drift).
 
 ### 2. Analyze
 
-Use the analysis cache:
+Use the analysis cache — `round-prep` already returned `analysis.status` and, when the cache is fresh, `analysis.cached`, so run `analysis-load` yourself only when you skipped `round-prep`:
 
 1. `analysis-load --repo <repo>`.
 2. If `"valid": true`, reuse it; do **not** re-scan the tree.

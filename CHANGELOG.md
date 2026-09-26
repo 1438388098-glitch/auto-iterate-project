@@ -10,6 +10,15 @@ agent reads, not the helper's runtime (0.58s per call).
 
 ### Added
 
+- `round-prep`: the loop's round start in one call. The payload is check's
+  loop-driving JSON plus the suggested candidates (brief form), the fresh
+  cached analysis, the standing directives and the round number `begin-round`
+  would open. The loop used to pay four script calls — and four tool
+  round-trips for the agent — per round (check, analysis-load, backlog-rank,
+  directive-list) before it started working; one call replaces them
+  (measured 2783 bytes vs 3401 across the four). `cmd_check` now builds its
+  payload through the shared `build_check_payload`, so the two can never
+  drift.
 - `backlog-rank --pending-only --top N --brief`: the loop read an 18KB
   ranking every round (16 candidates, 12 of them completed history, plus a
   ~1.1KB `score_breakdown` per entry) to pick a batch the helper had already

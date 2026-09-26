@@ -6235,5 +6235,92 @@ class BacklogRankViewTests(RepoTest):
         self.assertTrue(any("cut_reason" in entry for entry in ranked))
 
 
+class RoundPrepTests(RepoTest):
+    """round-prep exists because the loop paid four script calls (and four
+    tool round-trips) per round before it started working: check,
+    analysis-load, backlog-rank, directive-list."""
+
+    def _add(self, title, **extra):
+        args = ["--title", title, "--reason", "r", "--value", "4", "--effort", "2"]
+        for key, value in extra.items():
+            args += ["--" + key.replace("_", "-"), value]
+        result = self.run_state("backlog-add", *args)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        return result.stdout.strip().splitlines()[-1]
+
+    def _seed(self, count=4):
+        self.run_state("init")
+        return [self._add("pend{}".format(i)) for i in range(count)]
+
+    def test_carries_every_check_brief_field(self):
+        """Nothing the loop used to read from check may go missing."""
+        self._seed()
+        brief = json.loads(self.run_state("check", "--brief").stdout)
+        prep = json.loads(self.run_state("round-prep").stdout)
+        for key in brief:
+            self.assertIn(key, prep, "round-prep dropped check field {!r}".format(key))
+        self.assertEqual(brief["action_hint"], prep["action_hint"])
+        self.assertEqual(brief["continue"], prep["continue"])
+
+    def test_suggested_candidates_match_backlog_rank(self):
+        self._seed()
+        ranked = json.loads(self.run_state("backlog-rank", "--pending-only", "--top", "5", "--brief").stdout)
+        prep = json.loads(self.run_state("round-prep").stdout)
+        self.assertEqual([c["id"] for c in prep["candidates"]], [c["id"] for c in ranked])
+        self.assertTrue(prep["recommended"])
+        self.assertEqual(
+            prep["recommended"],
+            [c["id"] for c in prep["candidates"] if c["selected"]],
+        )
+
+    def test_next_round_number_matches_begin_round(self):
+        """The number must come from the same monotonic sequence begin-round
+        uses, not from the completed counters."""
+        ids = self._seed()
+        prep = json.loads(self.run_state("round-prep").stdout)
+        self.assertEqual(prep["next_round_number"], 1)
+        self.assertIsNone(prep["open_round"])
+        result = self.run_state("begin-round", "--title", "t", "--reason", "r",
+                                "--candidate-id", ids[0])
+        self.assertEqual(result.returncode, 0, result.stderr)
+        prep = json.loads(self.run_state("round-prep").stdout)
+        self.assertEqual(prep["open_round"]["number"], 1)
+        self.assertEqual(prep["open_round"]["candidate_ids"], [ids[0]])
+        self.assertEqual(prep["next_round_number"], 2)
+        self.assertIn("current_round is open", " ".join(prep["warnings"]))
+
+    def test_top_limits_candidates_and_reports_withheld(self):
+        self._seed(6)
+        prep = json.loads(self.run_state("round-prep", "--top", "2").stdout)
+        self.assertEqual(len(prep["candidates"]), 2)
+        self.assertEqual(prep["withheld"], 4)
+
+    def test_top_zero_is_rejected(self):
+        self._seed()
+        result = self.run_state("round-prep", "--top", "0")
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("--top must be a positive integer", result.stderr)
+
+    def test_default_top_is_batch_plus_one(self):
+        self._seed(6)
+        self.run_state("config-set", "--candidates-per-round", "3")
+        prep = json.loads(self.run_state("round-prep").stdout)
+        self.assertEqual(len(prep["candidates"]), 4)
+
+    def test_directives_and_cached_analysis_are_included(self):
+        self._seed()
+        self.run_state("directive-add", "--text", "always run the suite")
+        self.run_state("analysis-save", "--content", '{"notes": "hello"}')
+        prep = json.loads(self.run_state("round-prep").stdout)
+        self.assertEqual([d["text"] for d in prep["directives"]], ["always run the suite"])
+        loaded = json.loads(self.run_state("analysis-load").stdout)
+        self.assertEqual(prep["analysis"]["cached"], loaded["analysis"])
+
+    def test_not_initialized_is_a_clean_error(self):
+        result = self.run_state("round-prep")
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("not initialized", result.stderr.lower())
+
+
 if __name__ == "__main__":
     unittest.main()

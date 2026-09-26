@@ -2593,8 +2593,12 @@ def _check_text(cfg, zh_text, en_text):
     return zh_text if (cfg.get("report_lang") or "zh") == "zh" else en_text
 
 
-def cmd_check(args):
-    repo = Path(args.repo).resolve()
+def build_check_payload(repo, full=False):
+    """Build the check payload without printing it. `check` and `round-prep`
+    share this: round-prep is check's loop-driving fields plus the ranked
+    candidates, directives and schedule, so the loop needs one call per round
+    instead of four. `full` adds the state and config dump (the debugging
+    view; 5x the payload — the loop's contract is the brief form)."""
     # Validate git first: a non-git path must fail as "Not a git repository",
     # not as the misleading "state.json not found" that load_state would print.
     io.git_dir_for(repo)
@@ -2978,9 +2982,75 @@ def cmd_check(args):
         "remaining_minutes": remaining_minutes,
         "deadline_remaining_minutes": deadline_remaining,
     }
-    if not getattr(args, "brief", False):
+    if full:
         payload["state"] = st
         payload["config"] = cfg
+    return payload
+
+
+def cmd_check(args):
+    repo = Path(args.repo).resolve()
+    payload = build_check_payload(repo, full=not getattr(args, "brief", False))
+    print(json.dumps(payload, indent=2, ensure_ascii=False))
+    return 0
+
+
+def cmd_round_prep(args):
+    """One call that returns everything the loop needs to open the next round:
+    check's loop-driving payload, the recommended candidates in brief form,
+    the cached analysis when it is still fresh, the standing directives, and
+    the round number `begin-round` would open.
+
+    The loop otherwise spends four script calls per round (check,
+    analysis-load, backlog-rank, directive-list) before it even starts
+    working; every one of those is a separate tool round-trip for the agent
+    reading it. round-prep is one call and one JSON.
+    """
+    repo = Path(args.repo).resolve()
+    if not config.state_path_for(repo).exists():
+        return emit_result(args, False, "[ERROR] Autopilot not initialized. Run init first.")
+    top = getattr(args, "top", None)
+    if top is not None and top < 1:
+        return emit_result(args, False, "[ERROR] --top must be a positive integer.")
+    payload = build_check_payload(repo)
+    cfg = config.load_config(repo)
+    st = state.load_state(repo)
+    backlog = state.load_backlog(repo)
+
+    ranked = state.rank_candidates(
+        backlog, cfg, progress=state.progress_from_state(st, cfg),
+        completed_goals=list(st.get("completed_goals") or []),
+    )
+    if top is None:
+        # The recommended batch plus one backup: enough to open a round and
+        # absorb one candidate going stale between prep and begin-round,
+        # without dragging the whole backlog into the round's context.
+        top = int(cfg.get("candidates_per_round") or 4) + 1
+    pending = [entry for entry in ranked if entry.get("status") in ("pending", "picked")]
+    payload["candidates"] = [brief_rank_entry(entry) for entry in pending[:top]]
+    payload["recommended"] = [entry["id"] for entry in pending[:top] if entry.get("selected")]
+    payload["withheld"] = max(0, len(pending) - len(payload["candidates"]))
+
+    validity, reason = state.analysis_validity(repo)
+    cached = state.load_analysis(repo) if validity == "fresh" else None
+    payload["analysis"]["cached"] = (cached or {}).get("analysis") if isinstance(cached, dict) else None
+    payload["directives"] = state.load_directives(repo).get("directives") or []
+
+    open_round = st.get("current_round")
+    # Round numbers come from the monotonic `round_seq` (begin-round does
+    # `round_seq + 1`), NOT from the completed counters — a cancelled or
+    # reverted round advances the counter without matching the sequence. Read
+    # the same source begin-round reads, or this field lies.
+    payload["next_round_number"] = st.get("round_seq", 0) + 1
+    payload["open_round"] = (
+        {
+            "number": st.get("round_seq"),
+            "title": (open_round or {}).get("title"),
+            "candidate_ids": (open_round or {}).get("candidate_ids") or [],
+        }
+        if open_round
+        else None
+    )
 
     print(json.dumps(payload, indent=2, ensure_ascii=False))
     return 0
