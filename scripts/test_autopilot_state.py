@@ -6838,6 +6838,28 @@ class ViewLayerUnitTests(unittest.TestCase):
         brief = ap_commands.brief_rank_entry({"id": "x", "score": 0})
         self.assertEqual(brief, {"id": "x", "score": 0})
 
+class SecretMaskGoalNormUnitTests(unittest.TestCase):
+    """mine test-gap（R14）：mask_secret_text 掩码规则与 normalize_goal_text
+    归一规则（goal-met→stop 链的零宽字符防线）的直接锁定。"""
+
+    def test_mask_secret_text_keeps_locator_hides_secret(self):
+        from autopilot import secrets as ap_secrets
+        self.assertEqual(ap_secrets.mask_secret_text("AKIAEXAMPLEKEY1234"),
+                         "AKIAEX...1234")
+        self.assertEqual(ap_secrets.mask_secret_text("short"), "sh...")
+        self.assertEqual(ap_secrets.mask_secret_text(""), "...")       # 空串同短文本路径
+        self.assertEqual(ap_secrets.mask_secret_text(None), "...")     # (None or "") 路径
+
+    def test_normalize_goal_text_strips_zero_width_and_nfc(self):
+        from autopilot import state as ap_state
+        # 零宽空格 + 非规范 NFC：归一后与干净串等价（早停防线）
+        tricky = "升级到 1.9" + "\u200b"
+        self.assertEqual(ap_state.normalize_goal_text(tricky),
+                         ap_state.normalize_goal_text("升级到 1.9"))
+        self.assertEqual(ap_state.normalize_goal_text("  spaced  "), "spaced")
+        self.assertEqual(ap_state.normalize_goal_text(None), None)
+
+
 class ScannerHomeUnitTests(unittest.TestCase):
     """mine test-gap 批三（R7）：home_dir 解析序与 miner 扫描器在合成 repo
     上的直测（194 scan_markers 已由 MinerMarkerSelfScanTests 覆盖）。"""
