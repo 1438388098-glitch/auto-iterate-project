@@ -2,6 +2,8 @@
 round file changes, module aggregation, event correlation, snapshot
 assembly. No process spawning, no state writes — tests feed it fakes."""
 
+import json
+
 from pathlib import Path
 
 from . import io
@@ -330,6 +332,31 @@ def compute_run_file_changes(repo, run_start_sha, gitio=None):
     return changes
 
 
+def _recent_log_events(repo, limit=10):
+    """log.jsonl 尾部事件（可观测性）：每条 {ts, event, status}，坏行跳过。
+    无日志（新 run）→ 空列表；绝不抛错打断快照。"""
+    path = _autopilot_dir(repo) / "log.jsonl"
+    events = []
+    try:
+        with open(path, encoding="utf-8", errors="replace") as fh:
+            for line in fh:
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    d = json.loads(line)
+                except ValueError:
+                    continue
+                if isinstance(d, dict):
+                    events.append({
+                        "ts": d.get("ts"), "event": d.get("event"),
+                        "status": d.get("status"),
+                    })
+    except OSError:
+        return []
+    return events[-limit:]
+
+
 def build_snapshot(repo, gitio=None):
     """Assemble the read-only dashboard snapshot (design doc §3.1): a ``meta``
     header (generated_at, skill_version, run_id, degraded), a ``status``
@@ -459,6 +486,7 @@ def build_snapshot(repo, gitio=None):
                                      / io.RETROSPECTIVE_FILENAME).exists(),
             "retrospective_excerpt": _read_head(
                 _autopilot_dir(repo) / io.RETROSPECTIVE_FILENAME, 600),
+            "recent_events": _recent_log_events(repo),
         },
     }
 
