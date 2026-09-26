@@ -195,3 +195,20 @@ def aggregate_modules(file_changes, domain_map):
             "modules": modules,
         })
     return result
+
+
+def correlate_events(history, round_domains):
+    """history entries → evolution cards, oldest first. cancelled/aborted
+    rounds are kept (rendered grey upstream); missing review_score → None."""
+    events = []
+    for entry in history:
+        events.append({
+            "round": entry["round"],
+            "status": entry.get("status"),
+            "title": entry.get("title"),
+            "summary": entry.get("summary"),
+            "score": entry.get("review_score"),
+            "domains": sorted(round_domains.get(entry["round"], [])),
+            "commit_sha": entry.get("commit_sha"),
+        })
+    return events

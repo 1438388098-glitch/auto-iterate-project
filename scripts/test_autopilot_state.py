@@ -6828,6 +6828,31 @@ class DashboardDataTests(unittest.TestCase):
         self.assertNotIn("工具与脚本", by_name)                  # scripts/* 全部被映射覆盖
         self.assertIn("测试", by_name)                           # 测试文件不在映射内，仍走内置
 
+    def test_correlate_events_maps_domains_and_keeps_all_statuses(self):
+        """history 序即展示序（state.history 本就旧→新）；cancelled/aborted 轮
+        如实入史（由上游渲染灰卡）；缺 review_score 记 None；domains 取该轮
+        改动归因到的域并典序稳定（Task 6 传入的是 set，sorted 同样适用）。"""
+        from autopilot import dashboard_data as dd
+        history = [
+            {"round": 20, "status": "cancelled", "title": "exhausted 只计 apply run",
+             "summary": "…", "review_score": None, "commit_sha": None},
+            {"round": 22, "status": "completed", "title": "exhausted 只计 apply run",
+             "summary": "只读探测不再打断零新增序列", "review_score": 4, "commit_sha": "20c6a6e"},
+        ]
+        round_domains = {20: ["supply"], 22: ["supply", "quality"]}
+        events = dd.correlate_events(history, round_domains)
+        self.assertEqual(events[0]["round"], 20)
+        self.assertEqual(events[0]["status"], "cancelled")       # 灰卡如实入史
+        self.assertIsNone(events[0]["score"])
+        self.assertEqual(events[1]["domains"], ["quality", "supply"])  # 排序稳定
+        self.assertEqual(events[1]["score"], 4)
+
+    def test_correlate_events_defaults_domains_to_empty(self):
+        from autopilot import dashboard_data as dd
+        events = dd.correlate_events([{"round": 1, "status": "completed", "title": "t",
+                                       "summary": "", "review_score": None, "commit_sha": "x"}], {})
+        self.assertEqual(events[0]["domains"], [])
+
 
 if __name__ == "__main__":
     unittest.main()
