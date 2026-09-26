@@ -1,0 +1,166 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<title>auto·iterate 观察台 — 1.8 概念稿 v5</title>
+<style>
+  :root {
+    --bg: #0A0A0B; --surface: #131316; --surface2: #1A1A1F;
+    --line: #232329; --txt: #EDEDEF; --txt2: #9A9AA2; --txt3: #5C5C66;
+    --accent: #7EE0B8; --accent-dim: #3A6B57;
+    --warm: #E8A87C;
+  }
+  * { margin:0; padding:0; box-sizing:border-box; }
+  body { background:var(--bg); color:var(--txt); font-family:"Segoe UI",system-ui,sans-serif; padding:36px 44px; max-width:1280px; margin:0 auto; }
+  .mono { font-family:"Cascadia Code",Consolas,monospace; }
+  .topbar { display:flex; align-items:baseline; gap:20px; padding-bottom:20px; border-bottom:1px solid var(--line); }
+  .brand { font-size:17px; font-weight:650; letter-spacing:-.2px; }
+  .brand em { font-style:normal; color:var(--txt3); font-weight:400; }
+  .topmeta { font-size:12px; color:var(--txt2); display:flex; gap:18px; margin-left:auto; }
+  .topmeta b { color:var(--txt); font-weight:600; }
+  .live { color:var(--accent); }
+  .live::before { content:""; display:inline-block; width:6px; height:6px; border-radius:50%; background:var(--accent); margin-right:6px; vertical-align:1px; }
+  .stats { display:flex; gap:44px; padding:26px 0 30px; }
+  .stat .n { font-size:26px; font-weight:600; letter-spacing:-.5px; }
+  .stat .n small { font-size:14px; color:var(--txt3); font-weight:400; }
+  .stat .l { font-size:10px; letter-spacing:1.6px; color:var(--txt3); text-transform:uppercase; margin-top:3px; }
+  .main { display:grid; grid-template-columns: 1.72fr 1fr; gap:20px; align-items:stretch; }
+  .panel { background:var(--surface); border-radius:12px; padding:22px 24px; }
+  .panel h3 { font-size:10px; letter-spacing:1.6px; text-transform:uppercase; color:var(--txt3); font-weight:600; margin-bottom:4px; }
+  .panel .sub { font-size:11.5px; color:var(--txt2); margin-bottom:14px; }
+  .tree-cap { display:flex; justify-content:space-between; align-items:center; margin-bottom:6px; }
+  .mode { font-size:10.5px; color:var(--txt2); border:1px solid var(--line); border-radius:99px; padding:3px 12px; }
+  .mode b { color:var(--txt); font-weight:500; }
+  svg { display:block; width:100%; }
+  .ev { padding:13px 2px 13px 16px; border-left:2px solid var(--line); margin-left:4px; position:relative; }
+  .ev.hot { border-left-color:var(--accent); }
+  .ev::before { content:""; position:absolute; left:-4.5px; top:19px; width:7px; height:7px; border-radius:50%; background:var(--surface2); border:1.5px solid var(--txt3); }
+  .ev.hot::before { background:var(--accent); border-color:var(--accent); }
+  .ev .meta { font-size:10.5px; color:var(--txt3); margin-bottom:3px; }
+  .ev .meta b { color:var(--txt2); font-weight:500; }
+  .ev .t { font-size:13px; font-weight:600; letter-spacing:-.1px; margin-bottom:3px; }
+  .ev.hot .t { color:var(--accent); }
+  .ev .s { font-size:11.5px; color:var(--txt2); line-height:1.5; }
+  .goalrow { display:flex; align-items:center; gap:10px; margin-top:16px; padding-top:16px; border-top:1px solid var(--line); }
+  .goalbar { flex:1; height:3px; background:var(--surface2); border-radius:2px; overflow:hidden; }
+  .goalbar i { display:block; height:100%; width:60%; background:var(--accent); border-radius:2px; }
+  .replay { display:flex; align-items:center; gap:14px; margin-top:20px; background:var(--surface); border-radius:12px; padding:16px 24px; }
+  .play { width:30px; height:30px; border-radius:50%; background:var(--surface2); display:flex; align-items:center; justify-content:center; font-size:10px; color:var(--txt); }
+  .axis { flex:1; height:2px; background:var(--surface2); border-radius:1px; position:relative; }
+  .axis .fill { position:absolute; inset:0; border-radius:1px; background:linear-gradient(90deg, var(--accent-dim), var(--accent), var(--warm)); opacity:.85; }
+  .axis .cursor { position:absolute; top:-4px; right:2%; width:10px; height:10px; border-radius:50%; background:var(--bg); border:2px solid var(--accent); }
+  .axislbl { font-size:11px; color:var(--txt3); }
+</style>
+</head>
+<body>
+
+  <div class="topbar">
+    <div class="brand">auto·iterate <em>观察台</em></div>
+    <div class="topmeta mono">
+      <span><b>22</b> 轮 · <b>20</b> 有效</span>
+      <span>预算 <b>63%</b></span>
+      <span>backlog <b>16</b></span>
+      <span class="live">运行中</span>
+      <span style="color:var(--txt3)">v1.8.0</span>
+    </div>
+  </div>
+
+  <div class="stats mono">
+    <div class="stat"><div class="n">22<small> / 30</small></div><div class="l">轮次</div></div>
+    <div class="stat"><div class="n">495</div><div class="l">测试全绿</div></div>
+    <div class="stat"><div class="n">4<small> 域 · 14 模块</small></div><div class="l">生长规模</div></div>
+    <div class="stat"><div class="n">3<small> / 5</small></div><div class="l">目标达成</div></div>
+    <div class="stat"><div class="n">4.2<small>k</small></div><div class="l">tokens</div></div>
+  </div>
+
+  <div class="main">
+    <div class="panel">
+      <div class="tree-cap">
+        <div><h3>项目生长</h3></div>
+        <div class="mode"><b>当前态</b> · 回放</div>
+      </div>
+      <svg viewBox="0 0 560 320">
+        <!-- 主干：根在上，垂直向下贯穿 -->
+        <path d="M 84 46 L 84 266" stroke="#2E2E35" stroke-width="2" fill="none"/>
+        <!-- 域枝：主干水平出枝（粗细=生长强度），圆点与文字同基线 -->
+        <path d="M 84 88 L 144 88" stroke="#7EE0B8" stroke-width="3.2" fill="none" opacity=".9"/>
+        <path d="M 84 160 L 144 160" stroke="#7CA6D9" stroke-width="2.1" fill="none" opacity=".75"/>
+        <path d="M 84 218 L 144 218" stroke="#3A3A42" stroke-width="1.4" fill="none"/>
+        <path d="M 84 266 L 144 266" stroke="#3A3A42" stroke-width="1.4" fill="none"/>
+
+        <!-- 根 -->
+        <circle cx="84" cy="36" r="5" fill="#EDEDEF"/>
+        <text x="100" y="40" fill="#EDEDEF" font-size="12.5" font-weight="600" font-family="Consolas,monospace">auto-iterate-project</text>
+
+        <!-- 域 1：供给与探矿（活跃，展开） -->
+        <circle cx="152" cy="88" r="4.5" fill="#7EE0B8"/>
+        <text x="166" y="92" fill="#EDEDEF" font-size="12" font-weight="600">供给与探矿</text>
+        <text x="284" y="92" fill="#5C5C66" font-size="10" font-family="Consolas,monospace">r8 诞生 · 挖掘器决定迭代上限</text>
+        <!-- 域 1 的模块层：从域节点下挂二级竖线，再水平出枝 -->
+        <path d="M 152 96 L 152 142" stroke="#2E2E35" stroke-width="1.2" fill="none"/>
+        <path d="M 152 118 L 168 118" stroke="#3A3A42" stroke-width="1.2" fill="none"/>
+        <path d="M 152 142 L 168 142" stroke="#7EE0B8" stroke-width="1.6" fill="none"/>
+        <circle cx="175" cy="118" r="3" fill="#4A4A55"/>
+        <circle cx="175" cy="142" r="3" fill="#7EE0B8"/>
+        <text x="188" y="122" fill="#9A9AA2" font-size="11" font-family="Consolas,monospace">miner.py <tspan fill="#5C5C66">· r14 起</tspan></text>
+        <text x="188" y="146" fill="#EDEDEF" font-size="11" font-weight="600" font-family="Consolas,monospace">exhausted 序列</text>
+        <text x="308" y="146" fill="#7EE0B8" font-size="10" font-family="Consolas,monospace">● r20-22 · 三轮收敛</text>
+
+        <!-- 域 2：核心循环 -->
+        <circle cx="152" cy="160" r="4" fill="#7CA6D9"/>
+        <text x="166" y="164" fill="#EDEDEF" font-size="12" font-weight="600">核心循环</text>
+        <text x="284" y="164" fill="#5C5C66" font-size="10" font-family="Consolas,monospace">r1 诞生 · 每轮执行的主路径</text>
+
+        <!-- 域 3：质量防护（折叠态） -->
+        <circle cx="152" cy="218" r="4" fill="#4A4A55"/>
+        <text x="166" y="222" fill="#9A9AA2" font-size="12" font-weight="500">质量防护</text>
+        <text x="284" y="222" fill="#5C5C66" font-size="10" font-family="Consolas,monospace">420 → 495 测试 · 护栏实证 2 次</text>
+        <text x="520" y="222" fill="#3A3A42" font-size="10" font-family="Consolas,monospace">⋯</text>
+
+        <!-- 域 4：文档与知识（折叠态） -->
+        <circle cx="152" cy="266" r="4" fill="#4A4A55"/>
+        <text x="166" y="270" fill="#9A9AA2" font-size="12" font-weight="500">文档与知识</text>
+        <text x="284" y="270" fill="#5C5C66" font-size="10" font-family="Consolas,monospace">SKILL · references · README</text>
+        <text x="520" y="270" fill="#3A3A42" font-size="10" font-family="Consolas,monospace">⋯</text>
+      </svg>
+    </div>
+
+    <div class="panel">
+      <h3>进化叙事</h3>
+      <div class="ev hot">
+        <div class="meta mono"><b>r22</b> · 自评 4/5 · completed → 供给与探矿</div>
+        <div class="t">exhausted 只计 apply run</div>
+        <div class="s">只读探测不再永久打断零新增序列</div>
+      </div>
+      <div class="ev">
+        <div class="meta mono"><b>r20 → r21 → r22</b> · cancelled / aborted 如实入史</div>
+        <div class="t" style="color:var(--txt2)">同一条进化线的三次尝试</div>
+      </div>
+      <div class="ev">
+        <div class="meta mono"><b>r19</b> · 自评 4/5 → 文档与知识</div>
+        <div class="t">重写 README.md</div>
+        <div class="s">仓库门面恢复，用户决策取代旧约</div>
+      </div>
+      <div class="ev">
+        <div class="meta mono"><b>r16</b> · 自评 4/5 → 核心循环</div>
+        <div class="t">state.json 写前备份</div>
+        <div class="s">.bak 可恢复点</div>
+      </div>
+      <div class="goalrow">
+        <span style="font-size:11px;color:var(--txt2)">目标 3/5</span>
+        <div class="goalbar"><i></i></div>
+        <span class="mono" style="font-size:10.5px;color:var(--txt3)">下批候选 4 · 波次 2</span>
+      </div>
+    </div>
+  </div>
+
+  <div class="replay">
+    <div class="play">▶</div>
+    <div class="axis"><div class="fill"></div><div class="cursor"></div></div>
+    <div class="axislbl mono">r1 — r22</div>
+  </div>
+
+  
+
+</body>
+</html>
