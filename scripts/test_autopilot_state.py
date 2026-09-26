@@ -7220,6 +7220,24 @@ class VerifyDiscoveryUnitTests(unittest.TestCase):
         self.assertEqual(ap_verify.detect_verify_commands(repo), [])
 
 
+class FinishArchiveReportsTests(RepoTest):
+    """--archive-reports（expansion wave 2）：把 phase report 与 retrospective
+    拷进 docs/autopilot/，合并后协作者可见——.autopilot/ 本身不入库。"""
+
+    def test_finish_archives_reports_into_docs(self):
+        self.run_state("init")
+        self.run_state("begin-round", "--title", "r", "--reason", "x")
+        self.add_file("a.py", "a = 1\n")
+        self.run_state("complete-round", "--summary", "done")
+        result = self.run_state("finish", "--archive-reports", "--force",
+                                "--reason", "archive probe", "--stay")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        archived = self.repo / "docs" / "autopilot"
+        self.assertTrue((archived / "retrospective.md").exists())
+        # phase report 每 10 轮才写：单轮 run 无 report 是正确行为
+        self.assertFalse(list(archived.glob("phase-report-round-*.md")))
+
+
 class DashboardCmdTests(unittest.TestCase):
     """cmd_dashboard wiring (1.8.0 final review): config dashboard.auto_open is
     the default and --no-open forces it off; a busy --port exits with a clean
@@ -8004,9 +8022,67 @@ def _run_smoke():
     return 0 if result.wasSuccessful() else 1
 
 
+def _parallel_worker(class_name):
+    """--jobs worker（进程级）：独立进程跑一个 TestCase 类，返回结果摘要。
+    类间无共享 fixture（各自 mkdtemp/随机端口），进程隔离下互不干扰。"""
+    import io as _io
+    import time as _time
+    import unittest as _unittest
+    loader = _unittest.TestLoader()
+    suite = loader.loadTestsFromTestCase(globals()[class_name])
+    devnull = open(os.devnull, "w")
+    t0 = _time.time()
+    result = _unittest.TextTestRunner(verbosity=0, stream=devnull).run(suite)
+    devnull.close()
+    return {
+        "name": class_name, "ran": result.testsRun,
+        "seconds": round(_time.time() - t0, 1),
+        "problems": [str(f) for f in result.failures + result.errors],
+        "skipped": len(result.skipped),
+    }
+
+
+def _run_parallel(class_names, jobs):
+    """全量按类并行：慢类彼此独立，进程池把 455s 压到约 1/3（expansion
+    lens performance）。失败清单聚合打印，任一失败退出 1。"""
+    import multiprocessing
+    all_names = sorted(n for n, o in globals().items()
+                       if isinstance(o, type) and issubclass(o, unittest.TestCase)
+                       and o.__module__ == __name__)
+    if class_names:
+        unknown = [n for n in class_names if n not in all_names]
+        if unknown:
+            print("[ERROR] unknown test classes: {}".format(", ".join(unknown)))
+            return 2
+        targets = class_names
+    else:
+        targets = all_names
+    t0 = time.time()
+    with multiprocessing.Pool(processes=jobs) as pool:
+        results = pool.map(_parallel_worker, targets)
+    bad = []
+    total = 0
+    for r in sorted(results, key=lambda x: -x["seconds"]):
+        total += r["ran"]
+        if r["problems"]:
+            bad.append(r["name"])
+            print("[FAIL] {} ({}s)".format(r["name"], r["seconds"]))
+            for p in r["problems"]:
+                print(p)
+    print("[parallel jobs={}] {} classes, {} tests, {} failures/errors, "
+          "{:.1f}s total".format(jobs, len(results), total, len(bad),
+                                 time.time() - t0))
+    return 1 if bad else 0
+
+
 if __name__ == "__main__":
     argv = sys.argv[1:]
-    if "--time-report" in argv:
+    if "--jobs" in argv:
+        i = argv.index("--jobs")
+        jobs = int(argv[i + 1])
+        rest = argv[i + 2:]
+        sys.exit(_run_parallel(rest or None, jobs))
+    elif "--time-report" in argv:
         argv.remove("--time-report")
         _run_time_report()
     elif "--smoke" in argv:

@@ -1273,6 +1273,21 @@ def cmd_finish(args):
                 ),
                 file=sys.stderr,
             )
+        if getattr(args, "archive_reports", False):
+            # --archive-reports: copy the run's user-facing reports into the
+            # repo (docs/autopilot/) so collaborators see them after merge —
+            # .autopilot/ itself stays excluded from version control.
+            import shutil
+            archive_dir = repo / "docs" / "autopilot"
+            try:
+                archive_dir.mkdir(parents=True, exist_ok=True)
+                if retrospective_path:
+                    shutil.copy2(retrospective_path, archive_dir / io.RETROSPECTIVE_FILENAME)
+                for report in sorted((repo / io.AUTOPILOT_DIR).glob("phase-report-round-*.md")):
+                    shutil.copy2(report, archive_dir / report.name)
+                print("[OK] Reports archived to docs/autopilot/.")
+            except OSError as exc:
+                print("[WARN] Report archiving failed: {}".format(exc), file=sys.stderr)
         message = "[OK] Autopilot run finished."
         if cfg.get("branch_mode") == "feature" and st.get("branch"):
             # The run's commits live on the autopilot branch and finish does

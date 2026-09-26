@@ -227,6 +227,8 @@ def build_parser():
     finish_parser.add_argument("--repo", default=".")
     finish_parser.add_argument("--reason")
     finish_parser.add_argument("--stay", action="store_true", help="Stay on the autopilot branch instead of returning to origin")
+    finish_parser.add_argument("--archive-reports", dest="archive_reports", action="store_true",
+                               help="copy phase reports and the retrospective into docs/autopilot/ so they survive the merge")
     finish_parser.add_argument("--force", action="store_true",
                                help="Finish even while no stop condition is reached and ready work remains (user-approved early stop)")
     add_json(finish_parser)
