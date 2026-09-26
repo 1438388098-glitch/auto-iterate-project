@@ -28,7 +28,10 @@ def parse_numstat(raw):
     """Parse `git diff --numstat` output into [{path, insertions, deletions,
     binary, renamed}]. Rename syntax `{old => new}` (and full-line
     `old => new`) is normalized to the NEW path; git-quoted paths are
-    unquoted; binary rows (``-`` columns) count 0 lines."""
+    unquoted; binary rows (``-`` columns) count 0 lines. The rename
+    normalization is a heuristic: without ``-z`` a path literally containing
+    " => " (a legal unquoted filename) is indistinguishable from a rename —
+    the same lenient-parsing limit as io._parse_numstat."""
     changes = []
     for line in raw.splitlines():
         if not line.strip():
@@ -37,10 +40,14 @@ def parse_numstat(raw):
         if len(parts) != 3:
             continue
         ins, dele, path = parts
+        if not ((ins.isdigit() and dele.isdigit()) or (ins == "-" and dele == "-")):
+            # A returncode==0 numstat should not emit such lines; skip them
+            # leniently like io._parse_numstat instead of raising on int().
+            continue
         renamed = " => " in path
         if renamed:
             path = _rename_new_side(path)
-        binary = ins == "-" or dele == "-"
+        binary = ins == "-"
         changes.append({
             "path": io._unquote_git_path(path),
             "insertions": 0 if binary else int(ins),
@@ -58,7 +65,9 @@ def compute_round_file_changes(repo, history, run_start_sha, gitio=None):
     diff and leave the anchor untouched; any OTHER shaless round (completed /
     legacy statusless) cannot anchor its work, so the whole growth view
     degrades to None rather than showing a partial picture — the same for a
-    failed git diff, which must never render as an empty one. Returns
+    failed git diff, which must never render as an empty one. The ``gitio``
+    seam exposes run_git(repo, *args) -> stdout text with None on failure
+    (the default path wraps io.run_git's CompletedProcess). Returns
     {path: {first_round, touches, insertions, deletions, rounds}} where
     touches counts round appearances, rounds dedups, first_round is the min."""
     if gitio is not None:

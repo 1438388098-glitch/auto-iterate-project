@@ -6723,6 +6723,19 @@ class DashboardDataTests(unittest.TestCase):
         self.assertIsNone(changes)
         self.assertEqual([c[2] for c in calls], ["000..aaa"])   # 缺锚点轮之前仅第 1 轮 diff
 
+    def test_compute_round_file_changes_git_failure_degrades_to_none(self):
+        """A failed git diff (run_git -> None) must degrade to None: silently
+        rendering growth as empty would understate the run's work."""
+        from autopilot import dashboard_data as dd
+        history = [{"round": 1, "status": "completed", "commit_sha": "aaa"}]
+
+        class FakeIO:
+            @staticmethod
+            def run_git(repo, *args, **kw):
+                return None
+
+        self.assertIsNone(dd.compute_round_file_changes("R", history, "000", gitio=FakeIO))
+
     def test_compute_round_file_changes_returns_none_when_anchor_missing(self):
         from autopilot import dashboard_data as dd
         self.assertIsNone(dd.compute_round_file_changes("R", [{"round": 1, "commit_sha": None}], "000"))
