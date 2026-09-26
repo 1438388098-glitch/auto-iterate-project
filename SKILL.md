@@ -1,6 +1,6 @@
 ---
 name: auto-iterate-project
-version: 1.6.0
+version: 1.7.0
 description: Automatically iterate any git project inside the current agent session by analyzing the repository, choosing the next high-value improvement, implementing small changes, verifying, committing, and looping until a goal is met or configurable round/time/token limits are reached. Use when the user asks for autonomous project iteration, continuous self-improvement, auto-improve, keep improving this project, full-auto development, or wants the agent to keep making and committing improvements without per-step approval. Also use for Chinese requests like 全自动迭代这个项目, 自动改进并提交这个仓库, 连续自动开发, or 自动推进项目改进. Do NOT use for one-off bugfixes, single-file edits, doc-only changes, or when the user wants step-by-step approval of each change.
 ---
 
@@ -75,7 +75,7 @@ python <this-skill>/scripts/autopilot_state.py diagnose --repo <repo>
 6. Read `.autopilot/config.json` if present; otherwise initialize:
 
 ```powershell
-python <this-skill>/scripts/autopilot_state.py init --repo <repo> [--branch-mode feature] [--max-rounds N] [--max-minutes N] [--deadline "<expr>"] [--max-tokens N] [--goal "<goal>"] [--goals-from-prompt "<request>"] [--check-commands "<cmd>"] [--smoke-commands "<cmd>"] [--candidates-per-round N] [--commit-every-rounds N] [--verify-every-rounds N] [--checkpoint-every N] [--expand-after-goals] [--review-threshold N] [--report-lang zh|en]
+python <this-skill>/scripts/autopilot_state.py init --repo <repo> [--branch-mode feature] [--max-rounds N] [--max-minutes N] [--deadline "<expr>"] [--max-tokens N] [--max-expansion-waves N] [--goal "<goal>"] [--goals-from-prompt "<request>"] [--check-commands "<cmd>"] [--smoke-commands "<cmd>"] [--candidates-per-round N] [--commit-every-rounds N] [--verify-every-rounds N] [--checkpoint-every N] [--expand-after-goals] [--review-threshold N] [--report-lang zh|en]
 ```
 
 `--deadline` is the timer (定时器) stop: an absolute wall-clock moment. Accepts ISO (`2026-08-10T08:00:00`), relative (`+8h`, `+30min`, `+1d`, `+2w`), or local `HH:MM` (today, or tomorrow if already past). Complements `--max-minutes` (倒计时 = duration since last round activity). Ranking/recovery flags: see `references/config.md`.
@@ -218,6 +218,7 @@ When `action_hint: "expand"` (mine already fresh), the backlog is empty after mi
 
 ### Wave shape
 
+0. Budget check: subagent spend is invisible to `max_tokens` (it estimates from diffs), so if the run has `max_expansion_waves` set, read `expansion_budget` and stop expanding at the cap (`expansion-record` refuses past it); with no cap, a run that expands repeatedly can outspend every configured budget while `check` reports it healthy.
 1. Pick 3-6 unused lenses from `check`'s `lenses_unused` (see `references/expansion-lenses.md`). Each subagent returns 2-5 candidates **with evidence**. Record with `expansion-record --lens ...`. Repeating the previous wave's exact set warns.
 2. Judge and ingest: one concrete user-facing sentence of value **and** evidence (file:line or probe output). Unevidenced proposals get one follow-up, then reject. `backlog-add` with explicit scores and `--evidence`. Do not reject solely for high effort.
 3. Still thin → escalate search depth (not the user): Wave 2 lower the value floor temporarily; Wave 3+ read hardest paths / real user journeys / public symbols; Wave 4+ widen scope (siblings, CI, packaging, examples). Keep spawning until `min_pending_candidates` ready items or a budget stop. **Never finish with "expansion exhausted" while budgets remain** — `finish` without `--force` is refused while stop conditions are unmet and ready work exists. Declaring exhaustion requires 2 consecutive recorded waves (≥3 subagents, ≥3 unused lenses each) with zero value-gated candidates — and even then the run stops only on a budget.
@@ -236,7 +237,7 @@ Stop when any is true:
 - `max_rounds` reached (completed + blocked + cancelled + reverted).
 - `max_minutes` reached (wall-clock since last round activity; pause does not pause the clock). `null` = unlimited.
 - `deadline` reached (absolute timer). Past deadline stops on first `check`. `null` = disabled.
-- `max_tokens` soft budget reached (auto-estimated from diffs).
+- `max_tokens` soft budget reached (auto-estimated from diffs — subagent spend is NOT counted; `max_expansion_waves` is the bound that covers it).
 - `max_blocked_in_a_row` consecutive blocked rounds (default 2).
 - A round's staged diff exceeds `max_round_scope` and cannot be split.
 - The user interrupts or changes the request.

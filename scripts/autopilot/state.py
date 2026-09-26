@@ -514,7 +514,20 @@ def append_expansion_wave(st, lenses):
     waves.append(wave)
     if len(waves) > io.EXPANSION_WAVES_LIMIT:
         del waves[: len(waves) - io.EXPANSION_WAVES_LIMIT]
+    # Monotonic total, independent of the rolling window above: the wave cap
+    # (max_expansion_waves) must count every wave ever recorded, not just the
+    # ones still inside the window (len(expansion_waves) saturates).
+    st["expansion_wave_seq"] = int(st.get("expansion_wave_seq") or 0) + 1
     return wave
+
+
+def expansion_wave_count(st):
+    """Waves recorded in this run. Falls back to the rolling window for state
+    written before `expansion_wave_seq` existed."""
+    seq = st.get("expansion_wave_seq")
+    if isinstance(seq, int) and not isinstance(seq, bool):
+        return seq
+    return len(st.get("expansion_waves") or [])
 
 
 def resolve_seed(st, seed_id, status, notes=None, candidate_id=None):

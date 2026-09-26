@@ -219,6 +219,10 @@ def cmd_init(args):
     # Negative values are already rejected by the knob gate above.
     if getattr(args, "max_expansion_per_round", None) is not None:
         cfg["max_expansion_per_round"] = args.max_expansion_per_round
+    if getattr(args, "max_expansion_waves", None) is not None:
+        if args.max_expansion_waves < 0:
+            return emit_result(args, False, "[ERROR] --max-expansion-waves must be a non-negative integer.")
+        cfg["max_expansion_waves"] = args.max_expansion_waves
     if args.allow_path:
         cfg["allow_paths"] = list(args.allow_path)
     if args.deny_path:
@@ -2028,7 +2032,9 @@ def cmd_config_set(args):
     config-drift. Numeric budgets accept a --clear-* twin that stores null;
     --deadline resolves relative expressions (same parser as init) into an
     absolute timestamp. Guard-rail fields (branch_mode, allow_uncommitted_changes,
-    path whitelists) are deliberately not settable at runtime."""
+    path whitelists) are deliberately not settable at runtime. The expansion
+    wave cap IS settable on purpose: hitting a cap mid-run must leave an escape
+    hatch that is not "stop the whole run"."""
     repo = Path(args.repo).resolve()
     refused = _require_initialized(args, repo, message="[ERROR] Autopilot not initialized. Run init first.")
     if refused is not None:
@@ -2083,6 +2089,17 @@ def cmd_config_set(args):
             requested[name] = value
     if args.expand_after_goals is not None:
         requested["expand_after_goals"] = bool(args.expand_after_goals)
+    if getattr(args, "clear_max_expansion_waves", False):
+        if getattr(args, "max_expansion_waves", None) is not None:
+            return emit_result(
+                args, False,
+                "[ERROR] --max-expansion-waves and --clear-max-expansion-waves are mutually exclusive.",
+            )
+        requested["max_expansion_waves"] = None
+    elif getattr(args, "max_expansion_waves", None) is not None:
+        if args.max_expansion_waves < 0:
+            return emit_result(args, False, "[ERROR] --max-expansion-waves must be a non-negative integer.")
+        requested["max_expansion_waves"] = args.max_expansion_waves
     if getattr(args, "clear_smoke_commands", False):
         if getattr(args, "smoke_commands", None):
             return emit_result(
@@ -2112,7 +2129,8 @@ def cmd_config_set(args):
             "--max-rounds/--clear-max-rounds, --max-minutes/--clear-max-minutes, "
             "--max-tokens/--clear-max-tokens, --deadline/--clear-deadline, "
             "--push/--no-push, --scan-secrets/--no-scan-secrets, --report-lang, "
-            "--check-commands/--clear-check-commands, --smoke-commands/--clear-smoke-commands).",
+            "--check-commands/--clear-check-commands, --smoke-commands/--clear-smoke-commands, "
+            "--max-expansion-waves/--clear-max-expansion-waves).",
         )
 
     with io.run_lock(repo):
@@ -2178,6 +2196,21 @@ def cmd_expansion_record(args):
                     ", ".join(unknown), ", ".join(state.EXPANSION_LENSES)
                 ),
             )
+        # Checked only when a cap is configured, so uncapped runs pay no extra
+        # load. A capped run must not be able to open wave N+1 silently: the
+        # cap is the only bound on spend that does not depend on the diff-based
+        # token estimate (subagent tokens never enter it).
+        cap = config.load_config(repo).get("max_expansion_waves")
+        if cap is not None:
+            waves_used = state.expansion_wave_count(state.load_state(repo))
+            if waves_used >= cap:
+                io.append_log(repo, "expansion-wave", "error", reason="wave cap reached", waves_used=waves_used)
+                return emit_result(
+                    args, False,
+                    "[ERROR] Expansion wave cap reached ({}/{}): not recording another wave. Work the "
+                    "remaining backlog to a stop condition, or raise the cap with "
+                    "`config-set --max-expansion-waves N`.".format(waves_used, cap),
+                )
         if getattr(args, "dry_run", False):
             print(
                 "[DRY-RUN] Would record expansion wave with lenses: {}.".format(
@@ -3006,6 +3039,23 @@ def build_check_payload(repo, full=False):
         "remaining_minutes": remaining_minutes,
         "deadline_remaining_minutes": deadline_remaining,
     }
+    # Subagent spend from an expansion wave is invisible to max_tokens (that
+    # estimate counts diffs), so the wave cap is the bound that actually holds.
+    max_waves = cfg.get("max_expansion_waves")
+    waves_used = state.expansion_wave_count(st)
+    payload["expansion_budget"] = {
+        "waves_used": waves_used,
+        "max_waves": max_waves,
+        "waves_left": None if max_waves is None else max(0, max_waves - waves_used),
+    }
+    if max_waves is not None and waves_used >= max_waves and stop_reason is None:
+        # `warnings` is the same list object already bound into payload.
+        warnings.append(
+            "Expansion wave cap reached ({}/{}): stop expanding and work the remaining backlog to a "
+            "stop condition, or raise the cap with `config-set --max-expansion-waves N`. Note that "
+            "max_tokens does not see subagent spend (it estimates from diffs), so this cap is the "
+            "only hard bound on expansion cost.".format(waves_used, max_waves)
+        )
     if full:
         payload["state"] = st
         payload["config"] = cfg
