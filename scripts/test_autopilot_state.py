@@ -7238,6 +7238,49 @@ class FinishArchiveReportsTests(RepoTest):
         self.assertFalse(list(archived.glob("phase-report-round-*.md")))
 
 
+class ReportLayerUnitTests(unittest.TestCase):
+    """report 层三函数直测（此前 skip 的收尾）：合成最小 state，断言渲染
+    包含轮次/总结关键内容且不抛异常。"""
+
+    def setUp(self):
+        self.tmp = Path(tempfile.mkdtemp(prefix="report-layer-"))
+        self.addCleanup(shutil.rmtree, self.tmp, ignore_errors=True)
+        self.repo = self.tmp / "repo"
+        (self.repo / ".autopilot").mkdir(parents=True)
+        (self.repo / ".git").mkdir()
+        from autopilot import state as ap_state
+        self.st = ap_state
+        self.st.save_state(self.repo, {
+            "schema": "auto-iterate-state/1", "run_id": "run-x",
+            "repo": str(self.repo), "branch": "main",
+            "created_at": "2026-09-27T00:00:00+00:00",
+            "started_at": "2026-09-27T00:00:00+00:00",
+            "round": 1, "round_seq": 1, "blocked_rounds": 0,
+            "cancelled_rounds": 0, "completed_rounds": 1,
+            "estimated_tokens_used": 100, "goals": ["g1"], "completed_goals": [],
+            "expansion_waves": [], "history": [
+                {"round": 1, "status": "completed", "title": "first",
+                 "summary": "did things", "review_score": 4,
+                 "commit_sha": None, "estimated_tokens": 100},
+            ],
+            "finished_at": None, "run_start_sha": None,
+        })
+        self.cfg = {"report_lang": "zh", "goals": ["g1"], "branch_mode": "feature"}
+
+    def test_build_retrospective_and_report_render(self):
+        state_dict = self.st.load_state(self.repo)
+        retro = self.st.build_retrospective(self.repo, state_dict, self.cfg)
+        report = self.st.build_report(self.repo, state_dict, self.cfg)
+        self.assertIn("first", str(retro))
+        self.assertIn("first", str(report))
+
+    def test_write_phase_report_creates_file(self):
+        state_dict = self.st.load_state(self.repo)
+        self.st.write_phase_report(self.repo, state_dict, self.cfg)
+        reports = list((self.repo / ".autopilot").glob("phase-report-round-*.md"))
+        self.assertTrue(reports)
+
+
 class DashboardCmdTests(unittest.TestCase):
     """cmd_dashboard wiring (1.8.0 final review): config dashboard.auto_open is
     the default and --no-open forces it off; a busy --port exits with a clean
