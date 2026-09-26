@@ -148,6 +148,8 @@ Full verification every `verify_every_rounds` rounds (default 3), and always on 
 
 On a verification round: run each `check_commands` entry (or the project's test/build/lint) and require pass. On failure, fix and retry up to `retries_per_round` (default 3; the helper does not count retries — switch to `block-round` when exhausted). With no tests, keep changes low-risk and state the verification method in the summary.
 
+- **Prove the check harness can actually fail, and never read pass counters out of tool output**: a `check_commands` script that pipes test output through `tail`/`head`/`grep` exits with the *last* pipe element's status (always 0), so every round "passes" even when every test fails — write output to a log file and use the real exit code, or add `set -o pipefail`, then break one test once and confirm a non-zero exit. And `PASS=<digits>` is masked to `PASS=***` by the tool-output secret filter, so parse counts from a log file on disk instead of the literal number.
+
 ### 7. Commit
 
 Commits flush every `commit_every_rounds` rounds (default 5) as one batch — `commit` on a non-flush round prints a WARN naming the next flush round; committing early is allowed, but later rounds must not assume the batch was flushed. On stop mid-batch, flush before `finish`. Never stage `.autopilot/` unless `track_state: true` (staged `.autopilot/**` is refused even via `git add -f`).
