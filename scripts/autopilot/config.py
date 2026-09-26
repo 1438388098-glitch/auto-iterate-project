@@ -36,6 +36,7 @@ def default_config(repo):
         "review_threshold": None,
         "max_blocked_in_a_row": 2,
         "check_commands": [],
+        "smoke_commands": [],
         "track_state": False,
         "allow_paths": [],
         "deny_paths": [],
@@ -182,6 +183,12 @@ def validate_config(merged, source=None):
         _config_error(path, "'max_expansion_per_round' must be a non-negative integer or null", source)
     if not isinstance(merged["check_commands"], list) or not all(isinstance(c, str) for c in merged["check_commands"]):
         _config_error(path, "'check_commands' must be an array of strings", source)
+    # Declared cheap checks that run BETWEEN full verifications. Same shape as
+    # check_commands; separate key because the loop must not treat them as
+    # proof of correctness (see references/config.md).
+    smoke = merged.get("smoke_commands", [])
+    if not isinstance(smoke, list) or not all(isinstance(c, str) for c in smoke):
+        _config_error(path, "'smoke_commands' must be an array of strings", source)
     for key in ("allow_paths", "deny_paths", "secret_patterns"):
         if not isinstance(merged[key], list) or not all(isinstance(p, str) for p in merged[key]):
             _config_error(path, "'{}' must be an array of strings".format(key), source)

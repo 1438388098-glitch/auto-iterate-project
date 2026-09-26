@@ -10,6 +10,16 @@ agent reads, not the helper's runtime (0.58s per call).
 
 ### Added
 
+- `smoke_commands`: a declared place for the cheap between-verification check.
+  The loop verifies fully only every `verify_every_rounds` rounds and the
+  skill told it to "run a cheap smoke check when one is available" — with
+  nowhere to declare it, each round improvised, so the choice differed run to
+  run and left no trace in the config. New field (init `--smoke-commands`,
+  `config-set --smoke-commands`/`--clear-smoke-commands`), validated as an
+  array of strings, and `detect-verify` now reports `smoke_recommended`
+  (syntax-level checks per technology) as a suggestion only — it is never
+  auto-applied, and a test pins that `--apply` still writes only
+  `check_commands`.
 - `round-prep`: the loop's round start in one call. The payload is check's
   loop-driving JSON plus the suggested candidates (brief form), the fresh
   cached analysis, the standing directives and the round number `begin-round`

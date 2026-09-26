@@ -31,6 +31,28 @@ def _gitleaks_command():
     return None
 
 
+def detect_smoke_commands(repo):
+    """Suggest a cheap between-verification check per detected technology.
+
+    Suggestion only: the loop must not improvise its smoke check every round
+    (the choice then differs run to run and is invisible in the config), so
+    detect-verify reports these and the operator records one with
+    `config-set --smoke-commands`. Only syntax/type-level checks belong here —
+    a smoke command that runs the test suite is just the full verification
+    wearing a cheaper name."""
+    root = Path(repo)
+    signals = []
+    if (root / "pyproject.toml").exists() or (root / "setup.py").exists() or (root / "pytest.ini").exists() or (root / "setup.cfg").exists():
+        signals.append(("python", "python -m compileall -q ."))
+    if (root / "package.json").exists():
+        signals.append(("node", "npm run lint"))
+    if (root / "Cargo.toml").exists():
+        signals.append(("rust", "cargo check"))
+    if (root / "go.mod").exists():
+        signals.append(("go", "go vet ./..."))
+    return signals
+
+
 def detect_verify_commands(repo):
     """Return a list of (technology, command) pairs discovered from repo entry points."""
     root = Path(repo)

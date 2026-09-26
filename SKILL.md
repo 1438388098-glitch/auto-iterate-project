@@ -75,7 +75,7 @@ python <this-skill>/scripts/autopilot_state.py diagnose --repo <repo>
 6. Read `.autopilot/config.json` if present; otherwise initialize:
 
 ```powershell
-python <this-skill>/scripts/autopilot_state.py init --repo <repo> [--branch-mode feature] [--max-rounds N] [--max-minutes N] [--deadline "<expr>"] [--max-tokens N] [--goal "<goal>"] [--goals-from-prompt "<request>"] [--check-commands "<cmd>"] [--candidates-per-round N] [--commit-every-rounds N] [--verify-every-rounds N] [--checkpoint-every N] [--expand-after-goals] [--review-threshold N] [--report-lang zh|en]
+python <this-skill>/scripts/autopilot_state.py init --repo <repo> [--branch-mode feature] [--max-rounds N] [--max-minutes N] [--deadline "<expr>"] [--max-tokens N] [--goal "<goal>"] [--goals-from-prompt "<request>"] [--check-commands "<cmd>"] [--smoke-commands "<cmd>"] [--candidates-per-round N] [--commit-every-rounds N] [--verify-every-rounds N] [--checkpoint-every N] [--expand-after-goals] [--review-threshold N] [--report-lang zh|en]
 ```
 
 `--deadline` is the timer (定时器) stop: an absolute wall-clock moment. Accepts ISO (`2026-08-10T08:00:00`), relative (`+8h`, `+30min`, `+1d`, `+2w`), or local `HH:MM` (today, or tomorrow if already past). Complements `--max-minutes` (倒计时 = duration since last round activity). Ranking/recovery flags: see `references/config.md`.
@@ -146,7 +146,7 @@ Before verify, self-review the diff (`git diff --cached` after staging): scope c
 
 ### 6. Verify
 
-Full verification every `verify_every_rounds` rounds (default 3), and always on a commit round or before stop — never commit unverified work. Between those, run a cheap smoke check when available.
+Full verification every `verify_every_rounds` rounds (default 3), and always on a commit round or before stop — never commit unverified work. Between those, run the declared cheap check: `smoke_commands` in config (run `detect-verify` once to see what it suggests for this repo's technology, then record one with `config-set --smoke-commands '<cmd>'`). Record it rather than re-choosing every round — an improvised smoke check is invisible in the config and drifts between rounds. A smoke command is never proof: it must stay a syntax/type-level check, and a green smoke run does not excuse skipping the full verification on its boundary round.
 
 On a verification round: run each `check_commands` entry (or the project's test/build/lint) and require pass. On failure, fix and retry up to `retries_per_round` (default 3; the helper does not count retries — switch to `block-round` when exhausted). With no tests, keep changes low-risk and state the verification method in the summary.
 
@@ -262,7 +262,8 @@ An empty or thin backlog is **never** an escalation.
 - `push` — manual push of the run branch via an explicit non-force refspec (refuses while `push: false`).
 - `backlog-list` / `backlog-update` / `backlog-remove` / `backlog-pick` — backlog housekeeping (see `references/config.md`).
 - `directive-add` / `directive-list` / `directive-remove` — standing rules.
-- `detect-verify` — recommend `check_commands` (`--apply` writes them).
+- `round-prep` — the loop's round start in one call (check fields + candidates + cached analysis + directives).
+- `detect-verify` — recommend `check_commands` (`--apply` writes them) and report `smoke_recommended` (record one with `config-set --smoke-commands`).
 - `mine [--apply] [--kind K] [--limit N]` — deterministic repo mining into backlog candidates (first move when you do not know what to do). Every non-dry-run invocation appends to `state.mining_runs`; exhaustion = two consecutive runs with zero new findings.
 - Every state-changing command accepts `--dry-run`.
 

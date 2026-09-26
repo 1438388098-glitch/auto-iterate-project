@@ -15,7 +15,7 @@ from . import config, io, state
 from .guard import path_allowed
 from .secrets import scan_staged_diff
 from . import miner
-from .verify import detect_verify_commands
+from .verify import detect_smoke_commands, detect_verify_commands
 
 
 def emit_result(args, ok, message, data=None):
@@ -158,6 +158,8 @@ def cmd_init(args):
         cfg["track_state"] = True
     if args.check_commands:
         cfg["check_commands"] = args.check_commands
+    if getattr(args, "smoke_commands", None):
+        cfg["smoke_commands"] = args.smoke_commands
     if args.push:
         cfg["push"] = True
     if args.commit_message_prefix is not None:
@@ -2081,6 +2083,15 @@ def cmd_config_set(args):
             requested[name] = value
     if args.expand_after_goals is not None:
         requested["expand_after_goals"] = bool(args.expand_after_goals)
+    if getattr(args, "clear_smoke_commands", False):
+        if getattr(args, "smoke_commands", None):
+            return emit_result(
+                args, False,
+                "[ERROR] --smoke-commands and --clear-smoke-commands are mutually exclusive.",
+            )
+        requested["smoke_commands"] = []
+    elif getattr(args, "smoke_commands", None):
+        requested["smoke_commands"] = list(args.smoke_commands)
     if getattr(args, "clear_check_commands", False):
         if args.check_commands:
             return emit_result(
@@ -2100,7 +2111,8 @@ def cmd_config_set(args):
             "--commit-every-rounds, --verify-every-rounds, --checkpoint-every, "
             "--max-rounds/--clear-max-rounds, --max-minutes/--clear-max-minutes, "
             "--max-tokens/--clear-max-tokens, --deadline/--clear-deadline, "
-            "--push/--no-push, --scan-secrets/--no-scan-secrets, --report-lang).",
+            "--push/--no-push, --scan-secrets/--no-scan-secrets, --report-lang, "
+            "--check-commands/--clear-check-commands, --smoke-commands/--clear-smoke-commands).",
         )
 
     with io.run_lock(repo):
@@ -2341,7 +2353,15 @@ def cmd_detect_verify(args):
     repo = Path(args.repo).resolve()
     signals = detect_verify_commands(repo)
     commands = [cmd for _, cmd in signals]
-    payload = {"detected": [{"tech": tech, "command": cmd} for tech, cmd in signals], "commands": commands}
+    smoke = detect_smoke_commands(repo)
+    payload = {
+        "detected": [{"tech": tech, "command": cmd} for tech, cmd in signals],
+        "commands": commands,
+        # Report-only: recorded by the operator via config-set --smoke-commands,
+        # never applied behind their back (a wrong smoke command in config is
+        # worse than none, because the loop will trust it every round).
+        "smoke_recommended": [{"tech": tech, "command": cmd} for tech, cmd in smoke],
+    }
     payload["ok"] = bool(commands)
     payload["message"] = (
         "[OK] Detected {} verification command(s).".format(len(commands))
@@ -2375,6 +2395,10 @@ def cmd_detect_verify(args):
     print("Detected verification commands:")
     for tech, cmd in signals:
         print("  [{}] {}".format(tech, cmd))
+    if smoke:
+        print("Suggested cheap smoke commands (record one with config-set --smoke-commands):")
+        for tech, cmd in smoke:
+            print("  [{}] {}".format(tech, cmd))
     return 0
 
 
