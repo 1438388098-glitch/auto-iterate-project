@@ -191,6 +191,11 @@
 
   function fmt(v) { return v === null || v === undefined ? "—" : String(v); }
 
+  function maxRounds() {
+    return (snapshot && snapshot.status && snapshot.status.budget
+      && snapshot.status.budget.max_rounds) || null;
+  }
+
   function escapeHtml(s) {
     return String(s === null || s === undefined ? "" : s)
       .replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;")
@@ -367,7 +372,7 @@
     var tokens = budget.estimated_tokens_used;
     if (tokens === null || tokens === undefined) tokens = 0;
 
-    $("stat-rounds").textContent = "轮次 " + fmt(st.round) + " / " + fmt(st.round_seq);
+        $("stat-rounds").textContent = "轮次 " + fmt(st.round) + " / " + fmt(maxRounds());
     // max_minutes 无预算口径，百分比一期不做：如实显示累计 tokens
     $("stat-budget").textContent = "tokens " + tokens;
     $("stat-backlog").textContent = "backlog " + (backlog.pending === null

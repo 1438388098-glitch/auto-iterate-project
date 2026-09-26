@@ -467,6 +467,8 @@ def build_snapshot(repo, gitio=None):
                 "max_minutes": (config.get("max_minutes")
                                 if isinstance(config, dict) else None),
                 "estimated_tokens_used": state.get("estimated_tokens_used") or 0,
+                "max_rounds": (config.get("max_rounds")
+                               if isinstance(config, dict) else None),
             },
             "goals": {"total": len(state.get("goals") or []),
                       "met": len(state.get("completed_goals") or [])},

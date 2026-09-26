@@ -7706,7 +7706,7 @@ class DashboardSnapshotTests(AutopilotTestBase):
         self.assertEqual(snap["status"]["completed_rounds"], 1)  # 从 history 统计
         self.assertEqual(snap["status"]["goals"], {"total": 2, "met": 1})
         self.assertEqual(snap["status"]["budget"],
-                         {"max_minutes": None, "estimated_tokens_used": 4200})
+                         {"max_minutes": None, "estimated_tokens_used": 4200, "max_rounds": 10})
         self.assertEqual(snap["status"]["expansion_waves"], 1)
         self.assertEqual(snap["status"]["backlog"],
                          {"total": 0, "pending": 0, "ready": 0, "candidates": []})
