@@ -6789,6 +6789,7 @@ class DashboardDataTests(unittest.TestCase):
         self.assertNotIn("其他", by_name)                       # 不可达域名不得存在
         self.assertEqual(by_name["测试"]["modules"][0]["path"], "scripts/test_autopilot_state.py")
         self.assertEqual(by_name["测试"]["weight"], 1.0)        # touches 最大者归一为 1
+        self.assertEqual(by_name["测试"]["meaning"], dd.BUILTIN_DOMAIN_MEANINGS["测试"])
         self.assertLess(by_name["工具与脚本"]["weight"], by_name["测试"]["weight"])
         self.assertEqual([d["name"] for d in domains], ["测试", "工具与脚本", "文档与知识", "配置与入口"])
         tools = by_name["工具与脚本"]

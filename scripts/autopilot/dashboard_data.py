@@ -148,11 +148,13 @@ def _builtin_domain(path):
 def aggregate_modules(file_changes, domain_map):
     """Group {path: change} (compute_round_file_changes 的产物) into domain
     trees. domain_map 以最长前缀命中且优先于内置启发式；自定义域名与内置撞名
-    且未给 meaning 时回退内置默认释义，全新域名未给 meaning 则留空。每域聚合
+    且未给 meaning 时回退内置默认释义，全新域名未给 meaning 则留空；同域多条目
+    时首个非空 meaning 胜出（依赖 file_changes 插入序）。每域聚合
     first_round（min，None 轮号不参与）、active_rounds（并集，None 排最后）、
     weight（touches 对最忙域归一，最忙 = 1.0）与按 touches 降序的 modules；
-    域本身也按 touches 降序，保证快照间树形稳定。模块字段遵循快照契约
-    （设计文档 §3.1）：{name, path, first_round, churn, files}。空输入返回 []。"""
+    域本身也按 touches 降序，同分按域名典序，保证快照间树形稳定。模块字段
+    遵循快照契约（设计文档 §3.1）：{name, path, first_round, churn, files}。
+    空输入返回 []。"""
     domains = {}
     for path, ch in file_changes.items():
         mapped = _match_domain_map(path, domain_map)
@@ -181,9 +183,10 @@ def aggregate_modules(file_changes, domain_map):
         }
     max_touches = max((d["touches"] for d in domains.values()), default=1) or 1
     result = []
-    for name in sorted(domains, key=lambda n: -domains[n]["touches"]):
+    for name in sorted(domains, key=lambda n: (-domains[n]["touches"], n)):
         d = domains[name]
-        modules = sorted(d["modules"].values(), key=lambda m: -m["churn"]["touches"])
+        modules = sorted(d["modules"].values(),
+                         key=lambda m: (-m["churn"]["touches"], m["path"]))
         result.append({
             "id": name, "name": name, "meaning": d["meaning"],
             "first_round": d["first_round"],
