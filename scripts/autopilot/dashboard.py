@@ -5,9 +5,13 @@ a dead server's pid may be reused by the OS, so info_alive can false-positive
 on an unrelated process; the info file is short-lived and probe-only."""
 
 import json
+import os
+import signal
 import subprocess
 import sys
+import threading
 import time
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 
 from . import io
@@ -55,8 +59,6 @@ def clear_stale_info(repo):
 
 
 def _terminate(pid):
-    import os
-    import signal
     try:
         os.kill(pid, signal.SIGTERM)
     except OSError:
@@ -118,3 +120,123 @@ def ensure_dashboard(repo, config):
     if info_alive(repo):
         return read_info(repo)
     return spawn_server(repo, config)
+
+
+# ---- HTTP server (Task 8) ----
+
+# 单槽快照缓存：serve() 每进程只服务一个 repo，槽位足够。key 是受监视文件的
+# mtime_ns 元组（缺失文件记 None，no-run repo 也能稳定命中）；TTL 兜底约束
+# key 看不见的变化的陈旧上限。
+_snapshot_cache = {"key": None, "snapshot": None, "at": 0.0}
+
+
+def invalidate_snapshot_cache():
+    """Force the next get_snapshot() to rebuild. The mtime key already
+    self-invalidates when a watched file is rewritten; this is the explicit
+    seam for callers/tests that know state changed another way."""
+    _snapshot_cache["key"] = None
+
+
+def _cache_key(repo):
+    from . import dashboard_data as dd
+    names = (io.STATE_FILENAME, io.BACKLOG_FILENAME,
+             io.ANALYSIS_FILENAME, io.CONFIG_FILENAME)
+    mtimes = []
+    for name in names:
+        p = dd._autopilot_dir(repo) / name
+        try:
+            mtimes.append(p.stat().st_mtime_ns)
+        except OSError:
+            mtimes.append(None)
+    return tuple(mtimes)
+
+
+def get_snapshot(repo):
+    """build_snapshot with a one-slot cache: repeated browser polling between
+    state writes returns the identical dict (stable generated_at) instead of
+    re-running the growth pipeline per request; a changed mtime or the TTL
+    (SNAPSHOT_TTL_SECONDS) triggers one rebuild."""
+    key = _cache_key(repo)
+    now = time.time()
+    if _snapshot_cache["key"] == key and _snapshot_cache["snapshot"] is not None \
+            and now - _snapshot_cache["at"] < SNAPSHOT_TTL_SECONDS:
+        return _snapshot_cache["snapshot"]
+    from . import dashboard_data as dd
+    snapshot = dd.build_snapshot(repo)
+    _snapshot_cache.update(key=key, snapshot=snapshot, at=now)
+    return snapshot
+
+
+def _make_handler(repo):
+    page_path = Path(__file__).resolve().parent / "dashboard.html"
+
+    class Handler(BaseHTTPRequestHandler):
+        def _send(self, code, body, ctype):
+            self.send_response(code)
+            self.send_header("Content-Type", ctype)
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+
+        def do_GET(self):
+            Handler.last_request_at = time.time()
+            if self.path == "/" or self.path.startswith("/?"):
+                # 每请求现读磁盘：改页面无需重启服务器，也无需预缓存。
+                self._send(200, page_path.read_bytes(), "text/html; charset=utf-8")
+            elif self.path == "/api/snapshot":
+                try:
+                    body = json.dumps(get_snapshot(repo), ensure_ascii=False).encode("utf-8")
+                    self._send(200, body, "application/json; charset=utf-8")
+                except Exception as err:                      # 单请求异常不杀进程
+                    body = json.dumps({"error": "internal", "detail": str(err)}).encode("utf-8")
+                    self._send(500, body, "application/json; charset=utf-8")
+            else:
+                self._send(404, b'{"error": "not-found"}', "application/json")
+
+        def log_message(self, *args):                         # 静默访问日志
+            pass
+
+    Handler.last_request_at = time.time()
+    return Handler
+
+
+def start_in_thread(repo, host="127.0.0.1"):
+    """Test/dev entry: serve on a random port in a daemon thread. Returns
+    (server, port) — caller must server.shutdown()."""
+    handler = _make_handler(repo)
+    server = ThreadingHTTPServer((host, 0), handler)
+    port = server.server_address[1]
+    write_info(repo, {"pid": os.getpid(), "port": port,
+                      "started_at": io.now_iso(), "opened": False})
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    return server, port
+
+
+def serve(repo, port=0, auto_open=True, host="127.0.0.1"):
+    """Blocking entry for `autopilot dashboard --serve`: write dashboard.json,
+    open the browser once, serve requests from a daemon thread, and self-exit
+    after IDLE_TIMEOUT_SECONDS without a request (main-thread watchdog, every
+    60s; last_request_at starts at server start, so a never-visited server
+    also retires). Exit path shuts the server down, closes the socket and
+    removes the info file."""
+    handler = _make_handler(repo)
+    server = ThreadingHTTPServer((host, port), handler)
+    port = server.server_address[1]
+    write_info(repo, {"pid": os.getpid(), "port": port,
+                      "started_at": io.now_iso(), "opened": False})
+    if auto_open:
+        import webbrowser
+        try:
+            webbrowser.open("http://{}:{}/".format(host, port))
+        except Exception:
+            pass
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    while True:
+        time.sleep(60)
+        if time.time() - server.RequestHandlerClass.last_request_at > IDLE_TIMEOUT_SECONDS:
+            break
+    server.shutdown()
+    server.server_close()
+    _info_path(repo).unlink(missing_ok=True)

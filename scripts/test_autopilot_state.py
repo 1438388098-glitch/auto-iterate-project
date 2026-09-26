@@ -7088,5 +7088,70 @@ class DashboardPageContractTests(unittest.TestCase):
             self.assertIn(token, html)
 
 
+class DashboardServerTests(unittest.TestCase):
+    """HTTP half of the 1.8 dashboard (Task 8): the two endpoints on a real
+    loopback server (random port, daemon thread), the mtime-keyed snapshot
+    cache and the read-only guarantee. Repo fixture mirrors
+    DashboardLifecycleTests (fake .git, no state run)."""
+
+    def setUp(self):
+        self.repo = Path(tempfile.mkdtemp(prefix="dashboard-server-"))
+        (self.repo / ".git").mkdir()
+        self.addCleanup(shutil.rmtree, self.repo, ignore_errors=True)
+
+    def _start(self):
+        from autopilot import dashboard as ap_dash
+        server, port = ap_dash.start_in_thread(self.repo)
+        # addCleanup 是 LIFO：server_close 注册在前，实际先执行 shutdown
+        # 停掉 serve_forever、再关监听 socket，避免 unclosed-socket 告警。
+        self.addCleanup(server.server_close)
+        self.addCleanup(server.shutdown)
+        return port
+
+    def test_endpoints_and_readonly(self):
+        import json as _json
+        import urllib.error
+        import urllib.request
+        port = self._start()
+        base = "http://127.0.0.1:{}".format(port)
+        with urllib.request.urlopen(base + "/", timeout=5) as resp:
+            self.assertEqual(resp.status, 200)
+            self.assertIn("text/html", resp.headers["Content-Type"])
+        with urllib.request.urlopen(base + "/api/snapshot", timeout=5) as resp:
+            snap = _json.loads(resp.read().decode("utf-8"))
+            self.assertEqual(snap, {"error": "no-run"})
+        try:
+            urllib.request.urlopen(base + "/nope", timeout=5)
+            self.fail("expected 404")
+        except urllib.error.HTTPError as err:
+            self.assertEqual(err.code, 404)
+        # 只读保证：请求前后 .autopilot 目录内容一致
+        ap_dir = self.repo / ".autopilot"
+        before = sorted(p.name for p in ap_dir.glob("*")) if ap_dir.exists() else []
+        with urllib.request.urlopen(base + "/api/snapshot", timeout=5):
+            pass
+        after = sorted(p.name for p in ap_dir.glob("*")) if ap_dir.exists() else []
+        self.assertEqual(before, after)
+
+    def test_cached_snapshot_hits_until_invalidated(self):
+        import json as _json
+        import urllib.request
+        from autopilot import dashboard as ap_dash
+        # 缓存断言读 meta.generated_at，而 no-run repo 只返回
+        # {"error": "no-run"}：先种一个最小 state.json（空对象即可，
+        # build_snapshot 照常组装全板块 meta）。
+        ap_dir = self.repo / ".autopilot"
+        ap_dir.mkdir()
+        (ap_dir / "state.json").write_text("{}", encoding="utf-8")
+        port = self._start()
+        base = "http://127.0.0.1:{}/api/snapshot".format(port)
+        first = _json.loads(urllib.request.urlopen(base, timeout=5).read())
+        second = _json.loads(urllib.request.urlopen(base, timeout=5).read())
+        self.assertEqual(first["meta"]["generated_at"], second["meta"]["generated_at"])
+        ap_dash.invalidate_snapshot_cache()
+        third = _json.loads(urllib.request.urlopen(base, timeout=5).read())
+        self.assertNotEqual(second["meta"]["generated_at"], third["meta"]["generated_at"])
+
+
 if __name__ == "__main__":
     unittest.main()

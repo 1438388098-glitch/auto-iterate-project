@@ -289,6 +289,14 @@ def cmd_read(args):
     return 0
 
 
+def cmd_dashboard(args):
+    from autopilot import dashboard as ap_dash
+    repo = Path(args.repo).resolve()
+    if args.stop:
+        sys.exit(0 if ap_dash.stop_server(repo) else 2)
+    ap_dash.serve(repo, port=args.port, auto_open=args.auto_open)
+
+
 def cmd_begin_round(args):
     repo = Path(args.repo).resolve()
     refused = _require_initialized(args, repo)

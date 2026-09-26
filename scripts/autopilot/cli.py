@@ -112,6 +112,14 @@ def build_parser():
     read_parser.add_argument("--repo", default=".")
     read_parser.set_defaults(func=commands.cmd_read)
 
+    dash_parser = subparsers.add_parser("dashboard", help="Run the read-only observation dashboard")
+    dash_parser.add_argument("--repo", default=".")
+    dash_parser.add_argument("--serve", action="store_true", help="run the server in the foreground (default)")
+    dash_parser.add_argument("--port", type=int, default=0)
+    dash_parser.add_argument("--no-open", dest="auto_open", action="store_false", default=True)
+    dash_parser.add_argument("--stop", action="store_true", help="stop a running dashboard")
+    dash_parser.set_defaults(func=commands.cmd_dashboard)
+
     diagnose_parser = subparsers.add_parser("diagnose", help="Inspect repository health and git environment")
     diagnose_parser.add_argument("--repo", default=".")
     diagnose_parser.set_defaults(func=commands.cmd_diagnose)
