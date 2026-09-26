@@ -96,6 +96,9 @@ def compute_round_file_changes(repo, history, run_start_sha, gitio=None):
         # 同批多轮共享同一 sha，随后各轮 prev==sha 产生空 diff——行数归属在
         # 批次边界，依然真实。
         sha = entry.get("commit_sha") or entry.get("batch_commit_sha")
+        if sha and sha == prev:
+            # 同批多轮共享同一回填 sha：无新改动可 diff，静默跳过
+            continue
         if sha:
             base = prev or io.EMPTY_TREE
             raw = run_git(repo, "diff", "--numstat", "{}..{}".format(base, sha))

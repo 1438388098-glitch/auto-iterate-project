@@ -7509,8 +7509,8 @@ class DashboardDataTests(unittest.TestCase):
         self.assertEqual(changes["m1.py"]["first_round"], 1)
         self.assertEqual(changes["m1.py"]["insertions"], 4)
         self.assertEqual(changes["m2.py"]["first_round"], 3)
-        self.assertEqual([c[3] for c in calls if c[0] == "diff"],
-                         ["000..aaa", "aaa..bbb"])   # 同批第二轮不重复 diff
+        diff_ranges = [c[2] for c in calls if c[0] == "diff"]
+        self.assertEqual(diff_ranges, ["000..aaa", "aaa..bbb"])   # 同批第二轮不重复 diff
 
     def test_compute_round_file_changes_git_failure_degrades_to_none(self):
         """A failed git diff (run_git -> None) must degrade to None: silently
