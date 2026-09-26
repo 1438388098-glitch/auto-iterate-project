@@ -7074,10 +7074,11 @@ class DashboardSnapshotTests(AutopilotTestBase):
 
 
 class DashboardPageContractTests(unittest.TestCase):
-    """dashboard.html page contract (1.8.0 dashboard Task 9): the page ships
-    inside the package (the HTTP server reads it straight from there) and
-    carries the dual-theme design tokens plus the single reduced-motion
-    degradation block."""
+    """dashboard.html page contract (1.8.0 dashboard Task 9 + Task 10): the
+    page ships inside the package (the HTTP server reads it straight from
+    there), carries the dual-theme design tokens plus the single
+    reduced-motion degradation block, and only reads snapshot fields that
+    build_snapshot actually emits (API-drift guard)."""
 
     PAGE = (Path(autopilot.__file__).resolve().parent / "dashboard.html")
 
@@ -7086,6 +7087,15 @@ class DashboardPageContractTests(unittest.TestCase):
         for token in ("--bg", "--surface", "--accent", "prefers-color-scheme",
                       "prefers-reduced-motion"):
             self.assertIn(token, html)
+
+    def test_page_api_references_exist_in_snapshot_shape(self):
+        import re
+        html = self.PAGE.read_text(encoding="utf-8")
+        refs = {m.group(1).split(".")[0]
+                for m in re.finditer(r"\bsnapshot\.([A-Za-z_][A-Za-z0-9_]*)", html)}
+        self.assertTrue(refs, "page must reference snapshot fields")
+        allowed = {"meta", "status", "growth", "narrative", "error"}
+        self.assertLessEqual(refs, allowed)
 
 
 class DashboardServerTests(unittest.TestCase):
