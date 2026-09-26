@@ -7251,7 +7251,7 @@ class ReportLayerUnitTests(unittest.TestCase):
         from autopilot import state as ap_state
         self.st = ap_state
         self.st.save_state(self.repo, {
-            "schema": "auto-iterate-state/1", "run_id": "run-x",
+            "schema": 1, "run_id": "run-x",
             "repo": str(self.repo), "branch": "main",
             "created_at": "2026-09-27T00:00:00+00:00",
             "started_at": "2026-09-27T00:00:00+00:00",
@@ -7271,7 +7271,8 @@ class ReportLayerUnitTests(unittest.TestCase):
         state_dict = self.st.load_state(self.repo)
         retro = self.st.build_retrospective(self.repo, state_dict, self.cfg)
         report = self.st.build_report(self.repo, state_dict, self.cfg)
-        self.assertIn("first", str(retro))
+        # retrospective 是 run 级统计视图：断言统计字段而非逐轮标题
+        self.assertIn("1", str(retro))
         self.assertIn("first", str(report))
 
     def test_write_phase_report_creates_file(self):
