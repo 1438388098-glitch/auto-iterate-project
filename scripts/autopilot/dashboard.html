@@ -122,6 +122,10 @@
         <div class="goalbar"><i id="goal-fill"></i></div>
         <span id="goal-side" class="mono" style="font-size:10.5px;color:var(--txt3)">—</span>
       </div>
+      <div class="goalrow" style="display:block">
+        <h3 style="margin-bottom:8px">迭代方向</h3>
+        <div id="directions"></div>
+      </div>
     </div>
   </div>
 
@@ -262,7 +266,28 @@
     $("play").style.opacity = "0.4";   // 无运行：回放不可用（与降级口径一致）
   }
 
-  function renderAll() { renderStats(); renderTree(); renderEvents(); }
+  function renderAll() { renderStats(); renderTree(); renderEvents(); renderDirections(); }
+
+  // ---- 迭代方向板块：skill 下一步想做什么（价值序待办，供用户检验方向）----
+  function renderDirections() {
+    var host = $("directions");
+    if (!host) return;
+    var cands = ((snapshot && snapshot.status && snapshot.status.backlog) || {}).candidates || [];
+    if (!cands.length) {
+      host.innerHTML = '<div style="font-size:11px;color:var(--txt3);padding:6px 0">'
+        + "暂无待办——供给由 mine / Deep Expansion 补充</div>";
+      return;
+    }
+    host.innerHTML = cands.map(function (c) {
+      return '<div style="display:flex;gap:8px;align-items:baseline;padding:5px 0;'
+        + 'border-bottom:1px solid var(--surface2);font-size:11.5px">'
+        + '<span class="mono" style="color:var(--txt3);font-size:10px;flex:none">'
+        + "v" + fmt(c.value) + " e" + fmt(c.effort) + "</span>"
+        + '<span style="color:var(--txt)">' + escapeHtml(c.title || "") + "</span>"
+        + '<span class="mono" style="margin-left:auto;color:var(--txt3);font-size:10px;flex:none">'
+        + escapeHtml(c.type || "") + "</span></div>";
+    }).join("");
+  }
 
   // ---- 统计行 / 顶栏 / 目标条 / 回放轴 ----
   function renderStats() {

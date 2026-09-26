@@ -2,6 +2,42 @@
 
 All notable changes to auto-iterate-project are documented here.
 
+## 1.9.0 (2026-09-26)
+
+Self-hosted night run #2: the loop iterated on itself with the 1.8
+observation dashboard open the whole time — and the first thing the panel
+exposed was that the loop's own batch-commit cadence kept the evolution tree
+degraded. 1.9 fixes that, and pays down the runner's own friction.
+
+### Added
+
+- Evolution-tree run-level fallback: when history carries no per-round shas
+  (the default batch-commit cadence), build_snapshot aggregates
+  run_start_sha..HEAD into domains/modules and labels it
+  `growth.granularity: "run"` instead of switching the tree off; the panel
+  shows a coarse-grained banner and disables replay honestly. The dashboard
+  is a live panel on this very repository now.
+- Iteration-direction panel (the last of the original four sections): the
+  snapshot exposes the top pending backlog candidates (value-ordered, lean
+  fields) and the right column renders them as a board.
+- Test layering: `scripts/test_autopilot_state.py --smoke` runs the 39 fast
+  classes in ~25s (14x faster than the full 343s suite) for between-round
+  checks; `--time-report` re-measures per-class cost; smoke warns past the
+  60s promise line so the slow-class list cannot silently drift.
+
+### Fixed
+
+- markers scanner self-reference: miner.py's own MARKER_RE pattern, comments
+  and docstring matched the scanner (candidates 177/178/179 were phantoms);
+  scan_markers now skips its own syntax-definition file.
+- `serve()` started serving only after `webbrowser.open` returned — a slow
+  browser spawn left the socket bound but deaf; serve first, open second.
+
+### Tests
+
+- 532 → 536 (dashboard run-level fallback, direction panel, scanner
+  self-scan; plus smoke/time-report entry points).
+
 ## 1.8.0 (2026-09-26)
 
 The read-only observation dashboard: a self-hosted web panel that opens when

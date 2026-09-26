@@ -440,9 +440,22 @@ def _backlog_summary(path):
         candidates = []
     pending = [c for c in candidates
                if isinstance(c, dict) and c.get("status") == "pending"]
+    # 迭代方向板块（原始设计四板块之一）：价值序待办明细，供右栏看板。
+    # 只取精简字段——快照是只读聚合，不搬运整个 backlog。
+    def _score(c):
+        v = c.get("score")
+        return v if isinstance(v, (int, float)) else 0.0
+
+    top_pending = [
+        {"id": c.get("id"), "title": c.get("title"),
+         "value": c.get("value"), "effort": c.get("effort"),
+         "type": c.get("type"), "score": _score(c)}
+        for c in sorted(pending, key=_score, reverse=True)[:6]
+    ]
     return {
         "total": len(candidates),
         "pending": len(pending),
         "ready": sum(1 for c in pending
                      if isinstance(c.get("value"), (int, float)) and c["value"] >= 4),
+        "candidates": top_pending,
     }

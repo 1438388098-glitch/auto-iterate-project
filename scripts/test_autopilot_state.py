@@ -6704,7 +6704,7 @@ class MinerMarkerSelfScanTests(unittest.TestCase):
         miner = self.repo / "scripts" / "autopilot" / "miner.py"
         miner.parent.mkdir(parents=True)
         miner.write_text(
-            'MARKER_RE = re.compile(r"\b(TODO|FIXME|HACK|XXX)\b[:\s-]*(.*)$", re.I)\n'
+            'MARKER_RE = re.compile(r"\b(TODO|FIXME|HACK|XXX)\b[:\\s-]*(.*)$", re.I)\n'
             '# Doc extensions whose TODO markers are docs work.\n'
             'def scan_markers(repo, limit=30):\n'
             '    """TODO/FIXME/HACK/XXX markers with file:line."""\n',
@@ -7087,7 +7087,7 @@ class DashboardSnapshotTests(AutopilotTestBase):
                          {"max_minutes": None, "estimated_tokens_used": 4200})
         self.assertEqual(snap["status"]["expansion_waves"], 1)
         self.assertEqual(snap["status"]["backlog"],
-                         {"total": 0, "pending": 0, "ready": 0})
+                         {"total": 0, "pending": 0, "ready": 0, "candidates": []})
         self.assertEqual(snap["growth"]["domains"], [])
         self.assertEqual(snap["growth"]["rounds"], [])
         self.assertEqual(len(snap["growth"]["events"]), 1)       # 事件仍产出
@@ -7208,6 +7208,32 @@ class DashboardSnapshotTests(AutopilotTestBase):
         self.assertIn("growth", snap["meta"]["degraded"])
         self.assertEqual(snap["growth"]["domains"], [])
 
+    def test_snapshot_backlog_candidates_for_direction_panel(self):
+        """迭代方向板块（原始设计四板块之一）：snapshot 暴露 pending 候选
+        明细（价值序，含 value/effort/type/score），供右栏看板渲染。"""
+        from autopilot import dashboard_data as dd
+        self._seed_state(history=[])
+        ap_io.save_json(self.repo / ".autopilot" / "backlog.json", {
+            "next_id": 3,
+            "candidates": [
+                {"id": "candidate-1", "title": "low", "value": 2, "effort": 1,
+                 "type": "refactor", "status": "pending", "score": 0.5},
+                {"id": "candidate-2", "title": "high", "value": 5, "effort": 2,
+                 "type": "bugfix", "status": "pending", "score": 2.4},
+                {"id": "candidate-3", "title": "done", "value": 5, "effort": 2,
+                 "type": "bugfix", "status": "completed", "score": 9.9},
+            ],
+        })
+        snap = dd.build_snapshot(self.repo)
+        cands = snap["status"]["backlog"]["candidates"]
+        self.assertEqual([c["id"] for c in cands], ["candidate-2", "candidate-1"])
+        self.assertEqual(cands[0],
+                         {"id": "candidate-2", "title": "high", "value": 5,
+                          "effort": 2, "type": "bugfix", "score": 2.4})
+        # 候选缺失/损坏时板块降级为空清单而非崩溃（no-run 仓库路径）
+        snap2 = dd.build_snapshot(self.repo)   # backlog 仍在：不崩
+        self.assertEqual(snap2["status"]["backlog"]["candidates"], cands)
+
     def test_snapshot_corrupt_state_degrades_all(self):
         from autopilot import dashboard_data as dd
         (self.repo / ".autopilot").mkdir()
@@ -7224,7 +7250,7 @@ class DashboardSnapshotTests(AutopilotTestBase):
         from autopilot import dashboard_data as dd
         path = self.repo / ".autopilot" / "backlog.json"
         self.assertEqual(dd._backlog_summary(path),            # 缺失 → 全 0
-                         {"total": 0, "pending": 0, "ready": 0})
+                         {"total": 0, "pending": 0, "ready": 0, "candidates": []})
         # 真实结构（本仓库实测）：{"next_id": n, "candidates": […]}，status
         # 值域 pending/picked/completed/blocked，候选带 1-5 的 value 整数。
         ap_io.save_json(path, {"next_id": 6, "candidates": [
@@ -7235,13 +7261,23 @@ class DashboardSnapshotTests(AutopilotTestBase):
             {"id": "candidate-005", "status": "picked", "value": 5},
         ]})
         self.assertEqual(dd._backlog_summary(path),
-                         {"total": 5, "pending": 3, "ready": 2})
+                         {"total": 5, "pending": 3, "ready": 2,
+                          "candidates": [
+                              {"id": "candidate-001", "title": None, "value": 5,
+                               "effort": None, "type": None, "score": 0.0},
+                              {"id": "candidate-002", "title": None, "value": 4,
+                               "effort": None, "type": None, "score": 0.0},
+                              {"id": "candidate-003", "title": None, "value": 3,
+                               "effort": None, "type": None, "score": 0.0},
+                          ]})
         path.write_text("{oops", encoding="utf-8")             # 坏 JSON 降级全 0
         self.assertEqual(dd._backlog_summary(path),
-                         {"total": 0, "pending": 0, "ready": 0})
+                         {"total": 0, "pending": 0, "ready": 0, "candidates": []})
         ap_io.save_json(path, [{"status": "pending", "value": 5}])  # 裸 list 容忍
         self.assertEqual(dd._backlog_summary(path),
-                         {"total": 1, "pending": 1, "ready": 1})
+                         {"total": 1, "pending": 1, "ready": 1,
+                          "candidates": [{ "id": None, "title": None, "value": 5,
+                              "effort": None, "type": None, "score": 0.0}]})
 
     def test_compute_round_stats_mirrors_anchor_rules(self):
         """与 compute_round_file_changes 同一条锚点走查：NO_ANCHOR 轮不产生
@@ -7432,8 +7468,15 @@ def _run_smoke():
             count += 1
     t0 = time.time()
     result = unittest.TextTestRunner(verbosity=1).run(suite)
+    elapsed = time.time() - t0
     print("[smoke] %d classes, %.1fs (excluded %d slow classes)"
-          % (count, time.time() - t0, len(slow)))
+          % (count, elapsed, len(slow)))
+    # seed-001 对账：60s 是轮间快检的承诺线。既有类变慢（如新增子进程测试）
+    # 会无声击穿它——超线即提示重跑 --time-report 刷新 SLOW_TEST_CLASSES。
+    if elapsed > 60:
+        print("[smoke-warn] %.0fs 超过 60s 承诺线：慢类清单可能已漂移，"
+              "运行 py -3.13 scripts/test_autopilot_state.py --time-report 对账"
+              % elapsed, file=sys.stderr)
     return 0 if result.wasSuccessful() else 1
 
 
