@@ -20,10 +20,19 @@ degraded. 1.9 fixes that, and pays down the runner's own friction.
 - Iteration-direction panel (the last of the original four sections): the
   snapshot exposes the top pending backlog candidates (value-ordered, lean
   fields) and the right column renders them as a board.
-- Test layering: `scripts/test_autopilot_state.py --smoke` runs the 39 fast
+- Test layering: `scripts/test_autopilot_state.py --smoke` runs the fast
   classes in ~25s (14x faster than the full 343s suite) for between-round
   checks; `--time-report` re-measures per-class cost; smoke warns past the
   60s promise line so the slow-class list cannot silently drift.
+- Full-suite parallelization: `--jobs N` runs test classes in a process pool
+  (455s -> 153s at 6 workers); `--jobs 4 --smoke` parallelizes the
+  between-round check too (25s -> 13s).
+- `--time-report --update-slow` rewrites the SLOW_TEST_CLASSES block from a
+  fresh per-class measurement (no more hand-copying the snapshot).
+- `finish --archive-reports` copies phase reports and the retrospective into
+  `docs/autopilot/` so the run's record survives the merge.
+- Trend lines (self-review score / files changed per round) in the panel's
+  review section; overview.md gains the dashboard feature entry.
 
 ### Fixed
 
@@ -32,12 +41,15 @@ degraded. 1.9 fixes that, and pays down the runner's own friction.
   scan_markers now skips its own syntax-definition file.
 - `serve()` started serving only after `webbrowser.open` returned — a slow
   browser spawn left the socket bound but deaf; serve first, open second.
+- `analysis_validity` crashed on a corrupt analysis.json (io.load_json's
+  SystemExit escaped); it now degrades to "stale".
+- `docs/README.legacy.md` pointed its changelog link at a nonexistent path.
 
 ### Tests
 
-- 532 → 537 (dashboard run-level fallback, touched-file per-round
-  attribution, direction panel, scanner
-  self-scan; plus smoke/time-report entry points).
+- 532 → 576 (dashboard run-level fallback, touched-file per-round
+  attribution, direction panel, scanner self-scan; report/view-layer direct
+  tests; smoke/time-report entry points; parallel runner).
 
 ## 1.8.0 (2026-09-26)
 
