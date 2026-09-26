@@ -8075,12 +8075,40 @@ def _run_parallel(class_names, jobs):
     return 1 if bad else 0
 
 
+def _run_parallel_smoke(jobs):
+    """smoke 子集的并行版：同 _run_parallel 但目标是 smoke 类集合
+    （全量减 SLOW_TEST_CLASSES），轮间验证进一步压缩。"""
+    import multiprocessing
+    slow = set(SLOW_TEST_CLASSES)
+    targets = sorted(n for n, o in globals().items()
+                     if isinstance(o, type) and issubclass(o, unittest.TestCase)
+                     and o.__module__ == __name__ and n not in slow)
+    t0 = time.time()
+    with multiprocessing.Pool(processes=jobs) as pool:
+        results = pool.map(_parallel_worker, targets)
+    bad = []
+    total = 0
+    for r in results:
+        total += r["ran"]
+        if r["problems"]:
+            bad.append(r["name"])
+            print("[FAIL] {} ({}s)".format(r["name"], r["seconds"]))
+            for p in r["problems"]:
+                print(p)
+    print("[smoke-parallel jobs={}] {} classes, {} tests, {:.1f}s".format(
+        jobs, len(results), total, time.time() - t0))
+    return 1 if bad else 0
+
+
 if __name__ == "__main__":
     argv = sys.argv[1:]
     if "--jobs" in argv:
         i = argv.index("--jobs")
         jobs = int(argv[i + 1])
         rest = argv[i + 2:]
+        if "--smoke" in rest:
+            rest.remove("--smoke")
+            sys.exit(_run_parallel_smoke(jobs))
         sys.exit(_run_parallel(rest or None, jobs))
     elif "--time-report" in argv:
         argv.remove("--time-report")
