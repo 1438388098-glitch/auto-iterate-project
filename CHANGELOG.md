@@ -35,7 +35,8 @@ degraded. 1.9 fixes that, and pays down the runner's own friction.
 
 ### Tests
 
-- 532 → 536 (dashboard run-level fallback, direction panel, scanner
+- 532 → 537 (dashboard run-level fallback, touched-file per-round
+  attribution, direction panel, scanner
   self-scan; plus smoke/time-report entry points).
 
 ## 1.8.0 (2026-09-26)

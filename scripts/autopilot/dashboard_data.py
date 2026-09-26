@@ -271,6 +271,32 @@ def _autopilot_dir(repo):
     return Path(repo) / io.AUTOPILOT_DIR
 
 
+def compute_touched_file_changes(history):
+    """Batch-mode fallback #2 (seed-002): complete-round records each round's
+    touched_files (worktree names minus pre-round dirty files), giving
+    per-round domain attribution without any git diff anchor. Same
+    {path: change} shape; insertions/deletions are honestly 0 (no diff).
+    None when no entry carries touched_files — callers keep their chain:
+    per-round diff → touched files → run-level → degraded."""
+    changes = {}
+    for entry in history:
+        files = entry.get("touched_files")
+        if not files:
+            continue
+        rnd = entry.get("round")
+        for path in files:
+            agg = changes.setdefault(path, {
+                "first_round": rnd, "touches": 0,
+                "insertions": 0, "deletions": 0, "rounds": [],
+            })
+            agg["touches"] += 1
+            if rnd not in agg["rounds"]:
+                agg["rounds"].append(rnd)
+            if agg["first_round"] is None or (rnd is not None and rnd < agg["first_round"]):
+                agg["first_round"] = rnd
+    return changes or None
+
+
 def compute_run_file_changes(repo, run_start_sha, gitio=None):
     """Run-level fallback for batch-commit runs whose history carries no
     per-round shas: one numstat over run_start_sha..HEAD (EMPTY_TREE base
@@ -348,16 +374,21 @@ def build_snapshot(repo, gitio=None):
     granularity = "per-round"
     if changes is None or round_stats is None:
         # Batch-commit runs (default cadence) carry no per-round shas: fall
-        # back to a run-level aggregation so the tree stays alive, honestly
-        # labelled — the timeline (rounds/replay) simply does not exist.
-        changes = compute_run_file_changes(repo, run_start_sha, gitio=gitio)
+        # back so the tree stays alive, honestly labelled. First per-round
+        # file attribution from touched_files (seed-002), then a coarse
+        # run-level aggregation.
+        touched = compute_touched_file_changes(history)
+        if touched is not None:
+            changes = touched
+            granularity = "per-round-files"
+        else:
+            changes = compute_run_file_changes(repo, run_start_sha, gitio=gitio)
+            granularity = "run" if changes is not None else None
         round_stats = []
         if changes is None:
             degraded.append("growth")
-            granularity = None
             domains, round_domains, rounds = [], {}, []
         else:
-            granularity = "run"
             round_domains, rounds = {}, []
     if granularity is not None:
         dash_cfg = (config.get("dashboard") or {}) if isinstance(config, dict) else {}
@@ -374,11 +405,14 @@ def build_snapshot(repo, gitio=None):
             # round 是事件关联的硬关联键（correlate_events 同款纪律）：
             # 缺失即 malformed history，直接 KeyError 而非静默编一条。
             st = stats_by_round.get(entry["round"])
+            rnd = entry["round"]
             rounds.append({
-                "round": entry["round"], "status": entry.get("status"),
+                "round": rnd, "status": entry.get("status"),
                 "score": entry.get("review_score"),
-                # 无提交的取消/阻塞轮如实计 0：没有 commit 就没有可计改动。
-                "files_changed": st["files_changed"] if st else 0,
+                # per-round / per-round-files：按 changes 的 rounds 归属计数；
+                # run 级无逐轮信息，无提交的取消/阻塞轮如实计 0。
+                "files_changed": len([p for p, c in changes.items()
+                                      if rnd in c["rounds"]]),
                 "insertions": st["insertions"] if st else 0,
                 "deletions": st["deletions"] if st else 0,
             })

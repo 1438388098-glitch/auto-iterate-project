@@ -706,6 +706,13 @@ def cmd_complete_round(args):
                 # commit --round reads this to refuse absorbing the round's
                 # pre-existing user changes into a late batch flush.
                 "start_dirty_files": current.get("start_dirty_files"),
+                # seed-002: batch-commit rounds get no per-round sha; the
+                # touched-file list (worktree minus pre-round dirty files)
+                # still gives the dashboard per-round domain attribution.
+                "touched_files": [
+                    p for p in io.uncommitted_paths(repo)
+                    if p not in set(current.get("start_dirty_files") or [])
+                ],
                 "review_score": getattr(args, "review_score", None),
                 "review_notes": getattr(args, "review_notes", None) or "",
                 "below_threshold": below_threshold,

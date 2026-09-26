@@ -7234,6 +7234,31 @@ class DashboardSnapshotTests(AutopilotTestBase):
         snap2 = dd.build_snapshot(self.repo)   # backlog 仍在：不崩
         self.assertEqual(snap2["status"]["backlog"]["candidates"], cands)
 
+    def test_snapshot_touched_files_attribution_without_shas(self):
+        """Batch mode + seed-002: complete-round records touched_files per
+        round; build_snapshot uses them for per-round domain attribution
+        (granularity per-round-files) before ever falling back to run
+        level. Line counts are honestly zero (no diff anchor)."""
+        from autopilot import dashboard_data as dd
+        self._seed_state(history=[
+            {"round": 1, "status": "completed", "title": "t1", "summary": "s1",
+             "review_score": 4, "commit_sha": None,
+             "touched_files": ["scripts/autopilot/miner.py"]},
+            {"round": 2, "status": "completed", "title": "t2", "summary": "s2",
+             "review_score": 3, "commit_sha": None,
+             "touched_files": ["scripts/autopilot/miner.py", "README.md"]},
+        ])
+        snap = dd.build_snapshot(self.repo)   # 无 gitio：per-round diff 不可用
+        self.assertEqual(snap["meta"]["degraded"], [])
+        self.assertEqual(snap["growth"]["granularity"], "per-round-files")
+        by_name = {d["name"]: d for d in snap["growth"]["domains"]}
+        self.assertIn("工具与脚本", by_name)
+        self.assertIn("文档与知识", by_name)
+        tools = by_name["工具与脚本"]
+        self.assertEqual(tools["active_rounds"], [1, 2])
+        # rounds 曲线保留（行数诚实为 0），文件数按 touched_files 计
+        self.assertEqual(snap["growth"]["rounds"][1]["files_changed"], 2)
+
     def test_snapshot_corrupt_state_degrades_all(self):
         from autopilot import dashboard_data as dd
         (self.repo / ".autopilot").mkdir()
