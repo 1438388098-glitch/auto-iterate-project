@@ -5,7 +5,7 @@
 > still lives at [references/overview.md](../references/overview.md) and the
 > operating contract at [SKILL.md](../SKILL.md).
 
-Version 1.3.3 — see [CHANGELOG.md](CHANGELOG.md) for release history.
+Version 1.3.3 — see [CHANGELOG.md](../CHANGELOG.md) for release history.
 
 Automatically iterate any git project inside an agent session: analyze the repository, pick the next high-value improvement, implement small changes, verify, commit, and loop until a goal is met or configurable round/time/token limits are reached.
 
