@@ -105,3 +105,90 @@ def compute_round_file_changes(repo, history, run_start_sha, gitio=None):
         else:
             return None
     return changes
+
+
+# 内置通用启发式：(路径前缀, 域名)，按列表序匹配；用户 domain_map 最长前缀
+# 优先且先于内置。test 规则必须在 scripts/ 之前：scripts/test_*.py 是测试
+# 而非工具。不带斜杠的前缀（test/README/…）同时匹配文件基名，让嵌在任何
+# 目录下的测试文件命中「测试」；带斜杠的前缀只锚定路径本身。
+BUILTIN_DOMAIN_RULES = [
+    ("test", "测试"),
+    ("docs/", "文档与知识"), ("references/", "文档与知识"),
+    ("README", "文档与知识"), ("CHANGELOG", "文档与知识"), ("SKILL", "文档与知识"),
+    ("scripts/", "工具与脚本"), ("tools/", "工具与脚本"), ("bin/", "工具与脚本"),
+]
+BUILTIN_DOMAIN_MEANINGS = {
+    "测试": "回归防护网：改坏了立即知道",
+    "文档与知识": "agent 与人共同的知识面",
+    "工具与脚本": "构建与辅助工具链",
+    "核心实现": "产品行为的所在",
+    "配置与入口": "根散文件：装配与启动",
+}
+
+
+def _match_domain_map(path, domain_map):
+    """domain_map 命中：最长前缀优先，返回 {"name", "meaning"?} 或 None。"""
+    best, best_len = None, -1
+    for prefix, value in (domain_map or {}).items():
+        if path.startswith(prefix) and len(prefix) > best_len:
+            best, best_len = value, len(prefix)
+    return best
+
+
+def _builtin_domain(path):
+    base = path.rsplit("/", 1)[-1]
+    for prefix, name in BUILTIN_DOMAIN_RULES:
+        if path.startswith(prefix) or (not prefix.endswith("/") and base.startswith(prefix)):
+            return name
+    if "/" not in path:
+        return "配置与入口"
+    return "核心实现"
+
+
+def aggregate_modules(file_changes, domain_map):
+    """Group {path: change} (compute_round_file_changes 的产物) into domain
+    trees. domain_map 以最长前缀命中且优先于内置启发式；自定义域名与内置撞名
+    且未给 meaning 时回退内置默认释义，全新域名未给 meaning 则留空。每域聚合
+    first_round（min，None 轮号不参与）、active_rounds（并集，None 排最后）、
+    weight（touches 对最忙域归一，最忙 = 1.0）与按 touches 降序的 modules；
+    域本身也按 touches 降序，保证快照间树形稳定。模块字段遵循快照契约
+    （设计文档 §3.1）：{name, path, first_round, churn, files}。空输入返回 []。"""
+    domains = {}
+    for path, ch in file_changes.items():
+        mapped = _match_domain_map(path, domain_map)
+        if mapped is not None:
+            name = mapped["name"]
+            meaning = mapped.get("meaning") or BUILTIN_DOMAIN_MEANINGS.get(name, "")
+        else:
+            name = _builtin_domain(path)
+            meaning = BUILTIN_DOMAIN_MEANINGS.get(name, "")
+        domain = domains.setdefault(name, {
+            "name": name, "meaning": meaning, "modules": {},
+            "first_round": ch["first_round"], "active_rounds": set(), "touches": 0,
+        })
+        domain["meaning"] = domain["meaning"] or meaning
+        cur = ch["first_round"]
+        if domain["first_round"] is None or (cur is not None and cur < domain["first_round"]):
+            domain["first_round"] = cur
+        domain["active_rounds"].update(ch["rounds"])
+        domain["touches"] += ch["touches"]
+        domain["modules"][path] = {
+            "name": path.rsplit("/", 1)[-1], "path": path,
+            "first_round": cur,
+            "churn": {"touches": ch["touches"], "insertions": ch["insertions"],
+                      "deletions": ch["deletions"]},
+            "files": [path],
+        }
+    max_touches = max((d["touches"] for d in domains.values()), default=1) or 1
+    result = []
+    for name in sorted(domains, key=lambda n: -domains[n]["touches"]):
+        d = domains[name]
+        modules = sorted(d["modules"].values(), key=lambda m: -m["churn"]["touches"])
+        result.append({
+            "id": name, "name": name, "meaning": d["meaning"],
+            "first_round": d["first_round"],
+            "active_rounds": sorted(d["active_rounds"], key=lambda r: (r is None, r)),
+            "weight": round(d["touches"] / max_touches, 3),
+            "modules": modules,
+        })
+    return result

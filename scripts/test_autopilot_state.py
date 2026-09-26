@@ -6767,6 +6767,66 @@ class DashboardDataTests(unittest.TestCase):
         self.assertEqual(core["first_round"], 1)
         self.assertEqual(changes["other.py"]["first_round"], 4)
 
+    FIXTURE_CHANGES = {
+        "scripts/autopilot/miner.py": {"first_round": 8, "touches": 6, "insertions": 180, "deletions": 44, "rounds": [8, 14, 20]},
+        "scripts/autopilot/state.py": {"first_round": 1, "touches": 3, "insertions": 90, "deletions": 10, "rounds": [1, 16]},
+        "scripts/test_autopilot_state.py": {"first_round": 1, "touches": 10, "insertions": 900, "deletions": 100, "rounds": [1, 18]},
+        "references/config.md": {"first_round": 12, "touches": 2, "insertions": 30, "deletions": 4, "rounds": [12]},
+        "Makefile": {"first_round": 2, "touches": 1, "insertions": 5, "deletions": 0, "rounds": [2]},
+    }
+
+    def test_aggregate_builtin_heuristics(self):
+        """纯内置启发式归域：scripts/test_*.py 是测试而非工具（test 规则先于
+        scripts/ 且匹配基名），scripts/ 下实现文件归工具与脚本，根散文件归
+        配置与入口；touches 最大者 weight 归一为 1，域按 touches 降序稳定。"""
+        from autopilot import dashboard_data as dd
+        domains = dd.aggregate_modules(self.FIXTURE_CHANGES, None)
+        by_name = {d["name"]: d for d in domains}
+        self.assertIn("工具与脚本", by_name)
+        self.assertIn("测试", by_name)
+        self.assertIn("文档与知识", by_name)
+        self.assertIn("配置与入口", by_name)                    # 根散文件 Makefile 无前缀命中
+        self.assertNotIn("其他", by_name)                       # 不可达域名不得存在
+        self.assertEqual(by_name["测试"]["modules"][0]["path"], "scripts/test_autopilot_state.py")
+        self.assertEqual(by_name["测试"]["weight"], 1.0)        # touches 最大者归一为 1
+        self.assertLess(by_name["工具与脚本"]["weight"], by_name["测试"]["weight"])
+        self.assertEqual([d["name"] for d in domains], ["测试", "工具与脚本", "文档与知识", "配置与入口"])
+        tools = by_name["工具与脚本"]
+        self.assertEqual(tools["first_round"], 1)               # miner(8) 与 state(1) 取 min
+        self.assertEqual(tools["active_rounds"], [1, 8, 14, 16, 20])
+        miner = tools["modules"][0]
+        self.assertEqual(miner["name"], "miner.py")
+        self.assertEqual(miner["churn"], {"touches": 6, "insertions": 180, "deletions": 44})
+        self.assertEqual(miner["files"], ["scripts/autopilot/miner.py"])
+        self.assertEqual(dd.aggregate_modules({}, None), [])    # 空输入 → 空域
+        legacy = dd.aggregate_modules({
+            "a.py": {"first_round": None, "touches": 2, "insertions": 1, "deletions": 0, "rounds": [None]},
+            "b.py": {"first_round": 3, "touches": 1, "insertions": 1, "deletions": 0, "rounds": [3]},
+        }, None)
+        self.assertEqual(legacy[0]["first_round"], 3)           # None 轮号不参与 min
+        self.assertEqual(legacy[0]["active_rounds"], [3, None])  # None 轮号排最后
+
+    def test_aggregate_domain_map_overrides_and_meaning(self):
+        """domain_map 最长前缀优先于内置规则；meaning 显式给出则用之，与内置
+        域名撞名则回退内置默认释义，全新域名未给 meaning 则留空。"""
+        from autopilot import dashboard_data as dd
+        domain_map = {
+            "scripts/autopilot/miner.py": {"name": "供给与探矿", "meaning": "挖掘器决定迭代上限"},
+            "scripts/autopilot/": {"name": "核心循环", "meaning": "每轮执行的主路径"},
+            "references/": {"name": "文档与知识"},   # 撞内置名：meaning 回退内置默认
+            "Makefile": {"name": "自定义入口"},       # 未给 meaning：留空
+        }
+        domains = dd.aggregate_modules(self.FIXTURE_CHANGES, domain_map)
+        by_name = {d["name"]: d for d in domains}
+        self.assertEqual(by_name["供给与探矿"]["meaning"], "挖掘器决定迭代上限")
+        self.assertEqual(by_name["供给与探矿"]["modules"][0]["path"], "scripts/autopilot/miner.py")
+        self.assertEqual(by_name["核心循环"]["modules"][0]["path"], "scripts/autopilot/state.py")
+        self.assertEqual(by_name["供给与探矿"]["weight"], 0.6)   # 6/10，对自定义域同样归一
+        self.assertEqual(by_name["文档与知识"]["meaning"], dd.BUILTIN_DOMAIN_MEANINGS["文档与知识"])
+        self.assertEqual(by_name["自定义入口"]["meaning"], "")
+        self.assertNotIn("工具与脚本", by_name)                  # scripts/* 全部被映射覆盖
+        self.assertIn("测试", by_name)                           # 测试文件不在映射内，仍走内置
+
 
 if __name__ == "__main__":
     unittest.main()
