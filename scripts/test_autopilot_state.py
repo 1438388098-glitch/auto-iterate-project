@@ -6585,7 +6585,11 @@ class DashboardConfigTests(AutopilotTestBase):
         self.assertEqual(cfg["dashboard"]["port"], 8642)
         run = self.run_state("config-set", "--no-dashboard")
         self.assertEqual(run.returncode, 0, run.stderr)
-        self.assertFalse(ap_config.load_config(self.repo)["dashboard"]["enabled"])
+        cfg = ap_config.load_config(self.repo)
+        self.assertFalse(cfg["dashboard"]["enabled"])
+        # A partial dashboard write preserves sibling keys instead of
+        # clobbering the section back to defaults.
+        self.assertEqual(cfg["dashboard"]["port"], 8642)
         # Port 0 (random) is a valid choice, not a missing value: writing it
         # must stick instead of being dropped as falsy.
         run = self.run_state("config-set", "--dashboard-port", "0")
@@ -6594,6 +6598,22 @@ class DashboardConfigTests(AutopilotTestBase):
         run = self.run_state("config-set", "--dashboard-port", "70000")
         self.assertNotEqual(run.returncode, 0)
         self.assertIn("0..65535", run.stderr)
+
+    def test_config_set_normalizes_dashboard_null(self):
+        """validate_config sanctions "dashboard": null and load_config passes
+        it through as None; config-set must normalize it to an object before
+        merging instead of crashing with AttributeError inside the run lock."""
+        from autopilot import config as ap_config
+        self.run_state("init")
+        (self.repo / ".autopilot" / "config.json").write_text(
+            json.dumps({"dashboard": None}), encoding="utf-8"
+        )
+        run = self.run_state("config-set", "--dashboard")
+        self.assertEqual(run.returncode, 0, run.stderr)
+        cfg = ap_config.load_config(self.repo)
+        self.assertTrue(cfg["dashboard"]["enabled"])
+        self.assertEqual(cfg["dashboard"]["auto_open"], True)
+        self.assertEqual(cfg["dashboard"]["port"], 0)
 
 
 if __name__ == "__main__":

@@ -2153,28 +2153,38 @@ def cmd_config_set(args):
             "--dashboard/--no-dashboard, --dashboard-port).",
         )
 
+    # One rendering serves both the dry-run preview and the success summary;
+    # dashboard fields appear under dotted nested names.
+    named_items = sorted(requested.items()) + sorted(
+        ("dashboard." + name, value) for name, value in dashboard_update.items()
+    )
+    named_summary = ", ".join(
+        "{}={}".format(name, str(value).lower() if isinstance(value, bool) else value)
+        for name, value in named_items
+    )
+
     with io.run_lock(repo):
         # load_config validates the on-disk file; values above were parsed and
         # range-checked already, and the reload below re-runs the full
         # validator over what we actually wrote.
         cfg = config.load_config(repo)
         if getattr(args, "dry_run", False):
-            preview_items = sorted(requested.items()) + sorted(
-                ("dashboard." + name, value) for name, value in dashboard_update.items()
-            )
-            preview = ", ".join(
-                "{}={}".format(name, str(value).lower() if isinstance(value, bool) else value)
-                for name, value in preview_items
-            )
             print(
                 "[DRY-RUN] Would set {} in .autopilot/config.json and refresh the "
-                "state config fingerprint.".format(preview),
+                "state config fingerprint.".format(named_summary),
                 file=sys.stderr,
             )
             return 0
         cfg.update(requested)
         if dashboard_update:
-            cfg.setdefault("dashboard", {}).update(dashboard_update)
+            dash = cfg.get("dashboard")
+            if not isinstance(dash, dict):
+                # validate_config sanctions "dashboard": null and load_config
+                # passes it through as None; normalize to an object like the
+                # deep-merge would, or the update below crashes on None.
+                dash = {}
+                cfg["dashboard"] = dash
+            dash.update(dashboard_update)
         config.save_config(repo, cfg)
         reloaded = config.load_config(repo)
         mismatched = [
@@ -2197,20 +2207,13 @@ def cmd_config_set(args):
         st = state.load_state(repo)
         st["config_fingerprint"] = io.file_sha256(config.config_path_for(repo))
         state.save_state(repo, st)
-        summary_items = sorted(requested.items()) + sorted(
-            ("dashboard." + name, value) for name, value in dashboard_update.items()
-        )
-        summary = ", ".join(
-            "{}={}".format(name, str(value).lower() if isinstance(value, bool) else value)
-            for name, value in summary_items
-        )
         log_fields = dict(requested)
         if dashboard_update:
             log_fields["dashboard"] = dashboard_update
         io.append_log(repo, "config-set", "success", fields=log_fields)
         return emit_result(
             args, True,
-            "[OK] Config updated: {}; config fingerprint refreshed (no config-drift warning).".format(summary),
+            "[OK] Config updated: {}; config fingerprint refreshed (no config-drift warning).".format(named_summary),
         )
 
 
