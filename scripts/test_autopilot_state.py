@@ -6721,6 +6721,59 @@ class MinerMarkerSelfScanTests(unittest.TestCase):
         self.assertIn("src/real.py", by_file)
 
 
+class TestGapBatch2Tests(unittest.TestCase):
+    """mine test-gap 批二（R5）：spawn_server 真机路径、get_snapshot 缓存
+    语义、worktree_units/change_lines 计量。"""
+
+    def setUp(self):
+        self.tmp = Path(tempfile.mkdtemp(prefix="testgap2-"))
+        self.addCleanup(shutil.rmtree, self.tmp, ignore_errors=True)
+        self.repo = self.tmp / "repo"
+        (self.repo / ".git").mkdir(parents=True)
+
+    def test_worktree_units_counts_worktree_and_index(self):
+        import subprocess as sp
+        sp.run(["git", "init", "-q"], cwd=self.repo, check=True)
+        f = self.repo / "a.txt"
+        f.write_text("one\ntwo\n", encoding="utf-8")
+        sp.run(["git", "add", "a.txt"], cwd=self.repo, check=True)
+        sp.run(["git", "-c", "user.name=t", "-c", "user.email=t@t",
+                "commit", "-qm", "init"], cwd=self.repo, check=True)
+        from autopilot import io as ap_io
+        self.assertEqual(ap_io.worktree_units(self.repo), (0, 0))
+        f.write_text("one\nchanged\nthree\n", encoding="utf-8")
+        text, binary = ap_io.worktree_units(self.repo)      # 1 del + 2 ins
+        self.assertEqual(text, 3)
+        self.assertEqual(binary, 0)
+        self.assertEqual(ap_io.worktree_change_lines(self.repo), 3)
+
+    def test_get_snapshot_caches_until_invalidated(self):
+        from autopilot import dashboard as ap_dash
+        ap_dash.invalidate_snapshot_cache()
+        first = ap_dash.get_snapshot(self.repo)              # no-run error dict
+        self.assertEqual(first, {"error": "no-run"})
+        self.assertIs(ap_dash.get_snapshot(self.repo), first)  # 缓存命中：同对象
+        ap_dash.invalidate_snapshot_cache()
+        second = ap_dash.get_snapshot(self.repo)
+        self.assertIsNot(second, first)
+
+    def test_spawn_server_writes_live_info_and_stop_kills_it(self):
+        """Task 7 欠账的真机路径：spawn → 轮询到新进程的 info → stop。"""
+        import time as _time
+        from autopilot import dashboard as ap_dash
+        info = ap_dash.spawn_server(self.repo, {"dashboard": {"enabled": True, "port": 0}})
+        try:
+            self.assertIsNotNone(info)
+            self.assertTrue(ap_dash.info_alive(self.repo))
+        finally:
+            self.assertTrue(ap_dash.stop_server(self.repo))
+            self.assertIsNone(ap_dash.read_info(self.repo))
+        for _ in range(50):   # 子进程退出可能异步
+            if not ap_io._pid_alive(info["pid"]):
+                break
+            _time.sleep(0.1)
+        self.assertFalse(ap_io._pid_alive(info["pid"]))
+
 class ViewLayerUnitTests(unittest.TestCase):
     """Direct unit tests for the 1.7.0 view layer (test-gap candidates
     185/186): brief_rank_entry projection and build_check_payload shape
