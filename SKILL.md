@@ -14,6 +14,9 @@ description: Automatically iterate any git project inside the current agent sess
 4. Never run without a stop condition (goals, `max_rounds`, `max_minutes`, `max_tokens`, `deadline`, or `max_blocked_in_a_row`).
 5. Never idle: while `check` says continue, `mine` / begin a round / Deep Expansion immediately.
 6. Touching this skill's own scripts requires `python scripts/test_autopilot_state.py` green before you finish.
+   Layered verification (1.9+): between rounds run `python scripts/test_autopilot_state.py --smoke`
+   (~25s, fast classes only); the FULL suite stays mandatory on commit rounds and before stop.
+   `--jobs 4 --smoke` parallelizes it further; `--time-report` re-measures the slow-class list.
 7. **Mining before invention**: when you do not know what to do, run `mine --apply` first; lens-scan Deep Expansion is the second wave, not the first.
 
 ## Operating Contract
