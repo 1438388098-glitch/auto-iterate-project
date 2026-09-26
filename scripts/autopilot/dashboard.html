@@ -131,6 +131,11 @@
         <div id="retro-excerpt" class="mono" style="font-size:11px;color:var(--txt2);white-space:pre-wrap;line-height:1.6"></div>
       </div>
       <div class="goalrow" style="display:block">
+        <h3 style="margin-bottom:8px">趋势</h3>
+        <div id="trend"></div>
+        <div class="mono" style="font-size:9.5px;color:var(--txt3);margin-top:4px">— 自评分（0-5）　— 文件数</div>
+      </div>
+      <div class="goalrow" style="display:block">
         <h3 style="margin-bottom:8px">迭代方向</h3>
         <div id="directions"></div>
       </div>
@@ -274,7 +279,31 @@
     $("play").style.opacity = "0.4";   // 无运行：回放不可用（与降级口径一致）
   }
 
-  function renderAll() { renderStats(); renderTree(); renderEvents(); renderDirections(); renderRetro(); }
+  function renderAll() { renderStats(); renderTree(); renderEvents(); renderDirections(); renderTrend(); renderRetro(); }
+
+  // ---- 成果回顾趋势：score / 文件数随轮次折线（样张「趋势」板块）----
+  function renderTrend() {
+    var host = $("trend");
+    if (!host) return;
+    var rounds = ((snapshot && snapshot.growth) || {}).rounds || [];
+    if (rounds.length < 2) { host.innerHTML = ""; return; }
+    var W = 520, H = 60, pad = 6;
+    var maxFiles = 1;
+    rounds.forEach(function (r) { if (r.files_changed > maxFiles) maxFiles = r.files_changed; });
+    var px = function (i) { return pad + i * ((W - 2 * pad) / (rounds.length - 1)); };
+    var line = function (values, max) {
+      return values.map(function (v, i) {
+        return px(i).toFixed(1) + "," + (H - pad - v / max * (H - 2 * pad)).toFixed(1);
+      }).join(" ");
+    };
+    var scores = rounds.map(function (r) { return r.score == null ? 0 : r.score; });
+    var files = rounds.map(function (r) { return r.files_changed; });
+    host.innerHTML =
+      '<svg viewBox="0 0 ' + W + " " + H + '" style="width:100%;display:block">'
+      + '<polyline points="' + line(files, maxFiles) + '" fill="none" stroke="var(--accent)" stroke-width="1.5" opacity=".7"/>'
+      + '<polyline points="' + line(scores, maxScore) + '" fill="none" stroke="#7CA6D9" stroke-width="1.5" stroke-dasharray="4 3"/>'
+      + "</svg>";
+  }
 
   // ---- 回顾板块：run 结束后的 retrospective 摘要（无则隐藏）----
   function renderRetro() {
