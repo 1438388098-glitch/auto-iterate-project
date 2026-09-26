@@ -6523,5 +6523,49 @@ class ExpansionBudgetTests(RepoTest):
         self.assertEqual(ap_state.expansion_wave_count(st), 2)
 
 
+class DashboardConfigTests(unittest.TestCase):
+    """The 1.8 dashboard section of config.json: defaults present and
+    disabled, a user-written section deep-merges over defaults, and every
+    field validates (config layer of the 1.8.0 dashboard plan, Task 1)."""
+
+    def setUp(self):
+        self.repo = Path(tempfile.mkdtemp(prefix="dashboard-cfg-"))
+        (self.repo / ".git").mkdir()
+
+    def test_dashboard_defaults_present_and_disabled(self):
+        from autopilot import config as ap_config
+        cfg = ap_config.default_config(self.repo)
+        self.assertEqual(cfg["dashboard"], {
+            "enabled": False, "auto_open": True, "port": 0, "domain_map": None,
+        })
+
+    def test_user_dashboard_section_deep_merges_over_defaults(self):
+        from autopilot import config as ap_config
+        ap_config.save_config(self.repo, {"dashboard": {"enabled": True}})
+        cfg = ap_config.load_config(self.repo)
+        self.assertTrue(cfg["dashboard"]["enabled"])
+        self.assertTrue(cfg["dashboard"]["auto_open"])  # defaults survive the merge
+        self.assertEqual(cfg["dashboard"]["port"], 0)
+
+    def test_validate_rejects_bad_dashboard_values(self):
+        from autopilot import config as ap_config
+        for bad in (
+            {"dashboard": {"enabled": "yes"}},
+            {"dashboard": {"port": -1}},
+            {"dashboard": {"port": True}},
+            {"dashboard": {"domain_map": {"a": "b"}}},  # plain string values are invalid
+            {"dashboard": {"domain_map": {"a": {"meaning": "no name"}}}},
+            {"dashboard": []},
+        ):
+            with self.assertRaises(SystemExit):
+                ap_config.validate_config(dict(ap_config.default_config(self.repo), **bad))
+
+    def test_validate_accepts_structured_domain_map(self):
+        from autopilot import config as ap_config
+        cfg = ap_config.default_config(self.repo)
+        cfg["dashboard"]["domain_map"] = {"scripts/autopilot/miner.py": {"name": "supply-and-prospecting"}}
+        ap_config.validate_config(cfg)  # no raise = pass
+
+
 if __name__ == "__main__":
     unittest.main()

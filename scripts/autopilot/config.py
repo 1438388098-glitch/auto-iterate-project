@@ -51,6 +51,7 @@ def default_config(repo):
         "max_predicted_per_round": 1,
         "max_expansion_per_round": None,
         "max_expansion_waves": None,
+        "dashboard": {"enabled": False, "auto_open": True, "port": 0, "domain_map": None},
     }
 
 
@@ -99,6 +100,13 @@ def load_config(repo):
     merged = dict(defaults)
     merged.update(config)
     merged["repo"] = str(repo)
+    # A user-written "dashboard" section is partial: overlay it on the defaults
+    # field-by-field. merged.update() above replaced the whole dict, so merging
+    # from merged["dashboard"] would be a self-copy that loses auto_open/port.
+    if isinstance(config.get("dashboard"), dict):
+        dash = dict(defaults["dashboard"])
+        dash.update(config["dashboard"])
+        merged["dashboard"] = dash
     validate_config(merged)
     return merged
 
@@ -214,6 +222,29 @@ def validate_config(merged, source=None):
             _config_error(path, "'{}' must be true or false".format(key), source)
     if not isinstance(merged["commit_message_prefix"], str):
         _config_error(path, "'commit_message_prefix' must be a string", source)
+    dash = merged.get("dashboard")
+    if dash is not None:
+        if not isinstance(dash, dict):
+            _config_error(path, "'dashboard' must be an object or null", source)
+        for key in ("enabled", "auto_open"):
+            if not isinstance(dash.get(key, False), bool):
+                _config_error(path, "'dashboard.{}' must be a boolean".format(key), source)
+        port = dash.get("port", 0)
+        if isinstance(port, bool) or not isinstance(port, int) or not 0 <= port <= 65535:
+            _config_error(path, "'dashboard.port' must be an integer in 0..65535", source)
+        domain_map = dash.get("domain_map")
+        if domain_map is not None:
+            if not isinstance(domain_map, dict):
+                _config_error(path, "'dashboard.domain_map' must be an object or null", source)
+            for prefix, value in domain_map.items():
+                valid = isinstance(value, dict) and isinstance(value.get("name"), str) \
+                    and (value.get("meaning") is None or isinstance(value.get("meaning"), str))
+                if not valid:
+                    _config_error(
+                        path,
+                        "'dashboard.domain_map[{}]' must be {{\"name\": str, \"meaning\"?: str}}".format(prefix),
+                        source,
+                    )
 
 
 def save_config(repo, config):
