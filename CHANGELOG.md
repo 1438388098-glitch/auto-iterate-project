@@ -2,6 +2,20 @@
 
 All notable changes to auto-iterate-project are documented here.
 
+## Unreleased
+
+Efficiency pass on top of 1.6.0, driven by measuring a real 30-round run
+(BrainFog) instead of guessing: what costs tokens per round is the JSON the
+agent reads, not the helper's runtime (0.58s per call).
+
+### Fixed
+
+- The lock-probe test now patches the probe the current platform actually
+  uses. It patched `subprocess.run`, but `_pid_alive` probes with `os.kill`
+  on POSIX, so on Linux the test asserted nothing and failed outright on a
+  nonexistent PID (v1.6.0 shipped with one red test outside Windows). Added
+  the counterpart guard that a genuinely missing PID still reads as dead.
+
 ## 1.6.0 (2026-09-26)
 
 Self-hosted overnight iteration: the skill ran its own loop against its own
