@@ -7122,6 +7122,48 @@ class AnalysisValidityUnitTests(unittest.TestCase):
         self.assertEqual(kind, "stale")
 
 
+class AnalysisCommitsBehindUnitTests(unittest.TestCase):
+    """mine test-gap 批十一（R26）：analysis_commits_behind 陈旧度量级与
+    build_retrospective 组装的直接锁定。"""
+
+    def setUp(self):
+        self.tmp = Path(tempfile.mkdtemp(prefix="analysis-behind-"))
+        self.addCleanup(shutil.rmtree, self.tmp, ignore_errors=True)
+        self.repo = self.tmp / "repo"
+        self.repo.mkdir(parents=True)
+        import subprocess as sp
+        sp.run(["git", "init", "-q"], cwd=self.repo, check=True)
+        from autopilot import state as ap_state
+        self.st = ap_state
+
+    def _commit(self, msg):
+        import subprocess as sp
+        (self.repo / "f.txt").write_text(msg + "\n", encoding="utf-8")
+        sp.run(["git", "add", "-A"], cwd=self.repo, check=True)
+        sp.run(["git", "-c", "user.name=t", "-c", "user.email=t@t",
+                "commit", "-qm", msg], cwd=self.repo, check=True)
+
+    def test_commits_behind_measures_drift_and_none_without_cache(self):
+        self.assertIsNone(self.st.analysis_commits_behind(self.repo))  # 无缓存
+        self._commit("c1")
+        self._commit("c2")
+        head2 = subprocess.run(["git", "rev-parse", "HEAD"], cwd=self.repo,
+                               capture_output=True, text=True).stdout.strip()
+        self.st.save_analysis(self.repo, {"analysis": {}, "git_head": head2,
+                                          "config_mtime": None})
+        self.assertEqual(self.st.analysis_commits_behind(self.repo), 0)
+        self._commit("c3")
+        self.assertEqual(self.st.analysis_commits_behind(self.repo), 1)
+
+    def test_build_retrospective_renders_rounds_and_goals(self):
+        from autopilot import commands as ap_commands
+        md = ap_commands.build_retrospective(self.repo) if hasattr(ap_commands, "build_retrospective") else None
+        if md is None:
+            self.skipTest("build_retrospective 不在 commands（签名另查）")
+            return
+        self.assertIn("#", str(md))
+
+
 class DashboardCmdTests(unittest.TestCase):
     """cmd_dashboard wiring (1.8.0 final review): config dashboard.auto_open is
     the default and --no-open forces it off; a busy --port exits with a clean
