@@ -451,8 +451,19 @@ def build_snapshot(repo, gitio=None):
             "has_last_summary": (_autopilot_dir(repo) / "last-summary.md").exists(),
             "retrospective_exists": (_autopilot_dir(repo)
                                      / io.RETROSPECTIVE_FILENAME).exists(),
+            "retrospective_excerpt": _read_head(
+                _autopilot_dir(repo) / io.RETROSPECTIVE_FILENAME, 600),
         },
     }
+
+
+def _read_head(path, limit=600):
+    """First `limit` chars of a text file, or None when absent/unreadable —
+    lets the panel show the retrospective opening without shipping the file."""
+    try:
+        return path.read_text(encoding="utf-8", errors="replace")[:limit]
+    except OSError:
+        return None
 
 
 def _backlog_summary(path):
