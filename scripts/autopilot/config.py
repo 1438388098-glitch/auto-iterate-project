@@ -227,18 +227,21 @@ def validate_config(merged, source=None):
         if not isinstance(dash, dict):
             _config_error(path, "'dashboard' must be an object or null", source)
         for key in ("enabled", "auto_open"):
-            if not isinstance(dash.get(key, False), bool):
+            if not isinstance(dash[key], bool):
                 _config_error(path, "'dashboard.{}' must be a boolean".format(key), source)
-        port = dash.get("port", 0)
+        port = dash["port"]
         if isinstance(port, bool) or not isinstance(port, int) or not 0 <= port <= 65535:
             _config_error(path, "'dashboard.port' must be an integer in 0..65535", source)
-        domain_map = dash.get("domain_map")
+        domain_map = dash["domain_map"]
         if domain_map is not None:
             if not isinstance(domain_map, dict):
                 _config_error(path, "'dashboard.domain_map' must be an object or null", source)
             for prefix, value in domain_map.items():
-                valid = isinstance(value, dict) and isinstance(value.get("name"), str) \
+                valid = (
+                    isinstance(value, dict)
+                    and isinstance(value.get("name"), str)
                     and (value.get("meaning") is None or isinstance(value.get("meaning"), str))
+                )
                 if not valid:
                     _config_error(
                         path,

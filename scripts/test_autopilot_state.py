@@ -6530,7 +6530,6 @@ class DashboardConfigTests(unittest.TestCase):
 
     def setUp(self):
         self.repo = Path(tempfile.mkdtemp(prefix="dashboard-cfg-"))
-        (self.repo / ".git").mkdir()
 
     def test_dashboard_defaults_present_and_disabled(self):
         from autopilot import config as ap_config
@@ -6543,27 +6542,39 @@ class DashboardConfigTests(unittest.TestCase):
         from autopilot import config as ap_config
         ap_config.save_config(self.repo, {"dashboard": {"enabled": True}})
         cfg = ap_config.load_config(self.repo)
-        self.assertTrue(cfg["dashboard"]["enabled"])
-        self.assertTrue(cfg["dashboard"]["auto_open"])  # defaults survive the merge
-        self.assertEqual(cfg["dashboard"]["port"], 0)
+        # Full-shape pin: the user's enabled=True wins and every unspecified
+        # default (auto_open/port/domain_map) survives the merge.
+        self.assertEqual(cfg["dashboard"], {"enabled": True, "auto_open": True, "port": 0, "domain_map": None})
 
     def test_validate_rejects_bad_dashboard_values(self):
         from autopilot import config as ap_config
+        # validate_config indexes merged dashboard keys directly (they are
+        # guaranteed by default_config), so each bad fragment is deep-merged
+        # over the defaults exactly like load_config does before validating a
+        # user-written section.
         for bad in (
-            {"dashboard": {"enabled": "yes"}},
-            {"dashboard": {"port": -1}},
-            {"dashboard": {"port": True}},
-            {"dashboard": {"domain_map": {"a": "b"}}},  # plain string values are invalid
-            {"dashboard": {"domain_map": {"a": {"meaning": "no name"}}}},
-            {"dashboard": []},
+            {"enabled": "yes"},
+            {"port": -1},
+            {"port": True},
+            {"port": 70000},
+            {"domain_map": {"a": "b"}},  # plain string values are invalid
+            {"domain_map": {"a": {"meaning": "no name"}}},
         ):
+            cfg = ap_config.default_config(self.repo)
+            cfg["dashboard"] = dict(cfg["dashboard"], **bad)
             with self.assertRaises(SystemExit):
-                ap_config.validate_config(dict(ap_config.default_config(self.repo), **bad))
+                ap_config.validate_config(cfg)
+        cfg = ap_config.default_config(self.repo)
+        cfg["dashboard"] = []  # not an object at all
+        with self.assertRaises(SystemExit):
+            ap_config.validate_config(cfg)
 
     def test_validate_accepts_structured_domain_map(self):
         from autopilot import config as ap_config
         cfg = ap_config.default_config(self.repo)
-        cfg["dashboard"]["domain_map"] = {"scripts/autopilot/miner.py": {"name": "supply-and-prospecting"}}
+        cfg["dashboard"]["domain_map"] = {
+            "scripts/autopilot/miner.py": {"name": "supply-and-prospecting", "meaning": "ore survey and prospecting"},
+        }
         ap_config.validate_config(cfg)  # no raise = pass
 
 
