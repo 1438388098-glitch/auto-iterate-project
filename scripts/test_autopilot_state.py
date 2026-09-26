@@ -6747,6 +6747,43 @@ class TestGapBatch2Tests(unittest.TestCase):
         self.assertEqual(binary, 0)
         self.assertEqual(ap_io.worktree_change_lines(self.repo), 3)
 
+    def test_compute_touched_file_changes_aggregates_and_empty_is_none(self):
+        from autopilot import dashboard_data as dd
+        history = [
+            {"round": 1, "touched_files": ["a.py", "b.py"]},
+            {"round": 2, "touched_files": ["a.py"]},
+        ]
+        changes = dd.compute_touched_file_changes(history)
+        self.assertEqual(changes["a.py"]["touches"], 2)
+        self.assertEqual(changes["a.py"]["rounds"], [1, 2])
+        self.assertEqual(changes["a.py"]["first_round"], 1)
+        self.assertEqual(changes["b.py"]["insertions"], 0)   # 行数诚实为 0
+        self.assertIsNone(dd.compute_touched_file_changes([{"round": 1}]))
+
+    def test_compute_run_file_changes_uses_head_and_fails_closed(self):
+        from autopilot import dashboard_data as dd
+        calls = []
+
+        class FakeIO:
+            @staticmethod
+            def run_git(repo, *args, **kw):
+                calls.append(args)
+                if args[0] == "rev-parse":
+                    return "abc123\n"
+                return "5\t0\tnew.py\n"
+
+        changes = dd.compute_run_file_changes("R", "000", gitio=FakeIO)
+        self.assertEqual(changes["new.py"]["touches"], 1)
+        self.assertIsNone(changes["new.py"]["first_round"])
+        self.assertEqual(calls[1][-1], "000..abc123")
+
+        class DeadIO:
+            @staticmethod
+            def run_git(repo, *args, **kw):
+                return None
+
+        self.assertIsNone(dd.compute_run_file_changes("R", "000", gitio=DeadIO))
+
     def test_get_snapshot_caches_until_invalidated(self):
         from autopilot import dashboard as ap_dash
         ap_dash.invalidate_snapshot_cache()
