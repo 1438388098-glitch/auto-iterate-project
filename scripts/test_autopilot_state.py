@@ -7164,6 +7164,44 @@ class AnalysisCommitsBehindUnitTests(unittest.TestCase):
         self.assertIn("#", str(md))
 
 
+class VerifyDiscoveryUnitTests(unittest.TestCase):
+    """mine test-gap 批十二（R28）：detect_verify_commands 从仓库入口信号
+    推断验证命令的优先序行为。"""
+
+    def setUp(self):
+        self.tmp = Path(tempfile.mkdtemp(prefix="verify-discovery-"))
+        self.addCleanup(shutil.rmtree, self.tmp, ignore_errors=True)
+
+    def test_pyproject_yields_pytest_priority(self):
+        import subprocess as sp
+        repo = self.tmp / "py"
+        repo.mkdir(parents=True)
+        sp.run(["git", "init", "-q"], cwd=repo, check=True)
+        (repo / "pyproject.toml").write_text("[tool.x]\n", encoding="utf-8")
+        from autopilot import verify as ap_verify
+        pairs = ap_verify.detect_verify_commands(repo)
+        self.assertTrue(any(cmd == "pytest" for _, cmd in pairs))
+        self.assertEqual(pairs[0][0], "python")   # python 信号优先
+
+    def test_package_json_yields_npm(self):
+        import subprocess as sp
+        repo = self.tmp / "js"
+        repo.mkdir(parents=True)
+        sp.run(["git", "init", "-q"], cwd=repo, check=True)
+        (repo / "package.json").write_text('{"name": "x"}', encoding="utf-8")
+        from autopilot import verify as ap_verify
+        pairs = ap_verify.detect_verify_commands(repo)
+        self.assertTrue(any("npm" in cmd for _, cmd in pairs))
+
+    def test_empty_repo_yields_nothing(self):
+        import subprocess as sp
+        repo = self.tmp / "empty"
+        repo.mkdir(parents=True)
+        sp.run(["git", "init", "-q"], cwd=repo, check=True)
+        from autopilot import verify as ap_verify
+        self.assertEqual(ap_verify.detect_verify_commands(repo), [])
+
+
 class DashboardCmdTests(unittest.TestCase):
     """cmd_dashboard wiring (1.8.0 final review): config dashboard.auto_open is
     the default and --no-open forces it off; a busy --port exits with a clean
