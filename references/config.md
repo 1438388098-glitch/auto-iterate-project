@@ -159,7 +159,7 @@ String, default `"expected"`. How `backlog-rank` scores candidates:
 - `expected` (default): expected **value per round** — the scarce resource in a run is rounds, not effort. Score = `value × success_rate (1 − blocked_rate of the type) × calibration (review_avg / value_avg of the type, clamped 0.6-1.5; a type with fewer than 3 resolved samples borrows the run-wide global review/value ratio once that has ≥3 samples) × unlock_bonus (1 + 0.15 × pending candidates that depend on this one) × risk_factor × saturation × mix_penalty (1 − 0.3 × pending share of the type) ÷ effort_cost (free within the round's batch width, then `1 + 0.15 × (effort − width)` beyond it — a candidate that still fits this round's batch must not lose to a lighter one that would leave the batch idle)`. The risk factor tightens as the round budget is consumed (`risk_weight` 0.05 → 0.15), so early rounds take swings and late rounds play it safe.
 - `classic`: the legacy `value / effort` ratio with fixed risk/saturation/blocked discounts.
 
-Every `backlog-rank` entry carries a `score_breakdown` exposing each factor, plus `selected` (the recommended round batch), `below_floor`, `unlocks`, and `ready`/`blocked_by`.
+Every `backlog-rank` entry carries a `score_breakdown` exposing each factor, plus `selected` (the recommended round batch), `below_floor`, `unlocks`, and `ready`/`blocked_by`. Three view flags keep the loop's per-round read small without changing any score: `--pending-only` (drop completed/blocked history), `--top N` (truncate; the recommended batch stays in the head and truncation is announced on stderr), `--brief` (drop `score_breakdown`, free text and timestamps, keep the fields the loop acts on).
 
 ### min_candidate_value
 
@@ -249,7 +249,7 @@ Useful commands:
 ```powershell
 python <this-skill>/scripts/autopilot_state.py backlog-add --repo <repo> --title "<title>" --reason "<reason>" --value 4 --effort 2 --type refactor --risk 2 --depends-on candidate-002
 python <this-skill>/scripts/autopilot_state.py backlog-list --repo <repo>
-python <this-skill>/scripts/autopilot_state.py backlog-rank --repo <repo>
+python <this-skill>/scripts/autopilot_state.py backlog-rank --repo <repo> --pending-only --top 5 --brief
 ```
 
 Each candidate tracks:
