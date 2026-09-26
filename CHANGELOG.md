@@ -62,7 +62,9 @@ agent reads, not the helper's runtime (0.58s per call).
   uses. It patched `subprocess.run`, but `_pid_alive` probes with `os.kill`
   on POSIX, so on Linux the test asserted nothing and failed outright on a
   nonexistent PID (v1.6.0 shipped with one red test outside Windows). Added
-  the counterpart guard that a genuinely missing PID still reads as dead.
+  the counterpart guard that a genuinely missing PID still reads as dead, with
+  both platforms driven through a stubbed probe so the test never depends on
+  the host's real tasklist.
 
 ## 1.6.0 (2026-09-26)
 

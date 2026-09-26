@@ -1525,12 +1525,28 @@ class RobustnessTests(RepoTest):
     def test_pid_alive_missing_process_is_dead(self):
         """The counterpart guard: a PID that is genuinely gone must read as
         dead, so a stale lock still gets cleaned up (the EPERM branch above
-        must not swallow ProcessLookupError)."""
+        must not swallow ProcessLookupError).
+
+        Both platforms are driven through a stubbed probe rather than a real
+        one: an empty tasklist result for Windows (no matching row) and
+        ProcessLookupError for POSIX. Relying on the host's real tasklist
+        would make this test depend on machine state, and CI cannot be
+        trusted to catch that here (runs on this repo sit queued)."""
         import os as os_module
         import autopilot.io as ap_io_module
+
         if os_module.name == "nt":
-            self.assertFalse(ap_io_module._pid_alive(4000000000))
+            class _NoMatch:
+                stdout = "INFO: No tasks are running which match the specified criteria.\r\n"
+
+            original_run = ap_io_module.subprocess.run
+            try:
+                ap_io_module.subprocess.run = lambda *args, **kwargs: _NoMatch()
+                self.assertFalse(ap_io_module._pid_alive(12345))
+            finally:
+                ap_io_module.subprocess.run = original_run
             return
+
         original_kill = ap_io_module.os.kill
 
         def missing(pid, sig):
