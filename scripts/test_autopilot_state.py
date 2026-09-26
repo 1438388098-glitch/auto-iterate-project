@@ -6856,5 +6856,193 @@ class DashboardDataTests(unittest.TestCase):
         self.assertEqual(events[0]["domains"], [])
 
 
+class DashboardSnapshotTests(AutopilotTestBase):
+    """build_snapshot 三板块组装（1.8.0 观察台 Task 6）：no-run 报错、缺锚点
+    与坏 state 的诚实降级、真 git 提交下的完整 growth 统计与 backlog 计数。
+    夹具直接落盘最小 state.json——快照只读 state.json，不走迁移不写任何文件。"""
+
+    def _seed_state(self, **overrides):
+        st = {
+            "schema": "auto-iterate-state/1", "run_id": "run-test",
+            "repo": str(self.repo), "branch": "main",
+            "created_at": "2026-09-26T00:00:00+00:00",
+            "started_at": "2026-09-26T00:00:00+00:00",
+            "round": 1, "round_seq": 1,
+            "blocked_rounds": 0, "cancelled_rounds": 0,
+            # 故意与 history 不符：completed_rounds 必须从 history 统计，
+            # 不能照抄 state 键（快照契约）。
+            "completed_rounds": 99,
+            "estimated_tokens_used": 4200,
+            "goals": ["g1", "g2"], "completed_goals": ["g1"],
+            "expansion_waves": [{"id": 1}],
+            "history": [], "finished_at": None, "run_start_sha": None,
+        }
+        st.update(overrides)
+        ap_io.save_json(self.repo / ".autopilot" / "state.json", st)
+        return st
+
+    def test_snapshot_no_run_reports_error(self):
+        from autopilot import dashboard_data as dd
+        self.assertEqual(dd.build_snapshot(self.repo), {"error": "no-run"})
+
+    def test_snapshot_shape_and_degraded_growth(self):
+        from autopilot import dashboard_data as dd
+        from autopilot import __version__ as skill_version
+        self._seed_state(history=[
+            {"round": 1, "status": "completed", "title": "t1", "summary": "s1",
+             "review_score": 4, "commit_sha": None, "estimated_tokens": 0},
+        ])
+        snap = dd.build_snapshot(self.repo)
+        self.assertEqual(snap["meta"]["degraded"], ["growth"])   # 完成轮无锚点
+        self.assertEqual(snap["meta"]["run_id"], "run-test")
+        self.assertEqual(snap["meta"]["skill_version"], skill_version)
+        self.assertTrue(snap["meta"]["generated_at"])
+        self.assertEqual(snap["status"]["phase"], "running")
+        self.assertEqual(snap["status"]["completed_rounds"], 1)  # 从 history 统计
+        self.assertEqual(snap["status"]["goals"], {"total": 2, "met": 1})
+        self.assertEqual(snap["status"]["budget"],
+                         {"max_minutes": None, "estimated_tokens_used": 4200})
+        self.assertEqual(snap["status"]["expansion_waves"], 1)
+        self.assertEqual(snap["status"]["backlog"],
+                         {"total": 0, "pending": 0, "ready": 0})
+        self.assertEqual(snap["growth"]["domains"], [])
+        self.assertEqual(snap["growth"]["rounds"], [])
+        self.assertEqual(len(snap["growth"]["events"]), 1)       # 事件仍产出
+        self.assertEqual(snap["growth"]["events"][0]["title"], "t1")
+        self.assertEqual(snap["growth"]["events"][0]["domains"], [])
+        self.assertFalse(snap["narrative"]["has_last_summary"])
+        self.assertFalse(snap["narrative"]["retrospective_exists"])
+        # 收尾后的 phase 与两份叙事文件的存在性
+        (self.repo / ".autopilot" / "last-summary.md").write_text("s", encoding="utf-8")
+        (self.repo / ".autopilot" / "retrospective.md").write_text("r", encoding="utf-8")
+        self._seed_state(finished_at="2026-09-26T01:00:00+00:00",
+                         history=[{"round": 1, "status": "completed", "title": "t1",
+                                   "summary": "s1", "review_score": 4, "commit_sha": None}])
+        snap = dd.build_snapshot(self.repo)
+        self.assertEqual(snap["status"]["phase"], "finished")
+        self.assertTrue(snap["narrative"]["has_last_summary"])
+        self.assertTrue(snap["narrative"]["retrospective_exists"])
+
+    def test_snapshot_full_growth_path(self):
+        from autopilot import dashboard_data as dd
+        (self.repo / "a.py").write_text("x = 1\n", encoding="utf-8")
+        self.git("add", "a.py")
+        self.git("commit", "-q", "-m", "r1")
+        sha1 = self.git("rev-parse", "HEAD").stdout.strip()
+        (self.repo / "a.py").write_text("x = 1\nx += 1\n", encoding="utf-8")
+        (self.repo / "b.py").write_text("y = 2\n", encoding="utf-8")
+        self.git("add", "a.py", "b.py")
+        self.git("commit", "-q", "-m", "r2")
+        sha2 = self.git("rev-parse", "HEAD").stdout.strip()
+        ap_io.save_json(self.repo / ".autopilot" / "config.json", {
+            "max_minutes": 30,
+            "dashboard": {"domain_map": {"a.py": {"name": "入口域"}}},
+        })
+        self._seed_state(history=[
+            {"round": 1, "status": "completed", "title": "one", "summary": "",
+             "review_score": 5, "commit_sha": sha1},
+            {"round": 2, "status": "completed", "title": "two", "summary": "",
+             "review_score": 3, "commit_sha": sha2},
+        ])
+        calls = []
+
+        class DelegatingIO:
+            @staticmethod
+            def run_git(repo_, *args):
+                calls.append(args)
+                result = ap_io.run_git(repo_, *args)
+                return result.stdout if result.returncode == 0 else None
+
+        snap = dd.build_snapshot(self.repo, gitio=DelegatingIO)
+        self.assertEqual(snap["meta"]["degraded"], [])
+        # gitio 透传：锚点 numstat 走查跑两遍（per-path 聚合与 per-round 统计
+        # 各 2 轮 diff），共 4 次调用——未透传会是 0 次。
+        self.assertEqual(len(calls), 4)
+        self.assertEqual(snap["status"]["completed_rounds"], 2)
+        self.assertEqual(snap["status"]["budget"]["max_minutes"], 30)
+        self.assertEqual([d["name"] for d in snap["growth"]["domains"]],
+                         ["入口域", "配置与入口"])   # domain_map 覆盖 + 内置归域
+        events = snap["growth"]["events"]
+        self.assertEqual(events[0]["domains"], ["入口域"])
+        self.assertEqual(events[1]["domains"], ["入口域", "配置与入口"])
+        self.assertEqual(events[0]["score"], 5)
+        # 按轮独立统计：a.py 两轮各 +1 行——r2 的插入数是 a(1)+b(1)=2，而不是
+        # 按路径聚合错把 r1 的 +1 重复计入 r2（那样会是 3）。
+        self.assertEqual(snap["growth"]["rounds"], [
+            {"round": 1, "status": "completed", "score": 5,
+             "files_changed": 1, "insertions": 1, "deletions": 0},
+            {"round": 2, "status": "completed", "score": 3,
+             "files_changed": 2, "insertions": 2, "deletions": 0},
+        ])
+
+    def test_snapshot_corrupt_state_degrades_all(self):
+        from autopilot import dashboard_data as dd
+        (self.repo / ".autopilot").mkdir()
+        (self.repo / ".autopilot" / "state.json").write_text("{oops", encoding="utf-8")
+        snap = dd.build_snapshot(self.repo)
+        self.assertEqual(snap["meta"]["degraded"], ["status", "growth", "narrative"])
+        self.assertIsNone(snap["meta"]["run_id"])
+        self.assertTrue(snap["meta"]["generated_at"])
+        self.assertIsNone(snap["status"])
+        self.assertIsNone(snap["growth"])
+        self.assertIsNone(snap["narrative"])
+
+    def test_backlog_summary_counts(self):
+        from autopilot import dashboard_data as dd
+        path = self.repo / ".autopilot" / "backlog.json"
+        self.assertEqual(dd._backlog_summary(path),            # 缺失 → 全 0
+                         {"total": 0, "pending": 0, "ready": 0})
+        # 真实结构（本仓库实测）：{"next_id": n, "candidates": […]}，status
+        # 值域 pending/picked/completed/blocked，候选带 1-5 的 value 整数。
+        ap_io.save_json(path, {"next_id": 6, "candidates": [
+            {"id": "candidate-001", "status": "pending", "value": 5},
+            {"id": "candidate-002", "status": "pending", "value": 4},
+            {"id": "candidate-003", "status": "pending", "value": 3},
+            {"id": "candidate-004", "status": "completed", "value": 5},
+            {"id": "candidate-005", "status": "picked", "value": 5},
+        ]})
+        self.assertEqual(dd._backlog_summary(path),
+                         {"total": 5, "pending": 3, "ready": 2})
+        path.write_text("{oops", encoding="utf-8")             # 坏 JSON 降级全 0
+        self.assertEqual(dd._backlog_summary(path),
+                         {"total": 0, "pending": 0, "ready": 0})
+        ap_io.save_json(path, [{"status": "pending", "value": 5}])  # 裸 list 容忍
+        self.assertEqual(dd._backlog_summary(path),
+                         {"total": 1, "pending": 1, "ready": 1})
+
+    def test_compute_round_stats_mirrors_anchor_rules(self):
+        """与 compute_round_file_changes 同一条锚点走查：NO_ANCHOR 轮不产生
+        条目且锚点原地不动；缺锚点的完成轮 / diff 失败整体降级 None。"""
+        from autopilot import dashboard_data as dd
+        history = [
+            {"round": 1, "status": "completed", "commit_sha": "aaa"},
+            {"round": 2, "status": "cancelled", "commit_sha": None},
+            {"round": 3, "status": "completed", "commit_sha": "bbb"},
+            {"round": 4, "status": "completed", "commit_sha": None},
+        ]
+
+        class FakeIO:
+            @staticmethod
+            def run_git(repo, *args, **kw):
+                return "2\t1\ta.py\n" if "000..aaa" in args else "1\t0\tb.py\n1\t1\ta.py\n"
+
+        self.assertEqual(dd.compute_round_stats("R", history[:3], "000", gitio=FakeIO), [
+            {"round": 1, "status": "completed",
+             "files_changed": 1, "insertions": 2, "deletions": 1},
+            {"round": 3, "status": "completed",
+             "files_changed": 2, "insertions": 2, "deletions": 1},
+        ])
+        self.assertEqual(dd.compute_round_stats("R", [], "000", gitio=FakeIO), [])
+        self.assertIsNone(                                     # 缺锚点完成轮
+            dd.compute_round_stats("R", history, "000", gitio=FakeIO))
+
+        class FailingIO:
+            @staticmethod
+            def run_git(repo, *args, **kw):
+                return None
+
+        self.assertIsNone(dd.compute_round_stats("R", history[:3], "000", gitio=FailingIO))
+
+
 if __name__ == "__main__":
     unittest.main()

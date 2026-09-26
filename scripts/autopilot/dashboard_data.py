@@ -2,6 +2,8 @@
 round file changes, module aggregation, event correlation, snapshot
 assembly. No process spawning, no state writes — tests feed it fakes."""
 
+from pathlib import Path
+
 from . import io
 
 
@@ -58,6 +60,21 @@ def parse_numstat(raw):
     return changes
 
 
+def _resolve_run_git(gitio):
+    """The growth pipeline's shared run_git seam: ``gitio.run_git`` when a
+    fake is injected, else a wrapper over io.run_git returning stdout text
+    with None on failure (used by compute_round_file_changes and
+    compute_round_stats)."""
+    if gitio is not None:
+        return gitio.run_git
+
+    def run_git(repo_, *args):
+        result = io.run_git(repo_, *args)
+        return result.stdout if result.returncode == 0 else None
+
+    return run_git
+
+
 def compute_round_file_changes(repo, history, run_start_sha, gitio=None):
     """Per-round `git diff --numstat` over each round's commit anchor: every
     anchored round diffs prev-anchor..sha and advances the anchor. Rounds
@@ -70,12 +87,7 @@ def compute_round_file_changes(repo, history, run_start_sha, gitio=None):
     (the default path wraps io.run_git's CompletedProcess). Returns
     {path: {first_round, touches, insertions, deletions, rounds}} where
     touches counts round appearances, rounds dedups, first_round is the min."""
-    if gitio is not None:
-        run_git = gitio.run_git
-    else:
-        def run_git(repo_, *args):
-            result = io.run_git(repo_, *args)
-            return result.stdout if result.returncode == 0 else None
+    run_git = _resolve_run_git(gitio)
 
     changes = {}
     prev = run_start_sha
@@ -105,6 +117,44 @@ def compute_round_file_changes(repo, history, run_start_sha, gitio=None):
         else:
             return None
     return changes
+
+
+def compute_round_stats(repo, history, run_start_sha, gitio=None):
+    """Per-round churn for the rounds chart, walking the same anchors as
+    compute_round_file_changes (identical seam, anchor advance and
+    NO_ANCHOR_STATUSES skip; any other shaless round or a failed diff degrades
+    the whole view to None). Returns [{round, status, files_changed,
+    insertions, deletions}] in history order, one entry per anchored round,
+    counted from that round's own numstat rows — a path touched in several
+    rounds contributes to each of them, so nothing is double-counted across
+    rounds (the per-path lifetime aggregate lives in
+    compute_round_file_changes; running the anchor walk twice keeps both
+    contracts intact at the cost of doubled — and cheap — numstat diffs).
+    Unanchored NO_ANCHOR rounds produce no entry; build_snapshot renders them
+    as zeros."""
+    run_git = _resolve_run_git(gitio)
+    stats = []
+    prev = run_start_sha
+    for entry in history:
+        sha = entry.get("commit_sha")
+        if sha:
+            base = prev or io.EMPTY_TREE
+            raw = run_git(repo, "diff", "--numstat", "{}..{}".format(base, sha))
+            if raw is None:
+                return None
+            rows = parse_numstat(raw)
+            stats.append({
+                "round": entry.get("round"), "status": entry.get("status"),
+                "files_changed": len(rows),
+                "insertions": sum(r["insertions"] for r in rows),
+                "deletions": sum(r["deletions"] for r in rows),
+            })
+            prev = sha
+        elif entry.get("status") in NO_ANCHOR_STATUSES:
+            continue
+        else:
+            return None
+    return stats
 
 
 # 内置通用启发式：(路径前缀, 域名)，按列表序匹配；用户 domain_map 最长前缀
@@ -214,3 +264,146 @@ def correlate_events(history, round_domains):
             "commit_sha": entry.get("commit_sha"),
         })
     return events
+
+
+def _autopilot_dir(repo):
+    """The run's .autopilot directory (Path-wrapped; repo may be str)."""
+    return Path(repo) / io.AUTOPILOT_DIR
+
+
+def build_snapshot(repo, gitio=None):
+    """Assemble the read-only dashboard snapshot (design doc §3.1): a ``meta``
+    header (generated_at, skill_version, run_id, degraded), a ``status``
+    section (phase, round counters, budget, goals, backlog, expansion waves),
+    the ``growth`` section (domains, events, per-round churn) and
+    ``narrative`` (last-summary / retrospective presence). Reads .autopilot
+    files directly — never state.load_state: no migrations, no writes,
+    nothing mutated. A repo without a state run reports {"error": "no-run"}; a
+    state file that cannot be read as an object (corrupt JSON — io.load_json
+    raises SystemExit, so it is caught here — or any non-object document)
+    degrades ALL sections to None instead of guessing. Growth degrades when
+    rounds cannot be anchored to commits (shaless completed rounds — legal
+    under deferred-commit batches — or failed diffs): domains and rounds go
+    empty while events still render, attributed to no domain. Degradation is
+    always preferred over fabrication. ``gitio`` forwards to the growth
+    pipeline's run_git seam; the numstat anchor walk runs twice (per-path
+    aggregation + per-round churn), negligible at run scale with the snapshot
+    cached upstream."""
+    from . import config as ap_config
+    from . import __version__   # 惰性取版本号，待包 __init__ 完成（同 cli.main）
+
+    repo = Path(repo)
+    state_path = _autopilot_dir(repo) / io.STATE_FILENAME
+    if not state_path.exists():
+        return {"error": "no-run"}
+    try:
+        state = io.load_json(state_path, None)
+    except SystemExit:
+        # io.load_json 对坏 JSON/不可读文件会打印并 SystemExit(2)——只读快照
+        # 降级为全空板块，而不是拖垮渲染进程。
+        state = None
+    if not isinstance(state, dict):
+        return {
+            "meta": {"generated_at": io.now_iso(), "skill_version": __version__,
+                     "run_id": None, "degraded": ["status", "growth", "narrative"]},
+            "status": None, "growth": None, "narrative": None,
+        }
+    try:
+        config = ap_config.load_config(repo)
+    except SystemExit:
+        # 损坏/非法 config 同样不拖垮快照：预算与 domain_map 回退为空。
+        config = None
+    history = state.get("history") or []
+    run_start_sha = state.get("run_start_sha")
+    changes = compute_round_file_changes(repo, history, run_start_sha, gitio=gitio)
+    round_stats = compute_round_stats(repo, history, run_start_sha, gitio=gitio)
+    degraded = []
+    if changes is None or round_stats is None:
+        degraded.append("growth")
+        domains, round_domains, rounds = [], {}, []
+    else:
+        dash_cfg = (config.get("dashboard") or {}) if isinstance(config, dict) else {}
+        domain_map = dash_cfg.get("domain_map")
+        domains = aggregate_modules(changes, domain_map)
+        path_to_domain = {m["path"]: d["name"] for d in domains for m in d["modules"]}
+        round_domains = {}
+        for path, ch in changes.items():
+            for rnd in ch["rounds"]:
+                round_domains.setdefault(rnd, set()).add(path_to_domain[path])
+        stats_by_round = {st["round"]: st for st in round_stats}
+        rounds = []
+        for entry in history:
+            # round 是事件关联的硬关联键（correlate_events 同款纪律）：
+            # 缺失即 malformed history，直接 KeyError 而非静默编一条。
+            st = stats_by_round.get(entry["round"])
+            rounds.append({
+                "round": entry["round"], "status": entry.get("status"),
+                "score": entry.get("review_score"),
+                # 无提交的取消/阻塞轮如实计 0：没有 commit 就没有可计改动。
+                "files_changed": st["files_changed"] if st else 0,
+                "insertions": st["insertions"] if st else 0,
+                "deletions": st["deletions"] if st else 0,
+            })
+    completed = [h for h in history if h.get("status") == "completed"]
+    return {
+        "meta": {
+            "generated_at": io.now_iso(),
+            "skill_version": __version__,
+            "run_id": state.get("run_id"),
+            "degraded": degraded,
+        },
+        "status": {
+            "phase": "finished" if state.get("finished_at") else "running",
+            "round": state.get("round"), "round_seq": state.get("round_seq"),
+            "completed_rounds": len(completed),   # 从 history 统计，不照抄 state 键
+            "blocked_rounds": state.get("blocked_rounds") or 0,
+            "cancelled_rounds": state.get("cancelled_rounds") or 0,
+            "budget": {
+                "max_minutes": (config.get("max_minutes")
+                                if isinstance(config, dict) else None),
+                "estimated_tokens_used": state.get("estimated_tokens_used") or 0,
+            },
+            "goals": {"total": len(state.get("goals") or []),
+                      "met": len(state.get("completed_goals") or [])},
+            "backlog": _backlog_summary(_autopilot_dir(repo) / io.BACKLOG_FILENAME),
+            "expansion_waves": len(state.get("expansion_waves") or []),
+        },
+        "growth": {
+            "domains": domains,
+            "events": correlate_events(history, round_domains),
+            "rounds": rounds,
+        },
+        "narrative": {
+            # SKILL.md 流程把上一轮总结落在 .autopilot/last-summary.md。
+            "has_last_summary": (_autopilot_dir(repo) / "last-summary.md").exists(),
+            "retrospective_exists": (_autopilot_dir(repo)
+                                     / io.RETROSPECTIVE_FILENAME).exists(),
+        },
+    }
+
+
+def _backlog_summary(path):
+    """{total, pending, ready} over backlog.json（真实结构：{"next_id": …,
+    "candidates": […]；status 值域 pending/picked/completed/blocked，候选带
+    1-5 的 value 整数）。ready 取轻量启发式 value>=4 的待办——commands 的
+    依赖就绪语义（candidate_deps_status）对只读快照过重；顶层裸 list 亦容忍。
+    文件缺失、损坏（io.load_json 对坏 JSON 会 SystemExit(2)，此处降级捕获）
+    一律按全 0 计，绝不抛错打断快照。"""
+    try:
+        data = io.load_json(path, None)
+    except SystemExit:
+        data = None
+    if isinstance(data, dict):
+        candidates = data.get("candidates") or []
+    elif isinstance(data, list):
+        candidates = data
+    else:
+        candidates = []
+    pending = [c for c in candidates
+               if isinstance(c, dict) and c.get("status") == "pending"]
+    return {
+        "total": len(candidates),
+        "pending": len(pending),
+        "ready": sum(1 for c in pending
+                     if isinstance(c.get("value"), (int, float)) and c["value"] >= 4),
+    }
