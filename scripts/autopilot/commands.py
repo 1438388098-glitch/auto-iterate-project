@@ -2118,8 +2118,27 @@ def cmd_config_set(args):
         requested["check_commands"] = []
     elif args.check_commands:
         requested["check_commands"] = list(args.check_commands)
+    # Dashboard fields are nested under "dashboard" in config.json, so they
+    # collect into a partial dict instead of `requested` (whose keys are
+    # top-level) and are merged into cfg["dashboard"] right before the save
+    # below. load_config deep-merges a partial user dashboard over the
+    # defaults, so the reload underneath revalidates the merged result.
+    dashboard_update = {}
+    if getattr(args, "dashboard_enabled", None) is not None:
+        dashboard_update["enabled"] = bool(args.dashboard_enabled)
+    if getattr(args, "dashboard_port", None) is not None:
+        if not 0 <= args.dashboard_port <= 65535:
+            io.append_log(repo, "config-set", "error", reason="out-of-range value",
+                          field="dashboard.port", value=args.dashboard_port)
+            return emit_result(
+                args, False,
+                "[ERROR] --dashboard-port must be an integer in 0..65535 (got {}).".format(
+                    args.dashboard_port
+                ),
+            )
+        dashboard_update["port"] = args.dashboard_port
 
-    if not requested:
+    if not requested and not dashboard_update:
         io.append_log(repo, "config-set", "error", reason="nothing to set")
         return emit_result(
             args, False,
@@ -2130,7 +2149,8 @@ def cmd_config_set(args):
             "--max-tokens/--clear-max-tokens, --deadline/--clear-deadline, "
             "--push/--no-push, --scan-secrets/--no-scan-secrets, --report-lang, "
             "--check-commands/--clear-check-commands, --smoke-commands/--clear-smoke-commands, "
-            "--max-expansion-waves/--clear-max-expansion-waves).",
+            "--max-expansion-waves/--clear-max-expansion-waves, "
+            "--dashboard/--no-dashboard, --dashboard-port).",
         )
 
     with io.run_lock(repo):
@@ -2139,9 +2159,12 @@ def cmd_config_set(args):
         # validator over what we actually wrote.
         cfg = config.load_config(repo)
         if getattr(args, "dry_run", False):
+            preview_items = sorted(requested.items()) + sorted(
+                ("dashboard." + name, value) for name, value in dashboard_update.items()
+            )
             preview = ", ".join(
                 "{}={}".format(name, str(value).lower() if isinstance(value, bool) else value)
-                for name, value in sorted(requested.items())
+                for name, value in preview_items
             )
             print(
                 "[DRY-RUN] Would set {} in .autopilot/config.json and refresh the "
@@ -2150,12 +2173,21 @@ def cmd_config_set(args):
             )
             return 0
         cfg.update(requested)
+        if dashboard_update:
+            cfg.setdefault("dashboard", {}).update(dashboard_update)
         config.save_config(repo, cfg)
         reloaded = config.load_config(repo)
         mismatched = [
             name for name, value in requested.items()
             if reloaded.get(name) != value
         ]
+        if dashboard_update:
+            merged_dashboard = reloaded.get("dashboard")
+            if not isinstance(merged_dashboard, dict) or any(
+                merged_dashboard.get(name) != value
+                for name, value in dashboard_update.items()
+            ):
+                mismatched.append("dashboard")
         if mismatched:
             io.append_log(repo, "config-set", "error", reason="reload mismatch", fields=mismatched)
             return emit_result(
@@ -2165,11 +2197,17 @@ def cmd_config_set(args):
         st = state.load_state(repo)
         st["config_fingerprint"] = io.file_sha256(config.config_path_for(repo))
         state.save_state(repo, st)
+        summary_items = sorted(requested.items()) + sorted(
+            ("dashboard." + name, value) for name, value in dashboard_update.items()
+        )
         summary = ", ".join(
             "{}={}".format(name, str(value).lower() if isinstance(value, bool) else value)
-            for name, value in sorted(requested.items())
+            for name, value in summary_items
         )
-        io.append_log(repo, "config-set", "success", fields={k: v for k, v in requested.items()})
+        log_fields = dict(requested)
+        if dashboard_update:
+            log_fields["dashboard"] = dashboard_update
+        io.append_log(repo, "config-set", "success", fields=log_fields)
         return emit_result(
             args, True,
             "[OK] Config updated: {}; config fingerprint refreshed (no config-drift warning).".format(summary),

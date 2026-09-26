@@ -6523,13 +6523,11 @@ class ExpansionBudgetTests(RepoTest):
         self.assertEqual(ap_state.expansion_wave_count(st), 2)
 
 
-class DashboardConfigTests(unittest.TestCase):
+class DashboardConfigTests(AutopilotTestBase):
     """The 1.8 dashboard section of config.json: defaults present and
-    disabled, a user-written section deep-merges over defaults, and every
-    field validates (config layer of the 1.8.0 dashboard plan, Task 1)."""
-
-    def setUp(self):
-        self.repo = Path(tempfile.mkdtemp(prefix="dashboard-cfg-"))
+    disabled, a user-written section deep-merges over defaults, every field
+    validates, and config-set can toggle it at runtime (config layer of the
+    1.8.0 dashboard plan, Tasks 1-2)."""
 
     def test_dashboard_defaults_present_and_disabled(self):
         from autopilot import config as ap_config
@@ -6576,6 +6574,26 @@ class DashboardConfigTests(unittest.TestCase):
             "scripts/autopilot/miner.py": {"name": "supply-and-prospecting", "meaning": "ore survey and prospecting"},
         }
         ap_config.validate_config(cfg)  # no raise = pass
+
+    def test_config_set_dashboard_flags(self):
+        from autopilot import config as ap_config
+        self.run_state("init")
+        run = self.run_state("config-set", "--dashboard", "--dashboard-port", "8642")
+        self.assertEqual(run.returncode, 0, run.stderr)
+        cfg = ap_config.load_config(self.repo)
+        self.assertTrue(cfg["dashboard"]["enabled"])
+        self.assertEqual(cfg["dashboard"]["port"], 8642)
+        run = self.run_state("config-set", "--no-dashboard")
+        self.assertEqual(run.returncode, 0, run.stderr)
+        self.assertFalse(ap_config.load_config(self.repo)["dashboard"]["enabled"])
+        # Port 0 (random) is a valid choice, not a missing value: writing it
+        # must stick instead of being dropped as falsy.
+        run = self.run_state("config-set", "--dashboard-port", "0")
+        self.assertEqual(run.returncode, 0, run.stderr)
+        self.assertEqual(ap_config.load_config(self.repo)["dashboard"]["port"], 0)
+        run = self.run_state("config-set", "--dashboard-port", "70000")
+        self.assertNotEqual(run.returncode, 0)
+        self.assertIn("0..65535", run.stderr)
 
 
 if __name__ == "__main__":

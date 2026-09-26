@@ -321,6 +321,13 @@ def build_parser():
     expand_group.add_argument("--no-expand-after-goals", dest="expand_after_goals",
                               action="store_false", default=None,
                               help="Stop when all goals are met (disable the expansion phase)")
+    dash_group = config_set_parser.add_mutually_exclusive_group()
+    dash_group.add_argument("--dashboard", dest="dashboard_enabled", action="store_true", default=None,
+                            help="enable the read-only observation dashboard")
+    dash_group.add_argument("--no-dashboard", dest="dashboard_enabled", action="store_false", default=None,
+                            help="disable the observation dashboard")
+    config_set_parser.add_argument("--dashboard-port", type=int, default=None, metavar="N",
+                                   help="dashboard port (0 = random)")
     cadence = config_set_parser.add_argument_group("cadence fields")
     cadence.add_argument("--candidates-per-round", dest="candidates_per_round",
                          type=int, metavar="N",
