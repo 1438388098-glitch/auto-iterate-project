@@ -213,6 +213,49 @@ Arrays of fnmatch globs, default `[]`. When either is non-empty, `commit` refuse
 
 String, default `"zh"`. Language for generated reports and the automatic 10-round phase report: `"zh"` (Chinese) or `"en"`. Override per call with `report --lang`.
 
+### dashboard
+
+Object, default `{"enabled": false, "auto_open": true, "port": 0, "domain_map": null}`. Configuration for the read-only observation dashboard — the local web panel that opens when a run starts (see the observation-deck section in [SKILL.md](../SKILL.md)). Fields:
+
+- `enabled` (boolean, default `false`) — spawn the dashboard server when `begin-round` opens a round. The loop never depends on the panel: a dashboard failure only warns in `log.jsonl` and on stderr, never blocks the round.
+- `auto_open` (boolean, default `true`) — open a browser tab once when the server spawns.
+- `port` (integer 0-65535, default `0`) — TCP port for the 127.0.0.1-only HTTP server; `0` picks a random free port. A port already in use makes the spawn fail (harmless warning); prefer `0` unless you need a stable URL.
+- `domain_map` (object or `null`, default `null`) — map file paths to panel domains as `"<path prefix>": {"name": "<domain>", "meaning": "<what this domain is for>"}` (`meaning` optional). Longest matching prefix wins and takes priority over the builtin heuristics (which know only generic `test`/`docs`/`scripts` prefixes). Use it to name the real capability domains of *your* project so the evolution tree means something.
+
+Runtime flags: `config-set --dashboard` / `--no-dashboard` toggle `enabled`; `config-set --dashboard-port N` sets the port. There is no `init --dashboard` on purpose — enable the panel via config-set once you actually want to watch a run.
+
+Dogfooding example (the mapping this repository uses for itself — `scripts/autopilot/` implied in every prefix):
+
+```json
+{
+  "dashboard": {
+    "enabled": true,
+    "auto_open": true,
+    "port": 0,
+    "domain_map": {
+      "scripts/autopilot/miner.py": {"name": "供给与探矿", "meaning": "把仓库事实变成有证据的候选"},
+      "scripts/autopilot/state.py": {"name": "核心循环", "meaning": "状态机：轮的开关与停止条件"},
+      "scripts/autopilot/commands.py": {"name": "核心循环", "meaning": "全部 CLI 命令实现"},
+      "scripts/autopilot/config.py": {"name": "核心循环", "meaning": "配置 schema 与校验"},
+      "scripts/autopilot/io.py": {"name": "核心循环", "meaning": "时间/JSON/git/锁底层"},
+      "scripts/autopilot/cli.py": {"name": "核心循环", "meaning": "参数解析与分发"},
+      "scripts/autopilot/guard.py": {"name": "核心循环", "meaning": "提交路径白名单闸门"},
+      "scripts/autopilot/agent.py": {"name": "核心循环", "meaning": "运行时 agent 探测"},
+      "scripts/autopilot/verify.py": {"name": "核心循环", "meaning": "验证命令发现"},
+      "scripts/autopilot/dashboard.py": {"name": "观察台", "meaning": "生命周期/HTTP 服务/快照缓存"},
+      "scripts/autopilot/dashboard_data.py": {"name": "观察台", "meaning": "纯函数快照管道"},
+      "scripts/autopilot/dashboard.html": {"name": "观察台", "meaning": "零依赖前端页面"},
+      "scripts/test_": {"name": "质量防护", "meaning": "回归防护网：改坏了立即知道"},
+      "references/": {"name": "文档与知识", "meaning": "agent 与人共同的知识面"},
+      "SKILL.md": {"name": "文档与知识", "meaning": "技能契约"},
+      "README.md": {"name": "文档与知识", "meaning": "项目门面"},
+      "CHANGELOG.md": {"name": "文档与知识", "meaning": "发布史"},
+      "docs/": {"name": "文档与知识", "meaning": "设计文档"}
+    }
+  }
+}
+```
+
 ## Example
 
 ```json
@@ -346,6 +389,7 @@ Anti-noise scoring (刀 B): a promoted candidate carries `origin: "predicted"`, 
 - `backlog-add`, `backlog-update`, `backlog-remove`, `backlog-list`, `backlog-rank`, `backlog-pick` — backlog management (candidates carry `type`, `risk`, and `depends_on`; ranking defaults to expected value per round — see `ranking_mode`). `backlog-add --from-seed <id>` promotes a direction seed (see Direction Seeds above). `backlog-add` also refreshes `last_activity_at` so expansion scouting does not burn `max_minutes` without progress.
 - `ensure-branch` — create or check out the autopilot feature branch
 - `push` — push the current branch to its remote using an explicit non-force refspec; refuses to run when `push: false`
+- `dashboard` — the read-only observation panel's local server: `--serve` runs it in the foreground (the default; `--port N`, `--no-open` skips the browser tab) and `--stop` shuts a running server down. Bound to 127.0.0.1 only; it exits itself after 30 idle minutes. `begin-round` spawns it automatically (detached, reusing a live server, cleaning stale pid files) when `dashboard.enabled` is set — the loop never depends on it, a failed spawn is only a warning.
 
 Every state-changing command accepts `--dry-run` to rehearse the action without touching `.autopilot/` or git.
 

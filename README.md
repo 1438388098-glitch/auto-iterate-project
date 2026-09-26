@@ -1,6 +1,6 @@
 # Auto Iterate Project
 
-Version 1.7.0 — see [CHANGELOG.md](CHANGELOG.md) for release history.
+Version 1.8.0 — see [CHANGELOG.md](CHANGELOG.md) for release history.
 
 Automatically iterate any git project inside an agent session: analyze the repository, pick the next high-value improvement, implement small changes, verify, commit, and loop until a goal is met or a configured budget (rounds / minutes / tokens / absolute deadline) runs out.
 
@@ -34,7 +34,8 @@ The skill's entry point is [SKILL.md](SKILL.md) — the agent reads it, runs `de
 - **Self-owned state**: `.autopilot/` (config, state, backlog, directives, logs) — resumable, migratable, corruption fails clean, and every state write keeps a one-generation `.bak`.
 - **Honest accounting**: unverified goals withhold the "all goals met" stop; zero-work cancels consume no budget; `finish` is refused while real work remains unless a stop condition (or you) says otherwise.
 - **Safety rails**: never rewrites git history, never pushes unless configured, refuses to absorb pre-existing user changes into autopilot commits, `allow_paths`/`deny_paths` whitelists, secret patterns (AWS / private keys / GitHub / Slack / Google / `sk-*` / JWT).
-- **Deterministic helper**: all of the above runs through `scripts/autopilot_state.py` (Python 3.6+, stdlib only), covered by a 460-test suite on 3.8–3.13 across Linux and Windows.
+- **Deterministic helper**: all of the above runs through `scripts/autopilot_state.py` (Python 3.6+, stdlib only), covered by a 528-test suite on 3.8–3.13 across Linux and Windows.
+- **Observation dashboard (optional)**: a 127.0.0.1-only read-only web panel that opens when a run starts — an evolution tree (domain → module → file) beside a per-round card stream, with replay. Pure stdlib; the loop never depends on it (`dashboard --stop` shuts it down).
 
 ## Install
 

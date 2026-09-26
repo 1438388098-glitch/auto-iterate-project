@@ -2,6 +2,40 @@
 
 All notable changes to auto-iterate-project are documented here.
 
+## 1.8.0 (2026-09-26)
+
+The read-only observation dashboard: a self-hosted web panel that opens when
+a run starts and shows how the project grew — a capability evolution tree
+(domain → module → file) beside a per-round evolution card stream, with
+replay. Pure stdlib; the loop never depends on it.
+
+### Added
+
+- `autopilot dashboard` subcommand: 127.0.0.1-only HTTP server (two GET
+  endpoints: `/` page + `/api/snapshot`), mtime-keyed snapshot cache, idle
+  self-exit after 30 minutes, `--stop` to shut it down.
+- `dashboard` config section (`enabled`/`auto_open`/`port`/`domain_map`,
+  deep-merged and validated) + `config-set --dashboard/--no-dashboard/
+  --dashboard-port`; `init --dashboard` is NOT added — enable via config-set.
+- begin-round ensure hook: spawns the detached server when enabled, reuses
+  a live one, cleans stale pid files; failures log a warning and never
+  block the round (hard rule: the loop must not depend on the panel).
+- Data pipeline (dashboard_data.py, pure functions): per-round numstat diff
+  anchored on history commit_shas, module aggregation (domain_map longest-
+  prefix over builtin heuristics), event correlation (cancelled/aborted
+  rounds honestly kept), round stats. Missing anchors degrade the growth
+  view instead of fabricating it.
+- Frontend (dashboard.html, zero dependencies): dual-theme design tokens
+  (prefers-color-scheme + manual toggle), orthogonal-link evolution tree
+  with expansion, evolution card stream with click-to-highlight linkage,
+  replay with staggered growth animation (60ms/cap 1.2s) and cursor
+  scrubbing, prefers-reduced-motion full degradation.
+
+### Tests
+
+- 526 → 528 (dashboard config/pipeline/lifecycle/server/page-contract suites,
+  plus the two begin-round hook tests).
+
 ## 1.7.0 (2026-09-26)
 
 Efficiency pass on top of 1.6.0, driven by measuring a real 30-round run

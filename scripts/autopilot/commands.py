@@ -482,6 +482,15 @@ def cmd_begin_round(args):
         st["last_activity_at"] = current["started_at"]
         state.save_state(repo, st)
         io.append_log(repo, "begin-round", "success", round=round_number, candidate_id=candidate_ids)
+        # Observation dashboard (1.8.0): fire-and-forget spawn after the round
+        # is safely open. Hard rule: the loop must not depend on the panel —
+        # a failure only warns (stderr + log.jsonl), never blocks the round.
+        try:
+            from autopilot import dashboard as ap_dash
+            ap_dash.ensure_dashboard(repo, cfg)
+        except Exception as err:
+            io.append_log(repo, "dashboard", "error", reason="ensure failed", detail=str(err))
+            print("[WARN] dashboard ensure failed: {}".format(err), file=sys.stderr)
         if getattr(args, "json", False):
             return emit_result(args, True, "round opened", data={"round": current})
         print(json.dumps(current, indent=2, ensure_ascii=False))

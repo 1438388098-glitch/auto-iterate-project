@@ -1,6 +1,6 @@
 ---
 name: auto-iterate-project
-version: 1.7.0
+version: 1.8.0
 description: Automatically iterate any git project inside the current agent session by analyzing the repository, choosing the next high-value improvement, implementing small changes, verifying, committing, and looping until a goal is met or configurable round/time/token limits are reached. Use when the user asks for autonomous project iteration, continuous self-improvement, auto-improve, keep improving this project, full-auto development, or wants the agent to keep making and committing improvements without per-step approval. Also use for Chinese requests like 全自动迭代这个项目, 自动改进并提交这个仓库, 连续自动开发, or 自动推进项目改进. Do NOT use for one-off bugfixes, single-file edits, doc-only changes, or when the user wants step-by-step approval of each change.
 ---
 
@@ -267,6 +267,12 @@ An empty or thin backlog is **never** an escalation.
 - `detect-verify` — recommend `check_commands` (`--apply` writes them) and report `smoke_recommended` (record one with `config-set --smoke-commands`).
 - `mine [--apply] [--kind K] [--limit N]` — deterministic repo mining into backlog candidates (first move when you do not know what to do). Every non-dry-run invocation appends to `state.mining_runs`; exhaustion = two consecutive runs with zero new findings.
 - Every state-changing command accepts `--dry-run`.
+
+## Observation Dashboard
+
+Optional read-only web panel (off by default): an evolution tree (domain → module → file) beside a per-round card stream, with replay. Enable it only when the user wants to watch the run — `config-set --dashboard` (disable with `--no-dashboard`; `--dashboard-port N` picks the port, `0` = random). Once enabled, every `begin-round` spawns the server automatically; you do nothing in the loop.
+
+Hard guarantees: bound to 127.0.0.1, reads only `.autopilot/` state and git history (never writes), and the loop never depends on it — a dashboard failure is only a warning in `.autopilot/log.jsonl` and never blocks a round. Do not wait on the panel, do not open it yourself, do not treat it as output. `dashboard --stop` shuts it down (it also exits itself after 30 idle minutes). Field reference: `references/config.md` → `dashboard`.
 
 ## Safety Rules
 

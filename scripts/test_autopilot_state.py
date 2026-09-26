@@ -6645,6 +6645,40 @@ class DashboardLifecycleTests(unittest.TestCase):
         self.assertIsNone(ap_dash.read_info(self.repo))
 
 
+class DashboardBeginRoundHookTests(RepoTest):
+    """The begin-round ensure hook (1.8.0 wiring): a disabled dashboard is a
+    no-op, and an ensure failure never blocks opening the round — it only
+    warns on stderr and lands a warning in log.jsonl (hard rule: the loop
+    must not depend on the panel)."""
+
+    def test_begin_round_dashboard_disabled_is_noop(self):
+        self.run_state("init")
+        result = self.run_state("begin-round", "--title", "r", "--reason", "x")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertFalse((self.repo / ".autopilot" / "dashboard.json").exists())
+
+    def test_begin_round_dashboard_ensure_failure_never_blocks(self):
+        from autopilot import dashboard as ap_dash
+        self.run_state("init")
+        self.run_state("config-set", "--dashboard")
+        # Function-local import in cmd_begin_round reads the attribute off the
+        # module at call time, so patching the module attribute is enough.
+        with mock.patch.object(ap_dash, "ensure_dashboard",
+                               side_effect=RuntimeError("boom")):
+            result = self.run_state("begin-round", "--title", "r", "--reason", "x")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(self.read_json("state.json")["current_round"]["round"], 1)
+        # config-set's own log entry also mentions the field name, so match a
+        # dashboard *event* (the failure record), not a bare substring.
+        entries = [
+            json.loads(line)
+            for line in (self.repo / ".autopilot" / "log.jsonl")
+            .read_text(encoding="utf-8").splitlines()
+        ]
+        self.assertTrue(any(e.get("event") == "dashboard" for e in entries),
+                        "expected a dashboard failure entry in log.jsonl")
+
+
 class DashboardDataTests(unittest.TestCase):
     """Pure tests of the dashboard data pipeline (no repo fixture, FakeIO
     injected): numstat parsing and per-round file-change aggregation."""
