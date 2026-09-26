@@ -81,7 +81,7 @@ python <this-skill>/scripts/autopilot_state.py init --repo <repo> [--branch-mode
 `--deadline` is the timer (定时器) stop: an absolute wall-clock moment. Accepts ISO (`2026-08-10T08:00:00`), relative (`+8h`, `+30min`, `+1d`, `+2w`), or local `HH:MM` (today, or tomorrow if already past). Complements `--max-minutes` (倒计时 = duration since last round activity). Ranking/recovery flags: see `references/config.md`.
 
 7. If `branch_mode` is `feature`, run `ensure-branch` when resuming (init already creates the branch; calling again is safe).
-8. If `.autopilot/state.json` exists and is unfinished, run `read` and `check`, then continue from current state.
+8. If `.autopilot/state.json` exists and is unfinished, run `read` and `check --brief`, then continue from current state.
 
 ## Round Loop
 
@@ -182,7 +182,7 @@ python <this-skill>/scripts/autopilot_state.py goal-met --repo <repo> --goal "<e
 
 ### 10. Repeat
 
-Run `check` again after each round.
+Run `check --brief` again after each round. Always pass `--brief`: it carries every loop-driving field (`continue`, `stop_reason`, `warnings`, `action_hint`, schedule, backlog counts). The un-flagged form adds the whole state and config dump — measured 6.8KB vs 1.2KB — and the loop never reads it.
 
 ## Human Checkpoints & Directives
 
