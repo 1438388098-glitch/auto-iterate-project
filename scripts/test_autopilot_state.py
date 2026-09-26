@@ -6801,6 +6801,51 @@ class ViewLayerUnitTests(unittest.TestCase):
         brief = ap_commands.brief_rank_entry({"id": "x", "score": 0})
         self.assertEqual(brief, {"id": "x", "score": 0})
 
+class ScannerHomeUnitTests(unittest.TestCase):
+    """mine test-gap 批三（R7）：home_dir 解析序与 miner 扫描器在合成 repo
+    上的直测（194 scan_markers 已由 MinerMarkerSelfScanTests 覆盖）。"""
+
+    def setUp(self):
+        self.tmp = Path(tempfile.mkdtemp(prefix="scanner-gap-"))
+        self.addCleanup(shutil.rmtree, self.tmp, ignore_errors=True)
+        self.repo = self.tmp / "repo"
+        (self.repo / ".git").mkdir(parents=True)
+        src = self.repo / "src"
+        src.mkdir(parents=True)
+        (src / "bad.py").write_text(
+            "def broken(:\ntry:\n    pass\nexcept Exception:\n    pass\n",
+            encoding="utf-8")
+        (src / "app.py").write_text("x = 1\n", encoding="utf-8")
+        from autopilot import miner as ap_miner
+        self.miner = ap_miner
+
+    def test_home_dir_prefers_userprofile_then_home_then_path_home(self):
+        from autopilot import io as ap_io
+        with mock.patch.dict(os.environ, {"USERPROFILE": "C:\\u", "HOME": "/h"}):
+            self.assertEqual(ap_io.home_dir(), Path("C:\\u"))
+        with mock.patch.dict(os.environ, {"USERPROFILE": "", "HOME": "/h"}):
+            self.assertEqual(ap_io.home_dir(), Path("/h"))
+
+    def test_scan_syntax_finds_unparsable_file(self):
+        paths = [f["file"] for f in self.miner.scan_syntax(self.repo)]
+        self.assertIn("src/bad.py", paths)
+
+    def test_scan_swallowed_finds_except_pass(self):
+        paths = [f["file"] for f in self.miner.scan_swallowed(self.repo)]
+        self.assertIn("src/bad.py", paths)
+
+    def test_scan_test_gap_reports_uncovered_plain_def(self):
+        # 独立干净 repo：语法门会因 bad.py 跳过整个目录的分析
+        clean = self.tmp / "clean"
+        (clean / ".git").mkdir(parents=True)
+        src = clean / "src"
+        src.mkdir(parents=True)
+        (src / "mod.py").write_text(
+            "def plain_handler(request):\n    return 1\n", encoding="utf-8")
+        findings = self.miner.scan_test_gap(clean)
+        self.assertTrue(any(f["file"] == "src/mod.py" for f in findings))
+
+
 class DashboardCmdTests(unittest.TestCase):
     """cmd_dashboard wiring (1.8.0 final review): config dashboard.auto_open is
     the default and --no-open forces it off; a busy --port exits with a clean
