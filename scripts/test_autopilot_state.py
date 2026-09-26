@@ -3819,6 +3819,24 @@ class BatchCommitTests(RepoTest):
         self.assertEqual(state["completed_rounds"], 1)
         self.assertIsNone(state["history"][-1]["commit_sha"])
 
+    def test_batch_flush_backfills_batch_commit_sha(self):
+        """seed-002 延伸（1.9）：flush --round N 时把批次 sha 回填给本批
+        无独立 sha 的 completed 轮（观察台准逐轮锚点的数据源）。"""
+        self.run_state("init")
+        self.run_state("begin-round", "--title", "r1", "--reason", "x")
+        self.add_file("a.py", "a = 1\n")
+        self.run_state("complete-round", "--summary", "r1 done")
+        self.run_state("begin-round", "--title", "r2", "--reason", "x")
+        self.add_file("b.py", "b = 2\n")
+        self.run_state("complete-round", "--summary", "r2 done")
+        result = self.run_state("commit", "--round", "2", "--summary", "flush")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        history = self.read_json("state.json")["history"]
+        by_round = {h["round"]: h for h in history}
+        self.assertEqual(by_round[1]["batch_commit_sha"],
+                         by_round[2]["batch_commit_sha"])
+        self.assertIsNotNone(by_round[2].get("batch_commit_sha"))
+
     def test_token_no_double_count_batch(self):
         self.run_state("init")
         self.run_state("begin-round", "--title", "r1", "--reason", "x")
