@@ -473,6 +473,15 @@ def build_parser():
     add_dry_run(push_parser)
     push_parser.set_defaults(func=commands.cmd_push)
 
+    prep_parser = subparsers.add_parser(
+        "round-prep",
+        help="One call for the loop's round start: check fields + suggested candidates + analysis + directives",
+    )
+    prep_parser.add_argument("--repo", default=".")
+    prep_parser.add_argument("--top", type=int, metavar="N", default=None,
+                             help="Candidates to include (positive integer; default candidates_per_round + 1)")
+    prep_parser.set_defaults(func=commands.cmd_round_prep)
+
     check_parser = subparsers.add_parser("check", help="Check stop conditions")
     check_parser.add_argument("--repo", default=".")
     check_parser.add_argument("--brief", action="store_true", help="Return loop-driving fields only (continue/stop_reason/warnings/backlog/action_hint/schedule) without full state and config")
