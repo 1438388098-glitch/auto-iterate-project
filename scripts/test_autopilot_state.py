@@ -8,6 +8,7 @@ import shutil
 import subprocess
 import sys
 import tempfile
+import time
 import unittest
 from datetime import datetime, timedelta
 from io import StringIO
@@ -19,6 +20,7 @@ SCRIPT = Path(__file__).resolve().parent / "autopilot_state.py"
 # Direct import for pure-function adversarial tests (resolve_seed, scoring,
 # selection): the package lives next to this file.
 sys.path.insert(0, str(Path(__file__).resolve().parent))
+import autopilot  # noqa: E402
 from autopilot import state as ap_state  # noqa: E402
 from autopilot import io as ap_io  # noqa: E402
 from autopilot import commands as commands_module  # noqa: E402
@@ -6521,6 +6523,774 @@ class ExpansionBudgetTests(RepoTest):
         from autopilot import state as ap_state
         st = ap_state.load_state(self.repo)
         self.assertEqual(ap_state.expansion_wave_count(st), 2)
+
+
+class DashboardConfigTests(AutopilotTestBase):
+    """The 1.8 dashboard section of config.json: defaults present and
+    disabled, a user-written section deep-merges over defaults, every field
+    validates, and config-set can toggle it at runtime (config layer of the
+    1.8.0 dashboard plan, Tasks 1-2)."""
+
+    def test_dashboard_defaults_present_and_disabled(self):
+        from autopilot import config as ap_config
+        cfg = ap_config.default_config(self.repo)
+        self.assertEqual(cfg["dashboard"], {
+            "enabled": False, "auto_open": True, "port": 0, "domain_map": None,
+        })
+
+    def test_user_dashboard_section_deep_merges_over_defaults(self):
+        from autopilot import config as ap_config
+        ap_config.save_config(self.repo, {"dashboard": {"enabled": True}})
+        cfg = ap_config.load_config(self.repo)
+        # Full-shape pin: the user's enabled=True wins and every unspecified
+        # default (auto_open/port/domain_map) survives the merge.
+        self.assertEqual(cfg["dashboard"], {"enabled": True, "auto_open": True, "port": 0, "domain_map": None})
+
+    def test_validate_rejects_bad_dashboard_values(self):
+        from autopilot import config as ap_config
+        # validate_config indexes merged dashboard keys directly (they are
+        # guaranteed by default_config), so each bad fragment is deep-merged
+        # over the defaults exactly like load_config does before validating a
+        # user-written section.
+        for bad in (
+            {"enabled": "yes"},
+            {"port": -1},
+            {"port": True},
+            {"port": 70000},
+            {"domain_map": {"a": "b"}},  # plain string values are invalid
+            {"domain_map": {"a": {"meaning": "no name"}}},
+        ):
+            cfg = ap_config.default_config(self.repo)
+            cfg["dashboard"] = dict(cfg["dashboard"], **bad)
+            with self.assertRaises(SystemExit):
+                ap_config.validate_config(cfg)
+        cfg = ap_config.default_config(self.repo)
+        cfg["dashboard"] = []  # not an object at all
+        with self.assertRaises(SystemExit):
+            ap_config.validate_config(cfg)
+
+    def test_validate_accepts_structured_domain_map(self):
+        from autopilot import config as ap_config
+        cfg = ap_config.default_config(self.repo)
+        cfg["dashboard"]["domain_map"] = {
+            "scripts/autopilot/miner.py": {"name": "supply-and-prospecting", "meaning": "ore survey and prospecting"},
+        }
+        ap_config.validate_config(cfg)  # no raise = pass
+
+    def test_config_set_dashboard_flags(self):
+        from autopilot import config as ap_config
+        self.run_state("init")
+        run = self.run_state("config-set", "--dashboard", "--dashboard-port", "8642")
+        self.assertEqual(run.returncode, 0, run.stderr)
+        cfg = ap_config.load_config(self.repo)
+        self.assertTrue(cfg["dashboard"]["enabled"])
+        self.assertEqual(cfg["dashboard"]["port"], 8642)
+        run = self.run_state("config-set", "--no-dashboard")
+        self.assertEqual(run.returncode, 0, run.stderr)
+        cfg = ap_config.load_config(self.repo)
+        self.assertFalse(cfg["dashboard"]["enabled"])
+        # A partial dashboard write preserves sibling keys instead of
+        # clobbering the section back to defaults.
+        self.assertEqual(cfg["dashboard"]["port"], 8642)
+        # Port 0 (random) is a valid choice, not a missing value: writing it
+        # must stick instead of being dropped as falsy.
+        run = self.run_state("config-set", "--dashboard-port", "0")
+        self.assertEqual(run.returncode, 0, run.stderr)
+        self.assertEqual(ap_config.load_config(self.repo)["dashboard"]["port"], 0)
+        run = self.run_state("config-set", "--dashboard-port", "70000")
+        self.assertNotEqual(run.returncode, 0)
+        self.assertIn("0..65535", run.stderr)
+
+    def test_config_set_normalizes_dashboard_null(self):
+        """validate_config sanctions "dashboard": null and load_config passes
+        it through as None; config-set must normalize it to an object before
+        merging instead of crashing with AttributeError inside the run lock."""
+        from autopilot import config as ap_config
+        self.run_state("init")
+        (self.repo / ".autopilot" / "config.json").write_text(
+            json.dumps({"dashboard": None}), encoding="utf-8"
+        )
+        run = self.run_state("config-set", "--dashboard")
+        self.assertEqual(run.returncode, 0, run.stderr)
+        cfg = ap_config.load_config(self.repo)
+        self.assertTrue(cfg["dashboard"]["enabled"])
+        self.assertEqual(cfg["dashboard"]["auto_open"], True)
+        self.assertEqual(cfg["dashboard"]["port"], 0)
+
+
+class DashboardLifecycleTests(unittest.TestCase):
+    """Lifecycle half of the 1.8 dashboard: dashboard.json write/read/probe,
+    stale cleanup and the ensure hook. Plain tempdir fixture — these tests
+    never run the CLI and never spawn a real server."""
+
+    def setUp(self):
+        self.tmp = Path(tempfile.mkdtemp(prefix="dashboard-lifecycle-"))
+        self.addCleanup(shutil.rmtree, self.tmp, ignore_errors=True)
+        self.repo = self.tmp / "repo"
+        (self.repo / ".git").mkdir(parents=True)
+
+    def test_info_roundtrip_and_stale_cleanup(self):
+        from autopilot import dashboard as ap_dash
+        ap_dash.write_info(self.repo, {"pid": os.getpid(), "port": 1234,
+                                       "started_at": "t", "opened": False})
+        info = ap_dash.read_info(self.repo)
+        self.assertEqual(info["port"], 1234)
+        ap_dash.write_info(self.repo, {"pid": 999999999, "port": 1,
+                                       "started_at": "t", "opened": False})
+        self.assertFalse(ap_dash.info_alive(self.repo))      # 死 pid → 不存活
+        ap_dash.clear_stale_info(self.repo)
+        self.assertIsNone(ap_dash.read_info(self.repo))      # 已清理
+
+    def test_ensure_disabled_is_noop(self):
+        from autopilot import dashboard as ap_dash
+        ap_dash.ensure_dashboard(self.repo, {"dashboard": {"enabled": False}})
+        self.assertIsNone(ap_dash.read_info(self.repo))
+
+    def test_read_info_rejects_non_object_json(self):
+        """A hand-edited `[]`/`123` info file must degrade to None everywhere —
+        info_alive/stop_server read .get(...)/["pid"] and would crash on a
+        list (review finding: read_info promised never-raises but only
+        guarded parse errors, not shapes)."""
+        from autopilot import dashboard as ap_dash
+        info_path = self.repo / ".autopilot" / "dashboard.json"
+        info_path.parent.mkdir(parents=True, exist_ok=True)
+        for raw in ("[]", "123", '"str"', "null"):
+            info_path.write_text(raw, encoding="utf-8")
+            self.assertIsNone(ap_dash.read_info(self.repo), raw)
+            self.assertFalse(ap_dash.info_alive(self.repo), raw)
+            self.assertFalse(ap_dash.stop_server(self.repo), raw)
+        # stop_server short-circuits on unreadable info (returns False) —
+        # the junk file itself is left for clear_stale_info, which also
+        # tolerates it (info_alive is already None → unlink).
+        ap_dash.clear_stale_info(self.repo)
+        self.assertFalse(info_path.exists())
+
+    def test_stop_server_terminates_recorded_process(self):
+        """--stop contract on the real OS path: write_info pointing at a live
+        dummy child → stop_server kills it (taskkill/SIGTERM) and removes the
+        info file (spec §7.3: 'stop, tested by really launching')."""
+        import subprocess as sp
+        import sys as _sys
+        from autopilot import dashboard as ap_dash
+        child = sp.Popen([_sys.executable, "-c", "import time; time.sleep(30)"])
+        try:
+            self.assertTrue(child.poll() is None)
+            ap_dash.write_info(self.repo, {"pid": child.pid, "port": 0,
+                                           "started_at": "t", "opened": False})
+            self.assertTrue(ap_dash.stop_server(self.repo))
+            self.assertIsNone(ap_dash.read_info(self.repo))
+        finally:
+            if child.poll() is None:
+                child.kill()
+                child.wait(timeout=10)
+        # On Windows taskkill is asynchronous-ish; poll briefly for exit.
+        for _ in range(50):
+            if child.poll() is not None:
+                break
+            time.sleep(0.1)
+        self.assertIsNotNone(child.poll())
+
+
+class DashboardCmdTests(unittest.TestCase):
+    """cmd_dashboard wiring (1.8.0 final review): config dashboard.auto_open is
+    the default and --no-open forces it off; a busy --port exits with a clean
+    [ERROR] instead of a bind traceback."""
+
+    def setUp(self):
+        self.tmp = Path(tempfile.mkdtemp(prefix="dashboard-cmd-"))
+        self.addCleanup(shutil.rmtree, self.tmp, ignore_errors=True)
+        self.repo = self.tmp / "repo"
+        (self.repo / ".git").mkdir(parents=True)
+
+    def _run(self, argv, serve_spy):
+        from autopilot import dashboard as ap_dash
+        args = build_parser().parse_args(argv)
+        with mock.patch.object(ap_dash, "serve", serve_spy):
+            return commands_module.cmd_dashboard(args)
+
+    def test_auto_open_config_default_with_cli_override(self):
+        from autopilot import config as ap_config
+        seen = []
+        self._run(["dashboard", "--repo", str(self.repo)],
+                  lambda repo, port, auto_open: seen.append(auto_open))
+        self.assertTrue(seen[-1])                       # default: auto_open on
+        ap_config.save_config(self.repo, {"dashboard": {"auto_open": False}})
+        self._run(["dashboard", "--repo", str(self.repo)],
+                  lambda repo, port, auto_open: seen.append(auto_open))
+        self.assertFalse(seen[-1])                      # config field respected
+        self._run(["dashboard", "--repo", str(self.repo), "--no-open"],
+                  lambda repo, port, auto_open: seen.append(auto_open))
+        self.assertFalse(seen[-1])                      # CLI flag forces off
+
+    def test_stop_exit_zero_when_recorded_nonzero_when_not(self):
+        with mock.patch("autopilot.dashboard.stop_server", return_value=True):
+            with self.assertRaises(SystemExit) as ctx:
+                commands_module.cmd_dashboard(build_parser().parse_args(
+                    ["dashboard", "--repo", str(self.repo), "--stop"]))
+            self.assertEqual(ctx.exception.code, 0)
+        with mock.patch("autopilot.dashboard.stop_server", return_value=False):
+            with self.assertRaises(SystemExit) as ctx:
+                commands_module.cmd_dashboard(build_parser().parse_args(
+                    ["dashboard", "--repo", str(self.repo), "--stop"]))
+            self.assertEqual(ctx.exception.code, 2)
+
+
+class DashboardBeginRoundHookTests(RepoTest):
+    """The begin-round ensure hook (1.8.0 wiring): a disabled dashboard is a
+    no-op, and an ensure failure never blocks opening the round — it only
+    warns on stderr and lands a warning in log.jsonl (hard rule: the loop
+    must not depend on the panel)."""
+
+    def test_begin_round_dashboard_disabled_is_noop(self):
+        self.run_state("init")
+        result = self.run_state("begin-round", "--title", "r", "--reason", "x")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertFalse((self.repo / ".autopilot" / "dashboard.json").exists())
+
+    def test_begin_round_dashboard_ensure_failure_never_blocks(self):
+        from autopilot import dashboard as ap_dash
+        self.run_state("init")
+        self.run_state("config-set", "--dashboard")
+        # Function-local import in cmd_begin_round reads the attribute off the
+        # module at call time, so patching the module attribute is enough.
+        with mock.patch.object(ap_dash, "ensure_dashboard",
+                               side_effect=RuntimeError("boom")):
+            result = self.run_state("begin-round", "--title", "r", "--reason", "x")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(self.read_json("state.json")["current_round"]["round"], 1)
+        # config-set's own log entry also mentions the field name, so match a
+        # dashboard *event* (the failure record), not a bare substring.
+        entries = [
+            json.loads(line)
+            for line in (self.repo / ".autopilot" / "log.jsonl")
+            .read_text(encoding="utf-8").splitlines()
+        ]
+        self.assertTrue(any(e.get("event") == "dashboard" for e in entries),
+                        "expected a dashboard failure entry in log.jsonl")
+
+
+class DashboardDataTests(unittest.TestCase):
+    """Pure tests of the dashboard data pipeline (no repo fixture, FakeIO
+    injected): numstat parsing and per-round file-change aggregation."""
+
+    def test_parse_numstat_lines_basic_rename_and_binary(self):
+        from autopilot import dashboard_data as dd
+        raw = (
+            "12\t3\tscripts/autopilot/state.py\n"
+            "0\t0\told/{name.py => renamed.py}\n"
+            "-\t-\tassets/logo.png\n"
+            "5\t1\t\"quoted/路径#.py\"\n"
+        )
+        changes = dd.parse_numstat(raw)
+        by_path = {c["path"]: c for c in changes}
+        self.assertEqual(by_path["scripts/autopilot/state.py"]["insertions"], 12)
+        self.assertEqual(by_path["scripts/autopilot/state.py"]["deletions"], 3)
+        self.assertEqual(by_path["old/renamed.py"]["insertions"], 0)      # rename 归新路径
+        self.assertNotIn("old/name.py", by_path)
+        self.assertEqual(by_path["assets/logo.png"]["insertions"], 0)     # 二进制计 0 行
+        self.assertTrue(by_path["assets/logo.png"]["binary"])
+        self.assertIn("quoted/路径#.py", by_path)                          # 已 unquote
+        self.assertFalse(by_path["scripts/autopilot/state.py"]["renamed"])
+
+    def test_parse_numstat_cross_directory_rename_keeps_prefix(self):
+        """Brace-form renames wrap only the differing suffix around the shared
+        prefix: `a/{x.py => sub/y.py}` normalizes to a/sub/y.py and whole-dir
+        braces `d/{ => sub}/g.py` to d/sub/g.py — the prefix must survive."""
+        from autopilot import dashboard_data as dd
+        changes = dd.parse_numstat(
+            "2\t1\ta/{x.py => sub/y.py}\n"
+            "4\t0\t{olddir => newdir}/f.py\n"
+            "1\t1\tdir/{ => sub}/g.py\n"
+        )
+        by_path = {c["path"]: c for c in changes}
+        self.assertEqual(by_path["a/sub/y.py"]["renamed"], True)
+        self.assertEqual(by_path["newdir/f.py"]["deletions"], 0)
+        self.assertEqual(by_path["dir/sub/g.py"]["insertions"], 1)
+
+    def test_compute_round_file_changes_skips_shaless_rounds(self):
+        from autopilot import dashboard_data as dd
+        history = [
+            {"round": 1, "status": "completed", "commit_sha": "aaa"},
+            {"round": 2, "status": "cancelled", "commit_sha": None},   # 零工作取消：无提交
+            {"round": 3, "status": "completed", "commit_sha": "bbb"},
+        ]
+        calls = []
+
+        class FakeIO:
+            @staticmethod
+            def run_git(repo, *args, **kw):
+                calls.append(args)
+                return "2\t1\tf.py\n" if "aaa..bbb" in args else "1\t0\ta.py\n"
+
+        changes = dd.compute_round_file_changes("R", history, "000", gitio=FakeIO)
+        self.assertEqual(changes["a.py"]["first_round"], 1)
+        self.assertEqual(changes["f.py"]["first_round"], 3)
+        self.assertEqual(changes["f.py"]["touches"], 1)
+        self.assertEqual(len([c for c in calls if "aaa..bbb" in c]), 1)   # 取消轮不产生 diff
+
+    def test_compute_round_file_changes_skips_blocked_and_aborted_rounds(self):
+        """blocked / aborted rounds also close without a commit (work stayed
+        uncommitted): no anchor is legitimate, they consume no diff and the
+        anchor stays put — exactly one diff spans the two completed rounds."""
+        from autopilot import dashboard_data as dd
+        history = [
+            {"round": 1, "status": "completed", "commit_sha": "aaa"},
+            {"round": 2, "status": "blocked", "commit_sha": None},
+            {"round": 3, "status": "aborted", "commit_sha": None},
+            {"round": 4, "status": "completed", "commit_sha": "bbb"},
+        ]
+        calls = []
+
+        class FakeIO:
+            @staticmethod
+            def run_git(repo, *args, **kw):
+                calls.append(args)
+                return "1\t0\ta.py\n" if "000..aaa" in args else "1\t0\tb.py\n"
+
+        changes = dd.compute_round_file_changes("R", history, "000", gitio=FakeIO)
+        # 4 轮历史只产生 2 次 diff：blocked/aborted 轮不产生 diff，锚点原地不动
+        self.assertEqual([c[2] for c in calls], ["000..aaa", "aaa..bbb"])
+        self.assertEqual(changes["a.py"]["rounds"], [1])
+        self.assertEqual(changes["b.py"]["rounds"], [4])
+        self.assertEqual(changes["b.py"]["touches"], 1)
+
+    def test_compute_round_file_changes_shaless_completed_round_degrades_to_none(self):
+        """A completed round without commit_sha (deferred/legacy state) cannot
+        anchor its diff: the whole growth view degrades to None rather than
+        presenting a partial picture."""
+        from autopilot import dashboard_data as dd
+        history = [
+            {"round": 1, "status": "completed", "commit_sha": "aaa"},
+            {"round": 2, "status": "completed", "commit_sha": None},
+        ]
+
+        calls = []
+
+        class FakeIO:
+            @staticmethod
+            def run_git(repo, *args, **kw):
+                calls.append(args)
+                return "1\t0\ta.py\n"
+
+        changes = dd.compute_round_file_changes("R", history, "000", gitio=FakeIO)
+        self.assertIsNone(changes)
+        self.assertEqual([c[2] for c in calls], ["000..aaa"])   # 缺锚点轮之前仅第 1 轮 diff
+
+    def test_compute_round_file_changes_git_failure_degrades_to_none(self):
+        """A failed git diff (run_git -> None) must degrade to None: silently
+        rendering growth as empty would understate the run's work."""
+        from autopilot import dashboard_data as dd
+        history = [{"round": 1, "status": "completed", "commit_sha": "aaa"}]
+
+        class FakeIO:
+            @staticmethod
+            def run_git(repo, *args, **kw):
+                return None
+
+        self.assertIsNone(dd.compute_round_file_changes("R", history, "000", gitio=FakeIO))
+
+    def test_compute_round_file_changes_returns_none_when_anchor_missing(self):
+        from autopilot import dashboard_data as dd
+        self.assertIsNone(dd.compute_round_file_changes("R", [{"round": 1, "commit_sha": None}], "000"))
+
+    def test_compute_round_file_changes_aggregates_multi_round_touches(self):
+        from autopilot import dashboard_data as dd
+        history = [
+            {"round": 1, "status": "completed", "commit_sha": "aaa"},
+            {"round": 2, "status": "completed", "commit_sha": "bbb"},
+            {"round": 4, "status": "completed", "commit_sha": "ccc"},
+        ]
+        diffs = {
+            "000..aaa": "5\t2\tcore.py\n",
+            "aaa..bbb": "1\t0\tcore.py\n",
+            "bbb..ccc": "0\t3\tcore.py\n3\t1\tother.py\n",
+        }
+
+        class FakeIO:
+            @staticmethod
+            def run_git(repo, *args, **kw):
+                return diffs[args[-1]]
+
+        changes = dd.compute_round_file_changes("R", history, "000", gitio=FakeIO)
+        core = changes["core.py"]
+        self.assertEqual(core["touches"], 3)
+        self.assertEqual(core["insertions"], 6)
+        self.assertEqual(core["deletions"], 5)
+        self.assertEqual(core["rounds"], [1, 2, 4])
+        self.assertEqual(core["first_round"], 1)
+        self.assertEqual(changes["other.py"]["first_round"], 4)
+
+    FIXTURE_CHANGES = {
+        "scripts/autopilot/miner.py": {"first_round": 8, "touches": 6, "insertions": 180, "deletions": 44, "rounds": [8, 14, 20]},
+        "scripts/autopilot/state.py": {"first_round": 1, "touches": 3, "insertions": 90, "deletions": 10, "rounds": [1, 16]},
+        "scripts/test_autopilot_state.py": {"first_round": 1, "touches": 10, "insertions": 900, "deletions": 100, "rounds": [1, 18]},
+        "references/config.md": {"first_round": 12, "touches": 2, "insertions": 30, "deletions": 4, "rounds": [12]},
+        "Makefile": {"first_round": 2, "touches": 1, "insertions": 5, "deletions": 0, "rounds": [2]},
+    }
+
+    def test_aggregate_builtin_heuristics(self):
+        """纯内置启发式归域：scripts/test_*.py 是测试而非工具（test 规则先于
+        scripts/ 且匹配基名），scripts/ 下实现文件归工具与脚本，根散文件归
+        配置与入口；touches 最大者 weight 归一为 1，域按 touches 降序稳定。"""
+        from autopilot import dashboard_data as dd
+        domains = dd.aggregate_modules(self.FIXTURE_CHANGES, None)
+        by_name = {d["name"]: d for d in domains}
+        self.assertIn("工具与脚本", by_name)
+        self.assertIn("测试", by_name)
+        self.assertIn("文档与知识", by_name)
+        self.assertIn("配置与入口", by_name)                    # 根散文件 Makefile 无前缀命中
+        self.assertNotIn("其他", by_name)                       # 不可达域名不得存在
+        self.assertEqual(by_name["测试"]["modules"][0]["path"], "scripts/test_autopilot_state.py")
+        self.assertEqual(by_name["测试"]["weight"], 1.0)        # touches 最大者归一为 1
+        self.assertEqual(by_name["测试"]["meaning"], dd.BUILTIN_DOMAIN_MEANINGS["测试"])
+        self.assertLess(by_name["工具与脚本"]["weight"], by_name["测试"]["weight"])
+        self.assertEqual([d["name"] for d in domains], ["测试", "工具与脚本", "文档与知识", "配置与入口"])
+        tools = by_name["工具与脚本"]
+        self.assertEqual(tools["first_round"], 1)               # miner(8) 与 state(1) 取 min
+        self.assertEqual(tools["active_rounds"], [1, 8, 14, 16, 20])
+        miner = tools["modules"][0]
+        self.assertEqual(miner["name"], "miner.py")
+        self.assertEqual(miner["churn"], {"touches": 6, "insertions": 180, "deletions": 44})
+        self.assertEqual(miner["files"], ["scripts/autopilot/miner.py"])
+        self.assertEqual(dd.aggregate_modules({}, None), [])    # 空输入 → 空域
+        legacy = dd.aggregate_modules({
+            "a.py": {"first_round": None, "touches": 2, "insertions": 1, "deletions": 0, "rounds": [None]},
+            "b.py": {"first_round": 3, "touches": 1, "insertions": 1, "deletions": 0, "rounds": [3]},
+        }, None)
+        self.assertEqual(legacy[0]["first_round"], 3)           # None 轮号不参与 min
+        self.assertEqual(legacy[0]["active_rounds"], [3, None])  # None 轮号排最后
+
+    def test_aggregate_domain_map_overrides_and_meaning(self):
+        """domain_map 最长前缀优先于内置规则；meaning 显式给出则用之，与内置
+        域名撞名则回退内置默认释义，全新域名未给 meaning 则留空。"""
+        from autopilot import dashboard_data as dd
+        domain_map = {
+            "scripts/autopilot/miner.py": {"name": "供给与探矿", "meaning": "挖掘器决定迭代上限"},
+            "scripts/autopilot/": {"name": "核心循环", "meaning": "每轮执行的主路径"},
+            "references/": {"name": "文档与知识"},   # 撞内置名：meaning 回退内置默认
+            "Makefile": {"name": "自定义入口"},       # 未给 meaning：留空
+        }
+        domains = dd.aggregate_modules(self.FIXTURE_CHANGES, domain_map)
+        by_name = {d["name"]: d for d in domains}
+        self.assertEqual(by_name["供给与探矿"]["meaning"], "挖掘器决定迭代上限")
+        self.assertEqual(by_name["供给与探矿"]["modules"][0]["path"], "scripts/autopilot/miner.py")
+        self.assertEqual(by_name["核心循环"]["modules"][0]["path"], "scripts/autopilot/state.py")
+        self.assertEqual(by_name["供给与探矿"]["weight"], 0.6)   # 6/10，对自定义域同样归一
+        self.assertEqual(by_name["文档与知识"]["meaning"], dd.BUILTIN_DOMAIN_MEANINGS["文档与知识"])
+        self.assertEqual(by_name["自定义入口"]["meaning"], "")
+        self.assertNotIn("工具与脚本", by_name)                  # scripts/* 全部被映射覆盖
+        self.assertIn("测试", by_name)                           # 测试文件不在映射内，仍走内置
+
+    def test_correlate_events_maps_domains_and_keeps_all_statuses(self):
+        """history 序即展示序（state.history 本就旧→新）；cancelled/aborted 轮
+        如实入史（由上游渲染灰卡）；缺 review_score 记 None；domains 取该轮
+        改动归因到的域并典序稳定（Task 6 传入的是 set，sorted 同样适用）。"""
+        from autopilot import dashboard_data as dd
+        history = [
+            {"round": 20, "status": "cancelled", "title": "exhausted 只计 apply run",
+             "summary": "…", "review_score": None, "commit_sha": None},
+            {"round": 22, "status": "completed", "title": "exhausted 只计 apply run",
+             "summary": "只读探测不再打断零新增序列", "review_score": 4, "commit_sha": "20c6a6e"},
+        ]
+        round_domains = {20: ["supply"], 22: ["supply", "quality"]}
+        events = dd.correlate_events(history, round_domains)
+        self.assertEqual(events[0]["round"], 20)
+        self.assertEqual(events[0]["status"], "cancelled")       # 灰卡如实入史
+        self.assertIsNone(events[0]["score"])
+        self.assertEqual(events[1]["domains"], ["quality", "supply"])  # 排序稳定
+        self.assertEqual(events[1]["score"], 4)
+        self.assertEqual(events[1]["title"], "exhausted 只计 apply run")
+        self.assertEqual(events[1]["commit_sha"], "20c6a6e")
+
+    def test_correlate_events_defaults_domains_to_empty(self):
+        from autopilot import dashboard_data as dd
+        events = dd.correlate_events([{"round": 1, "status": "completed", "title": "t",
+                                       "summary": "", "review_score": None, "commit_sha": "x"}], {})
+        self.assertEqual(events[0]["domains"], [])
+
+
+class DashboardSnapshotTests(AutopilotTestBase):
+    """build_snapshot 三板块组装（1.8.0 观察台 Task 6）：no-run 报错、缺锚点
+    与坏 state 的诚实降级、真 git 提交下的完整 growth 统计与 backlog 计数。
+    夹具直接落盘最小 state.json——快照只读 state.json，不走迁移不写任何文件。"""
+
+    def _seed_state(self, **overrides):
+        st = {
+            "schema": "auto-iterate-state/1", "run_id": "run-test",
+            "repo": str(self.repo), "branch": "main",
+            "created_at": "2026-09-26T00:00:00+00:00",
+            "started_at": "2026-09-26T00:00:00+00:00",
+            "round": 1, "round_seq": 1,
+            "blocked_rounds": 0, "cancelled_rounds": 0,
+            # 故意与 history 不符：completed_rounds 必须从 history 统计，
+            # 不能照抄 state 键（快照契约）。
+            "completed_rounds": 99,
+            "estimated_tokens_used": 4200,
+            "goals": ["g1", "g2"], "completed_goals": ["g1"],
+            "expansion_waves": [{"id": 1}],
+            "history": [], "finished_at": None, "run_start_sha": None,
+        }
+        st.update(overrides)
+        ap_io.save_json(self.repo / ".autopilot" / "state.json", st)
+        return st
+
+    def test_snapshot_no_run_reports_error(self):
+        from autopilot import dashboard_data as dd
+        self.assertEqual(dd.build_snapshot(self.repo), {"error": "no-run"})
+
+    def test_snapshot_shape_and_degraded_growth(self):
+        from autopilot import dashboard_data as dd
+        from autopilot import __version__ as skill_version
+        self._seed_state(history=[
+            {"round": 1, "status": "completed", "title": "t1", "summary": "s1",
+             "review_score": 4, "commit_sha": None, "estimated_tokens": 0},
+        ])
+        snap = dd.build_snapshot(self.repo)
+        self.assertEqual(snap["meta"]["degraded"], ["growth"])   # 完成轮无锚点
+        self.assertEqual(snap["meta"]["run_id"], "run-test")
+        self.assertEqual(snap["meta"]["skill_version"], skill_version)
+        self.assertTrue(snap["meta"]["generated_at"])
+        self.assertEqual(snap["status"]["phase"], "running")
+        self.assertEqual(snap["status"]["completed_rounds"], 1)  # 从 history 统计
+        self.assertEqual(snap["status"]["goals"], {"total": 2, "met": 1})
+        self.assertEqual(snap["status"]["budget"],
+                         {"max_minutes": None, "estimated_tokens_used": 4200})
+        self.assertEqual(snap["status"]["expansion_waves"], 1)
+        self.assertEqual(snap["status"]["backlog"],
+                         {"total": 0, "pending": 0, "ready": 0})
+        self.assertEqual(snap["growth"]["domains"], [])
+        self.assertEqual(snap["growth"]["rounds"], [])
+        self.assertEqual(len(snap["growth"]["events"]), 1)       # 事件仍产出
+        self.assertEqual(snap["growth"]["events"][0]["title"], "t1")
+        self.assertEqual(snap["growth"]["events"][0]["domains"], [])
+        self.assertFalse(snap["narrative"]["has_last_summary"])
+        self.assertFalse(snap["narrative"]["retrospective_exists"])
+        # 收尾后的 phase 与两份叙事文件的存在性
+        (self.repo / ".autopilot" / "last-summary.md").write_text("s", encoding="utf-8")
+        (self.repo / ".autopilot" / "retrospective.md").write_text("r", encoding="utf-8")
+        self._seed_state(finished_at="2026-09-26T01:00:00+00:00",
+                         history=[{"round": 1, "status": "completed", "title": "t1",
+                                   "summary": "s1", "review_score": 4, "commit_sha": None}])
+        snap = dd.build_snapshot(self.repo)
+        self.assertEqual(snap["status"]["phase"], "finished")
+        self.assertTrue(snap["narrative"]["has_last_summary"])
+        self.assertTrue(snap["narrative"]["retrospective_exists"])
+
+    def test_snapshot_full_growth_path(self):
+        from autopilot import dashboard_data as dd
+        (self.repo / "a.py").write_text("x = 1\n", encoding="utf-8")
+        self.git("add", "a.py")
+        self.git("commit", "-q", "-m", "r1")
+        sha1 = self.git("rev-parse", "HEAD").stdout.strip()
+        (self.repo / "a.py").write_text("x = 1\nx += 1\n", encoding="utf-8")
+        (self.repo / "b.py").write_text("y = 2\n", encoding="utf-8")
+        self.git("add", "a.py", "b.py")
+        self.git("commit", "-q", "-m", "r2")
+        sha2 = self.git("rev-parse", "HEAD").stdout.strip()
+        ap_io.save_json(self.repo / ".autopilot" / "config.json", {
+            "max_minutes": 30,
+            "dashboard": {"domain_map": {"a.py": {"name": "入口域"}}},
+        })
+        self._seed_state(history=[
+            {"round": 1, "status": "completed", "title": "one", "summary": "",
+             "review_score": 5, "commit_sha": sha1},
+            {"round": 2, "status": "completed", "title": "two", "summary": "",
+             "review_score": 3, "commit_sha": sha2},
+        ])
+        calls = []
+
+        class DelegatingIO:
+            @staticmethod
+            def run_git(repo_, *args):
+                calls.append(args)
+                result = ap_io.run_git(repo_, *args)
+                return result.stdout if result.returncode == 0 else None
+
+        snap = dd.build_snapshot(self.repo, gitio=DelegatingIO)
+        self.assertEqual(snap["meta"]["degraded"], [])
+        # gitio 透传：锚点 numstat 走查跑两遍（per-path 聚合与 per-round 统计
+        # 各 2 轮 diff），共 4 次调用——未透传会是 0 次。
+        self.assertEqual(len(calls), 4)
+        self.assertEqual(snap["status"]["completed_rounds"], 2)
+        self.assertEqual(snap["status"]["budget"]["max_minutes"], 30)
+        self.assertEqual([d["name"] for d in snap["growth"]["domains"]],
+                         ["入口域", "配置与入口"])   # domain_map 覆盖 + 内置归域
+        events = snap["growth"]["events"]
+        self.assertEqual(events[0]["domains"], ["入口域"])
+        self.assertEqual(events[1]["domains"], ["入口域", "配置与入口"])
+        self.assertEqual(events[0]["score"], 5)
+        # 按轮独立统计：a.py 两轮各 +1 行——r2 的插入数是 a(1)+b(1)=2，而不是
+        # 按路径聚合错把 r1 的 +1 重复计入 r2（那样会是 3）。
+        self.assertEqual(snap["growth"]["rounds"], [
+            {"round": 1, "status": "completed", "score": 5,
+             "files_changed": 1, "insertions": 1, "deletions": 0},
+            {"round": 2, "status": "completed", "score": 3,
+             "files_changed": 2, "insertions": 2, "deletions": 0},
+        ])
+
+    def test_snapshot_corrupt_state_degrades_all(self):
+        from autopilot import dashboard_data as dd
+        (self.repo / ".autopilot").mkdir()
+        (self.repo / ".autopilot" / "state.json").write_text("{oops", encoding="utf-8")
+        snap = dd.build_snapshot(self.repo)
+        self.assertEqual(snap["meta"]["degraded"], ["status", "growth", "narrative"])
+        self.assertIsNone(snap["meta"]["run_id"])
+        self.assertTrue(snap["meta"]["generated_at"])
+        self.assertIsNone(snap["status"])
+        self.assertIsNone(snap["growth"])
+        self.assertIsNone(snap["narrative"])
+
+    def test_backlog_summary_counts(self):
+        from autopilot import dashboard_data as dd
+        path = self.repo / ".autopilot" / "backlog.json"
+        self.assertEqual(dd._backlog_summary(path),            # 缺失 → 全 0
+                         {"total": 0, "pending": 0, "ready": 0})
+        # 真实结构（本仓库实测）：{"next_id": n, "candidates": […]}，status
+        # 值域 pending/picked/completed/blocked，候选带 1-5 的 value 整数。
+        ap_io.save_json(path, {"next_id": 6, "candidates": [
+            {"id": "candidate-001", "status": "pending", "value": 5},
+            {"id": "candidate-002", "status": "pending", "value": 4},
+            {"id": "candidate-003", "status": "pending", "value": 3},
+            {"id": "candidate-004", "status": "completed", "value": 5},
+            {"id": "candidate-005", "status": "picked", "value": 5},
+        ]})
+        self.assertEqual(dd._backlog_summary(path),
+                         {"total": 5, "pending": 3, "ready": 2})
+        path.write_text("{oops", encoding="utf-8")             # 坏 JSON 降级全 0
+        self.assertEqual(dd._backlog_summary(path),
+                         {"total": 0, "pending": 0, "ready": 0})
+        ap_io.save_json(path, [{"status": "pending", "value": 5}])  # 裸 list 容忍
+        self.assertEqual(dd._backlog_summary(path),
+                         {"total": 1, "pending": 1, "ready": 1})
+
+    def test_compute_round_stats_mirrors_anchor_rules(self):
+        """与 compute_round_file_changes 同一条锚点走查：NO_ANCHOR 轮不产生
+        条目且锚点原地不动；缺锚点的完成轮 / diff 失败整体降级 None。"""
+        from autopilot import dashboard_data as dd
+        history = [
+            {"round": 1, "status": "completed", "commit_sha": "aaa"},
+            {"round": 2, "status": "cancelled", "commit_sha": None},
+            {"round": 3, "status": "completed", "commit_sha": "bbb"},
+            {"round": 4, "status": "completed", "commit_sha": None},
+        ]
+
+        class FakeIO:
+            @staticmethod
+            def run_git(repo, *args, **kw):
+                return "2\t1\ta.py\n" if "000..aaa" in args else "1\t0\tb.py\n1\t1\ta.py\n"
+
+        self.assertEqual(dd.compute_round_stats("R", history[:3], "000", gitio=FakeIO), [
+            {"round": 1, "status": "completed",
+             "files_changed": 1, "insertions": 2, "deletions": 1},
+            {"round": 3, "status": "completed",
+             "files_changed": 2, "insertions": 2, "deletions": 1},
+        ])
+        self.assertEqual(dd.compute_round_stats("R", [], "000", gitio=FakeIO), [])
+        self.assertIsNone(                                     # 缺锚点完成轮
+            dd.compute_round_stats("R", history, "000", gitio=FakeIO))
+
+        class FailingIO:
+            @staticmethod
+            def run_git(repo, *args, **kw):
+                return None
+
+        self.assertIsNone(dd.compute_round_stats("R", history[:3], "000", gitio=FailingIO))
+
+
+class DashboardPageContractTests(unittest.TestCase):
+    """dashboard.html page contract (1.8.0 dashboard Task 9 + 10 + 11): the
+    page ships inside the package (the HTTP server reads it straight from
+    there), carries the dual-theme design tokens plus the single
+    reduced-motion degradation block, only reads snapshot fields that
+    build_snapshot actually emits (API-drift guard), and carries the replay
+    entry points (replayRound state, axis-cursor mount, grow-in keyframes)."""
+
+    PAGE = (Path(autopilot.__file__).resolve().parent / "dashboard.html")
+
+    def test_page_exists_and_carries_design_tokens(self):
+        html = self.PAGE.read_text(encoding="utf-8")
+        for token in ("--bg", "--surface", "--accent", "prefers-color-scheme",
+                      "prefers-reduced-motion"):
+            self.assertIn(token, html)
+
+    def test_page_api_references_exist_in_snapshot_shape(self):
+        import re
+        html = self.PAGE.read_text(encoding="utf-8")
+        refs = {m.group(1).split(".")[0]
+                for m in re.finditer(r"\bsnapshot\.([A-Za-z_][A-Za-z0-9_]*)", html)}
+        self.assertTrue(refs, "page must reference snapshot fields")
+        allowed = {"meta", "status", "growth", "narrative", "error"}
+        self.assertLessEqual(refs, allowed)
+
+    def test_replay_controls_present(self):
+        html = self.PAGE.read_text(encoding="utf-8")
+        for needle in ("replayRound", "axis-cursor", "grow-in"):
+            self.assertIn(needle, html)
+
+
+class DashboardServerTests(unittest.TestCase):
+    """HTTP half of the 1.8 dashboard (Task 8): the two endpoints on a real
+    loopback server (random port, daemon thread), the mtime-keyed snapshot
+    cache and the read-only guarantee. Repo fixture mirrors
+    DashboardLifecycleTests (fake .git, no state run)."""
+
+    def setUp(self):
+        self.repo = Path(tempfile.mkdtemp(prefix="dashboard-server-"))
+        (self.repo / ".git").mkdir()
+        self.addCleanup(shutil.rmtree, self.repo, ignore_errors=True)
+
+    def _start(self):
+        from autopilot import dashboard as ap_dash
+        server, port = ap_dash.start_in_thread(self.repo)
+        # addCleanup 是 LIFO：server_close 注册在前，实际先执行 shutdown
+        # 停掉 serve_forever、再关监听 socket，避免 unclosed-socket 告警。
+        self.addCleanup(server.server_close)
+        self.addCleanup(server.shutdown)
+        return port
+
+    def test_endpoints_and_readonly(self):
+        import json as _json
+        import urllib.error
+        import urllib.request
+        port = self._start()
+        base = "http://127.0.0.1:{}".format(port)
+        with urllib.request.urlopen(base + "/", timeout=5) as resp:
+            self.assertEqual(resp.status, 200)
+            self.assertIn("text/html", resp.headers["Content-Type"])
+        with urllib.request.urlopen(base + "/api/snapshot", timeout=5) as resp:
+            snap = _json.loads(resp.read().decode("utf-8"))
+            self.assertEqual(snap, {"error": "no-run"})
+        try:
+            urllib.request.urlopen(base + "/nope", timeout=5)
+            self.fail("expected 404")
+        except urllib.error.HTTPError as err:
+            self.assertEqual(err.code, 404)
+        # 只读保证：请求前后 .autopilot 目录内容一致
+        ap_dir = self.repo / ".autopilot"
+        before = sorted(p.name for p in ap_dir.glob("*")) if ap_dir.exists() else []
+        with urllib.request.urlopen(base + "/api/snapshot", timeout=5):
+            pass
+        after = sorted(p.name for p in ap_dir.glob("*")) if ap_dir.exists() else []
+        self.assertEqual(before, after)
+
+    def test_cached_snapshot_hits_until_invalidated(self):
+        import json as _json
+        import urllib.request
+        from autopilot import dashboard as ap_dash
+        # 缓存断言读 meta.generated_at，而 no-run repo 只返回
+        # {"error": "no-run"}：先种一个最小 state.json（空对象即可，
+        # build_snapshot 照常组装全板块 meta）。
+        ap_dir = self.repo / ".autopilot"
+        ap_dir.mkdir()
+        (ap_dir / "state.json").write_text("{}", encoding="utf-8")
+        port = self._start()
+        base = "http://127.0.0.1:{}/api/snapshot".format(port)
+        first = _json.loads(urllib.request.urlopen(base, timeout=5).read())
+        second = _json.loads(urllib.request.urlopen(base, timeout=5).read())
+        self.assertEqual(first["meta"]["generated_at"], second["meta"]["generated_at"])
+        ap_dash.invalidate_snapshot_cache()
+        third = _json.loads(urllib.request.urlopen(base, timeout=5).read())
+        self.assertNotEqual(second["meta"]["generated_at"], third["meta"]["generated_at"])
 
 
 if __name__ == "__main__":

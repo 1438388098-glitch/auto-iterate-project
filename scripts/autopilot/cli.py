@@ -112,6 +112,16 @@ def build_parser():
     read_parser.add_argument("--repo", default=".")
     read_parser.set_defaults(func=commands.cmd_read)
 
+    dash_parser = subparsers.add_parser("dashboard", help="Run the read-only observation dashboard")
+    dash_parser.add_argument("--repo", default=".")
+    # --serve is parse-only (cmd_dashboard always serves); it exists so
+    # spawn_server's command line reads explicitly and users can type it.
+    dash_parser.add_argument("--serve", action="store_true", help="run the server in the foreground (default)")
+    dash_parser.add_argument("--port", type=int, default=0)
+    dash_parser.add_argument("--no-open", dest="auto_open", action="store_false", default=True)
+    dash_parser.add_argument("--stop", action="store_true", help="stop a running dashboard")
+    dash_parser.set_defaults(func=commands.cmd_dashboard)
+
     diagnose_parser = subparsers.add_parser("diagnose", help="Inspect repository health and git environment")
     diagnose_parser.add_argument("--repo", default=".")
     diagnose_parser.set_defaults(func=commands.cmd_diagnose)
@@ -321,6 +331,13 @@ def build_parser():
     expand_group.add_argument("--no-expand-after-goals", dest="expand_after_goals",
                               action="store_false", default=None,
                               help="Stop when all goals are met (disable the expansion phase)")
+    dash_group = config_set_parser.add_mutually_exclusive_group()
+    dash_group.add_argument("--dashboard", dest="dashboard_enabled", action="store_true", default=None,
+                            help="enable the read-only observation dashboard")
+    dash_group.add_argument("--no-dashboard", dest="dashboard_enabled", action="store_false", default=None,
+                            help="disable the observation dashboard")
+    config_set_parser.add_argument("--dashboard-port", type=int, default=None, metavar="N",
+                                   help="dashboard port (0 = random)")
     cadence = config_set_parser.add_argument_group("cadence fields")
     cadence.add_argument("--candidates-per-round", dest="candidates_per_round",
                          type=int, metavar="N",

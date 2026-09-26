@@ -1,0 +1,612 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<title>auto·iterate 观察台</title>
+<style>
+  :root {
+    --bg: #0A0A0B; --surface: #131316; --surface2: #1A1A1F;
+    --line: #232329; --txt: #EDEDEF; --txt2: #9A9AA2; --txt3: #5C5C66;
+    --accent: #7EE0B8; --accent-dim: #3A6B57;
+    --warm: #E8A87C;
+  }
+  @media (prefers-color-scheme: light) {
+    :root:not([data-theme="dark"]) {
+      --bg:#FAFAF8; --surface:#FFFFFF; --surface2:#F0F0EE; --line:#E4E4E0;
+      --txt:#1A1A1A; --txt2:#5A5A62; --txt3:#98989E;
+      --accent:#0E8A64; --accent-dim:#BFE3D6; --warm:#C77A3A;
+    }
+  }
+  :root[data-theme="light"] {
+    --bg:#FAFAF8; --surface:#FFFFFF; --surface2:#F0F0EE; --line:#E4E4E0;
+    --txt:#1A1A1A; --txt2:#5A5A62; --txt3:#98989E;
+    --accent:#0E8A64; --accent-dim:#BFE3D6; --warm:#C77A3A;
+  }
+  * { margin:0; padding:0; box-sizing:border-box; }
+  body { background:var(--bg); color:var(--txt); font-family:"Segoe UI",system-ui,sans-serif; padding:36px 44px; max-width:1280px; margin:0 auto; }
+  .mono { font-family:"Cascadia Code",Consolas,monospace; }
+  .topbar { display:flex; align-items:baseline; gap:20px; padding-bottom:20px; border-bottom:1px solid var(--line); }
+  .brand { font-size:17px; font-weight:650; letter-spacing:-.2px; }
+  .brand em { font-style:normal; color:var(--txt3); font-weight:400; }
+  .topmeta { font-size:12px; color:var(--txt2); display:flex; gap:18px; margin-left:auto; align-items:center; }
+  .topmeta b { color:var(--txt); font-weight:600; }
+  .live { color:var(--accent); }
+  .live::before { content:""; display:inline-block; width:6px; height:6px; border-radius:50%; background:var(--accent); margin-right:6px; vertical-align:1px; }
+  .stats { display:flex; gap:44px; padding:26px 0 30px; }
+  .stat .n { font-size:26px; font-weight:600; letter-spacing:-.5px; }
+  .stat .n small { font-size:14px; color:var(--txt3); font-weight:400; }
+  .stat .l { font-size:10px; letter-spacing:1.6px; color:var(--txt3); text-transform:uppercase; margin-top:3px; }
+  .main { display:grid; grid-template-columns: 1.72fr 1fr; gap:20px; align-items:stretch; }
+  .panel { background:var(--surface); border-radius:12px; padding:22px 24px; }
+  .panel h3 { font-size:10px; letter-spacing:1.6px; text-transform:uppercase; color:var(--txt3); font-weight:600; margin-bottom:4px; }
+  .panel .sub { font-size:11.5px; color:var(--txt2); margin-bottom:14px; }
+  .tree-cap { display:flex; justify-content:space-between; align-items:center; margin-bottom:6px; }
+  .mode { font-size:10.5px; color:var(--txt2); border:1px solid var(--line); border-radius:99px; padding:3px 12px; }
+  .mode b { color:var(--txt); font-weight:500; }
+  button.mode { background:none; font-family:inherit; cursor:pointer; }
+  svg { display:block; width:100%; }
+  .ev { padding:13px 2px 13px 16px; border-left:2px solid var(--line); margin-left:4px; position:relative; }
+  .ev.hot { border-left-color:var(--accent); }
+  .ev::before { content:""; position:absolute; left:-4.5px; top:19px; width:7px; height:7px; border-radius:50%; background:var(--surface2); border:1.5px solid var(--txt3); }
+  .ev.hot::before { background:var(--accent); border-color:var(--accent); }
+  .ev .meta { font-size:10.5px; color:var(--txt3); margin-bottom:3px; }
+  .ev .meta b { color:var(--txt2); font-weight:500; }
+  .ev .t { font-size:13px; font-weight:600; letter-spacing:-.1px; margin-bottom:3px; }
+  .ev.hot .t { color:var(--accent); }
+  .ev .s { font-size:11.5px; color:var(--txt2); line-height:1.5; }
+  .goalrow { display:flex; align-items:center; gap:10px; margin-top:16px; padding-top:16px; border-top:1px solid var(--line); }
+  .goalbar { flex:1; height:3px; background:var(--surface2); border-radius:2px; overflow:hidden; }
+  .goalbar i { display:block; height:100%; width:60%; background:var(--accent); border-radius:2px; }
+  .replay { display:flex; align-items:center; gap:14px; margin-top:20px; background:var(--surface); border-radius:12px; padding:16px 24px; }
+  .play { width:30px; height:30px; border-radius:50%; background:var(--surface2); display:flex; align-items:center; justify-content:center; font-size:10px; color:var(--txt); }
+  .axis { flex:1; height:2px; background:var(--surface2); border-radius:1px; position:relative; touch-action:none; }
+  .axis .fill { position:absolute; inset:0; border-radius:1px; background:linear-gradient(90deg, var(--accent-dim), var(--accent), var(--warm)); opacity:.85; }
+  .axis .cursor { position:absolute; top:-4px; right:2%; width:10px; height:10px; border-radius:50%; background:var(--bg); border:2px solid var(--accent); }
+  .axislbl { font-size:11px; color:var(--txt3); }
+  /* 树交互与联动：域行可点；高亮切换只动 opacity/stroke/fill，200ms 渐变 */
+  #tree .drow { cursor: pointer; }
+  #tree g.domain { transition: opacity 200ms cubic-bezier(.22,1,.36,1); }
+  #tree .branch { transition: stroke 200ms cubic-bezier(.22,1,.36,1); }
+  #tree .dot { transition: fill 200ms cubic-bezier(.22,1,.36,1); }
+  .ev.dim { opacity: .65; }
+  /* 回放生长（§4.6）：新节点/卡片浮现——只动 opacity/transform，400ms 统一缓动 */
+  @keyframes grow-in { from { opacity:0; transform:translateY(8px); } to { opacity:1; transform:translateY(0); } }
+  /* 窄屏（§4.2）：单列堆叠，树在上、叙事在下 */
+  @media (max-width: 900px) {
+    body { padding: 24px 20px; }
+    .stats { flex-wrap: wrap; gap: 24px; }
+    .main { grid-template-columns: 1fr; }
+  }
+  /* 动效降级——全文件唯一的全局声明处，新增动画/过渡无需另写 reduce 分支 */
+  @media (prefers-reduced-motion: reduce) {
+    *, *::before, *::after { animation: none !important; transition: none !important; }
+  }
+</style>
+</head>
+<body>
+
+  <div class="topbar">
+    <div class="brand">auto·iterate <em>观察台</em></div>
+    <div class="topmeta mono">
+      <span id="stat-rounds">轮次 — / —</span>
+      <span id="stat-budget">预算 —%</span>
+      <span id="stat-backlog">backlog —</span>
+      <span class="live" id="stat-phase">运行中</span>
+      <span style="color:var(--txt3)" id="stat-version">v1.8.0</span>
+      <button id="theme-toggle" class="mode" title="切换主题">主题</button>
+    </div>
+  </div>
+
+  <div class="stats mono">
+    <div class="stat"><div class="n" id="stat-rounds-big">—</div><div class="l">轮次</div></div>
+    <div class="stat"><div class="n" id="stat-completed">—</div><div class="l">完成轮次</div></div>
+    <div class="stat"><div class="n" id="stat-scale">—</div><div class="l">生长规模</div></div>
+    <div class="stat"><div class="n" id="stat-goals">—</div><div class="l">目标达成</div></div>
+    <div class="stat"><div class="n" id="stat-tokens">—</div><div class="l">tokens</div></div>
+  </div>
+
+  <div class="main">
+    <div class="panel">
+      <div class="tree-cap">
+        <div><h3>项目生长</h3></div>
+        <span class="mode"><b id="mode-label">当前态</b> · 回放</span>
+      </div>
+      <div id="tree"></div>
+    </div>
+
+    <div class="panel">
+      <h3>进化叙事</h3>
+      <div id="events"></div>
+      <div class="goalrow">
+        <span id="goal-label" style="font-size:11px;color:var(--txt2)">—</span>
+        <div class="goalbar"><i id="goal-fill"></i></div>
+        <span id="goal-side" class="mono" style="font-size:10.5px;color:var(--txt3)">—</span>
+      </div>
+    </div>
+  </div>
+
+  <div class="replay">
+    <div class="play" id="play">▶</div>
+    <div class="axis"><div class="fill" id="axis-fill"></div><div class="cursor" id="axis-cursor"></div></div>
+    <div class="axislbl mono" id="axis-label">r1 — r1</div>
+  </div>
+
+<script>
+(function () {
+  var root = document.documentElement;
+  var saved = localStorage.getItem("dashboard-theme");
+  if (saved === "light" || saved === "dark") root.setAttribute("data-theme", saved);
+  document.getElementById("theme-toggle").addEventListener("click", function () {
+    var cur = root.getAttribute("data-theme")
+      || (window.matchMedia && window.matchMedia("(prefers-color-scheme: light)").matches ? "light" : "dark");
+    var next = cur === "dark" ? "light" : "dark";
+    root.setAttribute("data-theme", next);
+    localStorage.setItem("dashboard-theme", next);
+  });
+})();
+</script>
+
+<script>
+/* 数据渲染：3s 轮询 /api/snapshot，正交连线生长树 + 进化卡片流 + 点卡联动。
+   快照契约见 dashboard_data.build_snapshot；只读其产出字段，不编造数据。 */
+(function () {
+  "use strict";
+
+  var POLL_MS = 3000;
+  var $ = function (id) { return document.getElementById(id); };
+
+  var snapshot = null;      // 最近一次成功拉取并渲染的快照
+  var lastDrawn = null;     // 已渲染画面标识：generated_at 或 "no-run"
+  var expanded = new Set(); // 展开的域名（页面内存，不持久化）
+  var highlighted = null;   // 联动高亮：Set(域名) 或 null
+  var highlightSrc = -1;    // 高亮来源事件下标（再点同一张取消）
+  var pollTimer = null;
+  var replayRound = null;   // 回放游标：null = 当前态；数字 = 停留的回放轮（§4.5）
+  var playing = false;      // 播放中：650ms setTimeout 步进链
+  var playTimer = null;     // 步进链当前定时器
+  var scrubbing = false;    // 拖动游标跳转中
+  var replayAnim = false;   // 本帧渲染带 stagger 生长动画（仅播放步进为真）
+  var growSeq = 0;          // 本帧新生长节点序号 → stagger delay
+
+  function fmt(v) { return v === null || v === undefined ? "—" : String(v); }
+
+  function escapeHtml(s) {
+    return String(s === null || s === undefined ? "" : s)
+      .replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;")
+      .replace(/"/g, "&quot;").replace(/'/g, "&#39;");
+  }
+
+  // ---- 回放（设计文档 §4.5/§4.6）----
+  // 轮界只取 growth.rounds 的最大轮；无 rounds 数据（含 degraded growth）→
+  // null：回放整体禁用（播放/拖动无效果，轴退化为 r1 — r1），不报错。
+  function roundBounds() {
+    var rounds = ((snapshot && snapshot.growth) || {}).rounds || [];
+    var maxTotal = 0, maxValid = 0;
+    rounds.forEach(function (r) {
+      if (r.round > maxTotal) maxTotal = r.round;
+      if (r.status === "completed" && r.round > maxValid) maxValid = r.round;
+    });
+    return maxTotal ? { min: 1, max: maxTotal, valid: maxValid } : null;
+  }
+
+  // 回放视图：replayRound === null → 原样全量；否则按 first_round <= replayRound
+  // 过滤域与模块。first_round 缺失 = 老数据无诞生轮，不能因回放而隐藏；域的
+  // first_round 是其全部模块的最小值，故「域可见」⟺「任一模块满足条件」。
+  function viewDomains() {
+    var domains = ((snapshot && snapshot.growth) || {}).domains || [];
+    if (replayRound === null) return domains;
+    return domains.filter(function (d) {
+      return d.first_round === null || d.first_round === undefined
+        || d.first_round <= replayRound;
+    }).map(function (d) {
+      var mods = d.modules || [];
+      var keep = mods.filter(function (m) {
+        return m.first_round === null || m.first_round === undefined
+          || m.first_round <= replayRound;
+      });
+      return keep.length === mods.length ? d : Object.assign({}, d, { modules: keep });
+    });
+  }
+
+  // stagger：仅播放步进帧生效；本轮新生长（first_round == replayRound）的
+  // 节点/卡片依次浮现——60ms 步进封顶 1.2s，400ms 统一缓动 backwards。
+  function isBorn(round) {
+    return replayAnim && replayRound !== null && round !== null
+      && round !== undefined && round === replayRound;
+  }
+  function growAnim() {
+    return "animation: grow-in .4s cubic-bezier(.22,1,.36,1) "
+      + Math.min(growSeq++ * 60, 1200) + "ms backwards";
+  }
+
+  // ---- 轮询：3s 一拍；页面隐藏时跳过；画面未变不重渲染；失败静默保留旧画面 ----
+  function schedule() { pollTimer = setTimeout(poll, POLL_MS); }
+
+  var polling = false;   // 重入守卫：visibilitychange 会在上一拍未落定时再拉
+
+  async function poll() {
+    if (polling) return;
+    polling = true;
+    try {
+      if (document.hidden) { polling = false; schedule(); return; }
+      var res = await fetch("/api/snapshot");
+      if (!res.ok) throw new Error("HTTP " + res.status);
+      var next = await res.json();
+      if (next && next.error === "no-run") {
+        if (lastDrawn !== "no-run") { lastDrawn = "no-run"; renderNoRun(); }
+      } else if (next && next.meta && next.meta.generated_at) {
+        if (lastDrawn !== next.meta.generated_at) {
+          var first = snapshot === null;
+          snapshot = next;
+          lastDrawn = next.meta.generated_at;
+          highlighted = null; highlightSrc = -1;   // 新数据，联动随之失效
+          if (first && snapshot.growth && snapshot.growth.domains
+              && snapshot.growth.domains.length) {
+            expanded.add(snapshot.growth.domains[0].name);   // 首屏展开最热域（样张基准）
+          }
+          renderAll();
+        }
+      }
+    } catch (err) { /* 网络/解析失败：保留旧画面，不打断观察 */ }
+    polling = false;
+    schedule();
+  }
+
+  function renderNoRun() {
+    $("tree").innerHTML = '<div style="color:var(--txt3);font-size:12.5px;padding:26px 2px">'
+      + "此处尚无运行——在目标仓库执行 autopilot init 后刷新</div>";
+    $("events").innerHTML = "";
+    $("play").style.opacity = "0.4";   // 无运行：回放不可用（与降级口径一致）
+  }
+
+  function renderAll() { renderStats(); renderTree(); renderEvents(); }
+
+  // ---- 统计行 / 顶栏 / 目标条 / 回放轴 ----
+  function renderStats() {
+    var st = (snapshot && snapshot.status) || {};
+    var growth = (snapshot && snapshot.growth) || {};
+    var domains = growth.domains || [];
+    var budget = st.budget || {};
+    var goals = st.goals || {};
+    var backlog = st.backlog || {};
+    var tokens = budget.estimated_tokens_used;
+    if (tokens === null || tokens === undefined) tokens = 0;
+
+    $("stat-rounds").textContent = "轮次 " + fmt(st.round) + " / " + fmt(st.round_seq);
+    // max_minutes 无预算口径，百分比一期不做：如实显示累计 tokens
+    $("stat-budget").textContent = "tokens " + tokens;
+    $("stat-backlog").textContent = "backlog " + (backlog.pending === null
+      || backlog.pending === undefined ? 0 : backlog.pending);
+    // phase 只有 running/finished 两种产出；status 降级（null）时如实显示 —
+    var phase = st.phase;
+    $("stat-phase").className = phase === "running" ? "live" : "";
+    $("stat-phase").textContent = phase === "running" ? "运行中"
+      : (phase === "finished" ? "已完成" : "—");
+    if (snapshot && snapshot.meta) $("stat-version").textContent = fmt(snapshot.meta.skill_version);
+
+    var modules = 0;
+    domains.forEach(function (d) { modules += (d.modules || []).length; });
+    $("stat-rounds-big").innerHTML = escapeHtml(fmt(st.round))
+      + "<small> / " + escapeHtml(fmt(st.round_seq)) + "</small>";
+    $("stat-completed").textContent = fmt(st.completed_rounds);
+    $("stat-scale").innerHTML = domains.length + "<small> 域 · " + modules + " 模块</small>";
+    $("stat-goals").innerHTML = escapeHtml(fmt(goals.met))
+      + "<small> / " + escapeHtml(fmt(goals.total)) + "</small>";
+    $("stat-tokens").innerHTML = (tokens / 1000).toFixed(1) + "<small>k</small>";
+
+    $("goal-label").textContent = "目标 " + fmt(goals.met) + "/" + fmt(goals.total);
+    $("goal-fill").style.width = (goals.total
+      ? Math.max(0, Math.min(100, goals.met / goals.total * 100)) : 0) + "%";
+    $("goal-side").textContent = "待办 " + fmt(backlog.pending) + " · 就绪 " + fmt(backlog.ready)
+      + " · 波次 " + fmt(st.expansion_waves);
+
+    // 回放轴：r1 — 最大轮；无 rounds 数据（含 degraded growth）→ r1 — r1，
+    // 播放键降灰、回放禁用（roundBounds 的 null 即禁用信号）。
+    // 当前态填充 = 最大有效（completed）轮占比；回放态填充与游标 = 回放进度
+    var bounds = roundBounds();
+    $("axis-label").textContent = "r1 — r" + (bounds ? bounds.max : "1");
+    $("play").style.opacity = bounds ? "" : "0.4";
+    var cur = $("axis-cursor");
+    if (!bounds || replayRound === null) {
+      $("axis-fill").style.width = bounds
+        ? Math.min(100, bounds.valid / bounds.max * 100) + "%" : "0%";
+      cur.style.right = "";
+    } else {
+      var span = bounds.max - bounds.min || 1;
+      var pct = Math.min(100, Math.max(0, (replayRound - bounds.min) / span * 100));
+      $("axis-fill").style.width = pct + "%";
+      cur.style.right = (100 - pct) + "%";
+    }
+  }
+
+  // ---- 树布局器：正交连线（禁止贝塞尔绕圈）----
+  // 根固定 (84,36)；主干 x=84 从 46 到 trunkEnd；域枝 84→152 水平出枝；
+  // 展开域从 (152, y+8) 下挂二级竖线，模块水平出枝到 (175, my)。
+  // 域 y 间距：展开 = 58 + 24×模块数 + 18 收尾；折叠 = 48（任务规格）。
+  function layoutTree(domains) {
+    var nodes = [{ kind: "root", x: 84, y: 36 }];
+    var edges = [];
+    var y = 88;
+    var trunkEnd = 46;
+    domains.forEach(function (d) {
+      var mods = (expanded.has(d.name) && d.modules) || [];
+      edges.push({ kind: "branch", x1: 84, y1: y, x2: 152, y2: y,
+        w: Math.round((1.2 + 2.0 * (d.weight || 0)) * 100) / 100, domainName: d.name });
+      nodes.push({ kind: "domain", x: 152, y: y, domain: d, open: mods.length > 0 });
+      if (mods.length) {
+        edges.push({ kind: "hang", x1: 152, y1: y + 8, x2: 152,
+          y2: y + 34 + 24 * (mods.length - 1), w: 1.2, domainName: d.name });
+        mods.forEach(function (m, j) {
+          var my = y + 34 + 24 * j;
+          edges.push({ kind: "module", x1: 152, y1: my, x2: 175, y2: my, w: 1.2,
+            domainName: d.name, j: j });
+          nodes.push({ kind: "module", x: 175, y: my, module: m, domainName: d.name, j: j });
+        });
+      }
+      trunkEnd = y;
+      y += mods.length ? 58 + 24 * mods.length + 18 : 48;
+    });
+    return { nodes: nodes, edges: edges, trunkEnd: trunkEnd };
+  }
+
+  function renderTree() {
+    var box = $("tree");
+    if (!snapshot) return;
+    var meta = snapshot.meta || {};
+    var growth = snapshot.growth || {};
+    // 生长降级：缺提交锚点（growth 为空或 meta.degraded 含 growth）→ 灰字提示
+    if (!growth.domains || (meta.degraded || []).indexOf("growth") >= 0) {
+      box.innerHTML = '<div style="color:var(--txt3);font-size:12.5px;padding:26px 2px">'
+        + "进化树不可用：本轮次记录缺少提交锚点</div>";
+      return;
+    }
+    var domains = viewDomains();   // 当前态全量；回放态按 first_round 过滤
+    var t = layoutTree(domains);
+    var w = Math.max(box.clientWidth || 0, 560);
+    var byDomain = {};
+    t.nodes.forEach(function (n) {
+      if (n.kind === "domain") byDomain[n.domain.name] = { y: n.y, open: n.open, branch: null, hang: null, modules: [] };
+      else if (n.kind === "module") byDomain[n.domainName].modules[n.j] = { node: n };
+    });
+    t.edges.forEach(function (e) {
+      var row = byDomain[e.domainName];
+      if (!row) return;
+      if (e.kind === "branch") row.branch = e;
+      else if (e.kind === "hang") row.hang = e;
+      else row.modules[e.j] = { edge: e, node: row.modules[e.j].node };
+    });
+
+    var s = '<svg width="' + w + '" height="' + (t.trunkEnd + 26) + '" role="img" aria-label="项目生长树">';
+    s += '<path d="M 84 46 L 84 ' + t.trunkEnd + '" stroke="var(--line)" stroke-width="2" fill="none"/>';
+    s += '<circle cx="84" cy="36" r="5" fill="var(--txt)"/>';
+    if (meta.run_id) {
+      s += '<text x="100" y="40" font-size="11" fill="var(--txt3)" class="mono">'
+        + escapeHtml(meta.run_id) + '</text>';
+    }
+    domains.forEach(function (d) {
+      var row = byDomain[d.name];
+      if (!row) return;
+      var y = row.y;
+      s += '<g class="domain" data-domain="' + escapeHtml(d.name) + '">'
+        + (isBorn(d.first_round)
+          ? '<g class="drow grow" style="' + growAnim() + '">'
+          : '<g class="drow">');
+      s += '<path class="branch" d="M ' + row.branch.x1 + " " + row.branch.y1
+        + " L " + row.branch.x2 + " " + row.branch.y2
+        + '" stroke="var(--line)" stroke-width="' + row.branch.w + '" fill="none"/>';
+      s += '<circle class="dot" cx="152" cy="' + y + '" r="4.5" fill="var(--txt3)"/>';
+      s += '<text x="166" y="' + (y + 4) + '" font-size="12" font-weight="600" fill="var(--txt)">'
+        + escapeHtml(d.name) + '</text>';
+      var note = [];
+      if (d.first_round !== null && d.first_round !== undefined) note.push("r" + escapeHtml(d.first_round) + " 诞生");
+      if (d.meaning) note.push(escapeHtml(d.meaning));
+      if (note.length) {
+        s += '<text class="mono" x="284" y="' + (y + 4) + '" font-size="10" fill="var(--txt3)">'
+          + note.join(" · ") + '</text>';
+      }
+      if (!row.open && (d.modules || []).length) {
+        s += '<text class="mono" x="' + (w - 32) + '" y="' + (y + 3.5)
+          + '" font-size="10" fill="var(--txt3)" text-anchor="end">⋯</text>';
+      }
+      s += "</g>";
+      if (row.open && row.hang) {
+        // 下挂线与首个可见模块同帧出现——首模块本轮新生则一并生长
+        var m0 = (d.modules || [])[0];
+        var hangAttr = isBorn(m0 && m0.first_round)
+          ? ' class="grow" style="' + growAnim() + '"' : "";
+        s += '<path' + hangAttr + ' d="M ' + row.hang.x1 + " " + row.hang.y1 + " L " + row.hang.x2 + " " + row.hang.y2
+          + '" stroke="var(--line)" stroke-width="' + row.hang.w + '" fill="none"/>';
+        (d.modules || []).forEach(function (m, j) {
+          var mm = row.modules[j];
+          if (!mm) return;
+          var fresh = isBorn(m.first_round);
+          var anim = fresh ? growAnim() : "";   // 每模块一个 delay，边/点/字共用
+          var attr = fresh ? ' class="grow" style="' + anim + '"' : "";
+          s += '<path' + attr + ' d="M ' + mm.edge.x1 + " " + mm.edge.y1 + " L " + mm.edge.x2 + " " + mm.edge.y2
+            + '" stroke="var(--line)" stroke-width="1.2" fill="none"/>';
+          s += '<circle' + attr + ' cx="175" cy="' + mm.node.y + '" r="3" fill="var(--txt3)"/>';
+          var born = (m.first_round === null || m.first_round === undefined) ? ""
+            : '<tspan fill="var(--txt3)"> · r' + escapeHtml(m.first_round) + " 起</tspan>";
+          s += '<text class="mono' + (fresh ? " grow" : "") + '"'
+            + (fresh ? ' style="' + anim + '"' : "") + ' x="188" y="' + (mm.node.y + 3.5)
+            + '" font-size="11" fill="var(--txt2)">' + escapeHtml(m.name) + born + '</text>';
+        });
+      }
+      s += "</g>";
+    });
+    s += "</svg>";
+    box.innerHTML = s;
+    applyHighlight();
+  }
+
+  // ---- 联动：点卡片 → 该轮域枝 accent 全亮，其余 opacity .35 ----
+  // 只改既有 DOM 的 style，不重建树——CSS transition 承担 200ms 渐变。
+  function applyHighlight() {
+    var svg = $("tree").querySelector("svg");
+    if (!svg) return;
+    var growth = (snapshot && snapshot.growth) || {};
+    var maxRound = 0;
+    (growth.rounds || []).forEach(function (r) { if (r.round > maxRound) maxRound = r.round; });
+    svg.querySelectorAll("g.domain").forEach(function (g) {
+      var name = g.getAttribute("data-domain");
+      var d = null;
+      (growth.domains || []).forEach(function (x) { if (x.name === name) d = x; });
+      var acts = d ? (d.active_rounds || []).filter(function (r) {
+        return r !== null && r !== undefined;
+      }) : [];
+      // 回放态：本轮活跃的域亮枝干；当前态：最近活跃的域亮（Task 10 口径）
+      var accent = (replayRound !== null
+          ? acts.indexOf(replayRound) >= 0
+          : (acts.length > 0 && Math.max.apply(null, acts) === maxRound))
+        || (highlighted !== null && highlighted.has(name));
+      g.style.opacity = (!highlighted || highlighted.has(name)) ? "1" : "0.35";
+      var branch = g.querySelector(".branch");
+      if (branch) branch.style.stroke = accent ? "var(--accent)" : "var(--line)";
+      var dot = g.querySelector(".dot");
+      if (dot) dot.style.fill = accent ? "var(--accent)" : "var(--txt3)";
+    });
+  }
+
+  // ---- 进化卡片流：最新在上；最近一条 completed 热卡；取消/中止灰卡 ----
+  function renderEvents() {
+    var evs = (snapshot && snapshot.growth && snapshot.growth.events) || [];
+    var hot = false;
+    var rows = [];
+    for (var i = evs.length - 1; i >= 0; i--) {
+      var ev = evs[i];
+      // 回放：只浮现 round <= replayRound 的卡片（round 是硬关联键，恒有值）
+      if (replayRound !== null
+          && (ev.round === null || ev.round === undefined
+            || ev.round > replayRound)) continue;
+      var cls = "ev";
+      if (!hot && ev.status === "completed") { cls += " hot"; hot = true; }
+      if (ev.status === "cancelled" || ev.status === "aborted") cls += " dim";
+      var fresh = isBorn(ev.round);
+      if (fresh) cls += " grow";
+      var meta = "<b>r" + escapeHtml(ev.round) + "</b> · 自评 "
+        + (ev.score === null || ev.score === undefined ? "—" : escapeHtml(ev.score)) + "/5";
+      if (ev.status) meta += " · " + escapeHtml(ev.status);
+      if (ev.domains && ev.domains.length) meta += " → " + escapeHtml(ev.domains.join("、"));
+      rows.push('<div class="' + cls + '" data-ev="' + i + '"'
+        + (fresh ? ' style="' + growAnim() + '"' : "") + '>'
+        + '<div class="meta mono">' + meta + '</div>'
+        + (ev.title ? '<div class="t">' + escapeHtml(ev.title) + '</div>' : "")
+        + (ev.summary ? '<div class="s">' + escapeHtml(ev.summary) + '</div>' : "")
+        + "</div>");
+    }
+    $("events").innerHTML = rows.join("");
+  }
+
+  // ---- 交互绑定（事件委托，DOM 重建不失效）----
+  $("tree").addEventListener("click", function (e) {
+    var row = e.target.closest(".drow");
+    if (!row) return;
+    var g = row.closest("g.domain");
+    var name = g && g.getAttribute("data-domain");
+    if (!name) return;
+    if (expanded.has(name)) expanded.delete(name); else expanded.add(name);
+    renderTree();
+  });
+
+  $("events").addEventListener("click", function (e) {
+    var card = e.target.closest(".ev");
+    if (!card || !snapshot) return;
+    var idx = Number(card.getAttribute("data-ev"));
+    var ev = ((snapshot.growth || {}).events || [])[idx];
+    if (!ev || !ev.domains || !ev.domains.length) return;
+    if (highlightSrc === idx) { highlighted = null; highlightSrc = -1; }
+    else { highlighted = new Set(ev.domains); highlightSrc = idx; }
+    renderEvents();
+    applyHighlight();
+  });
+
+  // ---- 回放控制（§4.5）：▶ 从 r1 逐轮生长（650ms/轮，stagger 生长）；
+  // 播放中再点 ⏸ = 停止回当前态；拖动游标跳任意轮，释放停留回放态；
+  // 回放态再点 ▶ 从 r1 重播；播完自动回当前态 ----
+  function stepTo(r) {
+    replayRound = r;
+    $("mode-label").textContent = "回放 r" + r;
+    replayAnim = true;
+    growSeq = 0;
+    renderAll();
+    replayAnim = false;
+  }
+
+  function scheduleStep() {
+    playTimer = setTimeout(function () {
+      var b = roundBounds();
+      if (!b || replayRound >= b.max) { exitReplay(); return; }   // 播完
+      stepTo(replayRound + 1);
+      scheduleStep();
+    }, 650);
+  }
+
+  function exitReplay() {
+    clearTimeout(playTimer);
+    playTimer = null;
+    playing = false;
+    replayRound = null;
+    $("play").textContent = "▶";
+    $("mode-label").textContent = "当前态";
+    renderAll();                        // 全量重渲染（replayAnim 已复位，无动画）
+  }
+
+  function startReplay() {
+    var b = roundBounds();
+    if (!b) return;                     // degraded：无 rounds 数据，回放不可用
+    clearTimeout(playTimer);
+    playing = true;
+    $("play").textContent = "⏸";
+    stepTo(b.min);
+    scheduleStep();
+  }
+
+  $("play").addEventListener("click", function () {
+    if (playing) { exitReplay(); return; }
+    startReplay();
+  });
+
+  // 游标拖动：按百分比映射 r1..rMax，即时重渲染（无动画），释放停留回放态
+  var axis = document.querySelector(".axis");
+  function scrubTo(e) {
+    var b = roundBounds();
+    if (!b) return;
+    var rect = axis.getBoundingClientRect();
+    var p = rect.width ? (e.clientX - rect.left) / rect.width : 0;
+    p = Math.max(0, Math.min(1, p));
+    var r = b.min + Math.round(p * (b.max - b.min));
+    if (r === replayRound) return;
+    replayRound = r;
+    $("mode-label").textContent = "回放 r" + r;
+    renderAll();
+  }
+  axis.addEventListener("pointerdown", function (e) {
+    if (!roundBounds()) return;         // degraded：拖动无效
+    if (playing) {                      // 拖动接管：停掉步进链
+      clearTimeout(playTimer);
+      playTimer = null;
+      playing = false;
+      $("play").textContent = "▶";
+    }
+    scrubbing = true;
+    e.preventDefault();
+    if (axis.setPointerCapture) {
+      try { axis.setPointerCapture(e.pointerId); } catch (err) { /* 忽略 */ }
+    }
+    scrubTo(e);
+  });
+  axis.addEventListener("pointermove", function (e) { if (scrubbing) scrubTo(e); });
+  axis.addEventListener("pointerup", function () { scrubbing = false; });
+  axis.addEventListener("pointercancel", function () { scrubbing = false; });
+
+  document.addEventListener("visibilitychange", function () {
+    if (!document.hidden) { clearTimeout(pollTimer); poll(); }
+  });
+  window.addEventListener("resize", function () { if (snapshot) renderTree(); });
+
+  poll();
+})();
+</script>
+
+</body>
+</html>

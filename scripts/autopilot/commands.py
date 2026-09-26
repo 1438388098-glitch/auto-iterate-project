@@ -289,6 +289,22 @@ def cmd_read(args):
     return 0
 
 
+def cmd_dashboard(args):
+    from autopilot import dashboard as ap_dash
+    repo = Path(args.repo).resolve()
+    if args.stop:
+        sys.exit(0 if ap_dash.stop_server(repo) else 2)
+    # auto_open: config field is the default; --no-open forces it off.
+    cfg = config.load_config(repo)
+    auto_open = bool((cfg.get("dashboard") or {}).get("auto_open", True)) and args.auto_open
+    try:
+        ap_dash.serve(repo, port=args.port, auto_open=auto_open)
+    except OSError as err:
+        print("[ERROR] dashboard: 端口 {} 无法绑定（可能被占用）——用 --port 0 换随机端口重试。（{}）".format(
+            args.port, err), file=sys.stderr)
+        return 2
+
+
 def cmd_begin_round(args):
     repo = Path(args.repo).resolve()
     refused = _require_initialized(args, repo)
@@ -474,10 +490,20 @@ def cmd_begin_round(args):
         st["last_activity_at"] = current["started_at"]
         state.save_state(repo, st)
         io.append_log(repo, "begin-round", "success", round=round_number, candidate_id=candidate_ids)
-        if getattr(args, "json", False):
-            return emit_result(args, True, "round opened", data={"round": current})
-        print(json.dumps(current, indent=2, ensure_ascii=False))
-        return 0
+    # Observation dashboard (1.8.0): fire-and-forget spawn AFTER the run lock
+    # is released — first enable busy-waits up to 5s inside ensure (spawn
+    # handshake) and must never extend the lock hold. Hard rule: the loop must
+    # not depend on the panel — a failure only warns, never blocks the round.
+    try:
+        from autopilot import dashboard as ap_dash
+        ap_dash.ensure_dashboard(repo, cfg)
+    except Exception as err:
+        io.append_log(repo, "dashboard", "error", reason="ensure failed", detail=str(err))
+        print("[WARN] dashboard ensure failed: {}".format(err), file=sys.stderr)
+    if getattr(args, "json", False):
+        return emit_result(args, True, "round opened", data={"round": current})
+    print(json.dumps(current, indent=2, ensure_ascii=False))
+    return 0
 
 
 def _resolve_tokens(args, repo, st):
@@ -2118,8 +2144,27 @@ def cmd_config_set(args):
         requested["check_commands"] = []
     elif args.check_commands:
         requested["check_commands"] = list(args.check_commands)
+    # Dashboard fields are nested under "dashboard" in config.json, so they
+    # collect into a partial dict instead of `requested` (whose keys are
+    # top-level) and are merged into cfg["dashboard"] right before the save
+    # below. load_config deep-merges a partial user dashboard over the
+    # defaults, so the reload underneath revalidates the merged result.
+    dashboard_update = {}
+    if getattr(args, "dashboard_enabled", None) is not None:
+        dashboard_update["enabled"] = bool(args.dashboard_enabled)
+    if getattr(args, "dashboard_port", None) is not None:
+        if not 0 <= args.dashboard_port <= 65535:
+            io.append_log(repo, "config-set", "error", reason="out-of-range value",
+                          field="dashboard.port", value=args.dashboard_port)
+            return emit_result(
+                args, False,
+                "[ERROR] --dashboard-port must be an integer in 0..65535 (got {}).".format(
+                    args.dashboard_port
+                ),
+            )
+        dashboard_update["port"] = args.dashboard_port
 
-    if not requested:
+    if not requested and not dashboard_update:
         io.append_log(repo, "config-set", "error", reason="nothing to set")
         return emit_result(
             args, False,
@@ -2130,8 +2175,19 @@ def cmd_config_set(args):
             "--max-tokens/--clear-max-tokens, --deadline/--clear-deadline, "
             "--push/--no-push, --scan-secrets/--no-scan-secrets, --report-lang, "
             "--check-commands/--clear-check-commands, --smoke-commands/--clear-smoke-commands, "
-            "--max-expansion-waves/--clear-max-expansion-waves).",
+            "--max-expansion-waves/--clear-max-expansion-waves, "
+            "--dashboard/--no-dashboard, --dashboard-port).",
         )
+
+    # One rendering serves both the dry-run preview and the success summary;
+    # dashboard fields appear under dotted nested names.
+    named_items = sorted(requested.items()) + sorted(
+        ("dashboard." + name, value) for name, value in dashboard_update.items()
+    )
+    named_summary = ", ".join(
+        "{}={}".format(name, str(value).lower() if isinstance(value, bool) else value)
+        for name, value in named_items
+    )
 
     with io.run_lock(repo):
         # load_config validates the on-disk file; values above were parsed and
@@ -2139,23 +2195,35 @@ def cmd_config_set(args):
         # validator over what we actually wrote.
         cfg = config.load_config(repo)
         if getattr(args, "dry_run", False):
-            preview = ", ".join(
-                "{}={}".format(name, str(value).lower() if isinstance(value, bool) else value)
-                for name, value in sorted(requested.items())
-            )
             print(
                 "[DRY-RUN] Would set {} in .autopilot/config.json and refresh the "
-                "state config fingerprint.".format(preview),
+                "state config fingerprint.".format(named_summary),
                 file=sys.stderr,
             )
             return 0
         cfg.update(requested)
+        if dashboard_update:
+            dash = cfg.get("dashboard")
+            if not isinstance(dash, dict):
+                # validate_config sanctions "dashboard": null and load_config
+                # passes it through as None; normalize to an object like the
+                # deep-merge would, or the update below crashes on None.
+                dash = {}
+                cfg["dashboard"] = dash
+            dash.update(dashboard_update)
         config.save_config(repo, cfg)
         reloaded = config.load_config(repo)
         mismatched = [
             name for name, value in requested.items()
             if reloaded.get(name) != value
         ]
+        if dashboard_update:
+            merged_dashboard = reloaded.get("dashboard")
+            if not isinstance(merged_dashboard, dict) or any(
+                merged_dashboard.get(name) != value
+                for name, value in dashboard_update.items()
+            ):
+                mismatched.append("dashboard")
         if mismatched:
             io.append_log(repo, "config-set", "error", reason="reload mismatch", fields=mismatched)
             return emit_result(
@@ -2165,14 +2233,13 @@ def cmd_config_set(args):
         st = state.load_state(repo)
         st["config_fingerprint"] = io.file_sha256(config.config_path_for(repo))
         state.save_state(repo, st)
-        summary = ", ".join(
-            "{}={}".format(name, str(value).lower() if isinstance(value, bool) else value)
-            for name, value in sorted(requested.items())
-        )
-        io.append_log(repo, "config-set", "success", fields={k: v for k, v in requested.items()})
+        log_fields = dict(requested)
+        if dashboard_update:
+            log_fields["dashboard"] = dashboard_update
+        io.append_log(repo, "config-set", "success", fields=log_fields)
         return emit_result(
             args, True,
-            "[OK] Config updated: {}; config fingerprint refreshed (no config-drift warning).".format(summary),
+            "[OK] Config updated: {}; config fingerprint refreshed (no config-drift warning).".format(named_summary),
         )
 
 
