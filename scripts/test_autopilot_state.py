@@ -6616,5 +6616,144 @@ class DashboardConfigTests(AutopilotTestBase):
         self.assertEqual(cfg["dashboard"]["port"], 0)
 
 
+class DashboardDataTests(unittest.TestCase):
+    """Pure tests of the dashboard data pipeline (no repo fixture, FakeIO
+    injected): numstat parsing and per-round file-change aggregation."""
+
+    def test_parse_numstat_lines_basic_rename_and_binary(self):
+        from autopilot import dashboard_data as dd
+        raw = (
+            "12\t3\tscripts/autopilot/state.py\n"
+            "0\t0\told/{name.py => renamed.py}\n"
+            "-\t-\tassets/logo.png\n"
+            "5\t1\t\"quoted/路径#.py\"\n"
+        )
+        changes = dd.parse_numstat(raw)
+        by_path = {c["path"]: c for c in changes}
+        self.assertEqual(by_path["scripts/autopilot/state.py"]["insertions"], 12)
+        self.assertEqual(by_path["scripts/autopilot/state.py"]["deletions"], 3)
+        self.assertEqual(by_path["old/renamed.py"]["insertions"], 0)      # rename 归新路径
+        self.assertNotIn("old/name.py", by_path)
+        self.assertEqual(by_path["assets/logo.png"]["insertions"], 0)     # 二进制计 0 行
+        self.assertTrue(by_path["assets/logo.png"]["binary"])
+        self.assertIn("quoted/路径#.py", by_path)                          # 已 unquote
+        self.assertFalse(by_path["scripts/autopilot/state.py"]["renamed"])
+
+    def test_parse_numstat_cross_directory_rename_keeps_prefix(self):
+        """Brace-form renames wrap only the differing suffix around the shared
+        prefix: `a/{x.py => sub/y.py}` normalizes to a/sub/y.py and whole-dir
+        braces `d/{ => sub}/g.py` to d/sub/g.py — the prefix must survive."""
+        from autopilot import dashboard_data as dd
+        changes = dd.parse_numstat(
+            "2\t1\ta/{x.py => sub/y.py}\n"
+            "4\t0\t{olddir => newdir}/f.py\n"
+            "1\t1\tdir/{ => sub}/g.py\n"
+        )
+        by_path = {c["path"]: c for c in changes}
+        self.assertEqual(by_path["a/sub/y.py"]["renamed"], True)
+        self.assertEqual(by_path["newdir/f.py"]["deletions"], 0)
+        self.assertEqual(by_path["dir/sub/g.py"]["insertions"], 1)
+
+    def test_compute_round_file_changes_skips_shaless_rounds(self):
+        from autopilot import dashboard_data as dd
+        history = [
+            {"round": 1, "status": "completed", "commit_sha": "aaa"},
+            {"round": 2, "status": "cancelled", "commit_sha": None},   # 零工作取消：无提交
+            {"round": 3, "status": "completed", "commit_sha": "bbb"},
+        ]
+        calls = []
+
+        class FakeIO:
+            @staticmethod
+            def run_git(repo, *args, **kw):
+                calls.append(args)
+                return "2\t1\tf.py\n" if "aaa..bbb" in args else "1\t0\ta.py\n"
+
+        changes = dd.compute_round_file_changes("R", history, "000", gitio=FakeIO)
+        self.assertEqual(changes["a.py"]["first_round"], 1)
+        self.assertEqual(changes["f.py"]["first_round"], 3)
+        self.assertEqual(changes["f.py"]["touches"], 1)
+        self.assertEqual(len([c for c in calls if "aaa..bbb" in c]), 1)   # 取消轮不产生 diff
+
+    def test_compute_round_file_changes_skips_blocked_and_aborted_rounds(self):
+        """blocked / aborted rounds also close without a commit (work stayed
+        uncommitted): no anchor is legitimate, they consume no diff and the
+        anchor stays put — exactly one diff spans the two completed rounds."""
+        from autopilot import dashboard_data as dd
+        history = [
+            {"round": 1, "status": "completed", "commit_sha": "aaa"},
+            {"round": 2, "status": "blocked", "commit_sha": None},
+            {"round": 3, "status": "aborted", "commit_sha": None},
+            {"round": 4, "status": "completed", "commit_sha": "bbb"},
+        ]
+        calls = []
+
+        class FakeIO:
+            @staticmethod
+            def run_git(repo, *args, **kw):
+                calls.append(args)
+                return "1\t0\ta.py\n" if "000..aaa" in args else "1\t0\tb.py\n"
+
+        changes = dd.compute_round_file_changes("R", history, "000", gitio=FakeIO)
+        # 4 轮历史只产生 2 次 diff：blocked/aborted 轮不产生 diff，锚点原地不动
+        self.assertEqual([c[2] for c in calls], ["000..aaa", "aaa..bbb"])
+        self.assertEqual(changes["a.py"]["rounds"], [1])
+        self.assertEqual(changes["b.py"]["rounds"], [4])
+        self.assertEqual(changes["b.py"]["touches"], 1)
+
+    def test_compute_round_file_changes_shaless_completed_round_degrades_to_none(self):
+        """A completed round without commit_sha (deferred/legacy state) cannot
+        anchor its diff: the whole growth view degrades to None rather than
+        presenting a partial picture."""
+        from autopilot import dashboard_data as dd
+        history = [
+            {"round": 1, "status": "completed", "commit_sha": "aaa"},
+            {"round": 2, "status": "completed", "commit_sha": None},
+        ]
+
+        calls = []
+
+        class FakeIO:
+            @staticmethod
+            def run_git(repo, *args, **kw):
+                calls.append(args)
+                return "1\t0\ta.py\n"
+
+        changes = dd.compute_round_file_changes("R", history, "000", gitio=FakeIO)
+        self.assertIsNone(changes)
+        self.assertEqual([c[2] for c in calls], ["000..aaa"])   # 缺锚点轮之前仅第 1 轮 diff
+
+    def test_compute_round_file_changes_returns_none_when_anchor_missing(self):
+        from autopilot import dashboard_data as dd
+        self.assertIsNone(dd.compute_round_file_changes("R", [{"round": 1, "commit_sha": None}], "000"))
+
+    def test_compute_round_file_changes_aggregates_multi_round_touches(self):
+        from autopilot import dashboard_data as dd
+        history = [
+            {"round": 1, "status": "completed", "commit_sha": "aaa"},
+            {"round": 2, "status": "completed", "commit_sha": "bbb"},
+            {"round": 4, "status": "completed", "commit_sha": "ccc"},
+        ]
+        diffs = {
+            "000..aaa": "5\t2\tcore.py\n",
+            "aaa..bbb": "1\t0\tcore.py\n",
+            "bbb..ccc": "0\t3\tcore.py\n3\t1\tother.py\n",
+        }
+
+        class FakeIO:
+            @staticmethod
+            def run_git(repo, *args, **kw):
+                return diffs[args[-1]]
+
+        changes = dd.compute_round_file_changes("R", history, "000", gitio=FakeIO)
+        core = changes["core.py"]
+        self.assertEqual(core["touches"], 3)
+        self.assertEqual(core["insertions"], 6)
+        self.assertEqual(core["deletions"], 5)
+        self.assertEqual(core["rounds"], [1, 2, 4])
+        self.assertEqual(core["first_round"], 1)
+        self.assertEqual(changes["other.py"]["first_round"], 4)
+
+
 if __name__ == "__main__":
     unittest.main()
