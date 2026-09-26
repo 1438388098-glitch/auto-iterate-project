@@ -117,10 +117,18 @@
     <div class="panel">
       <h3>进化叙事</h3>
       <div id="events"></div>
+      <div class="goalrow" style="display:block">
+        <h3 style="margin-bottom:8px">迭代方向</h3>
+        <div id="directions"></div>
+      </div>
       <div class="goalrow">
         <span id="goal-label" style="font-size:11px;color:var(--txt2)">—</span>
         <div class="goalbar"><i id="goal-fill"></i></div>
         <span id="goal-side" class="mono" style="font-size:10.5px;color:var(--txt3)">—</span>
+      </div>
+      <div class="goalrow" id="retro-block" style="display:none">
+        <h3 style="margin-bottom:8px">回顾</h3>
+        <div id="retro-excerpt" class="mono" style="font-size:11px;color:var(--txt2);white-space:pre-wrap;line-height:1.6"></div>
       </div>
       <div class="goalrow" style="display:block">
         <h3 style="margin-bottom:8px">迭代方向</h3>
@@ -266,7 +274,19 @@
     $("play").style.opacity = "0.4";   // 无运行：回放不可用（与降级口径一致）
   }
 
-  function renderAll() { renderStats(); renderTree(); renderEvents(); renderDirections(); }
+  function renderAll() { renderStats(); renderTree(); renderEvents(); renderDirections(); renderRetro(); }
+
+  // ---- 回顾板块：run 结束后的 retrospective 摘要（无则隐藏）----
+  function renderRetro() {
+    var narrative = (snapshot && snapshot.narrative) || {};
+    var block = $("retro-block");
+    if (narrative.retrospective_exists && narrative.retrospective_excerpt) {
+      $("retro-excerpt").textContent = narrative.retrospective_excerpt;
+      block.style.display = "";
+    } else {
+      block.style.display = "none";
+    }
+  }
 
   // ---- 迭代方向板块：skill 下一步想做什么（价值序待办，供用户检验方向）----
   function renderDirections() {

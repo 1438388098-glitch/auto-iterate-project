@@ -18,6 +18,7 @@ Works with opencode, Claude Code, Codex, and other agent runtimes (auto-detected
 - **Post-goal direction prediction (Wave 0)**: `goal-met --next-step` seeds causal follow-ups with a hit-rate feedback loop.
 - **Deep Expansion & anti-idle**: thin backlog is never a stop — rotate the 16-lens set (see `references/expansion-lenses.md`).
 - **Early-stop hard gates**: `finish` is refused while budgets remain and ready work exists unless `--force`.
+- **Observation dashboard (1.8+)**: read-only web panel (`autopilot dashboard`) — an evolution tree (domain → module → file) beside a per-round card stream, with replay and a pending-direction board. Binds to 127.0.0.1 only, reads `.autopilot/` state and git history without writing, self-exits after 30 idle minutes; `config-set --dashboard` enables it and every `begin-round` then keeps it alive. Failures never block the loop.
 - **Safety rails**: refuses to commit user changes, never rewrites history, defaults to no pushing.
 
 ## Installation

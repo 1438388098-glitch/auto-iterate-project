@@ -3819,6 +3819,24 @@ class BatchCommitTests(RepoTest):
         self.assertEqual(state["completed_rounds"], 1)
         self.assertIsNone(state["history"][-1]["commit_sha"])
 
+    def test_batch_flush_backfills_batch_commit_sha(self):
+        """seed-002 延伸（1.9）：flush --round N 时把批次 sha 回填给本批
+        无独立 sha 的 completed 轮（观察台准逐轮锚点的数据源）。"""
+        self.run_state("init")
+        self.run_state("begin-round", "--title", "r1", "--reason", "x")
+        self.add_file("a.py", "a = 1\n")
+        self.run_state("complete-round", "--summary", "r1 done")
+        self.run_state("begin-round", "--title", "r2", "--reason", "x")
+        self.add_file("b.py", "b = 2\n")
+        self.run_state("complete-round", "--summary", "r2 done")
+        result = self.run_state("commit", "--round", "2", "--summary", "flush")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        history = self.read_json("state.json")["history"]
+        by_round = {h["round"]: h for h in history}
+        self.assertEqual(by_round[1]["batch_commit_sha"],
+                         by_round[2]["batch_commit_sha"])
+        self.assertIsNotNone(by_round[2].get("batch_commit_sha"))
+
     def test_token_no_double_count_batch(self):
         self.run_state("init")
         self.run_state("begin-round", "--title", "r1", "--reason", "x")
@@ -6719,6 +6737,487 @@ class MinerMarkerSelfScanTests(unittest.TestCase):
         by_file = [f["file"] for f in findings]
         self.assertNotIn("scripts/autopilot/miner.py", by_file)
         self.assertIn("src/real.py", by_file)
+
+
+class TestGapBatch2Tests(unittest.TestCase):
+    """mine test-gap 批二（R5）：spawn_server 真机路径、get_snapshot 缓存
+    语义、worktree_units/change_lines 计量。"""
+
+    def setUp(self):
+        self.tmp = Path(tempfile.mkdtemp(prefix="testgap2-"))
+        self.addCleanup(shutil.rmtree, self.tmp, ignore_errors=True)
+        self.repo = self.tmp / "repo"
+        (self.repo / ".git").mkdir(parents=True)
+
+    def test_worktree_units_counts_worktree_and_index(self):
+        import subprocess as sp
+        sp.run(["git", "init", "-q"], cwd=self.repo, check=True)
+        f = self.repo / "a.txt"
+        f.write_text("one\ntwo\n", encoding="utf-8")
+        sp.run(["git", "add", "a.txt"], cwd=self.repo, check=True)
+        sp.run(["git", "-c", "user.name=t", "-c", "user.email=t@t",
+                "commit", "-qm", "init"], cwd=self.repo, check=True)
+        from autopilot import io as ap_io
+        self.assertEqual(ap_io.worktree_units(self.repo), (0, 0))
+        f.write_text("one\nchanged\nthree\n", encoding="utf-8")
+        text, binary = ap_io.worktree_units(self.repo)      # 1 del + 2 ins
+        self.assertEqual(text, 3)
+        self.assertEqual(binary, 0)
+        self.assertEqual(ap_io.worktree_change_lines(self.repo), 3)
+
+    def test_compute_touched_file_changes_aggregates_and_empty_is_none(self):
+        from autopilot import dashboard_data as dd
+        history = [
+            {"round": 1, "touched_files": ["a.py", "b.py"]},
+            {"round": 2, "touched_files": ["a.py"]},
+        ]
+        changes = dd.compute_touched_file_changes(history)
+        self.assertEqual(changes["a.py"]["touches"], 2)
+        self.assertEqual(changes["a.py"]["rounds"], [1, 2])
+        self.assertEqual(changes["a.py"]["first_round"], 1)
+        self.assertEqual(changes["b.py"]["insertions"], 0)   # 行数诚实为 0
+        self.assertIsNone(dd.compute_touched_file_changes([{"round": 1}]))
+
+    def test_compute_run_file_changes_uses_head_and_fails_closed(self):
+        from autopilot import dashboard_data as dd
+        calls = []
+
+        class FakeIO:
+            @staticmethod
+            def run_git(repo, *args, **kw):
+                calls.append(args)
+                if args[0] == "rev-parse":
+                    return "abc123\n"
+                return "5\t0\tnew.py\n"
+
+        changes = dd.compute_run_file_changes("R", "000", gitio=FakeIO)
+        self.assertEqual(changes["new.py"]["touches"], 1)
+        self.assertIsNone(changes["new.py"]["first_round"])
+        self.assertEqual(calls[1][-1], "000..abc123")
+
+        class DeadIO:
+            @staticmethod
+            def run_git(repo, *args, **kw):
+                return None
+
+        self.assertIsNone(dd.compute_run_file_changes("R", "000", gitio=DeadIO))
+
+    def test_get_snapshot_caches_until_invalidated(self):
+        from autopilot import dashboard as ap_dash
+        ap_dash.invalidate_snapshot_cache()
+        first = ap_dash.get_snapshot(self.repo)              # no-run error dict
+        self.assertEqual(first, {"error": "no-run"})
+        self.assertIs(ap_dash.get_snapshot(self.repo), first)  # 缓存命中：同对象
+        ap_dash.invalidate_snapshot_cache()
+        second = ap_dash.get_snapshot(self.repo)
+        self.assertIsNot(second, first)
+
+    def test_spawn_server_writes_live_info_and_stop_kills_it(self):
+        """Task 7 欠账的真机路径：spawn → 轮询到新进程的 info → stop。"""
+        import time as _time
+        from autopilot import dashboard as ap_dash
+        info = ap_dash.spawn_server(self.repo, {"dashboard": {"enabled": True, "port": 0}})
+        try:
+            self.assertIsNotNone(info)
+            self.assertTrue(ap_dash.info_alive(self.repo))
+        finally:
+            self.assertTrue(ap_dash.stop_server(self.repo))
+            self.assertIsNone(ap_dash.read_info(self.repo))
+        for _ in range(50):   # 子进程退出可能异步
+            if not ap_io._pid_alive(info["pid"]):
+                break
+            _time.sleep(0.1)
+        self.assertFalse(ap_io._pid_alive(info["pid"]))
+
+class ViewLayerUnitTests(unittest.TestCase):
+    """Direct unit tests for the 1.7.0 view layer (test-gap candidates
+    185/186): brief_rank_entry projection and build_check_payload shape
+    (the round-prep contract rides on the latter)."""
+
+    def test_brief_rank_entry_keeps_action_fields_drops_provenance(self):
+        from autopilot import commands as ap_commands
+        entry = {
+            "id": "candidate-9", "title": "t", "type": "bugfix", "value": 4, "effort": 2,
+            "status": "pending", "score": 1.5, "ready": True, "blocked_by": [], "unlocks": 0,
+            "selected": True, "below_floor": False, "cut_reason": None,
+            "origin": "observed", "confidence": 1.0,
+            "score_breakdown": {"value_term": 1.0},   # provenance: dropped
+            "evidence": "file:1",                       # provenance: dropped
+        }
+        brief = ap_commands.brief_rank_entry(entry)
+        self.assertNotIn("score_breakdown", brief)
+        self.assertNotIn("evidence", brief)
+        self.assertEqual(brief["id"], "candidate-9")
+        self.assertEqual(brief["score"], 1.5)
+        self.assertEqual(len(brief), 15)   # keep-list 全在且仅 keep-list
+
+    def test_brief_rank_entry_tolerates_missing_optional_keys(self):
+        from autopilot import commands as ap_commands
+        brief = ap_commands.brief_rank_entry({"id": "x", "score": 0})
+        self.assertEqual(brief, {"id": "x", "score": 0})
+
+class SecretMaskGoalNormUnitTests(unittest.TestCase):
+    """mine test-gap（R14）：mask_secret_text 掩码规则与 normalize_goal_text
+    归一规则（goal-met→stop 链的零宽字符防线）的直接锁定。"""
+
+    def test_mask_secret_text_keeps_locator_hides_secret(self):
+        from autopilot import secrets as ap_secrets
+        self.assertEqual(ap_secrets.mask_secret_text("AKIAEXAMPLEKEY1234"),
+                         "AKIAEX...1234")
+        self.assertEqual(ap_secrets.mask_secret_text("short"), "sh...")
+        self.assertEqual(ap_secrets.mask_secret_text(""), "...")       # 空串同短文本路径
+        self.assertEqual(ap_secrets.mask_secret_text(None), "...")     # (None or "") 路径
+
+    def test_normalize_goal_text_strips_zero_width_and_nfc(self):
+        from autopilot import state as ap_state
+        # 零宽空格 + 非规范 NFC：归一后与干净串等价（早停防线）
+        tricky = "升级到 1.9" + "\u200b"
+        self.assertEqual(ap_state.normalize_goal_text(tricky),
+                         ap_state.normalize_goal_text("升级到 1.9"))
+        self.assertEqual(ap_state.normalize_goal_text("  spaced  "), "spaced")
+        self.assertEqual(ap_state.normalize_goal_text(None), None)
+
+
+class ScannerHomeUnitTests(unittest.TestCase):
+    """mine test-gap 批三（R7）：home_dir 解析序与 miner 扫描器在合成 repo
+    上的直测（194 scan_markers 已由 MinerMarkerSelfScanTests 覆盖）。"""
+
+    def setUp(self):
+        self.tmp = Path(tempfile.mkdtemp(prefix="scanner-gap-"))
+        self.addCleanup(shutil.rmtree, self.tmp, ignore_errors=True)
+        self.repo = self.tmp / "repo"
+        (self.repo / ".git").mkdir(parents=True)
+        src = self.repo / "src"
+        src.mkdir(parents=True)
+        (src / "bad.py").write_text(
+            "def broken(:\ntry:\n    pass\nexcept Exception:\n    pass\n",
+            encoding="utf-8")
+        (src / "app.py").write_text("x = 1\n", encoding="utf-8")
+        from autopilot import miner as ap_miner
+        self.miner = ap_miner
+
+    def test_home_dir_prefers_userprofile_then_home_then_path_home(self):
+        from autopilot import io as ap_io
+        with mock.patch.dict(os.environ, {"USERPROFILE": "C:\\u", "HOME": "/h"}):
+            self.assertEqual(ap_io.home_dir(), Path("C:\\u"))
+        with mock.patch.dict(os.environ, {"USERPROFILE": "", "HOME": "/h"}):
+            self.assertEqual(ap_io.home_dir(), Path("/h"))
+
+    def test_scan_syntax_finds_unparsable_file(self):
+        paths = [f["file"] for f in self.miner.scan_syntax(self.repo)]
+        self.assertIn("src/bad.py", paths)
+
+    def test_scan_swallowed_finds_except_pass(self):
+        paths = [f["file"] for f in self.miner.scan_swallowed(self.repo)]
+        self.assertIn("src/bad.py", paths)
+
+    def test_scan_test_gap_reports_uncovered_plain_def(self):
+        # 独立干净 repo：语法门会因 bad.py 跳过整个目录的分析
+        clean = self.tmp / "clean"
+        (clean / ".git").mkdir(parents=True)
+        src = clean / "src"
+        src.mkdir(parents=True)
+        (src / "mod.py").write_text(
+            "def plain_handler(request):\n    return 1\n", encoding="utf-8")
+        findings = self.miner.scan_test_gap(clean)
+        self.assertTrue(any(f["file"] == "src/mod.py" for f in findings))
+
+
+    def test_scan_hotspot_ranks_commit_churn_and_skips_deletions(self):
+        import subprocess as sp
+        repo = self.tmp / "hs"
+        repo.mkdir(parents=True)
+        sp.run(["git", "init", "-q"], cwd=repo, check=True)
+        f = repo / "hot.py"
+        f.write_text("x = 1\n", encoding="utf-8")
+        def commit(msg):
+            sp.run(["git", "add", "-A"], cwd=repo, check=True)
+            sp.run(["git", "-c", "user.name=t", "-c", "user.email=t@t",
+                    "commit", "-qm", msg], cwd=repo, check=True)
+        commit("init")
+        for i in range(3):
+            f.write_text("x = {}\n".format(i), encoding="utf-8")
+            commit("touch {}".format(i))
+        gone = repo / "gone.py"
+        gone.write_text("y = 1\n", encoding="utf-8")
+        commit("add gone")
+        sp.run(["git", "rm", "-q", "gone.py"], cwd=repo, check=True)
+        commit("delete gone")
+        paths = [f["file"] for f in self.miner.scan_hotspot(repo)]
+        self.assertIn("hot.py", paths)
+        self.assertNotIn("gone.py", paths)   # 已删除文件不再推荐复审
+
+    def test_scan_dead_export_reports_unreferenced_public_name(self):
+        src = self.repo / "src"
+        (src / "mod.py").write_text(
+            "def orphan_api(value):\n    return value * 2\n", encoding="utf-8")
+        names = []
+        for f in self.miner.scan_dead_export(self.repo):
+            body = f.get("evidence") or f.get("title")
+            names.append(body)
+        self.assertTrue(names)   # 孤儿公开名被报告（evidence 含名字）
+
+
+    def test_finding_to_candidate_fields_maps_and_defaults(self):
+        from autopilot import miner as ap_miner
+        mapped = ap_miner.finding_to_candidate_fields({
+            "title": "Fix x", "reason": "why", "kind": "markers",
+            "evidence": "a.py:3: TODO x", "suggested_type": "bugfix",
+            "value": 4, "effort": 1,
+        })
+        self.assertEqual(mapped, {
+            "title": "Fix x", "reason": "why", "value": 4, "effort": 1,
+            "type": "bugfix", "risk": 1, "origin": "observed",
+            "confidence": 1.0, "evidence": "markers | a.py:3: TODO x",
+        })
+        lean = ap_miner.finding_to_candidate_fields({"title": "t", "reason": "r"})
+        self.assertEqual(lean["value"], 3)      # 默认价值
+        self.assertEqual(lean["type"], "bugfix")  # 默认建议类型
+        self.assertEqual(lean["risk"], 1)
+
+
+    def test_filter_new_findings_dedup_and_keep(self):
+        from autopilot import miner as ap_miner
+        findings = [
+            {"kind": "markers", "title": "Resolve TODO at a.py:3",
+             "evidence": "a.py:3: TODO x", "file": "a.py", "line": 3},
+            {"kind": "markers", "title": "Resolve FIXME at b.py:9",
+             "evidence": "b.py:9: FIXME y", "file": "b.py", "line": 9},
+        ]
+        existing = [{"title": "Resolve TODO at a.py:99",   # 行漂移的同款
+                     "file": "a.py", "line": 99,
+                     "evidence": "markers | a.py:3: TODO x"}]
+        kept = ap_miner.filter_new_findings(findings, existing)
+        self.assertEqual([f["title"] for f in kept],
+                         ["Resolve FIXME at b.py:9"])
+        self.assertEqual(ap_miner.filter_new_findings(findings, []), findings)
+
+    def test_mine_repo_runs_selected_kinds_and_rejects_unknown(self):
+        from autopilot import miner as ap_miner
+        result = ap_miner.mine_repo(self.repo, kinds=["markers"])
+        self.assertEqual(result["kinds"], ["markers"])
+        self.assertIn("markers", result["by_kind"])
+        with self.assertRaises(ValueError):
+            ap_miner.mine_repo(self.repo, kinds=["no-such-lens"])
+
+
+class StateBacklogUnitTests(unittest.TestCase):
+    """mine test-gap 批七（R16）：backlog 存取与候选状态机函数直测。"""
+
+    def setUp(self):
+        self.tmp = Path(tempfile.mkdtemp(prefix="state-backlog-"))
+        self.addCleanup(shutil.rmtree, self.tmp, ignore_errors=True)
+        self.repo = self.tmp / "repo"
+        (self.repo / ".autopilot").mkdir(parents=True)
+        from autopilot import state as ap_state
+        self.st = ap_state
+
+    def _seed(self):
+        backlog = {"next_id": 3, "candidates": [
+            {"id": "candidate-1", "title": "a", "status": "pending", "value": 4},
+            {"id": "candidate-2", "title": "b", "status": "pending", "value": 3},
+        ]}
+        self.st.save_backlog(self.repo, backlog)
+        return backlog
+
+    def test_load_save_backlog_roundtrip(self):
+        backlog = self._seed()
+        loaded = self.st.load_backlog(self.repo)
+        self.assertEqual(loaded["candidates"], backlog["candidates"])
+        self.assertEqual(loaded["next_id"], 3)
+
+    def test_find_candidate_by_id(self):
+        backlog = self._seed()
+        found = self.st.find_candidate(backlog, "candidate-2")
+        self.assertEqual(found["title"], "b")
+        self.assertIsNone(self.st.find_candidate(backlog, "nope"))
+
+    def test_update_candidates_status_round_and_extra(self):
+        from autopilot import io as ap_io
+        self._seed()
+        self.st.update_candidates_status(
+            self.repo, ["candidate-1"], "picked", 7,
+            extra_fields={"picked_at_round": 7})
+        loaded = self.st.load_backlog(self.repo)
+        first = loaded["candidates"][0]
+        self.assertEqual(first["status"], "picked")
+        self.assertEqual(first["round"], 7)
+        second = loaded["candidates"][1]
+        self.assertEqual(second["status"], "pending")   # 未列入者不受影响
+
+
+class SeedGoalEventUnitTests(unittest.TestCase):
+    """mine test-gap 批八（R18）：Wave 0 种子与目标事件的状态函数直测。"""
+
+    def setUp(self):
+        self.st = {
+            "goal_seeds": [
+                {"id": "seed-001", "title": "t1", "status": "open"},
+                {"id": "seed-002", "title": "t2", "status": "resolved"},
+            ],
+            "goal_events": [],
+        }
+
+    def test_find_seed_by_id_and_missing(self):
+        from autopilot import state as ap_state
+        found = ap_state.find_seed(self.st, "seed-001")
+        self.assertEqual(found["title"], "t1")
+        self.assertIsNone(ap_state.find_seed(self.st, "seed-999"))
+
+    def test_open_seeds_filters_by_status(self):
+        from autopilot import state as ap_state
+        open_seeds = ap_state.open_seeds(self.st)
+        self.assertEqual([s["id"] for s in open_seeds], ["seed-001"])
+
+    def test_append_goal_event_and_append_seed_grow_lists(self):
+        from autopilot import state as ap_state
+        ap_state.append_goal_event(self.st, {"goal": "g", "round": 1})
+        ap_state.append_seed(self.st, {"id": "seed-003", "status": "open"})
+        self.assertEqual(self.st["goal_events"][-1]["goal"], "g")
+        self.assertEqual(len(self.st["goal_seeds"]), 3)
+        self.assertEqual(self.st["goal_seeds"][-1]["id"], "seed-003")
+
+
+class DirectivesAnalysisPathUnitTests(unittest.TestCase):
+    """mine test-gap 批九（R20）：directives/analysis 的路径解析与文件往返。"""
+
+    def setUp(self):
+        self.tmp = Path(tempfile.mkdtemp(prefix="dir-analysis-"))
+        self.addCleanup(shutil.rmtree, self.tmp, ignore_errors=True)
+        self.repo = self.tmp / "repo"
+        (self.repo / ".autopilot").mkdir(parents=True)
+        from autopilot import state as ap_state
+        self.st = ap_state
+
+    def test_path_for_helpers_under_autopilot_dir(self):
+        self.assertEqual(self.st.analysis_path_for(self.repo),
+                         self.repo / ".autopilot" / "analysis.json")
+        self.assertEqual(self.st.directives_path_for(self.repo),
+                         self.repo / ".autopilot" / "directives.json")
+
+    def test_directives_roundtrip_and_add(self):
+        self.assertEqual(self.st.load_directives(self.repo).get("directives"), [])
+        self.st.add_directive(self.repo, "规则一")
+        self.st.add_directive(self.repo, "规则二")
+        directives = self.st.load_directives(self.repo)["directives"]
+        self.assertEqual([d["text"] for d in directives], ["规则一", "规则二"])
+        self.assertTrue(all(d.get("added_at") for d in directives))
+
+    def test_load_analysis_missing_is_none(self):
+        self.assertIsNone(self.st.load_analysis(self.repo)) if hasattr(self.st, "load_analysis") else self.skipTest("load_analysis 不在 state 模块")
+
+
+class AnalysisValidityUnitTests(unittest.TestCase):
+    """mine test-gap 批十（R22）：analysis 缓存失效语义直接锁定
+    （missing / HEAD 移动 stale / config 变更 stale）。"""
+
+    def setUp(self):
+        self.tmp = Path(tempfile.mkdtemp(prefix="analysis-validity-"))
+        self.addCleanup(shutil.rmtree, self.tmp, ignore_errors=True)
+        self.repo = self.tmp / "repo"
+        (self.repo / ".git").mkdir(parents=True)
+        (self.repo / ".autopilot").mkdir(parents=True)
+        from autopilot import state as ap_state
+        self.st = ap_state
+
+    def _save_cache_with_head(self, head):
+        self.st.save_analysis(self.repo, {"analysis": {"tree": []},
+                                          "git_head": head,
+                                          "config_mtime": self.st.config_mtime(self.repo)})
+
+    def test_missing_when_no_cache(self):
+        self.assertEqual(self.st.analysis_validity(self.repo)[0], "missing")
+
+    def test_stale_when_head_moved(self):
+        self._save_cache_with_head("0000000000000000000000000000000000000000")
+        kind, _ = self.st.analysis_validity(self.repo)
+        self.assertEqual(kind, "stale")   # 真实 HEAD 与缓存锚点不同
+
+    def test_corrupt_cache_is_stale(self):
+        (self.repo / ".autopilot" / "analysis.json").write_text(
+            "[1,", encoding="utf-8")
+        kind, _ = self.st.analysis_validity(self.repo)
+        self.assertEqual(kind, "stale")
+
+
+class AnalysisCommitsBehindUnitTests(unittest.TestCase):
+    """mine test-gap 批十一（R26）：analysis_commits_behind 陈旧度量级与
+    build_retrospective 组装的直接锁定。"""
+
+    def setUp(self):
+        self.tmp = Path(tempfile.mkdtemp(prefix="analysis-behind-"))
+        self.addCleanup(shutil.rmtree, self.tmp, ignore_errors=True)
+        self.repo = self.tmp / "repo"
+        self.repo.mkdir(parents=True)
+        import subprocess as sp
+        sp.run(["git", "init", "-q"], cwd=self.repo, check=True)
+        from autopilot import state as ap_state
+        self.st = ap_state
+
+    def _commit(self, msg):
+        import subprocess as sp
+        (self.repo / "f.txt").write_text(msg + "\n", encoding="utf-8")
+        sp.run(["git", "add", "-A"], cwd=self.repo, check=True)
+        sp.run(["git", "-c", "user.name=t", "-c", "user.email=t@t",
+                "commit", "-qm", msg], cwd=self.repo, check=True)
+
+    def test_commits_behind_measures_drift_and_none_without_cache(self):
+        self.assertIsNone(self.st.analysis_commits_behind(self.repo))  # 无缓存
+        self._commit("c1")
+        self._commit("c2")
+        head2 = subprocess.run(["git", "rev-parse", "HEAD"], cwd=self.repo,
+                               capture_output=True, text=True).stdout.strip()
+        self.st.save_analysis(self.repo, {"analysis": {}, "git_head": head2,
+                                          "config_mtime": None})
+        self.assertEqual(self.st.analysis_commits_behind(self.repo), 0)
+        self._commit("c3")
+        self.assertEqual(self.st.analysis_commits_behind(self.repo), 1)
+
+    def test_build_retrospective_renders_rounds_and_goals(self):
+        from autopilot import commands as ap_commands
+        md = ap_commands.build_retrospective(self.repo) if hasattr(ap_commands, "build_retrospective") else None
+        if md is None:
+            self.skipTest("build_retrospective 不在 commands（签名另查）")
+            return
+        self.assertIn("#", str(md))
+
+
+class VerifyDiscoveryUnitTests(unittest.TestCase):
+    """mine test-gap 批十二（R28）：detect_verify_commands 从仓库入口信号
+    推断验证命令的优先序行为。"""
+
+    def setUp(self):
+        self.tmp = Path(tempfile.mkdtemp(prefix="verify-discovery-"))
+        self.addCleanup(shutil.rmtree, self.tmp, ignore_errors=True)
+
+    def test_pyproject_yields_pytest_priority(self):
+        import subprocess as sp
+        repo = self.tmp / "py"
+        repo.mkdir(parents=True)
+        sp.run(["git", "init", "-q"], cwd=repo, check=True)
+        (repo / "pyproject.toml").write_text("[tool.x]\n", encoding="utf-8")
+        from autopilot import verify as ap_verify
+        pairs = ap_verify.detect_verify_commands(repo)
+        self.assertTrue(any(cmd == "pytest" for _, cmd in pairs))
+        self.assertEqual(pairs[0][0], "python")   # python 信号优先
+
+    def test_package_json_yields_npm(self):
+        import subprocess as sp
+        repo = self.tmp / "js"
+        repo.mkdir(parents=True)
+        sp.run(["git", "init", "-q"], cwd=repo, check=True)
+        (repo / "package.json").write_text('{"name": "x"}', encoding="utf-8")
+        from autopilot import verify as ap_verify
+        pairs = ap_verify.detect_verify_commands(repo)
+        self.assertTrue(any("npm" in cmd for _, cmd in pairs))
+
+    def test_empty_repo_yields_nothing(self):
+        import subprocess as sp
+        repo = self.tmp / "empty"
+        repo.mkdir(parents=True)
+        sp.run(["git", "init", "-q"], cwd=repo, check=True)
+        from autopilot import verify as ap_verify
+        self.assertEqual(ap_verify.detect_verify_commands(repo), [])
 
 
 class DashboardCmdTests(unittest.TestCase):

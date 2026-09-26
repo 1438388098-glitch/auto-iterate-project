@@ -1900,6 +1900,16 @@ def cmd_commit(args):
             io.append_log(repo, "commit", "error", reason="git commit failed")
             return emit_result(args, False, "[ERROR] git commit failed. Check pre-commit hooks or staged files.")
         sha = io.run_git(repo, "rev-parse", "HEAD").stdout.strip()
+        if round_no is not None:
+            # seed-002 延伸（1.9）：批量 flush 时把批次 sha 记入本批各轮
+            # （无独立 sha 的 completed 轮），观察台时间轴据此获得准逐轮锚点。
+            for entry in st.get("history") or []:
+                if (entry.get("status") == "completed"
+                        and not entry.get("commit_sha")
+                        and entry.get("round") is not None
+                        and entry["round"] <= round_no):
+                    entry.setdefault("batch_commit_sha", sha)
+            state.save_state(repo, st)
         if bypassed_secrets:
             # Audit trail for the --allow-secrets bypass (U: SEC-03).
             io.append_log(repo, "commit", "success", commit_sha=sha, message=message, round=round_no, secrets_bypassed=True)
