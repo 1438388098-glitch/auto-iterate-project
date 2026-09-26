@@ -52,10 +52,13 @@ Copy (or link) the folder into your agent's skills directory — for example `~/
 ## Development
 
 ```bash
-# run the test suite (Windows example; use python3/python consistently elsewhere)
-py -3.13 -m pytest scripts/test_autopilot_state.py -q
-# or the full runner
-python scripts/test_autopilot_state.py
+# full suite (Windows example; use python3/python consistently elsewhere)
+py -3.13 scripts/test_autopilot_state.py
+# layered verification (1.9+): between-round fast check (~25s, fast classes)
+py -3.13 scripts/test_autopilot_state.py --smoke
+# parallel variants (full / smoke subset)
+py -3.13 scripts/test_autopilot_state.py --jobs 4
+py -3.13 scripts/test_autopilot_state.py --jobs 4 --smoke
 ```
 
 CI runs the suite on Python 3.8 and 3.13, Ubuntu and Windows. The helper targets Python 3.6+ with a stdlib-only dependency policy.
