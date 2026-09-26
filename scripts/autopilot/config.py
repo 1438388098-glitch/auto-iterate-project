@@ -50,6 +50,7 @@ def default_config(repo):
         "min_pending_candidates": 3,
         "max_predicted_per_round": 1,
         "max_expansion_per_round": None,
+        "max_expansion_waves": None,
     }
 
 
@@ -181,6 +182,9 @@ def validate_config(merged, source=None):
     mer = merged.get("max_expansion_per_round")
     if mer is not None and (not isinstance(mer, int) or isinstance(mer, bool) or mer < 0):
         _config_error(path, "'max_expansion_per_round' must be a non-negative integer or null", source)
+    mew = merged.get("max_expansion_waves")
+    if mew is not None and (not isinstance(mew, int) or isinstance(mew, bool) or mew < 0):
+        _config_error(path, "'max_expansion_waves' must be a non-negative integer or null", source)
     if not isinstance(merged["check_commands"], list) or not all(isinstance(c, str) for c in merged["check_commands"]):
         _config_error(path, "'check_commands' must be an array of strings", source)
     # Declared cheap checks that run BETWEEN full verifications. Same shape as

@@ -1,6 +1,6 @@
 # Auto Iterate Project
 
-Version 1.6.0 — see [CHANGELOG.md](CHANGELOG.md) for release history.
+Version 1.7.0 — see [CHANGELOG.md](CHANGELOG.md) for release history.
 
 Automatically iterate any git project inside an agent session: analyze the repository, pick the next high-value improvement, implement small changes, verify, commit, and loop until a goal is met or a configured budget (rounds / minutes / tokens / absolute deadline) runs out.
 
@@ -8,7 +8,7 @@ Works with opencode, Claude Code, Codex, and other agent runtimes (auto-detected
 
 ## Why
 
-"Keep improving this project" usually fails one of two ways: the agent idles ("nothing obvious to do"), or it churns without verification. This skill owns the loop deterministically — a visible backlog, per-candidate verification, batched commits, hard early-stop gates, and an anti-idle contract — so a multi-hour autonomous run stays honest without per-step approval. It has been running against its own repository: the 1.6.0 release is the product of a 20-round self-hosted overnight iteration.
+"Keep improving this project" usually fails one of two ways: the agent idles ("nothing obvious to do"), or it churns without verification. This skill owns the loop deterministically — a visible backlog, per-candidate verification, batched commits, hard early-stop gates, and an anti-idle contract — so a multi-hour autonomous run stays honest without per-step approval. It has been running against its own repository: the 1.6.0 release is the product of a 20-round self-hosted overnight iteration. 1.7.0 is a measured efficiency pass on top of it — the per-round cost of an agent run is the JSON it reads and the number of helper calls it makes, not the helper's runtime.
 
 ## Quick start
 

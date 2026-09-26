@@ -59,6 +59,7 @@ def build_parser():
     init_parser.add_argument("--track-state", action="store_true")
     init_parser.add_argument("--check-commands", action="append", default=None)
     init_parser.add_argument("--smoke-commands", action="append", default=None)
+    init_parser.add_argument("--max-expansion-waves", dest="max_expansion_waves", type=int, default=None)
     init_parser.add_argument("--push", action="store_true")
     init_parser.add_argument("--commit-message-prefix", default=None)
     init_parser.add_argument("--retries-per-round", type=int, default=None)
@@ -349,6 +350,11 @@ def build_parser():
     budgets.add_argument("--clear-max-tokens", dest="clear_max_tokens",
                          action="store_true", default=False,
                          help="Remove the token budget")
+    budgets.add_argument("--max-expansion-waves", dest="max_expansion_waves", type=int, metavar="N",
+                         help="Cap Deep Expansion waves for the run (non-negative integer)")
+    budgets.add_argument("--clear-max-expansion-waves", dest="clear_max_expansion_waves",
+                         action="store_true", default=False,
+                         help="Remove the expansion wave cap")
     deadline = config_set_parser.add_mutually_exclusive_group()
     deadline.add_argument("--deadline", dest="deadline", metavar="EXPR",
                           help="Absolute stop time (ISO timestamp, +8h duration, or HH:MM)")

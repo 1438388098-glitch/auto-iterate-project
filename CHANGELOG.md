@@ -2,7 +2,7 @@
 
 All notable changes to auto-iterate-project are documented here.
 
-## Unreleased
+## 1.7.0 (2026-09-26)
 
 Efficiency pass on top of 1.6.0, driven by measuring a real 30-round run
 (BrainFog) instead of guessing: what costs tokens per round is the JSON the
@@ -20,6 +20,17 @@ agent reads, not the helper's runtime (0.58s per call).
   (syntax-level checks per technology) as a suggestion only — it is never
   auto-applied, and a test pins that `--apply` still writes only
   `check_commands`.
+- `max_expansion_waves`: a cap that covers what `max_tokens` cannot see.
+  Token accounting is diff-based (`500 + 12 x changed lines`), so Deep
+  Expansion subagent spend never entered the run's budget: a run could
+  outspend every configured limit while `check` reported the budget healthy.
+  New config field (init `--max-expansion-waves`, `config-set
+  --max-expansion-waves N`/`--clear-max-expansion-waves`), counted on a new
+  monotonic `state.expansion_wave_seq` (the 20-entry rolling window saturates,
+  so it cannot count a run). `check` reports `expansion_budget`
+  (`waves_used`/`max_waves`/`waves_left`) and warns at the cap;
+  `expansion-record` refuses past it and names the escape hatch. Default
+  `null` keeps existing runs uncapped.
 - `round-prep`: the loop's round start in one call. The payload is check's
   loop-driving JSON plus the suggested candidates (brief form), the fresh
   cached analysis, the standing directives and the round number `begin-round`
@@ -35,6 +46,15 @@ agent reads, not the helper's runtime (0.58s per call).
   marked. Measured on a real 30-round repo: 18165 -> 1252 bytes with no
   change to any score. Truncation is announced on stderr so a short list is
   never mistaken for the whole backlog.
+
+### Docs
+
+- The config-set guard-rail list no longer claims `check_commands` is
+  un-settable: `config-set --check-commands` has written it since 1.6.0
+  (verified against the CLI, not inferred from the flag table).
+- `references/config.md`, `SKILL.md` and `references/troubleshooting.md`
+  document the three view flags, `round-prep`, `smoke_commands` and the
+  expansion budget, including why subagent spend is outside `max_tokens`.
 
 ### Fixed
 

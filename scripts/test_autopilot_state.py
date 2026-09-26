@@ -4355,12 +4355,16 @@ class ContractTests(RepoTest):
                 "phase", "next_verify_round", "next_commit_round", "next_checkpoint_round",
                 "backlog", "action_hint", "selected_count", "selected_empty_reason",
                 "wave_no", "lenses_used", "lenses_unused", "analysis", "mining",
-                "blocked_streak", "budget",
+                "blocked_streak", "budget", "expansion_budget",
             },
         )
         self.assertEqual(
             set(data["backlog"]),
             {"pending", "ready", "min_pending_candidates", "needs_expansion"},
+        )
+        self.assertEqual(
+            set(data["expansion_budget"]),
+            {"waves_used", "max_waves", "waves_left"},
         )
         self.assertIn(data["action_hint"], ("work", "expand", "mine", "stop"))
 
@@ -6410,6 +6414,97 @@ class SmokeCommandTests(RepoTest):
         cfg = ap_config.load_config(self.repo)
         self.assertEqual(cfg["smoke_commands"], [])
         self.assertNotIn("python -m compileall -q .", cfg["check_commands"])
+
+
+class ExpansionBudgetTests(RepoTest):
+    """Subagent spend from a Deep Expansion wave is invisible to max_tokens
+    (estimated from diffs), so the wave cap is the only hard bound on it."""
+
+    def _record_wave(self, lens="architecture"):
+        return self.run_state("expansion-record", "--lens", lens)
+
+    def test_wave_count_is_monotonic_past_the_rolling_window(self):
+        from autopilot import io as ap_io
+        from autopilot import state as ap_state
+        self.run_state("init")
+        st = {"expansion_waves": []}
+        for _ in range(ap_io.EXPANSION_WAVES_LIMIT + 3):
+            ap_state.append_expansion_wave(st, ["architecture"])
+        self.assertEqual(len(st["expansion_waves"]), ap_io.EXPANSION_WAVES_LIMIT)
+        self.assertEqual(ap_state.expansion_wave_count(st), ap_io.EXPANSION_WAVES_LIMIT + 3)
+
+    def test_count_falls_back_to_window_for_old_state(self):
+        from autopilot import state as ap_state
+        self.assertEqual(ap_state.expansion_wave_count({"expansion_waves": [{}, {}]}), 2)
+        self.assertEqual(ap_state.expansion_wave_count({}), 0)
+
+    def test_default_is_uncapped(self):
+        self.run_state("init")
+        data = json.loads(self.run_state("check", "--brief").stdout)
+        self.assertEqual(data["expansion_budget"], {"waves_used": 0, "max_waves": None, "waves_left": None})
+
+    def test_cap_refuses_the_next_wave_and_check_warns(self):
+        self.run_state("init", "--max-expansion-waves", "1")
+        result = self._record_wave()
+        self.assertEqual(result.returncode, 0, result.stderr)
+        result = self._record_wave("tests")
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("wave cap reached", result.stderr)
+        data = json.loads(self.run_state("check", "--brief").stdout)
+        self.assertEqual(data["expansion_budget"]["waves_left"], 0)
+        self.assertTrue(any("wave cap reached" in warning for warning in data["warnings"]))
+
+    def test_cap_is_raisable_at_runtime(self):
+        self.run_state("init", "--max-expansion-waves", "1")
+        self._record_wave()
+        result = self.run_state("config-set", "--max-expansion-waves", "2")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(self._record_wave("tests").returncode, 0)
+        data = json.loads(self.run_state("check", "--brief").stdout)
+        self.assertEqual(data["expansion_budget"], {"waves_used": 2, "max_waves": 2, "waves_left": 0})
+
+    def test_clear_twin_and_mutual_exclusion(self):
+        self.run_state("init", "--max-expansion-waves", "1")
+        result = self.run_state("config-set", "--max-expansion-waves", "2",
+                                "--clear-max-expansion-waves")
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("mutually exclusive", result.stderr)
+        result = self.run_state("config-set", "--clear-max-expansion-waves")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        data = json.loads(self.run_state("check", "--brief").stdout)
+        self.assertIsNone(data["expansion_budget"]["max_waves"])
+
+    def test_config_set_rejects_negative_cap(self):
+        self.run_state("init")
+        result = self.run_state("config-set", "--max-expansion-waves", "-1")
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("non-negative", result.stderr)
+
+    def test_init_rejects_negative_cap(self):
+        # Fresh repo: init on an already-initialized one would fail for an
+        # unrelated reason and hide a missing range check.
+        result = self.run_state("init", "--max-expansion-waves", "-1")
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("non-negative", result.stderr)
+
+    def test_validation_rejects_wrong_shape(self):
+        from autopilot import config as ap_config
+        self.run_state("init")
+        for bad in ("three", -1, True):
+            cfg = ap_config.load_config(self.repo)
+            cfg["max_expansion_waves"] = bad
+            with self.assertRaises(SystemExit):
+                ap_config.validate_config(cfg)
+
+    def test_uncapped_run_records_waves_without_extra_state_reads(self):
+        """A run with no cap must not pay the probe: the counter only needs to
+        exist, and recording stays monotonic."""
+        self.run_state("init")
+        self._record_wave()
+        self._record_wave("tests")
+        from autopilot import state as ap_state
+        st = ap_state.load_state(self.repo)
+        self.assertEqual(ap_state.expansion_wave_count(st), 2)
 
 
 if __name__ == "__main__":
