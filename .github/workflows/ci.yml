@@ -27,5 +27,7 @@ jobs:
           python-version: \${{ matrix.python-version }}
       - name: Syntax check
         run: python -m py_compile scripts/autopilot_state.py scripts/autopilot/*.py
+      - name: Parallel smoke check
+        run: python scripts/test_autopilot_state.py --jobs 4 --smoke
       - name: Run test suite
         run: python scripts/test_autopilot_state.py
