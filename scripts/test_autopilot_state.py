@@ -7074,11 +7074,12 @@ class DashboardSnapshotTests(AutopilotTestBase):
 
 
 class DashboardPageContractTests(unittest.TestCase):
-    """dashboard.html page contract (1.8.0 dashboard Task 9 + Task 10): the
+    """dashboard.html page contract (1.8.0 dashboard Task 9 + 10 + 11): the
     page ships inside the package (the HTTP server reads it straight from
     there), carries the dual-theme design tokens plus the single
-    reduced-motion degradation block, and only reads snapshot fields that
-    build_snapshot actually emits (API-drift guard)."""
+    reduced-motion degradation block, only reads snapshot fields that
+    build_snapshot actually emits (API-drift guard), and carries the replay
+    entry points (replayRound state, axis-cursor mount, grow-in keyframes)."""
 
     PAGE = (Path(autopilot.__file__).resolve().parent / "dashboard.html")
 
@@ -7096,6 +7097,11 @@ class DashboardPageContractTests(unittest.TestCase):
         self.assertTrue(refs, "page must reference snapshot fields")
         allowed = {"meta", "status", "growth", "narrative", "error"}
         self.assertLessEqual(refs, allowed)
+
+    def test_replay_controls_present(self):
+        html = self.PAGE.read_text(encoding="utf-8")
+        for needle in ("replayRound", "axis-cursor", "grow-in"):
+            self.assertIn(needle, html)
 
 
 class DashboardServerTests(unittest.TestCase):
