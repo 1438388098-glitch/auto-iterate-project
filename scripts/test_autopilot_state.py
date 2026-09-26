@@ -8020,8 +8020,39 @@ SLOW_TEST_CLASSES = [
 ]
 
 
-def _run_time_report():
-    """按类计时跑全量（诊断入口）：打印每类耗时，标记超过阈值的类。"""
+def _render_slow_list(slow_names):
+    """把慢类名清单渲染为 SLOW_TEST_CLASSES 赋值块（--update-slow 写回用）。"""
+    lines = ["SLOW_TEST_CLASSES = ["]
+    for name in slow_names:
+        lines.append('    "{}",'.format(name))
+    lines.append("]")
+    return "\n".join(lines)
+
+
+def _update_slow_list(slow_names):
+    """把新清单写回本文件源码的 SLOW_TEST_CLASSES 块（方括号配平定位，
+    自修改仅限该标记区间）。"""
+    source_path = __file__
+    text = open(source_path, encoding="utf-8").read()
+    start = text.index("SLOW_TEST_CLASSES = [")
+    depth = 0
+    end = start
+    for idx in range(start, len(text)):
+        if text[idx] == "[":
+            depth += 1
+        elif text[idx] == "]":
+            depth -= 1
+            if depth == 0:
+                end = idx + 1
+                break
+    updated = text[:start] + _render_slow_list(slow_names) + text[end:]
+    with open(source_path, "w", encoding="utf-8", newline="") as fh:
+        fh.write(updated)
+
+
+def _run_time_report(update=False):
+    """按类计时跑全量（诊断入口）：打印每类耗时；--update-slow 时把新清单
+    直接写回源码的 SLOW_TEST_CLASSES 块。"""
     loader = unittest.TestLoader()
     names = sorted(n for n, o in globals().items()
                    if isinstance(o, type) and issubclass(o, unittest.TestCase)
@@ -8038,6 +8069,9 @@ def _run_time_report():
             print("%7.2fs %s" % (dt, n))
     print("TOTAL %.1fs across %d classes; %d slow (>= %.1fs)"
           % (time.time() - total0, len(names), len(slow), SLOW_CLASS_SECONDS))
+    if update:
+        _update_slow_list([n for _, n in slow])
+        print("[OK] SLOW_TEST_CLASSES updated ({} classes)".format(len(slow)))
 
 
 def _run_smoke():
@@ -8156,7 +8190,10 @@ if __name__ == "__main__":
         sys.exit(_run_parallel(rest or None, jobs))
     elif "--time-report" in argv:
         argv.remove("--time-report")
-        _run_time_report()
+        update = "--update-slow" in argv
+        if update:
+            argv.remove("--update-slow")
+        _run_time_report(update=update)
     elif "--smoke" in argv:
         argv.remove("--smoke")
         if argv:
