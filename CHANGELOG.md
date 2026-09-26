@@ -61,6 +61,10 @@ friction for real.
 - `references/config.md` documents the full `config-set` field list;
   SKILL.md and troubleshooting.md sync, including using `config-set` to
   raise or clear a stop condition mid-run.
+- Root **README.md reinstated** as the repository's GitHub face (owner
+  decision, superseding the earlier "skill folders must not ship a root
+  README" rule); the version-consistency tests now require it to carry the
+  release version, and docs/README.legacy.md records the decision history.
 
 ### Tests
 

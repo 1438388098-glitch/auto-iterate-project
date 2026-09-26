@@ -2101,8 +2101,8 @@ class PredictedHardeningTests(RepoTest):
         """Single version authority (scripts/autopilot/__init__.py __version__)
         must match SKILL.md frontmatter, agents/openai.yaml, references/overview.md,
         and the newest CHANGELOG section — drift fails here instead of at release
-        time. (Root README.md is intentionally absent: skill folders must not
-        ship one; overview lives under references/.)"""
+        time. (Root README.md also carries the version header since the owner
+        reinstated it as the repo face on 2026-09-26.)"""
         import autopilot
 
         repo_root = Path(__file__).resolve().parent.parent
@@ -2115,7 +2115,8 @@ class PredictedHardeningTests(RepoTest):
         self.assertIn("Version {}".format(version), overview)
         changelog = (repo_root / "CHANGELOG.md").read_text(encoding="utf-8")
         self.assertIn("## {} (".format(version), changelog)
-        self.assertFalse((repo_root / "README.md").exists(), "skill folders must not ship a root README.md")
+        readme = (repo_root / "README.md").read_text(encoding="utf-8")
+        self.assertIn("Version {}".format(version), readme)
 
     def test_parse_deadline_overflow_returns_none(self):
         from autopilot import io as ap_io
@@ -4719,9 +4720,13 @@ class ReviewFixRegressionTests(RepoTest):
         self.assertNotIn("docs / ux-copy", skill)
         self.assertNotIn("| docs / ux-copy |", lenses_doc)
 
-    def test_skill_ship_surface_has_no_root_readme(self):
+    def test_skill_ship_surface_docs_present(self):
+        """The repo carries a root README.md as its GitHub face (owner decision
+        2026-09-26, superseding the earlier "no root README" rule), while the
+        agent-facing overview still lives under references/ — the skill entry
+        point remains SKILL.md either way."""
         repo_root = Path(__file__).resolve().parent.parent
-        self.assertFalse((repo_root / "README.md").exists())
+        self.assertTrue((repo_root / "README.md").exists())
         for name in (
             "overview.md",
             "config.md",

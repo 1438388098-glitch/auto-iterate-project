@@ -1,10 +1,9 @@
 # Auto Iterate Project
 
-> Historical archive (1.3.3). This repository intentionally ships **no root
-> README.md**: skill folders must not ship one — the agent-facing overview
-> lives at [references/overview.md](../references/overview.md) and the
-> operating contract at [SKILL.md](../SKILL.md). A version-consistency test
-> enforces the absence, so do not reintroduce a root README.
+> Historical archive (1.3.3). The repository now carries a root [README.md](../README.md)
+> as its GitHub face (owner decision 2026-09-26); the agent-facing overview
+> still lives at [references/overview.md](../references/overview.md) and the
+> operating contract at [SKILL.md](../SKILL.md).
 
 Version 1.3.3 — see [CHANGELOG.md](CHANGELOG.md) for release history.
 
