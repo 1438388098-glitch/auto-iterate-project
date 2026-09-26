@@ -6616,6 +6616,34 @@ class DashboardConfigTests(AutopilotTestBase):
         self.assertEqual(cfg["dashboard"]["port"], 0)
 
 
+class DashboardLifecycleTests(unittest.TestCase):
+    """Lifecycle half of the 1.8 dashboard: dashboard.json write/read/probe,
+    stale cleanup and the ensure hook. Plain tempdir fixture — these tests
+    never run the CLI and never spawn a real server."""
+
+    def setUp(self):
+        self.tmp = Path(tempfile.mkdtemp(prefix="dashboard-lifecycle-"))
+        self.repo = self.tmp / "repo"
+        (self.repo / ".git").mkdir(parents=True)
+
+    def test_info_roundtrip_and_stale_cleanup(self):
+        from autopilot import dashboard as ap_dash
+        ap_dash.write_info(self.repo, {"pid": os.getpid(), "port": 1234,
+                                       "started_at": "t", "opened": False})
+        info = ap_dash.read_info(self.repo)
+        self.assertEqual(info["port"], 1234)
+        ap_dash.write_info(self.repo, {"pid": 999999999, "port": 1,
+                                       "started_at": "t", "opened": False})
+        self.assertFalse(ap_dash.info_alive(self.repo))      # 死 pid → 不存活
+        ap_dash.clear_stale_info(self.repo)
+        self.assertIsNone(ap_dash.read_info(self.repo))      # 已清理
+
+    def test_ensure_disabled_is_noop(self):
+        from autopilot import dashboard as ap_dash
+        ap_dash.ensure_dashboard(self.repo, {"dashboard": {"enabled": False}})
+        self.assertIsNone(ap_dash.read_info(self.repo))
+
+
 class DashboardDataTests(unittest.TestCase):
     """Pure tests of the dashboard data pipeline (no repo fixture, FakeIO
     injected): numstat parsing and per-round file-change aggregation."""
