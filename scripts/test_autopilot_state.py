@@ -7293,5 +7293,81 @@ class DashboardServerTests(unittest.TestCase):
         self.assertNotEqual(second["meta"]["generated_at"], third["meta"]["generated_at"])
 
 
+# ---- 分层验证（1.9 goal：轮间 smoke <60s，全量留给边界轮）----
+# SLOW_TEST_CLASSES：单类实测耗时超过 SLOW_CLASS_SECONDS 的类名清单（由
+# scripts/test_autopilot_state.py --time-report 生成）。--smoke 跳过它们；
+# 新类默认进 smoke（fail-safe：smoke 只做轮间快检，全量才是边界的证明）。
+SLOW_CLASS_SECONDS = 2.0
+SLOW_TEST_CLASSES = [
+    # 2026-09-27 实测（--time-report，全量 343s/82 类），>=2.0s 的类：
+    "PredictedHardeningTests", "SecurityFixRegressionTests", "FeatureTests",
+    "OptimizationTests", "LifecycleStateFixTests", "RoundFlowTests",
+    "MiningAndFinishGateTests", "BudgetAccountingTests", "DirectionSeedTests",
+    "ExpansionWatchTests", "BacklogScoreTests", "PredictedOriginTests",
+    "RoundPrepTests", "BatchContractTests", "ExpansionWaveTests",
+    "ExpandPhaseTests", "BeginRoundStopTests", "BacklogRankViewTests",
+    "ExpansionBudgetTests", "FailurePathTests", "CommitCadenceWarnTests",
+    "BatchCommitTests", "ConfigSetTests", "RobustnessTests",
+    "RetrospectiveTests", "SecretPatternCoverageTests", "SecretScanTests",
+    "ReviewGateTests", "ConfigValidationMatrixTests", "ContractTests",
+    "SmokeCommandTests", "AllowPathsDirectoryPrefixTests", "InitTests",
+    "AnalysisCacheTests", "GoalEvidenceTests", "ReviewFixRegressionTests",
+    "ApiConsistencyFixTests", "FinishGateTests", "DetectAgentTests",
+    "BacklogPickTests", "RankingModeTests", "TokenEstimateTests",
+    "BacklogManageTests", "OrphanCommitTests",
+]
+
+
+def _run_time_report():
+    """按类计时跑全量（诊断入口）：打印每类耗时，标记超过阈值的类。"""
+    loader = unittest.TestLoader()
+    names = sorted(n for n, o in globals().items()
+                   if isinstance(o, type) and issubclass(o, unittest.TestCase)
+                   and o.__module__ == __name__)
+    total0 = time.time()
+    slow = []
+    for n in names:
+        suite = loader.loadTestsFromTestCase(globals()[n])
+        t0 = time.time()
+        res = unittest.TextTestRunner(verbosity=0).run(suite)
+        dt = time.time() - t0
+        if dt >= SLOW_CLASS_SECONDS:
+            slow.append((dt, n))
+            print("%7.2fs %s" % (dt, n))
+    print("TOTAL %.1fs across %d classes; %d slow (>= %.1fs)"
+          % (time.time() - total0, len(names), len(slow), SLOW_CLASS_SECONDS))
+
+
+def _run_smoke():
+    """全量减去 SLOW_TEST_CLASSES：轮间快速回归。新类默认包含——漏标记的
+    慢类只会让 smoke 变慢，不会让它漏测新代码；全量才是提交边界证明。"""
+    loader = unittest.TestLoader()
+    suite = unittest.TestSuite()
+    slow = set(SLOW_TEST_CLASSES)
+    count = 0
+    for n in sorted(globals()):
+        obj = globals()[n]
+        if isinstance(obj, type) and issubclass(obj, unittest.TestCase)                 and obj.__module__ == __name__ and n not in slow:
+            suite.addTest(loader.loadTestsFromTestCase(obj))
+            count += 1
+    t0 = time.time()
+    result = unittest.TextTestRunner(verbosity=1).run(suite)
+    print("[smoke] %d classes, %.1fs (excluded %d slow classes)"
+          % (count, time.time() - t0, len(slow)))
+    return 0 if result.wasSuccessful() else 1
+
+
 if __name__ == "__main__":
-    unittest.main()
+    argv = sys.argv[1:]
+    if "--time-report" in argv:
+        argv.remove("--time-report")
+        _run_time_report()
+    elif "--smoke" in argv:
+        argv.remove("--smoke")
+        if argv:
+            # --smoke 显式跟类名：只跑指定类（人工快检，不走 smoke 子集）
+            unittest.main(argv=[sys.argv[0]] + argv)
+        else:
+            sys.exit(_run_smoke())
+    else:
+        unittest.main(argv=[sys.argv[0]] + argv)
