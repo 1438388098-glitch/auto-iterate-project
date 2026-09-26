@@ -92,7 +92,10 @@ def compute_round_file_changes(repo, history, run_start_sha, gitio=None):
     changes = {}
     prev = run_start_sha
     for entry in history:
-        sha = entry.get("commit_sha")
+        # batch_commit_sha（flush --round 回填）与 commit_sha 同为合法锚点；
+        # 同批多轮共享同一 sha，随后各轮 prev==sha 产生空 diff——行数归属在
+        # 批次边界，依然真实。
+        sha = entry.get("commit_sha") or entry.get("batch_commit_sha")
         if sha:
             base = prev or io.EMPTY_TREE
             raw = run_git(repo, "diff", "--numstat", "{}..{}".format(base, sha))

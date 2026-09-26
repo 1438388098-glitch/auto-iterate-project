@@ -7482,6 +7482,36 @@ class DashboardDataTests(unittest.TestCase):
         self.assertIsNone(changes)
         self.assertEqual([c[2] for c in calls], ["000..aaa"])   # 缺锚点轮之前仅第 1 轮 diff
 
+    def test_compute_round_file_changes_consumes_batch_commit_sha(self):
+        """批量 flush 回填的 batch_commit_sha 是合法锚点：批内首轮 diff
+        prev..batch_sha 获得真实行数，同批后续轮 prev==sha 空 diff 跳过。"""
+        from autopilot import dashboard_data as dd
+        history = [
+            {"round": 1, "status": "completed", "commit_sha": None,
+             "batch_commit_sha": "aaa"},
+            {"round": 2, "status": "completed", "commit_sha": None,
+             "batch_commit_sha": "aaa"},
+            {"round": 3, "status": "completed", "commit_sha": "bbb"},
+        ]
+        calls = []
+
+        class FakeIO:
+            @staticmethod
+            def run_git(repo, *args, **kw):
+                calls.append(args)
+                if "000..aaa" in args:
+                    return "4\t2\tm1.py\n"
+                if "aaa..bbb" in args:
+                    return "1\t1\tm2.py\n"
+                return ""
+
+        changes = dd.compute_round_file_changes("R", history, "000", gitio=FakeIO)
+        self.assertEqual(changes["m1.py"]["first_round"], 1)
+        self.assertEqual(changes["m1.py"]["insertions"], 4)
+        self.assertEqual(changes["m2.py"]["first_round"], 3)
+        self.assertEqual([c[3] for c in calls if c[0] == "diff"],
+                         ["000..aaa", "aaa..bbb"])   # 同批第二轮不重复 diff
+
     def test_compute_round_file_changes_git_failure_degrades_to_none(self):
         """A failed git diff (run_git -> None) must degrade to None: silently
         rendering growth as empty would understate the run's work."""
