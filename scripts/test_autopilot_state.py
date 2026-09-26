@@ -7182,6 +7182,21 @@ class AnalysisCommitsBehindUnitTests(unittest.TestCase):
         self.assertIn("#", str(md))
 
 
+class CompilePatternsUnitTests(unittest.TestCase):
+    """mine test-gap 反复重挖的 compile_patterns（secrets.py:34）真缺口：
+    编译用户 pattern、空串跳过、非法正则干净报错退出。"""
+
+    def test_compile_patterns_compiles_and_clean_error(self):
+        from autopilot import secrets as ap_secrets
+        compiled = ap_secrets.compile_patterns(["AKIA[A-Z0-9]{16}", "-----BEGIN"])
+        self.assertEqual(len(compiled), 2)
+        self.assertTrue(all(hasattr(p, "search") for p in compiled))
+        self.assertEqual(ap_secrets.compile_patterns(None), [])
+        self.assertEqual(ap_secrets.compile_patterns([""]), [])   # 空串跳过
+        with self.assertRaises(SystemExit):
+            ap_secrets.compile_patterns(["([bad"])   # 非法正则：干净报错退出
+
+
 class VerifyDiscoveryUnitTests(unittest.TestCase):
     """mine test-gap 批十二（R28）：detect_verify_commands 从仓库入口信号
     推断验证命令的优先序行为。"""
