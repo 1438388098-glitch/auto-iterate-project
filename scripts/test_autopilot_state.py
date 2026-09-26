@@ -8,6 +8,7 @@ import shutil
 import subprocess
 import sys
 import tempfile
+import time
 import unittest
 from datetime import datetime, timedelta
 from io import StringIO
@@ -6624,6 +6625,7 @@ class DashboardLifecycleTests(unittest.TestCase):
 
     def setUp(self):
         self.tmp = Path(tempfile.mkdtemp(prefix="dashboard-lifecycle-"))
+        self.addCleanup(shutil.rmtree, self.tmp, ignore_errors=True)
         self.repo = self.tmp / "repo"
         (self.repo / ".git").mkdir(parents=True)
 
@@ -6643,6 +6645,94 @@ class DashboardLifecycleTests(unittest.TestCase):
         from autopilot import dashboard as ap_dash
         ap_dash.ensure_dashboard(self.repo, {"dashboard": {"enabled": False}})
         self.assertIsNone(ap_dash.read_info(self.repo))
+
+    def test_read_info_rejects_non_object_json(self):
+        """A hand-edited `[]`/`123` info file must degrade to None everywhere —
+        info_alive/stop_server read .get(...)/["pid"] and would crash on a
+        list (review finding: read_info promised never-raises but only
+        guarded parse errors, not shapes)."""
+        from autopilot import dashboard as ap_dash
+        info_path = self.repo / ".autopilot" / "dashboard.json"
+        info_path.parent.mkdir(parents=True, exist_ok=True)
+        for raw in ("[]", "123", '"str"', "null"):
+            info_path.write_text(raw, encoding="utf-8")
+            self.assertIsNone(ap_dash.read_info(self.repo), raw)
+            self.assertFalse(ap_dash.info_alive(self.repo), raw)
+            self.assertFalse(ap_dash.stop_server(self.repo), raw)
+        # stop_server short-circuits on unreadable info (returns False) —
+        # the junk file itself is left for clear_stale_info, which also
+        # tolerates it (info_alive is already None → unlink).
+        ap_dash.clear_stale_info(self.repo)
+        self.assertFalse(info_path.exists())
+
+    def test_stop_server_terminates_recorded_process(self):
+        """--stop contract on the real OS path: write_info pointing at a live
+        dummy child → stop_server kills it (taskkill/SIGTERM) and removes the
+        info file (spec §7.3: 'stop, tested by really launching')."""
+        import subprocess as sp
+        import sys as _sys
+        from autopilot import dashboard as ap_dash
+        child = sp.Popen([_sys.executable, "-c", "import time; time.sleep(30)"])
+        try:
+            self.assertTrue(child.poll() is None)
+            ap_dash.write_info(self.repo, {"pid": child.pid, "port": 0,
+                                           "started_at": "t", "opened": False})
+            self.assertTrue(ap_dash.stop_server(self.repo))
+            self.assertIsNone(ap_dash.read_info(self.repo))
+        finally:
+            if child.poll() is None:
+                child.kill()
+                child.wait(timeout=10)
+        # On Windows taskkill is asynchronous-ish; poll briefly for exit.
+        for _ in range(50):
+            if child.poll() is not None:
+                break
+            time.sleep(0.1)
+        self.assertIsNotNone(child.poll())
+
+
+class DashboardCmdTests(unittest.TestCase):
+    """cmd_dashboard wiring (1.8.0 final review): config dashboard.auto_open is
+    the default and --no-open forces it off; a busy --port exits with a clean
+    [ERROR] instead of a bind traceback."""
+
+    def setUp(self):
+        self.tmp = Path(tempfile.mkdtemp(prefix="dashboard-cmd-"))
+        self.addCleanup(shutil.rmtree, self.tmp, ignore_errors=True)
+        self.repo = self.tmp / "repo"
+        (self.repo / ".git").mkdir(parents=True)
+
+    def _run(self, argv, serve_spy):
+        from autopilot import dashboard as ap_dash
+        args = build_parser().parse_args(argv)
+        with mock.patch.object(ap_dash, "serve", serve_spy):
+            return commands_module.cmd_dashboard(args)
+
+    def test_auto_open_config_default_with_cli_override(self):
+        from autopilot import config as ap_config
+        seen = []
+        self._run(["dashboard", "--repo", str(self.repo)],
+                  lambda repo, port, auto_open: seen.append(auto_open))
+        self.assertTrue(seen[-1])                       # default: auto_open on
+        ap_config.save_config(self.repo, {"dashboard": {"auto_open": False}})
+        self._run(["dashboard", "--repo", str(self.repo)],
+                  lambda repo, port, auto_open: seen.append(auto_open))
+        self.assertFalse(seen[-1])                      # config field respected
+        self._run(["dashboard", "--repo", str(self.repo), "--no-open"],
+                  lambda repo, port, auto_open: seen.append(auto_open))
+        self.assertFalse(seen[-1])                      # CLI flag forces off
+
+    def test_stop_exit_zero_when_recorded_nonzero_when_not(self):
+        with mock.patch("autopilot.dashboard.stop_server", return_value=True):
+            with self.assertRaises(SystemExit) as ctx:
+                commands_module.cmd_dashboard(build_parser().parse_args(
+                    ["dashboard", "--repo", str(self.repo), "--stop"]))
+            self.assertEqual(ctx.exception.code, 0)
+        with mock.patch("autopilot.dashboard.stop_server", return_value=False):
+            with self.assertRaises(SystemExit) as ctx:
+                commands_module.cmd_dashboard(build_parser().parse_args(
+                    ["dashboard", "--repo", str(self.repo), "--stop"]))
+            self.assertEqual(ctx.exception.code, 2)
 
 
 class DashboardBeginRoundHookTests(RepoTest):

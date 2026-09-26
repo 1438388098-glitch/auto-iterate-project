@@ -36,12 +36,14 @@ def write_info(repo, info):
 
 def read_info(repo):
     """Return the recorded dashboard info dict, or None when the file is
-    missing, unreadable or corrupt. Never raises."""
+    missing, unreadable, corrupt, or not a JSON object (a hand-edited `[]`
+    must degrade, not crash info_alive/stop_server). Never raises."""
     path = _info_path(repo)
     try:
-        return json.loads(path.read_text(encoding="utf-8"))
+        info = json.loads(path.read_text(encoding="utf-8"))
     except (OSError, ValueError):
         return None
+    return info if isinstance(info, dict) else None
 
 
 def info_alive(repo):
@@ -139,8 +141,10 @@ def invalidate_snapshot_cache():
 
 def _cache_key(repo):
     from . import dashboard_data as dd
-    names = (io.STATE_FILENAME, io.BACKLOG_FILENAME,
-             io.ANALYSIS_FILENAME, io.CONFIG_FILENAME)
+    # Exactly the files build_snapshot reads (analysis.json is legacy state
+    # the pipeline never consumes; the narrative .md files it does).
+    names = (io.STATE_FILENAME, io.BACKLOG_FILENAME, io.CONFIG_FILENAME,
+             "last-summary.md", "retrospective.md")
     mtimes = []
     for name in names:
         p = dd._autopilot_dir(repo) / name
@@ -187,7 +191,10 @@ def _make_handler(repo):
                 try:
                     body = json.dumps(get_snapshot(repo), ensure_ascii=False).encode("utf-8")
                     self._send(200, body, "application/json; charset=utf-8")
-                except Exception as err:                      # 单请求异常不杀进程
+                # (Exception, SystemExit): io.load_json's corrupt-file guard
+                # raises SystemExit (BaseException) — it must degrade to this
+                # 500 JSON, not kill the request thread with a traceback.
+                except (Exception, SystemExit) as err:
                     body = json.dumps({"error": "internal", "detail": str(err)}).encode("utf-8")
                     self._send(500, body, "application/json; charset=utf-8")
             else:
@@ -229,8 +236,12 @@ def serve(repo, port=0, auto_open=True, host="127.0.0.1"):
         import webbrowser
         try:
             webbrowser.open("http://{}:{}/".format(host, port))
-        except Exception:
-            pass
+        except Exception as err:
+            # Headless/unattended hosts: stay silent on stderr, leave a trail.
+            try:
+                io.append_log(repo, "dashboard", "warn", reason="auto_open failed", detail=str(err))
+            except Exception:
+                pass
     thread = threading.Thread(target=server.serve_forever, daemon=True)
     thread.start()
     while True:

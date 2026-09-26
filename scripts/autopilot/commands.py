@@ -294,7 +294,15 @@ def cmd_dashboard(args):
     repo = Path(args.repo).resolve()
     if args.stop:
         sys.exit(0 if ap_dash.stop_server(repo) else 2)
-    ap_dash.serve(repo, port=args.port, auto_open=args.auto_open)
+    # auto_open: config field is the default; --no-open forces it off.
+    cfg = config.load_config(repo)
+    auto_open = bool((cfg.get("dashboard") or {}).get("auto_open", True)) and args.auto_open
+    try:
+        ap_dash.serve(repo, port=args.port, auto_open=auto_open)
+    except OSError as err:
+        print("[ERROR] dashboard: 端口 {} 无法绑定（可能被占用）——用 --port 0 换随机端口重试。（{}）".format(
+            args.port, err), file=sys.stderr)
+        return 2
 
 
 def cmd_begin_round(args):
@@ -482,19 +490,20 @@ def cmd_begin_round(args):
         st["last_activity_at"] = current["started_at"]
         state.save_state(repo, st)
         io.append_log(repo, "begin-round", "success", round=round_number, candidate_id=candidate_ids)
-        # Observation dashboard (1.8.0): fire-and-forget spawn after the round
-        # is safely open. Hard rule: the loop must not depend on the panel —
-        # a failure only warns (stderr + log.jsonl), never blocks the round.
-        try:
-            from autopilot import dashboard as ap_dash
-            ap_dash.ensure_dashboard(repo, cfg)
-        except Exception as err:
-            io.append_log(repo, "dashboard", "error", reason="ensure failed", detail=str(err))
-            print("[WARN] dashboard ensure failed: {}".format(err), file=sys.stderr)
-        if getattr(args, "json", False):
-            return emit_result(args, True, "round opened", data={"round": current})
-        print(json.dumps(current, indent=2, ensure_ascii=False))
-        return 0
+    # Observation dashboard (1.8.0): fire-and-forget spawn AFTER the run lock
+    # is released — first enable busy-waits up to 5s inside ensure (spawn
+    # handshake) and must never extend the lock hold. Hard rule: the loop must
+    # not depend on the panel — a failure only warns, never blocks the round.
+    try:
+        from autopilot import dashboard as ap_dash
+        ap_dash.ensure_dashboard(repo, cfg)
+    except Exception as err:
+        io.append_log(repo, "dashboard", "error", reason="ensure failed", detail=str(err))
+        print("[WARN] dashboard ensure failed: {}".format(err), file=sys.stderr)
+    if getattr(args, "json", False):
+        return emit_result(args, True, "round opened", data={"round": current})
+    print(json.dumps(current, indent=2, ensure_ascii=False))
+    return 0
 
 
 def _resolve_tokens(args, repo, st):

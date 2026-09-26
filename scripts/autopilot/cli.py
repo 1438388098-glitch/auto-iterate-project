@@ -114,6 +114,8 @@ def build_parser():
 
     dash_parser = subparsers.add_parser("dashboard", help="Run the read-only observation dashboard")
     dash_parser.add_argument("--repo", default=".")
+    # --serve is parse-only (cmd_dashboard always serves); it exists so
+    # spawn_server's command line reads explicitly and users can type it.
     dash_parser.add_argument("--serve", action="store_true", help="run the server in the foreground (default)")
     dash_parser.add_argument("--port", type=int, default=0)
     dash_parser.add_argument("--no-open", dest="auto_open", action="store_false", default=True)

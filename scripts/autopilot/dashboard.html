@@ -71,6 +71,12 @@
   .ev.dim { opacity: .65; }
   /* 回放生长（§4.6）：新节点/卡片浮现——只动 opacity/transform，400ms 统一缓动 */
   @keyframes grow-in { from { opacity:0; transform:translateY(8px); } to { opacity:1; transform:translateY(0); } }
+  /* 窄屏（§4.2）：单列堆叠，树在上、叙事在下 */
+  @media (max-width: 900px) {
+    body { padding: 24px 20px; }
+    .stats { flex-wrap: wrap; gap: 24px; }
+    .main { grid-template-columns: 1fr; }
+  }
   /* 动效降级——全文件唯一的全局声明处，新增动画/过渡无需另写 reduce 分支 */
   @media (prefers-reduced-motion: reduce) {
     *, *::before, *::after { animation: none !important; transition: none !important; }
@@ -93,7 +99,7 @@
 
   <div class="stats mono">
     <div class="stat"><div class="n" id="stat-rounds-big">—</div><div class="l">轮次</div></div>
-    <div class="stat"><div class="n" id="stat-completed">—</div><div class="l">测试全绿</div></div>
+    <div class="stat"><div class="n" id="stat-completed">—</div><div class="l">完成轮次</div></div>
     <div class="stat"><div class="n" id="stat-scale">—</div><div class="l">生长规模</div></div>
     <div class="stat"><div class="n" id="stat-goals">—</div><div class="l">目标达成</div></div>
     <div class="stat"><div class="n" id="stat-tokens">—</div><div class="l">tokens</div></div>
@@ -216,9 +222,13 @@
   // ---- 轮询：3s 一拍；页面隐藏时跳过；画面未变不重渲染；失败静默保留旧画面 ----
   function schedule() { pollTimer = setTimeout(poll, POLL_MS); }
 
+  var polling = false;   // 重入守卫：visibilitychange 会在上一拍未落定时再拉
+
   async function poll() {
-    if (document.hidden) { schedule(); return; }
+    if (polling) return;
+    polling = true;
     try {
+      if (document.hidden) { polling = false; schedule(); return; }
       var res = await fetch("/api/snapshot");
       if (!res.ok) throw new Error("HTTP " + res.status);
       var next = await res.json();
@@ -238,6 +248,7 @@
         }
       }
     } catch (err) { /* 网络/解析失败：保留旧画面，不打断观察 */ }
+    polling = false;
     schedule();
   }
 
@@ -387,7 +398,7 @@
       s += '<text x="166" y="' + (y + 4) + '" font-size="12" font-weight="600" fill="var(--txt)">'
         + escapeHtml(d.name) + '</text>';
       var note = [];
-      if (d.first_round !== null && d.first_round !== undefined) note.push("r" + d.first_round + " 诞生");
+      if (d.first_round !== null && d.first_round !== undefined) note.push("r" + escapeHtml(d.first_round) + " 诞生");
       if (d.meaning) note.push(escapeHtml(d.meaning));
       if (note.length) {
         s += '<text class="mono" x="284" y="' + (y + 4) + '" font-size="10" fill="var(--txt3)">'
@@ -415,7 +426,7 @@
             + '" stroke="var(--line)" stroke-width="1.2" fill="none"/>';
           s += '<circle' + attr + ' cx="175" cy="' + mm.node.y + '" r="3" fill="var(--txt3)"/>';
           var born = (m.first_round === null || m.first_round === undefined) ? ""
-            : '<tspan fill="var(--txt3)"> · r' + m.first_round + " 起</tspan>";
+            : '<tspan fill="var(--txt3)"> · r' + escapeHtml(m.first_round) + " 起</tspan>";
           s += '<text class="mono' + (fresh ? " grow" : "") + '"'
             + (fresh ? ' style="' + anim + '"' : "") + ' x="188" y="' + (mm.node.y + 3.5)
             + '" font-size="11" fill="var(--txt2)">' + escapeHtml(m.name) + born + '</text>';
@@ -472,7 +483,7 @@
       if (ev.status === "cancelled" || ev.status === "aborted") cls += " dim";
       var fresh = isBorn(ev.round);
       if (fresh) cls += " grow";
-      var meta = "<b>r" + fmt(ev.round) + "</b> · 自评 "
+      var meta = "<b>r" + escapeHtml(ev.round) + "</b> · 自评 "
         + (ev.score === null || ev.score === undefined ? "—" : escapeHtml(ev.score)) + "/5";
       if (ev.status) meta += " · " + escapeHtml(ev.status);
       if (ev.domains && ev.domains.length) meta += " → " + escapeHtml(ev.domains.join("、"));
