@@ -579,10 +579,14 @@
   // ---- 进化卡片流：最新在上；最近一条 completed 热卡；取消/中止灰卡 ----
   function renderEvents() {
     var evs = (snapshot && snapshot.growth && snapshot.growth.events) || [];
+    // 长 run 只渲染最近 20 条（DOM 防膨胀），总数如实标注
+    var EVENTS_RENDER_LIMIT = 20;
+    var render = evs.length > EVENTS_RENDER_LIMIT
+      ? evs.slice(evs.length - EVENTS_RENDER_LIMIT) : evs;
     var hot = false;
     var rows = [];
-    for (var i = evs.length - 1; i >= 0; i--) {
-      var ev = evs[i];
+    for (var i = render.length - 1; i >= 0; i--) {
+      var ev = render[i];
       // 回放：只浮现 round <= replayRound 的卡片（round 是硬关联键，恒有值）
       if (replayRound !== null
           && (ev.round === null || ev.round === undefined
