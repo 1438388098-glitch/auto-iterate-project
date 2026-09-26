@@ -1490,21 +1490,57 @@ class RobustnessTests(RepoTest):
         self.assertIn("- [x]", report.stdout)
 
     def test_pid_alive_permission_error_is_alive(self):
+        import os as os_module
         import autopilot.io as ap_io_module
-        original_run = ap_io_module.subprocess.run
 
-        def refuse(*args, **kwargs):
-            raise PermissionError("EPERM: operation not permitted")
+        # EPERM means the holder EXISTS: the lock must fail closed to "alive"
+        # so a cross-user live lock is never deleted. _pid_alive probes with
+        # os.kill on POSIX and with the tasklist subprocess on Windows, so the
+        # test has to patch whichever probe the current platform actually
+        # uses — patching subprocess.run on POSIX leaves os.kill in place and
+        # asserts nothing (it used to fail outright on a nonexistent PID).
+        if os_module.name == "nt":
+            original_run = ap_io_module.subprocess.run
+
+            def refuse_tasklist(*args, **kwargs):
+                raise PermissionError("EPERM: operation not permitted")
+
+            try:
+                ap_io_module.subprocess.run = refuse_tasklist
+                self.assertTrue(ap_io_module._pid_alive(12345))
+            finally:
+                ap_io_module.subprocess.run = original_run
+        else:
+            original_kill = ap_io_module.os.kill
+
+            def refuse_kill(pid, sig):
+                raise PermissionError("EPERM: operation not permitted")
+
+            try:
+                ap_io_module.os.kill = refuse_kill
+                self.assertTrue(ap_io_module._pid_alive(12345))
+            finally:
+                ap_io_module.os.kill = original_kill
+
+    def test_pid_alive_missing_process_is_dead(self):
+        """The counterpart guard: a PID that is genuinely gone must read as
+        dead, so a stale lock still gets cleaned up (the EPERM branch above
+        must not swallow ProcessLookupError)."""
+        import os as os_module
+        import autopilot.io as ap_io_module
+        if os_module.name == "nt":
+            self.assertFalse(ap_io_module._pid_alive(4000000000))
+            return
+        original_kill = ap_io_module.os.kill
+
+        def missing(pid, sig):
+            raise ProcessLookupError("ESRCH: no such process")
 
         try:
-            ap_io_module.subprocess.run = refuse
-            # PermissionError (EPERM) means the holder EXISTS: on POSIX os.kill
-            # raises it, on Windows the tasklist probe surfaces the same error
-            # class — both must fail closed to "alive" so a cross-user live
-            # lock is never deleted.
-            self.assertTrue(ap_io_module._pid_alive(12345))
+            ap_io_module.os.kill = missing
+            self.assertFalse(ap_io_module._pid_alive(12345))
         finally:
-            ap_io_module.subprocess.run = original_run
+            ap_io_module.os.kill = original_kill
 
 
 class OrphanCommitTests(RepoTest):
