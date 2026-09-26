@@ -6846,6 +6846,84 @@ class ScannerHomeUnitTests(unittest.TestCase):
         self.assertTrue(any(f["file"] == "src/mod.py" for f in findings))
 
 
+    def test_scan_hotspot_ranks_commit_churn_and_skips_deletions(self):
+        import subprocess as sp
+        repo = self.tmp / "hs"
+        repo.mkdir(parents=True)
+        sp.run(["git", "init", "-q"], cwd=repo, check=True)
+        f = repo / "hot.py"
+        f.write_text("x = 1\n", encoding="utf-8")
+        def commit(msg):
+            sp.run(["git", "add", "-A"], cwd=repo, check=True)
+            sp.run(["git", "-c", "user.name=t", "-c", "user.email=t@t",
+                    "commit", "-qm", msg], cwd=repo, check=True)
+        commit("init")
+        for i in range(3):
+            f.write_text("x = {}\n".format(i), encoding="utf-8")
+            commit("touch {}".format(i))
+        gone = repo / "gone.py"
+        gone.write_text("y = 1\n", encoding="utf-8")
+        commit("add gone")
+        sp.run(["git", "rm", "-q", "gone.py"], cwd=repo, check=True)
+        commit("delete gone")
+        paths = [f["file"] for f in self.miner.scan_hotspot(repo)]
+        self.assertIn("hot.py", paths)
+        self.assertNotIn("gone.py", paths)   # 已删除文件不再推荐复审
+
+    def test_scan_dead_export_reports_unreferenced_public_name(self):
+        src = self.repo / "src"
+        (src / "mod.py").write_text(
+            "def orphan_api(value):\n    return value * 2\n", encoding="utf-8")
+        names = []
+        for f in self.miner.scan_dead_export(self.repo):
+            body = f.get("evidence") or f.get("title")
+            names.append(body)
+        self.assertTrue(names)   # 孤儿公开名被报告（evidence 含名字）
+
+
+    def test_finding_to_candidate_fields_maps_and_defaults(self):
+        from autopilot import miner as ap_miner
+        mapped = ap_miner.finding_to_candidate_fields({
+            "title": "Fix x", "reason": "why", "kind": "markers",
+            "evidence": "a.py:3: TODO x", "suggested_type": "bugfix",
+            "value": 4, "effort": 1,
+        })
+        self.assertEqual(mapped, {
+            "title": "Fix x", "reason": "why", "value": 4, "effort": 1,
+            "type": "bugfix", "risk": 1, "origin": "observed",
+            "confidence": 1.0, "evidence": "markers | a.py:3: TODO x",
+        })
+        lean = ap_miner.finding_to_candidate_fields({"title": "t", "reason": "r"})
+        self.assertEqual(lean["value"], 3)      # 默认价值
+        self.assertEqual(lean["type"], "bugfix")  # 默认建议类型
+        self.assertEqual(lean["risk"], 1)
+
+
+    def test_filter_new_findings_dedup_and_keep(self):
+        from autopilot import miner as ap_miner
+        findings = [
+            {"kind": "markers", "title": "Resolve TODO at a.py:3",
+             "evidence": "a.py:3: TODO x", "file": "a.py", "line": 3},
+            {"kind": "markers", "title": "Resolve FIXME at b.py:9",
+             "evidence": "b.py:9: FIXME y", "file": "b.py", "line": 9},
+        ]
+        existing = [{"title": "Resolve TODO at a.py:99",   # 行漂移的同款
+                     "file": "a.py", "line": 99,
+                     "evidence": "markers | a.py:3: TODO x"}]
+        kept = ap_miner.filter_new_findings(findings, existing)
+        self.assertEqual([f["title"] for f in kept],
+                         ["Resolve FIXME at b.py:9"])
+        self.assertEqual(ap_miner.filter_new_findings(findings, []), findings)
+
+    def test_mine_repo_runs_selected_kinds_and_rejects_unknown(self):
+        from autopilot import miner as ap_miner
+        result = ap_miner.mine_repo(self.repo, kinds=["markers"])
+        self.assertEqual(result["kinds"], ["markers"])
+        self.assertIn("markers", result["by_kind"])
+        with self.assertRaises(ValueError):
+            ap_miner.mine_repo(self.repo, kinds=["no-such-lens"])
+
+
 class DashboardCmdTests(unittest.TestCase):
     """cmd_dashboard wiring (1.8.0 final review): config dashboard.auto_open is
     the default and --no-open forces it off; a busy --port exits with a clean
