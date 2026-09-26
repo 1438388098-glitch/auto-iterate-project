@@ -28,10 +28,14 @@ def _info_path(repo):
 def write_info(repo, info):
     """Persist the server's lifecycle info (pid/port/started_at/opened) as
     plain JSON. Deliberately not io.save_json: a torn or corrupt file must
-    degrade to read_info() → None, never SystemExit like io.load_json."""
+    degrade to read_info() → None, never SystemExit like io.load_json.
+    Atomic tmp+replace (io.save_json precedent): a killed writer leaves the
+    previous file intact instead of a torn one."""
     path = _info_path(repo)
     path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text(json.dumps(info), encoding="utf-8")
+    tmp = path.with_suffix(".json.tmp")
+    tmp.write_text(json.dumps(info), encoding="utf-8")
+    os.replace(str(tmp), str(path))
 
 
 def read_info(repo):
