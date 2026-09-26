@@ -6691,6 +6691,36 @@ class DashboardLifecycleTests(unittest.TestCase):
         self.assertIsNotNone(child.poll())
 
 
+class MinerMarkerSelfScanTests(unittest.TestCase):
+    """markers 扫描器的自指误报（1.9 R2）：扫描语法定义文件（miner.py）的
+    MARKER_RE 模式串、解释注释与 docstring 全部含字面 TODO——自指命中永不
+    是真债务，扫描器跳过自身文件（先例：1.6.0 跳过测试夹具）。"""
+
+    def setUp(self):
+        self.tmp = Path(tempfile.mkdtemp(prefix="miner-self-scan-"))
+        self.addCleanup(shutil.rmtree, self.tmp, ignore_errors=True)
+        self.repo = self.tmp / "repo"
+        (self.repo / ".git").mkdir(parents=True)
+        miner = self.repo / "scripts" / "autopilot" / "miner.py"
+        miner.parent.mkdir(parents=True)
+        miner.write_text(
+            'MARKER_RE = re.compile(r"\b(TODO|FIXME|HACK|XXX)\b[:\s-]*(.*)$", re.I)\n'
+            '# Doc extensions whose TODO markers are docs work.\n'
+            'def scan_markers(repo, limit=30):\n'
+            '    """TODO/FIXME/HACK/XXX markers with file:line."""\n',
+            encoding="utf-8")
+        real = self.repo / "src" / "real.py"
+        real.parent.mkdir(parents=True)
+        real.write_text("# TODO: wire the retry loop to the backlog\n", encoding="utf-8")
+
+    def test_scanner_skips_its_own_syntax_file(self):
+        from autopilot import miner as ap_miner
+        findings = ap_miner.scan_markers(self.repo)
+        by_file = [f["file"] for f in findings]
+        self.assertNotIn("scripts/autopilot/miner.py", by_file)
+        self.assertIn("src/real.py", by_file)
+
+
 class DashboardCmdTests(unittest.TestCase):
     """cmd_dashboard wiring (1.8.0 final review): config dashboard.auto_open is
     the default and --no-open forces it off; a busy --port exits with a clean
@@ -7127,6 +7157,56 @@ class DashboardSnapshotTests(AutopilotTestBase):
             {"round": 2, "status": "completed", "score": 3,
              "files_changed": 2, "insertions": 2, "deletions": 0},
         ])
+
+    def test_snapshot_run_level_fallback_when_anchors_missing(self):
+        """Batch-commit runs (default cadence) carry no per-round shas;
+        growth must degrade to a RUN-LEVEL aggregation (run_start_sha..HEAD)
+        instead of switching the tree off entirely (1.9 R3)."""
+        from autopilot import dashboard_data as dd
+        self._seed_state(history=[
+            {"round": 1, "status": "completed", "title": "t1", "summary": "s1",
+             "review_score": 4, "commit_sha": None},
+        ])
+        calls = []
+
+        class FakeIO:
+            @staticmethod
+            def run_git(repo, *args, **kw):
+                calls.append(args)
+                if args[0] == "rev-parse":
+                    return "abc123"
+                return "12\t3\tscripts/autopilot/miner.py\n"
+
+        snap = dd.build_snapshot(self.repo, gitio=FakeIO)
+        self.assertEqual(snap["meta"]["degraded"], [])
+        self.assertEqual(snap["growth"]["granularity"], "run")
+        domains = snap["growth"]["domains"]
+        self.assertEqual(len(domains), 1)
+        self.assertEqual(domains[0]["modules"][0]["path"], "scripts/autopilot/miner.py")
+        self.assertEqual(domains[0]["modules"][0]["churn"]["insertions"], 12)
+        self.assertEqual(snap["growth"]["rounds"],
+                         [{"round": 1, "status": "completed", "score": 4,
+                           "files_changed": 0, "insertions": 0, "deletions": 0}])
+        self.assertEqual(len(snap["growth"]["events"]), 1)
+        self.assertEqual(calls[0][0], "rev-parse")   # 先解析 HEAD
+        self.assertIn("abc123", calls[1][-1])        # diff range 以 HEAD 收尾
+
+    def test_snapshot_growth_stays_degraded_when_run_diff_fails(self):
+        """No anchors AND a failing run-level diff (unborn repo / git error)
+        keeps the old fail-closed behaviour: growth listed in degraded."""
+        from autopilot import dashboard_data as dd
+        self._seed_state(history=[
+            {"round": 1, "status": "completed", "title": "t1", "summary": "s1", "review_score": None, "commit_sha": None},
+        ])
+
+        class DeadIO:
+            @staticmethod
+            def run_git(repo, *args, **kw):
+                return None
+
+        snap = dd.build_snapshot(self.repo, gitio=DeadIO)
+        self.assertIn("growth", snap["meta"]["degraded"])
+        self.assertEqual(snap["growth"]["domains"], [])
 
     def test_snapshot_corrupt_state_degrades_all(self):
         from autopilot import dashboard_data as dd

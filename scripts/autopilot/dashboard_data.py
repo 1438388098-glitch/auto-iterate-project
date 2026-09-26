@@ -271,6 +271,33 @@ def _autopilot_dir(repo):
     return Path(repo) / io.AUTOPILOT_DIR
 
 
+def compute_run_file_changes(repo, run_start_sha, gitio=None):
+    """Run-level fallback for batch-commit runs whose history carries no
+    per-round shas: one numstat over run_start_sha..HEAD (EMPTY_TREE base
+    when unanchored, same as the per-round walk). Returns the same
+    {path: change} shape as compute_round_file_changes with first_round=None
+    and rounds=[] — the tree renders, the timeline does not exist. None when
+    HEAD cannot be resolved or the diff fails (fail-closed, callers keep
+    their degraded path)."""
+    run_git = _resolve_run_git(gitio)
+    head_raw = run_git(repo, "rev-parse", "--verify", "-q", "HEAD")
+    if not head_raw:
+        return None
+    head = head_raw.strip().splitlines()[0].strip()
+    base = run_start_sha or io.EMPTY_TREE
+    raw = run_git(repo, "diff", "--numstat", "{}..{}".format(base, head))
+    if raw is None:
+        return None
+    changes = {}
+    for item in parse_numstat(raw):
+        changes[item["path"]] = {
+            "first_round": None, "touches": 1,
+            "insertions": item["insertions"], "deletions": item["deletions"],
+            "rounds": [],
+        }
+    return changes
+
+
 def build_snapshot(repo, gitio=None):
     """Assemble the read-only dashboard snapshot (design doc §3.1): a ``meta``
     header (generated_at, skill_version, run_id, degraded), a ``status``
@@ -318,10 +345,21 @@ def build_snapshot(repo, gitio=None):
     changes = compute_round_file_changes(repo, history, run_start_sha, gitio=gitio)
     round_stats = compute_round_stats(repo, history, run_start_sha, gitio=gitio)
     degraded = []
+    granularity = "per-round"
     if changes is None or round_stats is None:
-        degraded.append("growth")
-        domains, round_domains, rounds = [], {}, []
-    else:
+        # Batch-commit runs (default cadence) carry no per-round shas: fall
+        # back to a run-level aggregation so the tree stays alive, honestly
+        # labelled — the timeline (rounds/replay) simply does not exist.
+        changes = compute_run_file_changes(repo, run_start_sha, gitio=gitio)
+        round_stats = []
+        if changes is None:
+            degraded.append("growth")
+            granularity = None
+            domains, round_domains, rounds = [], {}, []
+        else:
+            granularity = "run"
+            round_domains, rounds = {}, []
+    if granularity is not None:
         dash_cfg = (config.get("dashboard") or {}) if isinstance(config, dict) else {}
         domain_map = dash_cfg.get("domain_map")
         domains = aggregate_modules(changes, domain_map)
@@ -369,6 +407,7 @@ def build_snapshot(repo, gitio=None):
             "expansion_waves": len(state.get("expansion_waves") or []),
         },
         "growth": {
+            "granularity": granularity,
             "domains": domains,
             "events": correlate_events(history, round_domains),
             "rounds": rounds,

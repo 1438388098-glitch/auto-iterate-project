@@ -180,7 +180,10 @@
   // 轮界只取 growth.rounds 的最大轮；无 rounds 数据（含 degraded growth）→
   // null：回放整体禁用（播放/拖动无效果，轴退化为 r1 — r1），不报错。
   function roundBounds() {
-    var rounds = ((snapshot && snapshot.growth) || {}).rounds || [];
+    var g = (snapshot && snapshot.growth) || {};
+    // 粗粒度（run 级聚合）没有真实逐轮时间轴：回放如实禁用
+    if (g.granularity && g.granularity !== "per-round") return null;
+    var rounds = g.rounds || [];
     var maxTotal = 0, maxValid = 0;
     rounds.forEach(function (r) {
       if (r.round > maxTotal) maxTotal = r.round;
@@ -361,6 +364,12 @@
       return;
     }
     var domains = viewDomains();   // 当前态全量；回放态按 first_round 过滤
+    var banner = "";
+    if (growth.granularity === "run") {
+      // 粗粒度状态条（产品信息，非注释）：批量提交 run 无逐轮锚点
+      banner = '<div style="color:var(--txt3);font-size:11px;padding:0 2px 10px">'
+        + "粗粒度视图：本 run 为批量提交，展示 run 级聚合（无逐轮时间轴）</div>";
+    }
     var t = layoutTree(domains);
     var w = Math.max(box.clientWidth || 0, 560);
     var byDomain = {};
@@ -435,7 +444,7 @@
       s += "</g>";
     });
     s += "</svg>";
-    box.innerHTML = s;
+    box.innerHTML = banner + s;
     applyHighlight();
   }
 
