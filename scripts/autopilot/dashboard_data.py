@@ -198,8 +198,10 @@ def aggregate_modules(file_changes, domain_map):
 
 
 def correlate_events(history, round_domains):
-    """history entries → evolution cards, oldest first. cancelled/aborted
-    rounds are kept (rendered grey upstream); missing review_score → None."""
+    """History entries → evolution cards, oldest first (input order preserved;
+    state.history is already old→new). round is hard-required (join key —
+    malformed history raises); cancelled/aborted rounds are kept (rendered
+    grey upstream); missing review_score → None."""
     events = []
     for entry in history:
         events.append({

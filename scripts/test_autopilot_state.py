@@ -6846,6 +6846,8 @@ class DashboardDataTests(unittest.TestCase):
         self.assertIsNone(events[0]["score"])
         self.assertEqual(events[1]["domains"], ["quality", "supply"])  # 排序稳定
         self.assertEqual(events[1]["score"], 4)
+        self.assertEqual(events[1]["title"], "exhausted 只计 apply run")
+        self.assertEqual(events[1]["commit_sha"], "20c6a6e")
 
     def test_correlate_events_defaults_domains_to_empty(self):
         from autopilot import dashboard_data as dd
