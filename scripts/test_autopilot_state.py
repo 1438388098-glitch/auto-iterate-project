@@ -7028,6 +7028,38 @@ class StateBacklogUnitTests(unittest.TestCase):
         self.assertEqual(second["status"], "pending")   # 未列入者不受影响
 
 
+class SeedGoalEventUnitTests(unittest.TestCase):
+    """mine test-gap 批八（R18）：Wave 0 种子与目标事件的状态函数直测。"""
+
+    def setUp(self):
+        self.st = {
+            "goal_seeds": [
+                {"id": "seed-001", "title": "t1", "status": "open"},
+                {"id": "seed-002", "title": "t2", "status": "resolved"},
+            ],
+            "goal_events": [],
+        }
+
+    def test_find_seed_by_id_and_missing(self):
+        from autopilot import state as ap_state
+        found = ap_state.find_seed(self.st, "seed-001")
+        self.assertEqual(found["title"], "t1")
+        self.assertIsNone(ap_state.find_seed(self.st, "seed-999"))
+
+    def test_open_seeds_filters_by_status(self):
+        from autopilot import state as ap_state
+        open_seeds = ap_state.open_seeds(self.st)
+        self.assertEqual([s["id"] for s in open_seeds], ["seed-001"])
+
+    def test_append_goal_event_and_append_seed_grow_lists(self):
+        from autopilot import state as ap_state
+        ap_state.append_goal_event(self.st, {"goal": "g", "round": 1})
+        ap_state.append_seed(self.st, {"id": "seed-003", "status": "open"})
+        self.assertEqual(self.st["goal_events"][-1]["goal"], "g")
+        self.assertEqual(len(self.st["goal_seeds"]), 3)
+        self.assertEqual(self.st["goal_seeds"][-1]["id"], "seed-003")
+
+
 class DashboardCmdTests(unittest.TestCase):
     """cmd_dashboard wiring (1.8.0 final review): config dashboard.auto_open is
     the default and --no-open forces it off; a busy --port exits with a clean
