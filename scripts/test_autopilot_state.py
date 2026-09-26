@@ -6983,6 +6983,51 @@ class ScannerHomeUnitTests(unittest.TestCase):
             ap_miner.mine_repo(self.repo, kinds=["no-such-lens"])
 
 
+class StateBacklogUnitTests(unittest.TestCase):
+    """mine test-gap 批七（R16）：backlog 存取与候选状态机函数直测。"""
+
+    def setUp(self):
+        self.tmp = Path(tempfile.mkdtemp(prefix="state-backlog-"))
+        self.addCleanup(shutil.rmtree, self.tmp, ignore_errors=True)
+        self.repo = self.tmp / "repo"
+        (self.repo / ".autopilot").mkdir(parents=True)
+        from autopilot import state as ap_state
+        self.st = ap_state
+
+    def _seed(self):
+        backlog = {"next_id": 3, "candidates": [
+            {"id": "candidate-1", "title": "a", "status": "pending", "value": 4},
+            {"id": "candidate-2", "title": "b", "status": "pending", "value": 3},
+        ]}
+        self.st.save_backlog(self.repo, backlog)
+        return backlog
+
+    def test_load_save_backlog_roundtrip(self):
+        backlog = self._seed()
+        loaded = self.st.load_backlog(self.repo)
+        self.assertEqual(loaded["candidates"], backlog["candidates"])
+        self.assertEqual(loaded["next_id"], 3)
+
+    def test_find_candidate_by_id(self):
+        backlog = self._seed()
+        found = self.st.find_candidate(backlog, "candidate-2")
+        self.assertEqual(found["title"], "b")
+        self.assertIsNone(self.st.find_candidate(backlog, "nope"))
+
+    def test_update_candidates_status_round_and_extra(self):
+        from autopilot import io as ap_io
+        self._seed()
+        self.st.update_candidates_status(
+            self.repo, ["candidate-1"], "picked", 7,
+            extra_fields={"picked_at_round": 7})
+        loaded = self.st.load_backlog(self.repo)
+        first = loaded["candidates"][0]
+        self.assertEqual(first["status"], "picked")
+        self.assertEqual(first["round"], 7)
+        second = loaded["candidates"][1]
+        self.assertEqual(second["status"], "pending")   # 未列入者不受影响
+
+
 class DashboardCmdTests(unittest.TestCase):
     """cmd_dashboard wiring (1.8.0 final review): config dashboard.auto_open is
     the default and --no-open forces it off; a busy --port exits with a clean
