@@ -21,7 +21,7 @@ description: Automatically iterate any git project inside the current agent sess
 - Operate in the current working directory unless the user names a different git repository path.
 - Batch by default. Each round works on `candidates_per_round` backlog candidates (default `4`); each candidate is implemented and verified as its own unit. Full regression verification runs once every `verify_every_rounds` rounds (default `3`). Commits are deferred and flushed once every `commit_every_rounds` rounds (default `5`). Set any of these to `1` for the original one-change-per-round contract.
 - Maintain a visible improvement backlog in `.autopilot/backlog.json`.
-- When `check` reports `action_hint: "mine"`, run `python <this-skill>/scripts/autopilot_state.py mine --repo <repo> --apply` immediately, then `backlog-rank` and open a round. When it reports `action_hint: "expand"`, mine is already fresh — run Deep Expansion. Empty backlog is not a stop.
+- When `check` reports `action_hint: "mine"`, run `python <this-skill>/scripts/autopilot_state.py mine --repo <repo> --apply` immediately, then `backlog-rank --pending-only --top 5 --brief` and open a round. When it reports `action_hint: "expand"`, mine is already fresh — run Deep Expansion. Empty backlog is not a stop.
 - Use `branch_mode: feature` when autonomous work should be isolated from the current branch.
 - Resume unfinished state from `.autopilot/state.json` instead of starting over.
 - Do not rely on host-specific goal tools. This skill owns its loop and state through `.autopilot/`.
@@ -122,7 +122,7 @@ When nothing matches, run `detect-verify --repo <repo>` (`--apply` writes `check
 
 - **Supply first**: if the backlog is thin/empty or `action_hint` is `mine`, run `mine --repo <repo> --apply` (scanners: markers, swallowed, syntax, test-gap, hotspot, dead-export, docs-drift). It writes deduped, evidence-backed candidates. Judgment invention is the fallback, not the default.
 - `backlog-add` with title, reason, `value` (1-5), `effort` (1-5), `type` (`bugfix|feature|refactor|perf|test|docs`), optional `risk` (1-5), optional `depends-on`.
-- `backlog-rank` sorts by expected value per round (`ranking_mode: expected` is **not** value/effort). Read `score_breakdown`, `selected`, `below_floor`, `cut_reason`, `unlocks`, `ready`/`blocked_by`. `classic` is the legacy ratio.
+- `backlog-rank` sorts by expected value per round (`ranking_mode: expected` is **not** value/effort). Read `selected`, `below_floor`, `cut_reason`, `unlocks`, `ready`/`blocked_by`; `--brief` adds `score_breakdown`-free output and the loop should always pass `--pending-only --top 5 --brief` (the full ranking is ~18KB per round on a 30-round repo, mostly completed history). Add `--brief`-free full output only when debugging a score. `classic` is the legacy ratio.
 - Pick the `selected` batch (`candidates_per_round`, default 4). Diversity quota `max_same_type_per_round` (default 2), value floor `min_candidate_value` (default 3). Empty batch while ready entries exist → read `selected_empty_reason` (`quota`/`late_run`/`cutoff`/`floor`/`batch_full`/`type`) and choose Deep Expansion vs an explicit `--candidate-id` round.
 - Do not combine unrelated candidates into one change; each is its own unit inside the round.
 - **Thin-backlog rule**: when `action_hint` is `"expand"`, run Deep Expansion **in parallel with** any ready work. Never start a round with zero ready candidates on an empty backlog.

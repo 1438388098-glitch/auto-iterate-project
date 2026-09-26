@@ -6156,5 +6156,84 @@ class SuiteIntegrityTests(unittest.TestCase):
         )
 
 
+class BacklogRankViewTests(RepoTest):
+    """The loop reads backlog-rank every round; on a real 30-round repo that
+    was 18KB per round, 82% of it completed history and per-entry
+    score_breakdown. The view flags trim what the reader sees without
+    touching the ranking itself."""
+
+    def _add(self, title, **extra):
+        args = ["--title", title, "--reason", "r", "--value", "4", "--effort", "2"]
+        for key, value in extra.items():
+            args += ["--" + key.replace("_", "-"), value]
+        result = self.run_state("backlog-add", *args)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        return result.stdout.strip().splitlines()[-1]
+
+    def _seed(self):
+        self.run_state("init")
+        return [self._add("pend{}".format(i)) for i in range(4)]
+
+    def test_view_flags_are_opt_in(self):
+        """No flags keeps the full shape: existing callers and the human
+        debugging a score still get score_breakdown and the free text."""
+        self._seed()
+        ranked = json.loads(self.run_state("backlog-rank").stdout)
+        self.assertIn("score_breakdown", ranked[0])
+        self.assertIn("reason", ranked[0])
+
+    def test_brief_drops_breakdown_and_free_text(self):
+        self._seed()
+        result = self.run_state("backlog-rank", "--brief")
+        ranked = json.loads(result.stdout)
+        entry = ranked[0]
+        self.assertNotIn("score_breakdown", entry)
+        self.assertNotIn("reason", entry)
+        self.assertNotIn("created_at", entry)
+        for key in ("id", "title", "type", "value", "effort", "status", "score", "selected"):
+            self.assertIn(key, entry)
+        self.assertTrue(entry["selected"])
+
+    def test_view_flags_do_not_change_scores(self):
+        self._seed()
+        full = {e["id"]: e["score"] for e in json.loads(self.run_state("backlog-rank").stdout)}
+        brief = {e["id"]: e["score"] for e in json.loads(self.run_state("backlog-rank", "--brief").stdout)}
+        self.assertEqual(full, brief)
+
+    def test_pending_only_drops_completed_history(self):
+        ids = self._seed()
+        self.run_state("backlog-update", "--id", ids[0], "--status", "completed")
+        full = json.loads(self.run_state("backlog-rank").stdout)
+        self.assertIn(ids[0], [e["id"] for e in full])
+        pending_only = json.loads(self.run_state("backlog-rank", "--pending-only").stdout)
+        self.assertNotIn(ids[0], [e["id"] for e in pending_only])
+        self.assertTrue(len(pending_only) < len(full))
+
+    def test_top_truncates_and_keeps_selected_head(self):
+        self._seed()
+        result = self.run_state("backlog-rank", "--top", "2")
+        ranked = json.loads(result.stdout)
+        self.assertEqual(len(ranked), 2)
+        self.assertTrue(all(entry["selected"] for entry in ranked))
+        # Truncation must announce itself: a silent short list reads as
+        # "that is everything there is".
+        self.assertIn("showing 2 of 4", result.stderr)
+
+    def test_top_zero_is_rejected(self):
+        self._seed()
+        result = self.run_state("backlog-rank", "--top", "0")
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("--top must be a positive integer", result.stderr)
+
+    def test_brief_entry_keeps_cut_reason_when_present(self):
+        """A candidate pushed out of the batch by the diversity quota carries
+        cut_reason; --brief must not hide why it was skipped."""
+        self._seed()
+        for i in range(3):
+            self._add("same-type{}".format(i), type="docs")
+        ranked = json.loads(self.run_state("backlog-rank", "--brief").stdout)
+        self.assertTrue(any("cut_reason" in entry for entry in ranked))
+
+
 if __name__ == "__main__":
     unittest.main()

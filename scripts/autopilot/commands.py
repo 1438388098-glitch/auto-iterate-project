@@ -1547,6 +1547,9 @@ def cmd_backlog_rank(args):
     repo = Path(args.repo).resolve()
     if not config.state_path_for(repo).exists():
         return emit_result(args, False, "[ERROR] Autopilot not initialized. Run init first.")
+    top = getattr(args, "top", None)
+    if top is not None and top < 1:
+        return emit_result(args, False, "[ERROR] --top must be a positive integer.")
     backlog = state.load_backlog(repo)
     cfg = config.load_config(repo)
     st = state.load_state(repo)
@@ -1554,8 +1557,39 @@ def cmd_backlog_rank(args):
         backlog, cfg, progress=state.progress_from_state(st, cfg),
         completed_goals=list(st.get("completed_goals") or []),
     )
+    total = len(ranked)
+    if getattr(args, "pending_only", False):
+        # The loop only ever picks pending work; the completed/blocked tail is
+        # history that ranking keeps for its statistics, not for the reader.
+        ranked = [entry for entry in ranked if entry.get("status") in ("pending", "picked")]
+    if top is not None:
+        ranked = ranked[:top]
+    if getattr(args, "brief", False):
+        ranked = [brief_rank_entry(entry) for entry in ranked]
     print(json.dumps(ranked, indent=2, ensure_ascii=False))
+    if len(ranked) < total:
+        # Say what was withheld: a silently truncated ranking reads as "this is
+        # all there is" and hides the below-floor quick wins at the tail.
+        print(
+            "[INFO] backlog-rank: showing {} of {} candidates (--top/--pending-only). "
+            "Drop the flags for the full ranking.".format(len(ranked), total),
+            file=sys.stderr,
+        )
     return 0
+
+
+def brief_rank_entry(entry):
+    """Compact one ranked backlog entry for the loop's per-round read. Ranking
+    keeps score_breakdown and provenance because they explain a score to a
+    human debugging the ranking; the loop only needs what it acts on, and the
+    full form costs ~1.1KB per candidate per round (measured: 18KB for a
+    16-candidate backlog)."""
+    keep = (
+        "id", "title", "type", "value", "effort", "status", "score",
+        "ready", "blocked_by", "unlocks", "selected", "below_floor",
+        "cut_reason", "origin", "confidence",
+    )
+    return {key: entry[key] for key in keep if key in entry}
 
 
 def cmd_backlog_pick(args):

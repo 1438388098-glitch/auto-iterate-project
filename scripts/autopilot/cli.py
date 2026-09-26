@@ -446,6 +446,12 @@ def build_parser():
         help="List candidates sorted by expected value per round (ranking_mode; classic is value/effort)",
     )
     backlog_rank_parser.add_argument("--repo", default=".")
+    backlog_rank_parser.add_argument("--top", type=int, metavar="N", default=None,
+                                     help="Print at most N entries (positive integer); the recommended batch stays in the head")
+    backlog_rank_parser.add_argument("--pending-only", action="store_true",
+                                     help="Drop completed/blocked history and print only pending/picked entries")
+    backlog_rank_parser.add_argument("--brief", action="store_true",
+                                     help="Compact entries: drop score_breakdown and free text, keep the loop-driving fields")
     backlog_rank_parser.set_defaults(func=commands.cmd_backlog_rank)
 
     backlog_pick_parser = subparsers.add_parser("backlog-pick", help="Mark a candidate picked")

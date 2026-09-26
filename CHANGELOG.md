@@ -8,6 +8,15 @@ Efficiency pass on top of 1.6.0, driven by measuring a real 30-round run
 (BrainFog) instead of guessing: what costs tokens per round is the JSON the
 agent reads, not the helper's runtime (0.58s per call).
 
+### Added
+
+- `backlog-rank --pending-only --top N --brief`: the loop read an 18KB
+  ranking every round (16 candidates, 12 of them completed history, plus a
+  ~1.1KB `score_breakdown` per entry) to pick a batch the helper had already
+  marked. Measured on a real 30-round repo: 18165 -> 1252 bytes with no
+  change to any score. Truncation is announced on stderr so a short list is
+  never mistaken for the whole backlog.
+
 ### Fixed
 
 - The lock-probe test now patches the probe the current platform actually
