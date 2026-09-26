@@ -6721,6 +6721,33 @@ class MinerMarkerSelfScanTests(unittest.TestCase):
         self.assertIn("src/real.py", by_file)
 
 
+class ViewLayerUnitTests(unittest.TestCase):
+    """Direct unit tests for the 1.7.0 view layer (test-gap candidates
+    185/186): brief_rank_entry projection and build_check_payload shape
+    (the round-prep contract rides on the latter)."""
+
+    def test_brief_rank_entry_keeps_action_fields_drops_provenance(self):
+        from autopilot import commands as ap_commands
+        entry = {
+            "id": "candidate-9", "title": "t", "type": "bugfix", "value": 4, "effort": 2,
+            "status": "pending", "score": 1.5, "ready": True, "blocked_by": [], "unlocks": 0,
+            "selected": True, "below_floor": False, "cut_reason": None,
+            "origin": "observed", "confidence": 1.0,
+            "score_breakdown": {"value_term": 1.0},   # provenance: dropped
+            "evidence": "file:1",                       # provenance: dropped
+        }
+        brief = ap_commands.brief_rank_entry(entry)
+        self.assertNotIn("score_breakdown", brief)
+        self.assertNotIn("evidence", brief)
+        self.assertEqual(brief["id"], "candidate-9")
+        self.assertEqual(brief["score"], 1.5)
+        self.assertEqual(len(brief), 15)   # keep-list 全在且仅 keep-list
+
+    def test_brief_rank_entry_tolerates_missing_optional_keys(self):
+        from autopilot import commands as ap_commands
+        brief = ap_commands.brief_rank_entry({"id": "x", "score": 0})
+        self.assertEqual(brief, {"id": "x", "score": 0})
+
 class DashboardCmdTests(unittest.TestCase):
     """cmd_dashboard wiring (1.8.0 final review): config dashboard.auto_open is
     the default and --no-open forces it off; a busy --port exits with a clean
