@@ -1,0 +1,136 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<title>auto·iterate 观察台</title>
+<style>
+  :root {
+    --bg: #0A0A0B; --surface: #131316; --surface2: #1A1A1F;
+    --line: #232329; --txt: #EDEDEF; --txt2: #9A9AA2; --txt3: #5C5C66;
+    --accent: #7EE0B8; --accent-dim: #3A6B57;
+    --warm: #E8A87C;
+  }
+  @media (prefers-color-scheme: light) {
+    :root:not([data-theme="dark"]) {
+      --bg:#FAFAF8; --surface:#FFFFFF; --surface2:#F0F0EE; --line:#E4E4E0;
+      --txt:#1A1A1A; --txt2:#5A5A62; --txt3:#98989E;
+      --accent:#0E8A64; --accent-dim:#BFE3D6; --warm:#C77A3A;
+    }
+  }
+  :root[data-theme="light"] {
+    --bg:#FAFAF8; --surface:#FFFFFF; --surface2:#F0F0EE; --line:#E4E4E0;
+    --txt:#1A1A1A; --txt2:#5A5A62; --txt3:#98989E;
+    --accent:#0E8A64; --accent-dim:#BFE3D6; --warm:#C77A3A;
+  }
+  * { margin:0; padding:0; box-sizing:border-box; }
+  body { background:var(--bg); color:var(--txt); font-family:"Segoe UI",system-ui,sans-serif; padding:36px 44px; max-width:1280px; margin:0 auto; }
+  .mono { font-family:"Cascadia Code",Consolas,monospace; }
+  .topbar { display:flex; align-items:baseline; gap:20px; padding-bottom:20px; border-bottom:1px solid var(--line); }
+  .brand { font-size:17px; font-weight:650; letter-spacing:-.2px; }
+  .brand em { font-style:normal; color:var(--txt3); font-weight:400; }
+  .topmeta { font-size:12px; color:var(--txt2); display:flex; gap:18px; margin-left:auto; align-items:center; }
+  .topmeta b { color:var(--txt); font-weight:600; }
+  .live { color:var(--accent); }
+  .live::before { content:""; display:inline-block; width:6px; height:6px; border-radius:50%; background:var(--accent); margin-right:6px; vertical-align:1px; }
+  .stats { display:flex; gap:44px; padding:26px 0 30px; }
+  .stat .n { font-size:26px; font-weight:600; letter-spacing:-.5px; }
+  .stat .n small { font-size:14px; color:var(--txt3); font-weight:400; }
+  .stat .l { font-size:10px; letter-spacing:1.6px; color:var(--txt3); text-transform:uppercase; margin-top:3px; }
+  .main { display:grid; grid-template-columns: 1.72fr 1fr; gap:20px; align-items:stretch; }
+  .panel { background:var(--surface); border-radius:12px; padding:22px 24px; }
+  .panel h3 { font-size:10px; letter-spacing:1.6px; text-transform:uppercase; color:var(--txt3); font-weight:600; margin-bottom:4px; }
+  .panel .sub { font-size:11.5px; color:var(--txt2); margin-bottom:14px; }
+  .tree-cap { display:flex; justify-content:space-between; align-items:center; margin-bottom:6px; }
+  .mode { font-size:10.5px; color:var(--txt2); border:1px solid var(--line); border-radius:99px; padding:3px 12px; }
+  .mode b { color:var(--txt); font-weight:500; }
+  button.mode { background:none; font-family:inherit; cursor:pointer; }
+  svg { display:block; width:100%; }
+  .ev { padding:13px 2px 13px 16px; border-left:2px solid var(--line); margin-left:4px; position:relative; }
+  .ev.hot { border-left-color:var(--accent); }
+  .ev::before { content:""; position:absolute; left:-4.5px; top:19px; width:7px; height:7px; border-radius:50%; background:var(--surface2); border:1.5px solid var(--txt3); }
+  .ev.hot::before { background:var(--accent); border-color:var(--accent); }
+  .ev .meta { font-size:10.5px; color:var(--txt3); margin-bottom:3px; }
+  .ev .meta b { color:var(--txt2); font-weight:500; }
+  .ev .t { font-size:13px; font-weight:600; letter-spacing:-.1px; margin-bottom:3px; }
+  .ev.hot .t { color:var(--accent); }
+  .ev .s { font-size:11.5px; color:var(--txt2); line-height:1.5; }
+  .goalrow { display:flex; align-items:center; gap:10px; margin-top:16px; padding-top:16px; border-top:1px solid var(--line); }
+  .goalbar { flex:1; height:3px; background:var(--surface2); border-radius:2px; overflow:hidden; }
+  .goalbar i { display:block; height:100%; width:60%; background:var(--accent); border-radius:2px; }
+  .replay { display:flex; align-items:center; gap:14px; margin-top:20px; background:var(--surface); border-radius:12px; padding:16px 24px; }
+  .play { width:30px; height:30px; border-radius:50%; background:var(--surface2); display:flex; align-items:center; justify-content:center; font-size:10px; color:var(--txt); }
+  .axis { flex:1; height:2px; background:var(--surface2); border-radius:1px; position:relative; }
+  .axis .fill { position:absolute; inset:0; border-radius:1px; background:linear-gradient(90deg, var(--accent-dim), var(--accent), var(--warm)); opacity:.85; }
+  .axis .cursor { position:absolute; top:-4px; right:2%; width:10px; height:10px; border-radius:50%; background:var(--bg); border:2px solid var(--accent); }
+  .axislbl { font-size:11px; color:var(--txt3); }
+  /* 动效降级——全文件唯一的全局声明处，新增动画/过渡无需另写 reduce 分支 */
+  @media (prefers-reduced-motion: reduce) {
+    *, *::before, *::after { animation: none !important; transition: none !important; }
+  }
+</style>
+</head>
+<body>
+
+  <div class="topbar">
+    <div class="brand">auto·iterate <em>观察台</em></div>
+    <div class="topmeta mono">
+      <span id="stat-rounds">轮次 — / —</span>
+      <span id="stat-budget">预算 —%</span>
+      <span id="stat-backlog">backlog —</span>
+      <span class="live" id="stat-phase">运行中</span>
+      <span style="color:var(--txt3)" id="stat-version">v1.8.0</span>
+      <button id="theme-toggle" class="mode" title="切换主题">主题</button>
+    </div>
+  </div>
+
+  <div class="stats mono">
+    <div class="stat"><div class="n" id="stat-rounds-big">—</div><div class="l">轮次</div></div>
+    <div class="stat"><div class="n" id="stat-completed">—</div><div class="l">测试全绿</div></div>
+    <div class="stat"><div class="n" id="stat-scale">—</div><div class="l">生长规模</div></div>
+    <div class="stat"><div class="n" id="stat-goals">—</div><div class="l">目标达成</div></div>
+    <div class="stat"><div class="n" id="stat-tokens">—</div><div class="l">tokens</div></div>
+  </div>
+
+  <div class="main">
+    <div class="panel">
+      <div class="tree-cap">
+        <div><h3>项目生长</h3></div>
+        <span class="mode"><b id="mode-label">当前态</b> · 回放</span>
+      </div>
+      <div id="tree"></div>
+    </div>
+
+    <div class="panel">
+      <h3>进化叙事</h3>
+      <div id="events"></div>
+      <div class="goalrow">
+        <span id="goal-label" style="font-size:11px;color:var(--txt2)">—</span>
+        <div class="goalbar"><i id="goal-fill"></i></div>
+        <span id="goal-side" class="mono" style="font-size:10.5px;color:var(--txt3)">—</span>
+      </div>
+    </div>
+  </div>
+
+  <div class="replay">
+    <div class="play" id="play">▶</div>
+    <div class="axis"><div class="fill" id="axis-fill"></div><div class="cursor" id="axis-cursor"></div></div>
+    <div class="axislbl mono" id="axis-label">r1 — r1</div>
+  </div>
+
+<script>
+(function () {
+  var root = document.documentElement;
+  var saved = localStorage.getItem("dashboard-theme");
+  if (saved === "light" || saved === "dark") root.setAttribute("data-theme", saved);
+  document.getElementById("theme-toggle").addEventListener("click", function () {
+    var cur = root.getAttribute("data-theme")
+      || (window.matchMedia && window.matchMedia("(prefers-color-scheme: light)").matches ? "light" : "dark");
+    var next = cur === "dark" ? "light" : "dark";
+    root.setAttribute("data-theme", next);
+    localStorage.setItem("dashboard-theme", next);
+  });
+})();
+</script>
+
+</body>
+</html>

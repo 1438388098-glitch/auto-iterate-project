@@ -19,6 +19,7 @@ SCRIPT = Path(__file__).resolve().parent / "autopilot_state.py"
 # Direct import for pure-function adversarial tests (resolve_seed, scoring,
 # selection): the package lives next to this file.
 sys.path.insert(0, str(Path(__file__).resolve().parent))
+import autopilot  # noqa: E402
 from autopilot import state as ap_state  # noqa: E402
 from autopilot import io as ap_io  # noqa: E402
 from autopilot import commands as commands_module  # noqa: E402
@@ -7070,6 +7071,21 @@ class DashboardSnapshotTests(AutopilotTestBase):
                 return None
 
         self.assertIsNone(dd.compute_round_stats("R", history[:3], "000", gitio=FailingIO))
+
+
+class DashboardPageContractTests(unittest.TestCase):
+    """dashboard.html page contract (1.8.0 dashboard Task 9): the page ships
+    inside the package (the HTTP server reads it straight from there) and
+    carries the dual-theme design tokens plus the single reduced-motion
+    degradation block."""
+
+    PAGE = (Path(autopilot.__file__).resolve().parent / "dashboard.html")
+
+    def test_page_exists_and_carries_design_tokens(self):
+        html = self.PAGE.read_text(encoding="utf-8")
+        for token in ("--bg", "--surface", "--accent", "prefers-color-scheme",
+                      "prefers-reduced-motion"):
+            self.assertIn(token, html)
 
 
 if __name__ == "__main__":
