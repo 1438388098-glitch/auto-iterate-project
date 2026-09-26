@@ -6322,5 +6322,95 @@ class RoundPrepTests(RepoTest):
         self.assertIn("not initialized", result.stderr.lower())
 
 
+class SmokeCommandTests(RepoTest):
+    """smoke_commands exists because the loop verifies fully only every
+    verify_every_rounds rounds; the cheap check in between used to be
+    re-improvised each round, so it differed run to run and left no trace."""
+
+    def test_defaults_to_empty_and_merges_into_old_configs(self):
+        self.run_state("init")
+        cfg_path = self.repo / ".autopilot" / "config.json"
+        cfg = json.loads(cfg_path.read_text(encoding="utf-8"))
+        self.assertEqual(cfg["smoke_commands"], [])
+        # A config written before the field existed must still load (defaults merge).
+        cfg.pop("smoke_commands")
+        cfg_path.write_text(json.dumps(cfg), encoding="utf-8")
+        from autopilot import config as ap_config
+        self.assertEqual(ap_config.load_config(self.repo)["smoke_commands"], [])
+
+    def test_validation_rejects_wrong_shapes(self):
+        from autopilot import config as ap_config
+        self.run_state("init")
+        for bad in ("not-a-list", [1, 2], [None]):
+            cfg = ap_config.load_config(self.repo)
+            cfg["smoke_commands"] = bad
+            with self.assertRaises(SystemExit):
+                ap_config.validate_config(cfg)
+
+    def test_init_flag_records_a_smoke_command(self):
+        result = self.run_state("init", "--smoke-commands", "python -m compileall -q .")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        from autopilot import config as ap_config
+        self.assertEqual(ap_config.load_config(self.repo)["smoke_commands"],
+                         ["python -m compileall -q ."])
+
+    def test_config_set_round_trip(self):
+        self.run_state("init")
+        result = self.run_state("config-set", "--smoke-commands", "cargo check",
+                                "--smoke-commands", "go vet ./...")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        from autopilot import config as ap_config
+        self.assertEqual(ap_config.load_config(self.repo)["smoke_commands"],
+                         ["cargo check", "go vet ./..."])
+        result = self.run_state("config-set", "--clear-smoke-commands")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(ap_config.load_config(self.repo)["smoke_commands"], [])
+
+    def test_config_set_rejects_set_and_clear_together(self):
+        self.run_state("init")
+        result = self.run_state("config-set", "--smoke-commands", "cargo check",
+                                "--clear-smoke-commands")
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("mutually exclusive", result.stderr)
+
+    def test_config_set_still_requires_a_field(self):
+        self.run_state("init")
+        result = self.run_state("config-set")
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("at least one field", result.stderr)
+
+    def test_detect_smoke_commands_suggests_per_technology(self):
+        from autopilot.verify import detect_smoke_commands
+        (self.repo / "pyproject.toml").write_text("[project]\n", encoding="utf-8")
+        (self.repo / "Cargo.toml").write_text("[package]\n", encoding="utf-8")
+        suggested = dict(detect_smoke_commands(self.repo))
+        self.assertEqual(suggested["python"], "python -m compileall -q .")
+        self.assertEqual(suggested["rust"], "cargo check")
+
+    def test_detect_verify_reports_smoke_recommendation(self):
+        self.run_state("init")
+        (self.repo / "pyproject.toml").write_text("[project]\n", encoding="utf-8")
+        result = self.run_state("detect-verify", "--json")
+        payload = json.loads(result.stdout)
+        self.assertIn("smoke_recommended", payload)
+        self.assertTrue(any(entry["command"] == "python -m compileall -q ."
+                            for entry in payload["smoke_recommended"]))
+        # Report-only: detection must never write smoke_commands itself.
+        from autopilot import config as ap_config
+        self.assertEqual(ap_config.load_config(self.repo)["smoke_commands"], [])
+
+    def test_detect_verify_does_not_overwrite_check_commands_with_smoke(self):
+        """--apply keeps writing only check_commands: a smoke command silently
+        promoted to the verification set would weaken every verify round."""
+        self.run_state("init")
+        (self.repo / "pyproject.toml").write_text("[project]\n", encoding="utf-8")
+        result = self.run_state("detect-verify", "--apply")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        from autopilot import config as ap_config
+        cfg = ap_config.load_config(self.repo)
+        self.assertEqual(cfg["smoke_commands"], [])
+        self.assertNotIn("python -m compileall -q .", cfg["check_commands"])
+
+
 if __name__ == "__main__":
     unittest.main()

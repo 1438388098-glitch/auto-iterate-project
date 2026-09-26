@@ -58,6 +58,7 @@ def build_parser():
     init_parser.add_argument("--allow-uncommitted-changes", action="store_true")
     init_parser.add_argument("--track-state", action="store_true")
     init_parser.add_argument("--check-commands", action="append", default=None)
+    init_parser.add_argument("--smoke-commands", action="append", default=None)
     init_parser.add_argument("--push", action="store_true")
     init_parser.add_argument("--commit-message-prefix", default=None)
     init_parser.add_argument("--retries-per-round", type=int, default=None)
@@ -367,6 +368,12 @@ def build_parser():
     config_set_parser.add_argument("--check-commands", dest="check_commands",
                                    action="append", metavar="CMD",
                                    help="Verification command (repeatable; replaces the previous list)")
+    config_set_parser.add_argument("--smoke-commands", dest="smoke_commands",
+                                   action="append", metavar="CMD",
+                                   help="Cheap between-verification check (repeatable; replaces the previous list)")
+    config_set_parser.add_argument("--clear-smoke-commands", dest="clear_smoke_commands",
+                                   action="store_true", default=False,
+                                   help="Remove every declared smoke command")
     config_set_parser.add_argument("--clear-check-commands", dest="clear_check_commands",
                                    action="store_true", default=False,
                                    help="Remove all verification commands")
