@@ -1395,8 +1395,13 @@ def analysis_validity(repo):
     """Check whether the cached .autopilot/analysis.json can be reused. Returns
     ('missing'|'fresh'|'stale', reason). A cache is stale when the repository HEAD
     moved since it was saved (the code the analysis described changed) or the
-    autopilot config changed (commands/limits the analysis relied on changed)."""
-    analysis = load_analysis(repo)
+    autopilot config changed (commands/limits the analysis relied on changed).
+    Corrupt JSON (io.load_json fails closed with SystemExit) is "stale", never
+    a crash in the caller's loop."""
+    try:
+        analysis = load_analysis(repo)
+    except SystemExit:
+        return "stale", "cached analysis is corrupt"
     if analysis is None:
         return "missing", "no cached analysis"
     if not isinstance(analysis, dict):

@@ -7089,6 +7089,39 @@ class DirectivesAnalysisPathUnitTests(unittest.TestCase):
         self.assertIsNone(self.st.load_analysis(self.repo)) if hasattr(self.st, "load_analysis") else self.skipTest("load_analysis 不在 state 模块")
 
 
+class AnalysisValidityUnitTests(unittest.TestCase):
+    """mine test-gap 批十（R22）：analysis 缓存失效语义直接锁定
+    （missing / HEAD 移动 stale / config 变更 stale）。"""
+
+    def setUp(self):
+        self.tmp = Path(tempfile.mkdtemp(prefix="analysis-validity-"))
+        self.addCleanup(shutil.rmtree, self.tmp, ignore_errors=True)
+        self.repo = self.tmp / "repo"
+        (self.repo / ".git").mkdir(parents=True)
+        (self.repo / ".autopilot").mkdir(parents=True)
+        from autopilot import state as ap_state
+        self.st = ap_state
+
+    def _save_cache_with_head(self, head):
+        self.st.save_analysis(self.repo, {"analysis": {"tree": []},
+                                          "git_head": head,
+                                          "config_mtime": self.st.config_mtime(self.repo)})
+
+    def test_missing_when_no_cache(self):
+        self.assertEqual(self.st.analysis_validity(self.repo)[0], "missing")
+
+    def test_stale_when_head_moved(self):
+        self._save_cache_with_head("0000000000000000000000000000000000000000")
+        kind, _ = self.st.analysis_validity(self.repo)
+        self.assertEqual(kind, "stale")   # 真实 HEAD 与缓存锚点不同
+
+    def test_corrupt_cache_is_stale(self):
+        (self.repo / ".autopilot" / "analysis.json").write_text(
+            "[1,", encoding="utf-8")
+        kind, _ = self.st.analysis_validity(self.repo)
+        self.assertEqual(kind, "stale")
+
+
 class DashboardCmdTests(unittest.TestCase):
     """cmd_dashboard wiring (1.8.0 final review): config dashboard.auto_open is
     the default and --no-open forces it off; a busy --port exits with a clean
