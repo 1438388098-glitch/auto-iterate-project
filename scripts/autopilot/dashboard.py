@@ -232,6 +232,10 @@ def serve(repo, port=0, auto_open=True, host="127.0.0.1"):
     port = server.server_address[1]
     write_info(repo, {"pid": os.getpid(), "port": port,
                       "started_at": io.now_iso(), "opened": False})
+    # Serve BEFORE auto_open: webbrowser.open can block seconds while the
+    # browser process spawns — the socket must already accept connections.
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
     if auto_open:
         import webbrowser
         try:
@@ -242,8 +246,6 @@ def serve(repo, port=0, auto_open=True, host="127.0.0.1"):
                 io.append_log(repo, "dashboard", "warn", reason="auto_open failed", detail=str(err))
             except Exception:
                 pass
-    thread = threading.Thread(target=server.serve_forever, daemon=True)
-    thread.start()
     while True:
         time.sleep(60)
         if time.time() - server.RequestHandlerClass.last_request_at > IDLE_TIMEOUT_SECONDS:

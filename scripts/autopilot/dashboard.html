@@ -122,6 +122,10 @@
         <div class="goalbar"><i id="goal-fill"></i></div>
         <span id="goal-side" class="mono" style="font-size:10.5px;color:var(--txt3)">—</span>
       </div>
+      <div class="goalrow" style="display:block">
+        <h3 style="margin-bottom:8px">迭代方向</h3>
+        <div id="directions"></div>
+      </div>
     </div>
   </div>
 
@@ -180,7 +184,10 @@
   // 轮界只取 growth.rounds 的最大轮；无 rounds 数据（含 degraded growth）→
   // null：回放整体禁用（播放/拖动无效果，轴退化为 r1 — r1），不报错。
   function roundBounds() {
-    var rounds = ((snapshot && snapshot.growth) || {}).rounds || [];
+    var g = (snapshot && snapshot.growth) || {};
+    // 仅 run 级聚合（无逐轮信息）禁回放；per-round-files 有每轮锚点可播
+    if (g.granularity === "run") return null;
+    var rounds = g.rounds || [];
     var maxTotal = 0, maxValid = 0;
     rounds.forEach(function (r) {
       if (r.round > maxTotal) maxTotal = r.round;
@@ -259,7 +266,28 @@
     $("play").style.opacity = "0.4";   // 无运行：回放不可用（与降级口径一致）
   }
 
-  function renderAll() { renderStats(); renderTree(); renderEvents(); }
+  function renderAll() { renderStats(); renderTree(); renderEvents(); renderDirections(); }
+
+  // ---- 迭代方向板块：skill 下一步想做什么（价值序待办，供用户检验方向）----
+  function renderDirections() {
+    var host = $("directions");
+    if (!host) return;
+    var cands = ((snapshot && snapshot.status && snapshot.status.backlog) || {}).candidates || [];
+    if (!cands.length) {
+      host.innerHTML = '<div style="font-size:11px;color:var(--txt3);padding:6px 0">'
+        + "暂无待办——供给由 mine / Deep Expansion 补充</div>";
+      return;
+    }
+    host.innerHTML = cands.map(function (c) {
+      return '<div style="display:flex;gap:8px;align-items:baseline;padding:5px 0;'
+        + 'border-bottom:1px solid var(--surface2);font-size:11.5px">'
+        + '<span class="mono" style="color:var(--txt3);font-size:10px;flex:none">'
+        + "v" + fmt(c.value) + " e" + fmt(c.effort) + "</span>"
+        + '<span style="color:var(--txt)">' + escapeHtml(c.title || "") + "</span>"
+        + '<span class="mono" style="margin-left:auto;color:var(--txt3);font-size:10px;flex:none">'
+        + escapeHtml(c.type || "") + "</span></div>";
+    }).join("");
+  }
 
   // ---- 统计行 / 顶栏 / 目标条 / 回放轴 ----
   function renderStats() {
@@ -361,6 +389,15 @@
       return;
     }
     var domains = viewDomains();   // 当前态全量；回放态按 first_round 过滤
+    var banner = "";
+    if (growth.granularity === "run") {
+      // 粗粒度状态条（产品信息，非注释）：批量提交 run 无逐轮锚点
+      banner = '<div style="color:var(--txt3);font-size:11px;padding:0 2px 10px">'
+        + "粗粒度视图：本 run 为批量提交，展示 run 级聚合（无逐轮时间轴）</div>";
+    } else if (growth.granularity === "per-round-files") {
+      banner = '<div style="color:var(--txt3);font-size:11px;padding:0 2px 10px">'
+        + "文件级时间轴：批量提交 run，行数统计不可用（按触碰文件归因）</div>";
+    }
     var t = layoutTree(domains);
     var w = Math.max(box.clientWidth || 0, 560);
     var byDomain = {};
@@ -435,7 +472,7 @@
       s += "</g>";
     });
     s += "</svg>";
-    box.innerHTML = s;
+    box.innerHTML = banner + s;
     applyHighlight();
   }
 

@@ -147,12 +147,18 @@ def _finding(kind, title, reason, evidence, file=None, line=None,
 def scan_markers(repo, limit=30):
     """TODO/FIXME/HACK/XXX markers with file:line."""
     findings = []
+    self_name = Path(__file__).name
     for path in _iter_source_files(repo):
         if path.suffix.lower() == ".md":
             continue
         # Test-fixture markers are sample data, not tech debt: on this repo
         # every single marker finding lived inside a fixture string.
         if _is_test_path(_rel(repo, path)):
+            continue
+        # The scanner's own syntax-definition file matches MARKER_RE on its
+        # regex pattern, comments and docstring — self-referential by
+        # construction, never real debt. Same rationale as the fixture skip.
+        if path.name == self_name:
             continue
         try:
             text = path.read_text(encoding="utf-8", errors="replace")

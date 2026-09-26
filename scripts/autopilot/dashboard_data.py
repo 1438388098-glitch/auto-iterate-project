@@ -271,6 +271,59 @@ def _autopilot_dir(repo):
     return Path(repo) / io.AUTOPILOT_DIR
 
 
+def compute_touched_file_changes(history):
+    """Batch-mode fallback #2 (seed-002): complete-round records each round's
+    touched_files (worktree names minus pre-round dirty files), giving
+    per-round domain attribution without any git diff anchor. Same
+    {path: change} shape; insertions/deletions are honestly 0 (no diff).
+    None when no entry carries touched_files — callers keep their chain:
+    per-round diff → touched files → run-level → degraded."""
+    changes = {}
+    for entry in history:
+        files = entry.get("touched_files")
+        if not files:
+            continue
+        rnd = entry.get("round")
+        for path in files:
+            agg = changes.setdefault(path, {
+                "first_round": rnd, "touches": 0,
+                "insertions": 0, "deletions": 0, "rounds": [],
+            })
+            agg["touches"] += 1
+            if rnd not in agg["rounds"]:
+                agg["rounds"].append(rnd)
+            if agg["first_round"] is None or (rnd is not None and rnd < agg["first_round"]):
+                agg["first_round"] = rnd
+    return changes or None
+
+
+def compute_run_file_changes(repo, run_start_sha, gitio=None):
+    """Run-level fallback for batch-commit runs whose history carries no
+    per-round shas: one numstat over run_start_sha..HEAD (EMPTY_TREE base
+    when unanchored, same as the per-round walk). Returns the same
+    {path: change} shape as compute_round_file_changes with first_round=None
+    and rounds=[] — the tree renders, the timeline does not exist. None when
+    HEAD cannot be resolved or the diff fails (fail-closed, callers keep
+    their degraded path)."""
+    run_git = _resolve_run_git(gitio)
+    head_raw = run_git(repo, "rev-parse", "--verify", "-q", "HEAD")
+    if not head_raw:
+        return None
+    head = head_raw.strip().splitlines()[0].strip()
+    base = run_start_sha or io.EMPTY_TREE
+    raw = run_git(repo, "diff", "--numstat", "{}..{}".format(base, head))
+    if raw is None:
+        return None
+    changes = {}
+    for item in parse_numstat(raw):
+        changes[item["path"]] = {
+            "first_round": None, "touches": 1,
+            "insertions": item["insertions"], "deletions": item["deletions"],
+            "rounds": [],
+        }
+    return changes
+
+
 def build_snapshot(repo, gitio=None):
     """Assemble the read-only dashboard snapshot (design doc §3.1): a ``meta``
     header (generated_at, skill_version, run_id, degraded), a ``status``
@@ -318,10 +371,26 @@ def build_snapshot(repo, gitio=None):
     changes = compute_round_file_changes(repo, history, run_start_sha, gitio=gitio)
     round_stats = compute_round_stats(repo, history, run_start_sha, gitio=gitio)
     degraded = []
+    granularity = "per-round"
     if changes is None or round_stats is None:
-        degraded.append("growth")
-        domains, round_domains, rounds = [], {}, []
-    else:
+        # Batch-commit runs (default cadence) carry no per-round shas: fall
+        # back so the tree stays alive, honestly labelled. First per-round
+        # file attribution from touched_files (seed-002), then a coarse
+        # run-level aggregation.
+        touched = compute_touched_file_changes(history)
+        if touched is not None:
+            changes = touched
+            granularity = "per-round-files"
+        else:
+            changes = compute_run_file_changes(repo, run_start_sha, gitio=gitio)
+            granularity = "run" if changes is not None else None
+        round_stats = []
+        if changes is None:
+            degraded.append("growth")
+            domains, round_domains, rounds = [], {}, []
+        else:
+            round_domains, rounds = {}, []
+    if granularity is not None:
         dash_cfg = (config.get("dashboard") or {}) if isinstance(config, dict) else {}
         domain_map = dash_cfg.get("domain_map")
         domains = aggregate_modules(changes, domain_map)
@@ -336,11 +405,14 @@ def build_snapshot(repo, gitio=None):
             # round 是事件关联的硬关联键（correlate_events 同款纪律）：
             # 缺失即 malformed history，直接 KeyError 而非静默编一条。
             st = stats_by_round.get(entry["round"])
+            rnd = entry["round"]
             rounds.append({
-                "round": entry["round"], "status": entry.get("status"),
+                "round": rnd, "status": entry.get("status"),
                 "score": entry.get("review_score"),
-                # 无提交的取消/阻塞轮如实计 0：没有 commit 就没有可计改动。
-                "files_changed": st["files_changed"] if st else 0,
+                # per-round / per-round-files：按 changes 的 rounds 归属计数；
+                # run 级无逐轮信息，无提交的取消/阻塞轮如实计 0。
+                "files_changed": len([p for p, c in changes.items()
+                                      if rnd in c["rounds"]]),
                 "insertions": st["insertions"] if st else 0,
                 "deletions": st["deletions"] if st else 0,
             })
@@ -369,6 +441,7 @@ def build_snapshot(repo, gitio=None):
             "expansion_waves": len(state.get("expansion_waves") or []),
         },
         "growth": {
+            "granularity": granularity,
             "domains": domains,
             "events": correlate_events(history, round_domains),
             "rounds": rounds,
@@ -401,9 +474,22 @@ def _backlog_summary(path):
         candidates = []
     pending = [c for c in candidates
                if isinstance(c, dict) and c.get("status") == "pending"]
+    # 迭代方向板块（原始设计四板块之一）：价值序待办明细，供右栏看板。
+    # 只取精简字段——快照是只读聚合，不搬运整个 backlog。
+    def _score(c):
+        v = c.get("score")
+        return v if isinstance(v, (int, float)) else 0.0
+
+    top_pending = [
+        {"id": c.get("id"), "title": c.get("title"),
+         "value": c.get("value"), "effort": c.get("effort"),
+         "type": c.get("type"), "score": _score(c)}
+        for c in sorted(pending, key=_score, reverse=True)[:6]
+    ]
     return {
         "total": len(candidates),
         "pending": len(pending),
         "ready": sum(1 for c in pending
                      if isinstance(c.get("value"), (int, float)) and c["value"] >= 4),
+        "candidates": top_pending,
     }

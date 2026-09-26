@@ -6691,6 +6691,36 @@ class DashboardLifecycleTests(unittest.TestCase):
         self.assertIsNotNone(child.poll())
 
 
+class MinerMarkerSelfScanTests(unittest.TestCase):
+    """markers 扫描器的自指误报（1.9 R2）：扫描语法定义文件（miner.py）的
+    MARKER_RE 模式串、解释注释与 docstring 全部含字面 TODO——自指命中永不
+    是真债务，扫描器跳过自身文件（先例：1.6.0 跳过测试夹具）。"""
+
+    def setUp(self):
+        self.tmp = Path(tempfile.mkdtemp(prefix="miner-self-scan-"))
+        self.addCleanup(shutil.rmtree, self.tmp, ignore_errors=True)
+        self.repo = self.tmp / "repo"
+        (self.repo / ".git").mkdir(parents=True)
+        miner = self.repo / "scripts" / "autopilot" / "miner.py"
+        miner.parent.mkdir(parents=True)
+        miner.write_text(
+            'MARKER_RE = re.compile(r"\b(TODO|FIXME|HACK|XXX)\b[:\\s-]*(.*)$", re.I)\n'
+            '# Doc extensions whose TODO markers are docs work.\n'
+            'def scan_markers(repo, limit=30):\n'
+            '    """TODO/FIXME/HACK/XXX markers with file:line."""\n',
+            encoding="utf-8")
+        real = self.repo / "src" / "real.py"
+        real.parent.mkdir(parents=True)
+        real.write_text("# TODO: wire the retry loop to the backlog\n", encoding="utf-8")
+
+    def test_scanner_skips_its_own_syntax_file(self):
+        from autopilot import miner as ap_miner
+        findings = ap_miner.scan_markers(self.repo)
+        by_file = [f["file"] for f in findings]
+        self.assertNotIn("scripts/autopilot/miner.py", by_file)
+        self.assertIn("src/real.py", by_file)
+
+
 class DashboardCmdTests(unittest.TestCase):
     """cmd_dashboard wiring (1.8.0 final review): config dashboard.auto_open is
     the default and --no-open forces it off; a busy --port exits with a clean
@@ -7057,7 +7087,7 @@ class DashboardSnapshotTests(AutopilotTestBase):
                          {"max_minutes": None, "estimated_tokens_used": 4200})
         self.assertEqual(snap["status"]["expansion_waves"], 1)
         self.assertEqual(snap["status"]["backlog"],
-                         {"total": 0, "pending": 0, "ready": 0})
+                         {"total": 0, "pending": 0, "ready": 0, "candidates": []})
         self.assertEqual(snap["growth"]["domains"], [])
         self.assertEqual(snap["growth"]["rounds"], [])
         self.assertEqual(len(snap["growth"]["events"]), 1)       # 事件仍产出
@@ -7128,6 +7158,107 @@ class DashboardSnapshotTests(AutopilotTestBase):
              "files_changed": 2, "insertions": 2, "deletions": 0},
         ])
 
+    def test_snapshot_run_level_fallback_when_anchors_missing(self):
+        """Batch-commit runs (default cadence) carry no per-round shas;
+        growth must degrade to a RUN-LEVEL aggregation (run_start_sha..HEAD)
+        instead of switching the tree off entirely (1.9 R3)."""
+        from autopilot import dashboard_data as dd
+        self._seed_state(history=[
+            {"round": 1, "status": "completed", "title": "t1", "summary": "s1",
+             "review_score": 4, "commit_sha": None},
+        ])
+        calls = []
+
+        class FakeIO:
+            @staticmethod
+            def run_git(repo, *args, **kw):
+                calls.append(args)
+                if args[0] == "rev-parse":
+                    return "abc123"
+                return "12\t3\tscripts/autopilot/miner.py\n"
+
+        snap = dd.build_snapshot(self.repo, gitio=FakeIO)
+        self.assertEqual(snap["meta"]["degraded"], [])
+        self.assertEqual(snap["growth"]["granularity"], "run")
+        domains = snap["growth"]["domains"]
+        self.assertEqual(len(domains), 1)
+        self.assertEqual(domains[0]["modules"][0]["path"], "scripts/autopilot/miner.py")
+        self.assertEqual(domains[0]["modules"][0]["churn"]["insertions"], 12)
+        self.assertEqual(snap["growth"]["rounds"],
+                         [{"round": 1, "status": "completed", "score": 4,
+                           "files_changed": 0, "insertions": 0, "deletions": 0}])
+        self.assertEqual(len(snap["growth"]["events"]), 1)
+        self.assertEqual(calls[0][0], "rev-parse")   # 先解析 HEAD
+        self.assertIn("abc123", calls[1][-1])        # diff range 以 HEAD 收尾
+
+    def test_snapshot_growth_stays_degraded_when_run_diff_fails(self):
+        """No anchors AND a failing run-level diff (unborn repo / git error)
+        keeps the old fail-closed behaviour: growth listed in degraded."""
+        from autopilot import dashboard_data as dd
+        self._seed_state(history=[
+            {"round": 1, "status": "completed", "title": "t1", "summary": "s1", "review_score": None, "commit_sha": None},
+        ])
+
+        class DeadIO:
+            @staticmethod
+            def run_git(repo, *args, **kw):
+                return None
+
+        snap = dd.build_snapshot(self.repo, gitio=DeadIO)
+        self.assertIn("growth", snap["meta"]["degraded"])
+        self.assertEqual(snap["growth"]["domains"], [])
+
+    def test_snapshot_backlog_candidates_for_direction_panel(self):
+        """迭代方向板块（原始设计四板块之一）：snapshot 暴露 pending 候选
+        明细（价值序，含 value/effort/type/score），供右栏看板渲染。"""
+        from autopilot import dashboard_data as dd
+        self._seed_state(history=[])
+        ap_io.save_json(self.repo / ".autopilot" / "backlog.json", {
+            "next_id": 3,
+            "candidates": [
+                {"id": "candidate-1", "title": "low", "value": 2, "effort": 1,
+                 "type": "refactor", "status": "pending", "score": 0.5},
+                {"id": "candidate-2", "title": "high", "value": 5, "effort": 2,
+                 "type": "bugfix", "status": "pending", "score": 2.4},
+                {"id": "candidate-3", "title": "done", "value": 5, "effort": 2,
+                 "type": "bugfix", "status": "completed", "score": 9.9},
+            ],
+        })
+        snap = dd.build_snapshot(self.repo)
+        cands = snap["status"]["backlog"]["candidates"]
+        self.assertEqual([c["id"] for c in cands], ["candidate-2", "candidate-1"])
+        self.assertEqual(cands[0],
+                         {"id": "candidate-2", "title": "high", "value": 5,
+                          "effort": 2, "type": "bugfix", "score": 2.4})
+        # 候选缺失/损坏时板块降级为空清单而非崩溃（no-run 仓库路径）
+        snap2 = dd.build_snapshot(self.repo)   # backlog 仍在：不崩
+        self.assertEqual(snap2["status"]["backlog"]["candidates"], cands)
+
+    def test_snapshot_touched_files_attribution_without_shas(self):
+        """Batch mode + seed-002: complete-round records touched_files per
+        round; build_snapshot uses them for per-round domain attribution
+        (granularity per-round-files) before ever falling back to run
+        level. Line counts are honestly zero (no diff anchor)."""
+        from autopilot import dashboard_data as dd
+        self._seed_state(history=[
+            {"round": 1, "status": "completed", "title": "t1", "summary": "s1",
+             "review_score": 4, "commit_sha": None,
+             "touched_files": ["scripts/autopilot/miner.py"]},
+            {"round": 2, "status": "completed", "title": "t2", "summary": "s2",
+             "review_score": 3, "commit_sha": None,
+             "touched_files": ["scripts/autopilot/miner.py", "README.md"]},
+        ])
+        snap = dd.build_snapshot(self.repo)   # 无 gitio：per-round diff 不可用
+        self.assertEqual(snap["meta"]["degraded"], [])
+        self.assertEqual(snap["growth"]["granularity"], "per-round-files")
+        by_name = {d["name"]: d for d in snap["growth"]["domains"]}
+        self.assertIn("工具与脚本", by_name)
+        self.assertIn("文档与知识", by_name)
+        tools = by_name["工具与脚本"]
+        self.assertEqual(tools["active_rounds"], [1, 2])
+        # rounds 曲线保留（行数诚实为 0），文件数按 touched_files 计
+        self.assertEqual(snap["growth"]["rounds"][1]["files_changed"], 2)
+
     def test_snapshot_corrupt_state_degrades_all(self):
         from autopilot import dashboard_data as dd
         (self.repo / ".autopilot").mkdir()
@@ -7144,7 +7275,7 @@ class DashboardSnapshotTests(AutopilotTestBase):
         from autopilot import dashboard_data as dd
         path = self.repo / ".autopilot" / "backlog.json"
         self.assertEqual(dd._backlog_summary(path),            # 缺失 → 全 0
-                         {"total": 0, "pending": 0, "ready": 0})
+                         {"total": 0, "pending": 0, "ready": 0, "candidates": []})
         # 真实结构（本仓库实测）：{"next_id": n, "candidates": […]}，status
         # 值域 pending/picked/completed/blocked，候选带 1-5 的 value 整数。
         ap_io.save_json(path, {"next_id": 6, "candidates": [
@@ -7155,13 +7286,23 @@ class DashboardSnapshotTests(AutopilotTestBase):
             {"id": "candidate-005", "status": "picked", "value": 5},
         ]})
         self.assertEqual(dd._backlog_summary(path),
-                         {"total": 5, "pending": 3, "ready": 2})
+                         {"total": 5, "pending": 3, "ready": 2,
+                          "candidates": [
+                              {"id": "candidate-001", "title": None, "value": 5,
+                               "effort": None, "type": None, "score": 0.0},
+                              {"id": "candidate-002", "title": None, "value": 4,
+                               "effort": None, "type": None, "score": 0.0},
+                              {"id": "candidate-003", "title": None, "value": 3,
+                               "effort": None, "type": None, "score": 0.0},
+                          ]})
         path.write_text("{oops", encoding="utf-8")             # 坏 JSON 降级全 0
         self.assertEqual(dd._backlog_summary(path),
-                         {"total": 0, "pending": 0, "ready": 0})
+                         {"total": 0, "pending": 0, "ready": 0, "candidates": []})
         ap_io.save_json(path, [{"status": "pending", "value": 5}])  # 裸 list 容忍
         self.assertEqual(dd._backlog_summary(path),
-                         {"total": 1, "pending": 1, "ready": 1})
+                         {"total": 1, "pending": 1, "ready": 1,
+                          "candidates": [{ "id": None, "title": None, "value": 5,
+                              "effort": None, "type": None, "score": 0.0}]})
 
     def test_compute_round_stats_mirrors_anchor_rules(self):
         """与 compute_round_file_changes 同一条锚点走查：NO_ANCHOR 轮不产生
@@ -7293,5 +7434,88 @@ class DashboardServerTests(unittest.TestCase):
         self.assertNotEqual(second["meta"]["generated_at"], third["meta"]["generated_at"])
 
 
+# ---- 分层验证（1.9 goal：轮间 smoke <60s，全量留给边界轮）----
+# SLOW_TEST_CLASSES：单类实测耗时超过 SLOW_CLASS_SECONDS 的类名清单（由
+# scripts/test_autopilot_state.py --time-report 生成）。--smoke 跳过它们；
+# 新类默认进 smoke（fail-safe：smoke 只做轮间快检，全量才是边界的证明）。
+SLOW_CLASS_SECONDS = 2.0
+SLOW_TEST_CLASSES = [
+    # 2026-09-27 实测（--time-report，全量 343s/82 类），>=2.0s 的类：
+    "PredictedHardeningTests", "SecurityFixRegressionTests", "FeatureTests",
+    "OptimizationTests", "LifecycleStateFixTests", "RoundFlowTests",
+    "MiningAndFinishGateTests", "BudgetAccountingTests", "DirectionSeedTests",
+    "ExpansionWatchTests", "BacklogScoreTests", "PredictedOriginTests",
+    "RoundPrepTests", "BatchContractTests", "ExpansionWaveTests",
+    "ExpandPhaseTests", "BeginRoundStopTests", "BacklogRankViewTests",
+    "ExpansionBudgetTests", "FailurePathTests", "CommitCadenceWarnTests",
+    "BatchCommitTests", "ConfigSetTests", "RobustnessTests",
+    "RetrospectiveTests", "SecretPatternCoverageTests", "SecretScanTests",
+    "ReviewGateTests", "ConfigValidationMatrixTests", "ContractTests",
+    "SmokeCommandTests", "AllowPathsDirectoryPrefixTests", "InitTests",
+    "AnalysisCacheTests", "GoalEvidenceTests", "ReviewFixRegressionTests",
+    "ApiConsistencyFixTests", "FinishGateTests", "DetectAgentTests",
+    "BacklogPickTests", "RankingModeTests", "TokenEstimateTests",
+    "BacklogManageTests", "OrphanCommitTests",
+]
+
+
+def _run_time_report():
+    """按类计时跑全量（诊断入口）：打印每类耗时，标记超过阈值的类。"""
+    loader = unittest.TestLoader()
+    names = sorted(n for n, o in globals().items()
+                   if isinstance(o, type) and issubclass(o, unittest.TestCase)
+                   and o.__module__ == __name__)
+    total0 = time.time()
+    slow = []
+    for n in names:
+        suite = loader.loadTestsFromTestCase(globals()[n])
+        t0 = time.time()
+        res = unittest.TextTestRunner(verbosity=0).run(suite)
+        dt = time.time() - t0
+        if dt >= SLOW_CLASS_SECONDS:
+            slow.append((dt, n))
+            print("%7.2fs %s" % (dt, n))
+    print("TOTAL %.1fs across %d classes; %d slow (>= %.1fs)"
+          % (time.time() - total0, len(names), len(slow), SLOW_CLASS_SECONDS))
+
+
+def _run_smoke():
+    """全量减去 SLOW_TEST_CLASSES：轮间快速回归。新类默认包含——漏标记的
+    慢类只会让 smoke 变慢，不会让它漏测新代码；全量才是提交边界证明。"""
+    loader = unittest.TestLoader()
+    suite = unittest.TestSuite()
+    slow = set(SLOW_TEST_CLASSES)
+    count = 0
+    for n in sorted(globals()):
+        obj = globals()[n]
+        if isinstance(obj, type) and issubclass(obj, unittest.TestCase)                 and obj.__module__ == __name__ and n not in slow:
+            suite.addTest(loader.loadTestsFromTestCase(obj))
+            count += 1
+    t0 = time.time()
+    result = unittest.TextTestRunner(verbosity=1).run(suite)
+    elapsed = time.time() - t0
+    print("[smoke] %d classes, %.1fs (excluded %d slow classes)"
+          % (count, elapsed, len(slow)))
+    # seed-001 对账：60s 是轮间快检的承诺线。既有类变慢（如新增子进程测试）
+    # 会无声击穿它——超线即提示重跑 --time-report 刷新 SLOW_TEST_CLASSES。
+    if elapsed > 60:
+        print("[smoke-warn] %.0fs 超过 60s 承诺线：慢类清单可能已漂移，"
+              "运行 py -3.13 scripts/test_autopilot_state.py --time-report 对账"
+              % elapsed, file=sys.stderr)
+    return 0 if result.wasSuccessful() else 1
+
+
 if __name__ == "__main__":
-    unittest.main()
+    argv = sys.argv[1:]
+    if "--time-report" in argv:
+        argv.remove("--time-report")
+        _run_time_report()
+    elif "--smoke" in argv:
+        argv.remove("--smoke")
+        if argv:
+            # --smoke 显式跟类名：只跑指定类（人工快检，不走 smoke 子集）
+            unittest.main(argv=[sys.argv[0]] + argv)
+        else:
+            sys.exit(_run_smoke())
+    else:
+        unittest.main(argv=[sys.argv[0]] + argv)
