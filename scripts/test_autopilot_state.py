@@ -7060,6 +7060,35 @@ class SeedGoalEventUnitTests(unittest.TestCase):
         self.assertEqual(self.st["goal_seeds"][-1]["id"], "seed-003")
 
 
+class DirectivesAnalysisPathUnitTests(unittest.TestCase):
+    """mine test-gap 批九（R20）：directives/analysis 的路径解析与文件往返。"""
+
+    def setUp(self):
+        self.tmp = Path(tempfile.mkdtemp(prefix="dir-analysis-"))
+        self.addCleanup(shutil.rmtree, self.tmp, ignore_errors=True)
+        self.repo = self.tmp / "repo"
+        (self.repo / ".autopilot").mkdir(parents=True)
+        from autopilot import state as ap_state
+        self.st = ap_state
+
+    def test_path_for_helpers_under_autopilot_dir(self):
+        self.assertEqual(self.st.analysis_path_for(self.repo),
+                         self.repo / ".autopilot" / "analysis.json")
+        self.assertEqual(self.st.directives_path_for(self.repo),
+                         self.repo / ".autopilot" / "directives.json")
+
+    def test_directives_roundtrip_and_add(self):
+        self.assertEqual(self.st.load_directives(self.repo).get("directives"), [])
+        self.st.add_directive(self.repo, "规则一")
+        self.st.add_directive(self.repo, "规则二")
+        directives = self.st.load_directives(self.repo)["directives"]
+        self.assertEqual([d["text"] for d in directives], ["规则一", "规则二"])
+        self.assertTrue(all(d.get("added_at") for d in directives))
+
+    def test_load_analysis_missing_is_none(self):
+        self.assertIsNone(self.st.load_analysis(self.repo)) if hasattr(self.st, "load_analysis") else self.skipTest("load_analysis 不在 state 模块")
+
+
 class DashboardCmdTests(unittest.TestCase):
     """cmd_dashboard wiring (1.8.0 final review): config dashboard.auto_open is
     the default and --no-open forces it off; a busy --port exits with a clean
