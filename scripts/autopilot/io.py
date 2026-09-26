@@ -167,6 +167,8 @@ def save_json(path, data):
             os.fsync(handle.fileno())
         os.replace(tmp_name, str(path))
     except BaseException:
+        # Best-effort temp cleanup: a failed unlink here must not mask the
+        # original error that triggered it (re-raised below).
         try:
             os.unlink(tmp_name)
         except OSError:
@@ -221,10 +223,6 @@ def branch_exists(repo, branch):
 
 def has_commits(repo):
     return run_git(repo, "rev-parse", "--verify", "-q", "HEAD").returncode == 0
-
-
-def is_detached_head(repo):
-    return has_commits(repo) and current_branch(repo) == "HEAD"
 
 
 def _is_autopilot_path(path):
@@ -400,10 +398,18 @@ def _create_lock_exclusive(path):
     return True
 
 
+def _sleep(seconds):
+    """Indirection so tests can stub the lock-race backoff."""
+    import time
+    time.sleep(seconds)
+
+
 def _acquire_lock(repo):
     path = lock_path_for(repo)
     path.parent.mkdir(parents=True, exist_ok=True)
-    for _ in range(2):
+    # Three attempts: create / grace-backoff (fresh corrupt-looking lock may
+    # be mid-creation by a live process) / steal-and-recreate.
+    for attempt in range(3):
         if _create_lock_exclusive(path):
             return path
         holder = _read_lock_file(path)
@@ -436,6 +442,13 @@ def _acquire_lock(repo):
                 file=sys.stderr,
             )
         else:
+            # A lock that was just created (O_EXCL done, payload not yet
+            # written) reads as corrupt. A file this young is almost surely
+            # mid-creation by a live process — back off once before stealing.
+            age = datetime.now(timezone.utc).timestamp() - path.stat().st_mtime
+            if age < 2.0 and attempt == 0:
+                _sleep(0.1)
+                continue
             print("[WARN] Removing corrupt autopilot lock file at {}.".format(path), file=sys.stderr)
         try:
             path.unlink()

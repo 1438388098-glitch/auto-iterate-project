@@ -2,6 +2,71 @@
 
 All notable changes to auto-iterate-project are documented here.
 
+## 1.6.0 (2026-09-26)
+
+Self-hosted overnight iteration: the skill ran its own loop against its own
+repository for 14 verified rounds. Every fix below came from actually using
+the tool (or a debug agent simulating a first-time user) and hitting the
+friction for real.
+
+### Added
+
+- `config-set` accepts runtime field flags beyond `expand_after_goals`:
+  cadence (`--candidates-per-round`, `--commit-every-rounds`,
+  `--verify-every-rounds`, `--checkpoint-every`), budgets with `--clear-*`
+  twins (`--max-rounds`, `--max-minutes`, `--max-tokens`),
+  `--deadline EXPR`/`--clear-deadline` (init's expression parser),
+  `--push`/`--no-push`, `--scan-secrets`/`--no-scan-secrets`,
+  `--report-lang`. Every invocation refreshes the state config fingerprint.
+  Guard-rail fields stay deliberately unsettable at runtime.
+- CLI flag aliases matching natural agent phrasing: `directive-add --directive`
+  (= `--text`), `backlog-remove --candidate-id` (= `--id`).
+- Direct unit-test packs for the foundation layers: `io` (JSON atomic
+  write/read, git state probes, identity), `agent` (detect_python probe
+  chain, agent_profile, cmd_detect_agent payload), pure functions
+  (`emit_result` contract, config paths/defaults, `validate_config(source)`,
+  `any_ready_candidates`, `now_iso`, `git_dir_for`).
+
+### Fixed
+
+- Miner false-positive root causes (a stocked backlog is only useful if its
+  supply is clean):
+  - `test-gap` now skips CLI dispatch handlers registered via
+    `set_defaults(func=...)` — their coverage lives in CLI-level tests that
+    static symbol matching cannot see (32 phantom candidates on this repo).
+  - `dead-export` skips `unittest.TestCase` subclasses, resolved transitively
+    through local intermediate base classes (20 phantom candidates); fixing
+    this immediately surfaced 2 real dead symbols, now removed
+    (`io.is_detached_head`, `state.update_candidate_status`).
+  - `markers`/`swallowed` skip test files — fixture strings are sample data,
+    not tech debt (13 phantom TODO candidates).
+  - `hotspot` reads `--name-status` and skips deleted paths (no more
+    "review" suggestions for files that no longer exist).
+- Branch-drift guard gap in the report layer: `report`/retrospective fall
+  back to the real current branch when state records none.
+- `diagnose` on a non-git directory is a quiet probe (`is_git_repo: false`,
+  exit 0) instead of leaking git_dir_for's `[ERROR]` prefix.
+- `init` config-validation errors distinguish flag sources: the message
+  points at the offending init flag instead of a config.json that does not
+  exist yet.
+- Lock acquisition grants a 100 ms grace retry before stealing a
+  just-created (empty-looking) lock file, closing the create-vs-payload
+  race window; retry budget widened so the grace attempt cannot exhaust the
+  loop.
+- `check` merges its duplicate `current_branch` probes (one fewer git
+  subprocess on the loop's hottest command).
+
+### Docs
+
+- `references/config.md` documents the full `config-set` field list;
+  SKILL.md and troubleshooting.md sync, including using `config-set` to
+  raise or clear a stop condition mid-run.
+
+### Tests
+
+- 420 → 456 (36 new regression tests across the miner false-positive,
+  config-set, alias, lock-race, and unit-pack areas).
+
 ## 1.5.0 (2026-07-18)
 
 Mining supply side + early-stop gate hardening (user-reported: weak discovery, still early-stopping).

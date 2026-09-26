@@ -32,6 +32,6 @@ from . import cli
 # Single version authority: SKILL.md, agents/openai.yaml, references/overview.md,
 # and the CHANGELOG's newest section must all carry this value (asserted by the
 # suite's version-consistency test so drift turns CI red instead of relying on memory).
-__version__ = "1.5.0"
+__version__ = "1.6.0"
 
 __all__ = ["io", "config", "state", "agent", "secrets", "guard", "verify", "miner", "commands", "cli", "__version__"]

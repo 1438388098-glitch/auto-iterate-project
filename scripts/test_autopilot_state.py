@@ -9,6 +9,7 @@ import subprocess
 import sys
 import tempfile
 import unittest
+from datetime import datetime, timedelta
 from io import StringIO
 from unittest import mock
 from pathlib import Path
@@ -21,6 +22,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 from autopilot import state as ap_state  # noqa: E402
 from autopilot import io as ap_io  # noqa: E402
 from autopilot import commands as commands_module  # noqa: E402
+from autopilot import config as config_module  # noqa: E402
 from autopilot.cli import build_parser  # noqa: E402
 from autopilot.guard import path_allowed  # noqa: E402
 from autopilot.secrets import SECRET_PATTERNS  # noqa: E402
@@ -1148,7 +1150,50 @@ class ConfigSetTests(RepoTest):
         )
         data = json.loads(self.run_state("check", "--brief").stdout)
         self.assertFalse(any("config.json changed since init" in w for w in data["warnings"]))
-        self.assertEqual(self.read_json("config.json")["min_pending_candidates"], 5)
+
+    def test_config_set_multiple_fields_roundtrip(self):
+        self.run_state("init")
+        result = self.run_state(
+            "config-set", "--candidates-per-round", "6", "--commit-every-rounds", "3",
+            "--max-minutes", "90",
+        )
+        self.assertEqual(result.returncode, 0, result.stderr)
+        config = self.read_json("config.json")
+        self.assertEqual(config["candidates_per_round"], 6)
+        self.assertEqual(config["commit_every_rounds"], 3)
+        self.assertEqual(config["max_minutes"], 90)
+        state = self.read_json("state.json")
+        self.assertEqual(
+            state["config_fingerprint"],
+            ap_io.file_sha256(self.repo / ".autopilot" / "config.json"),
+        )
+        data = json.loads(self.run_state("check", "--brief").stdout)
+        self.assertFalse(any("config.json changed since init" in w for w in data["warnings"]))
+
+    def test_config_set_clear_budget_stores_null(self):
+        self.run_state("init", "--max-minutes", "45")
+        result = self.run_state("config-set", "--clear-max-minutes")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIsNone(self.read_json("config.json")["max_minutes"])
+
+    def test_config_set_deadline_resolves_relative_expression(self):
+        self.run_state("init")
+        result = self.run_state("config-set", "--deadline", "+2h")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        stored = self.read_json("config.json")["deadline"]
+        self.assertIsNotNone(ap_io.parse_time(stored))
+
+    def test_config_set_rejects_nonpositive_and_value_clear_conflicts(self):
+        self.run_state("init")
+        bad = self.run_state("config-set", "--candidates-per-round", "0")
+        self.assertNotEqual(bad.returncode, 0)
+        self.assertIn("positive integer", bad.stderr)
+        conflict = self.run_state("config-set", "--max-rounds", "5", "--clear-max-rounds")
+        self.assertNotEqual(conflict.returncode, 0)
+        self.assertIn("mutually exclusive", conflict.stderr)
+        unparsable = self.run_state("config-set", "--deadline", "昨天")
+        self.assertNotEqual(unparsable.returncode, 0)
+        self.assertIn("Could not parse --deadline", unparsable.stderr)
 
 
 class BudgetAccountingTests(RepoTest):
@@ -4754,6 +4799,30 @@ class MiningAndFinishGateTests(RepoTest):
         self.assertEqual(third["new"], 0)
         self.assertTrue(third["exhausted"], "two consecutive zero-new runs are exhaustion")
 
+    def test_mine_exhaustion_ignores_readonly_probes(self):
+        """A read-only mine (no --apply) never touches the backlog, so its
+        new-count is always the raw count — it must not reset the exhaustion
+        sequence the way an applying run would."""
+        (self.repo / "app.py").write_text("# TODO: resident\n", encoding="utf-8")
+        self.git("add", "app.py")
+        self.git("commit", "-q", "-m", "add app")
+        self.run_state("init")
+        first = json.loads(self.run_state("mine", "--kind", "markers", "--apply", "--json").stdout)
+        self.assertGreaterEqual(first["applied"], 1)
+        self.assertFalse(first["exhausted"])
+        second = json.loads(self.run_state("mine", "--kind", "markers", "--apply", "--json").stdout)
+        self.assertEqual(second["new"], 0)
+        self.assertFalse(second["exhausted"])
+        # Two read-only probes in between: without the apply-run filter these
+        # would show new > 0 and reset the two-consecutive-zero-new sequence.
+        probe_a = json.loads(self.run_state("mine", "--kind", "markers", "--json").stdout)
+        self.assertGreaterEqual(probe_a["new"], 0)
+        probe_b = json.loads(self.run_state("mine", "--kind", "markers", "--json").stdout)
+        self.assertFalse(probe_b["exhausted"])
+        third = json.loads(self.run_state("mine", "--kind", "markers", "--apply", "--json").stdout)
+        self.assertEqual(third["new"], 0)
+        self.assertTrue(third["exhausted"], "read-only probes must not reset the exhaustion sequence")
+
     def test_finish_refuses_below_floor_ready_work(self):
         """The proven early-stop hole: ready work below min_candidate_value used
         to leave the finish gate open while check still said work."""
@@ -4970,6 +5039,102 @@ class MiningAndFinishGateTests(RepoTest):
         self.run_state("init")
         result = json.loads(self.run_state("mine", "--kind", "markers", "--json").stdout)
         self.assertEqual(result["found"], 0)
+
+    def test_mine_test_gap_skips_cli_dispatch_handlers(self):
+        pkg = self.repo / "pkg"
+        pkg.mkdir()
+        (pkg / "cli.py").write_text(
+            "def register(sub):\n"
+            "    sub.set_defaults(func=handlers.cmd_greet)\n"
+            "    sub.set_defaults(func=cmd_bye)\n",
+            encoding="utf-8",
+        )
+        (pkg / "handlers.py").write_text(
+            "def cmd_greet():\n    pass\n",
+            encoding="utf-8",
+        )
+        (pkg / "other.py").write_text(
+            "def plain_function():\n    pass\n",
+            encoding="utf-8",
+        )
+        (self.repo / "test_cli_pkg.py").write_text("import pkg\n", encoding="utf-8")
+        self.git("add", "-A")
+        self.git("commit", "-q", "-m", "pkg")
+        self.run_state("init")
+        result = json.loads(self.run_state("mine", "--kind", "test-gap", "--json").stdout)
+        names = [f["title"] for f in result["findings"]]
+        self.assertFalse(any("cmd_greet" in n or "cmd_bye" in n for n in names),
+                         "CLI dispatch handlers must not be reported as test gaps")
+        self.assertTrue(any("plain_function" in n for n in names))
+
+    def test_mine_dead_export_skips_testcase_subclasses(self):
+        pkg = self.repo / "pkg"
+        pkg.mkdir()
+        (pkg / "tests_a.py").write_text(
+            "import unittest\n"
+            "class Base(unittest.TestCase):\n    pass\n"
+            "class Middle(Base):\n    pass\n"
+            "class Covered(Middle):\n    pass\n",
+            encoding="utf-8",
+        )
+        (pkg / "lib.py").write_text(
+            "def really_dead():\n    pass\n",
+            encoding="utf-8",
+        )
+        (self.repo / "test_pkg.py").write_text("import pkg\n", encoding="utf-8")
+        self.git("add", "-A")
+        self.git("commit", "-q", "-m", "pkg")
+        self.run_state("init")
+        result = json.loads(self.run_state("mine", "--kind", "dead-export", "--json").stdout)
+        names = [f["title"] for f in result["findings"]]
+        self.assertFalse(any("Covered" in n or "Middle" in n or "Base" in n for n in names),
+                         "TestCase subclasses (incl. via intermediate bases) are not dead code")
+        self.assertTrue(any("really_dead" in n for n in names))
+
+    def test_mine_hotspot_skips_deleted_paths(self):
+        (self.repo / "gone.py").write_text("x = 1\n", encoding="utf-8")
+        self.git("add", "gone.py")
+        self.git("commit", "-q", "-m", "add gone")
+        (self.repo / "gone.py").unlink()
+        self.git("add", "-A")
+        self.git("commit", "-q", "-m", "delete gone")
+        (self.repo / "keep.py").write_text("y = 2\n", encoding="utf-8")
+        self.git("add", "keep.py")
+        self.git("commit", "-q", "-m", "add keep")
+        self.run_state("init")
+        result = json.loads(self.run_state("mine", "--kind", "hotspot", "--json").stdout)
+        titles = [f["title"] for f in result["findings"]]
+        self.assertFalse(any("gone.py" in t for t in titles),
+                         "deleted files must not be suggested as hotspots")
+
+    def test_mine_markers_and_swallowed_skip_test_fixtures(self):
+        (self.repo / "app.py").write_text(
+            "# TODO: real debt in product code\n"
+            "def f():\n    pass\n",
+            encoding="utf-8",
+        )
+        (self.repo / "test_app.py").write_text(
+            "# TODO: fixture sample string\n"
+            "try:\n    run()\nexcept Exception:\n    pass\n",
+            encoding="utf-8",
+        )
+        self.git("add", "-A")
+        self.git("commit", "-q", "-m", "seed")
+        self.run_state("init")
+        markers = json.loads(self.run_state("mine", "--kind", "markers", "--json").stdout)
+        marker_files = [f["file"] for f in markers["findings"]]
+        self.assertEqual(marker_files, ["app.py"])
+        swallowed = json.loads(self.run_state("mine", "--kind", "swallowed", "--json").stdout)
+        self.assertEqual(swallowed["findings"], [])
+
+    def test_diagnose_non_git_reports_finding_not_error(self):
+        plain = Path(self.tmp) / "plain"
+        plain.mkdir()
+        result = self.run_state("diagnose", "--repo", str(plain))
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertNotIn("[ERROR]", result.stderr)
+        payload = json.loads(result.stdout)
+        self.assertFalse(payload["is_git_repo"])
 
 
 class LifecycleStateFixTests(RepoTest):
@@ -5601,6 +5766,332 @@ class CommitCadenceWarnTests(RepoTest):
         result = self.run_state("commit", "--round", "1", "--summary", "flush r1")
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
         self.assertNotIn("not a flush round", result.stderr)
+
+
+class AgentModuleUnitTests(unittest.TestCase):
+    """Direct unit coverage for scripts/autopilot/agent.py public helpers
+    (detect_python / agent_profile / cmd_detect_agent). The detect_agent
+    selection logic itself is covered end-to-end by DetectAgentTests."""
+
+    def _load_agent(self):
+        from autopilot import agent as ap_agent
+        return ap_agent
+
+    def test_detect_python_returns_first_runnable_launcher(self):
+        ap_agent = self._load_agent()
+        completed = mock.Mock(returncode=0)
+        with mock.patch.object(ap_agent.shutil, "which", return_value="C:/bin/python.exe"), \
+                mock.patch.object(ap_agent.subprocess, "run", return_value=completed) as run:
+            self.assertEqual(ap_agent.detect_python(), "python")
+        run.assert_called_once()
+        self.assertEqual(run.call_args[0][0], ["python", "-V"])
+
+    def test_detect_python_skips_dead_shims_in_fallback_order(self):
+        ap_agent = self._load_agent()
+
+        def fake_which(name):
+            return "shim" if name in ("python", "py") else None
+
+        def fake_run(argv, **kwargs):
+            if argv[0] == "python":
+                raise OSError("cannot execute shim")
+            return mock.Mock(returncode=0)
+
+        with mock.patch.object(ap_agent.shutil, "which", side_effect=fake_which), \
+                mock.patch.object(ap_agent.subprocess, "run", side_effect=fake_run):
+            self.assertEqual(ap_agent.detect_python(), "py")
+
+    def test_detect_python_rejects_nonzero_probe(self):
+        ap_agent = self._load_agent()
+
+        def fake_run(argv, **kwargs):
+            return mock.Mock(returncode=1 if argv[0] == "python" else 0)
+
+        with mock.patch.object(ap_agent.shutil, "which", return_value="x"), \
+                mock.patch.object(ap_agent.subprocess, "run", side_effect=fake_run):
+            self.assertEqual(ap_agent.detect_python(), "python3")
+
+    def test_detect_python_falls_back_to_python_when_nothing_probes(self):
+        ap_agent = self._load_agent()
+        with mock.patch.object(ap_agent.shutil, "which", return_value=None):
+            self.assertEqual(ap_agent.detect_python(), "python")
+
+    def test_agent_profile_known_and_unknown(self):
+        ap_agent = self._load_agent()
+        profile = ap_agent.agent_profile("claude-code")
+        self.assertEqual(profile["label"], "Claude Code")
+        self.assertEqual(profile["project_marker"], "CLAUDE.md")
+        self.assertIs(ap_agent.agent_profile("nope"), ap_agent.AGENT_PROFILES["generic"])
+
+    def _run_cmd_detect_agent(self, env_overrides):
+        ap_agent = self._load_agent()
+        env = dict(os.environ)
+        env.pop("SKILL_DIR", None)
+        env.update(env_overrides)
+        args = mock.Mock(repo=os.path.join(tempfile.gettempdir(), "detect-agent-repo"), home=None)
+        buf = StringIO()
+        with mock.patch.dict(os.environ, env, clear=True), \
+                mock.patch.object(ap_agent, "detect_agent", return_value=("codex", "test")), \
+                mock.patch.object(ap_agent, "detect_python", return_value="py"), \
+                mock.patch("sys.stdout", buf):
+            rc = ap_agent.cmd_detect_agent(args)
+        return rc, json.loads(buf.getvalue())
+
+    def test_cmd_detect_agent_payload_keys_and_adaptation(self):
+        rc, payload = self._run_cmd_detect_agent({})
+        self.assertEqual(rc, 0)
+        self.assertEqual(
+            set(payload),
+            {"agent", "label", "detected_by", "shell", "python_cmd", "skill_dir",
+             "project_marker", "agent_config", "adaptation"},
+        )
+        self.assertEqual(payload["agent"], "codex")
+        self.assertEqual(payload["detected_by"], "test")
+        self.assertEqual(payload["python_cmd"], "py")
+        self.assertEqual(
+            payload["adaptation"],
+            {"use_python": "py", "shell_syntax": "bash", "command_style": "bash"},
+        )
+
+    def test_cmd_detect_agent_skill_dir_env_override_wins(self):
+        rc, payload = self._run_cmd_detect_agent({"SKILL_DIR": "S:/custom-skills"})
+        self.assertEqual(rc, 0)
+        self.assertEqual(payload["skill_dir"], "S:/custom-skills")
+
+    def test_cmd_detect_agent_skill_dir_defaults_to_package_root(self):
+        ap_agent = self._load_agent()
+        rc, payload = self._run_cmd_detect_agent({})
+        self.assertEqual(rc, 0)
+        expected = Path(ap_agent.__file__).resolve().parents[2]
+        self.assertEqual(Path(payload["skill_dir"]), expected)
+        self.assertTrue((expected / "SKILL.md").exists())
+
+
+class IoFoundationUnitTests(unittest.TestCase):
+    """Direct unit coverage for the io.py foundation helpers (JSON atomic
+    write/read, git state probes, identity check). CLI-level tests cover them
+    indirectly; these pinpoint regressions to the IO layer itself."""
+
+    def setUp(self):
+        self.tmp = Path(tempfile.mkdtemp(prefix="io-unit-"))
+
+    def _git_repo(self):
+        repo = self.tmp / "repo"
+        repo.mkdir()
+        for args in (["init", "-q"], ["config", "user.name", "t"], ["config", "user.email", "t@x"]):
+            subprocess.run(["git", "-C", str(repo)] + args, capture_output=True)
+        (repo / "f.txt").write_text("x\n", encoding="utf-8")
+        subprocess.run(["git", "-C", str(repo), "add", "-A"], capture_output=True)
+        subprocess.run(["git", "-C", str(repo), "commit", "-q", "-m", "init"], capture_output=True)
+        return repo
+
+    def test_load_json_missing_returns_default(self):
+        self.assertIsNone(ap_io.load_json(self.tmp / "nope.json"))
+        sentinel = {"a": 1}
+        self.assertEqual(ap_io.load_json(self.tmp / "nope.json", default=sentinel), sentinel)
+
+    def test_load_json_dies_clean_on_corruption(self):
+        path = self.tmp / "bad.json"
+        path.write_text("{truncated", encoding="utf-8")
+        with self.assertRaises(SystemExit) as ctx:
+            ap_io.load_json(path)
+        self.assertEqual(ctx.exception.code, 2)
+
+    def test_save_json_roundtrip_and_bom_tolerance(self):
+        path = self.tmp / "dir" / "data.json"
+        payload = {"zh": "中文", "n": 3, "nested": [1, 2]}
+        ap_io.save_json(path, payload)
+        self.assertEqual(ap_io.load_json(path), payload)
+
+    def test_save_json_fails_closed_on_nan(self):
+        path = self.tmp / "nan.json"
+        with self.assertRaises(ValueError):
+            ap_io.save_json(path, {"x": float("nan")})
+        self.assertFalse(path.exists())
+
+    def test_working_tree_dirty_and_uncommitted_paths(self):
+        repo = self._git_repo()
+        self.assertFalse(ap_io.working_tree_dirty(repo))
+        (repo / "mod.txt").write_text("changed\n", encoding="utf-8")
+        (repo / "new.txt").write_text("new\n", encoding="utf-8")
+        self.assertTrue(ap_io.working_tree_dirty(repo))
+        paths = ap_io.uncommitted_paths(repo)
+        self.assertIn("mod.txt", paths)
+        self.assertIn("new.txt", paths)
+
+    def test_branch_exists_and_current_branch(self):
+        repo = self._git_repo()
+        self.assertTrue(ap_io.branch_exists(repo, "master") or ap_io.branch_exists(repo, "main"))
+        self.assertFalse(ap_io.branch_exists(repo, "no-such-branch"))
+
+    def test_git_identity_ok_reads_repo_local_config(self):
+        repo = self._git_repo()
+        ok, name, email = ap_io.git_identity_ok(repo)
+        self.assertTrue(ok)
+        self.assertEqual(name, "t")
+        self.assertEqual(email, "t@x")
+
+
+class ApiConsistencyFixTests(RepoTest):
+    """Round-9 usability fixes: CLI flag aliases for natural agent phrasings,
+    init-time config errors that point at the flag (not a nonexistent file),
+    and a grace retry before stealing a just-created (empty) lock file."""
+
+    def test_save_state_keeps_last_good_backup(self):
+        self.run_state("init")
+        state_path = self.repo / ".autopilot" / "state.json"
+        backup_path = self.repo / ".autopilot" / "state.json.bak"
+        self.assertFalse(backup_path.exists())  # first write: nothing to back up
+        before = state_path.read_bytes()
+        # A second save keeps the first generation as the backup.
+        st = json.loads(state_path.read_text(encoding="utf-8"))
+        st["round"] = 9
+        ap_state.save_state(self.repo, st)
+        self.assertTrue(backup_path.exists())
+        self.assertEqual(json.loads(backup_path.read_text(encoding="utf-8"))["round"], 0)
+        # Corrupting the live file leaves a restorable copy behind.
+        state_path.write_text("{truncated", encoding="utf-8")
+        restored = json.loads(backup_path.read_text(encoding="utf-8"))
+        self.assertEqual(restored["round"], 0)
+        self.assertEqual(before, backup_path.read_bytes())
+
+    def test_config_set_check_commands_roundtrip(self):
+        self.run_state("init", "--check-commands", "old-cmd")
+        result = self.run_state("config-set", "--check-commands", "pytest -q", "--check-commands", "npm test")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(self.read_json("config.json")["check_commands"], ["pytest -q", "npm test"])
+        cleared = self.run_state("config-set", "--clear-check-commands")
+        self.assertEqual(cleared.returncode, 0, cleared.stderr)
+        self.assertEqual(self.read_json("config.json")["check_commands"], [])
+        conflict = self.run_state("config-set", "--check-commands", "x", "--clear-check-commands")
+        self.assertNotEqual(conflict.returncode, 0)
+        self.assertIn("mutually exclusive", conflict.stderr)
+
+    def test_directive_add_and_backlog_remove_accept_aliases(self):
+        self.run_state("init")
+        ok = self.run_state("directive-add", "--directive", "rule via alias")
+        self.assertEqual(ok.returncode, 0, ok.stderr)
+        listed = json.loads(self.run_state("directive-list").stdout)
+        self.assertTrue(any("rule via alias" in d["text"] for d in listed["directives"]))
+        added = self.run_state("backlog-add", "--title", "t", "--reason", "r")
+        self.assertEqual(added.returncode, 0, added.stderr)
+        removed = self.run_state("backlog-remove", "--candidate-id", "candidate-001")
+        self.assertEqual(removed.returncode, 0, removed.stderr)
+
+    def test_init_secret_pattern_error_points_at_flag_not_file(self):
+        bad = self.run_state("init", "--secret-pattern", "[")
+        self.assertNotEqual(bad.returncode, 0)
+        self.assertIn("values from init flags", bad.stderr)
+        self.assertNotIn("delete the file", bad.stderr)
+
+    def test_acquire_lock_grace_retries_before_stealing_fresh_lock(self):
+        lock = ap_io.lock_path_for(self.repo)
+        lock.parent.mkdir(parents=True, exist_ok=True)
+        lock.write_text("", encoding="utf-8")  # mid-creation shape: no payload yet
+        sleeps = []
+        with mock.patch.object(ap_io, "_sleep", side_effect=sleeps.append):
+            with ap_io.run_lock(self.repo):
+                self.assertEqual(sleeps, [0.1])
+        self.assertFalse(lock.exists(), "lock released after the run")
+
+
+class PureFunctionUnitTests(unittest.TestCase):
+    """Direct unit coverage for pure helpers: commands.emit_result's output
+    contract and config's path/default functions."""
+
+    def _args(self, json_mode=False):
+        return mock.Mock(json=json_mode)
+
+    def test_emit_result_json_mode_object_and_exit_code(self):
+        buf = StringIO()
+        with mock.patch("sys.stdout", buf):
+            rc = commands_module.emit_result(self._args(json_mode=True), False, "boom", data={"x": 1})
+        self.assertEqual(rc, 2)
+        payload = json.loads(buf.getvalue())
+        self.assertEqual(payload, {"ok": False, "message": "boom", "x": 1})
+
+    def test_emit_result_text_mode_ok_goes_to_stdout_only(self):
+        out, err = StringIO(), StringIO()
+        with mock.patch("sys.stdout", out), mock.patch("sys.stderr", err):
+            rc = commands_module.emit_result(self._args(), True, "fine")
+        self.assertEqual(rc, 0)
+        self.assertIn("fine", out.getvalue())
+        self.assertEqual(err.getvalue(), "")
+
+    def test_emit_result_text_mode_error_goes_to_stderr_only(self):
+        out, err = StringIO(), StringIO()
+        with mock.patch("sys.stdout", out), mock.patch("sys.stderr", err):
+            rc = commands_module.emit_result(self._args(), False, "bad")
+        self.assertEqual(rc, 2)
+        self.assertIn("bad", err.getvalue())
+        self.assertEqual(out.getvalue(), "")
+
+    def test_config_path_helpers_lay_under_autopilot_dir(self):
+        repo = Path(tempfile.mkdtemp(prefix="pure-fn-"))
+        for helper in (config_module.config_path_for, config_module.state_path_for,
+                       config_module.backlog_path_for):
+            path = helper(repo)
+            self.assertEqual(path.parent, repo / ".autopilot")
+
+    def test_default_config_and_backlog_shapes(self):
+        repo = Path(tempfile.mkdtemp(prefix="pure-fn-"))
+        cfg = config_module.default_config(repo)
+        self.assertEqual(cfg["repo"], str(repo))
+        self.assertTrue(cfg["scan_secrets"])
+        self.assertFalse(cfg["push"])
+        self.assertIn("goals", cfg)
+        backlog = config_module.default_backlog()
+        self.assertEqual(backlog.get("candidates"), [])
+
+    def test_save_config_roundtrips_through_load(self):
+        repo = Path(tempfile.mkdtemp(prefix="pure-fn-"))
+        cfg = config_module.default_config(repo)
+        cfg["candidates_per_round"] = 7
+        cfg["goals"] = ["g1"]
+        config_module.save_config(repo, cfg)
+        loaded = config_module.load_config(repo)
+        self.assertEqual(loaded["candidates_per_round"], 7)
+        self.assertEqual(loaded["goals"], ["g1"])
+
+    def test_any_ready_candidates_counts_dependency_ready_pending(self):
+        backlog = {"candidates": [
+            {"id": "a", "status": "pending", "depends_on": []},
+            {"id": "b", "status": "pending", "depends_on": ["ghost"]},
+            {"id": "c", "status": "completed", "depends_on": []},
+        ]}
+        self.assertEqual(commands_module.any_ready_candidates(backlog), 1)
+
+    def test_validate_config_source_labels_error_and_clean_config_passes(self):
+        repo = Path(tempfile.mkdtemp(prefix="pure-fn-"))
+        cfg = config_module.default_config(repo)
+        cfg["secret_patterns"] = ["["]
+        with self.assertRaises(SystemExit):
+            config_module.validate_config(cfg, source="values from init flags")
+        config_module.validate_config(config_module.default_config(repo))  # clean: no raise
+
+    def test_now_iso_is_utc_isoformat(self):
+        stamp = ap_io.now_iso()
+        parsed = datetime.fromisoformat(stamp)
+        self.assertIsNotNone(parsed.tzinfo)
+        self.assertEqual(parsed.utcoffset(), timedelta(0))
+
+    def test_git_dir_for_accepts_repo_and_dies_on_non_git(self):
+        repo = self._git_repo()
+        git_dir = ap_io.git_dir_for(repo)
+        self.assertTrue(Path(git_dir).exists())
+        plain = Path(tempfile.mkdtemp(prefix="pure-fn-plain"))
+        with self.assertRaises(SystemExit) as ctx:
+            ap_io.git_dir_for(plain)
+        self.assertEqual(ctx.exception.code, 2)
+
+    def _git_repo(self):
+        repo = Path(tempfile.mkdtemp(prefix="pure-fn-git-"))
+        for args in (["init", "-q"], ["config", "user.name", "t"], ["config", "user.email", "t@x"]):
+            subprocess.run(["git", "-C", str(repo)] + args, capture_output=True)
+        (repo / "f.txt").write_text("x\n", encoding="utf-8")
+        subprocess.run(["git", "-C", str(repo), "add", "-A"], capture_output=True)
+        subprocess.run(["git", "-C", str(repo), "commit", "-q", "-m", "init"], capture_output=True)
+        return repo
 
 
 class SuiteIntegrityTests(unittest.TestCase):

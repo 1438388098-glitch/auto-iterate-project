@@ -253,8 +253,10 @@ def cmd_init(args):
                 "[WARN] state.json already exists. Resume with read/check instead of reinitializing.",
             )
         # Same validation the next load_config would apply — an init that
-        # writes a config it could never re-load is a bricked run.
-        config.validate_config(cfg)
+        # writes a config it could never re-load is a bricked run. The source
+        # label keeps the error pointing at the init flag, not at a config
+        # file that does not exist yet.
+        config.validate_config(cfg, source="values from init flags")
         config.save_config(repo, cfg)
         started_at = io.now_iso()
         run_id = uuid.uuid4().hex[:io.RUN_ID_LENGTH]
@@ -1985,53 +1987,128 @@ def cmd_analysis_load(args):
 
 
 def cmd_config_set(args):
-    """Runtime config adjustment (currently --expand-after-goals /
-    --no-expand-after-goals). Rewrites .autopilot/config.json and refreshes
+    """Runtime config adjustment. Rewrites .autopilot/config.json and refreshes
     state's config_fingerprint, so the deliberate change is not flagged as
-    config-drift — and an "all goals met" stop can be reopened for the
-    expansion phase (or closed again) without touching files by hand."""
+    config-drift. Numeric budgets accept a --clear-* twin that stores null;
+    --deadline resolves relative expressions (same parser as init) into an
+    absolute timestamp. Guard-rail fields (branch_mode, allow_uncommitted_changes,
+    path whitelists) are deliberately not settable at runtime."""
     repo = Path(args.repo).resolve()
     refused = _require_initialized(args, repo, message="[ERROR] Autopilot not initialized. Run init first.")
     if refused is not None:
         return refused
-    with io.run_lock(repo):
-        if getattr(args, "expand_after_goals", None) is None:
-            io.append_log(repo, "config-set", "error", reason="nothing to set")
+
+    positive_int_fields = (
+        ("candidates_per_round", args.candidates_per_round),
+        ("commit_every_rounds", args.commit_every_rounds),
+        ("verify_every_rounds", args.verify_every_rounds),
+        ("checkpoint_every", args.checkpoint_every),
+        ("max_rounds", args.max_rounds),
+        ("max_minutes", args.max_minutes),
+        ("max_tokens", args.max_tokens),
+    )
+    requested = {name: value for name, value in positive_int_fields if value is not None}
+    for name, value in requested.items():
+        if value < 1:
+            io.append_log(repo, "config-set", "error", reason="non-positive value", field=name, value=value)
             return emit_result(
                 args, False,
-                "[ERROR] config-set requires at least one field to set "
-                "(currently --expand-after-goals or --no-expand-after-goals).",
+                "[ERROR] --{} must be a positive integer (got {}).".format(name.replace("_", "-"), value),
             )
-        desired = bool(args.expand_after_goals)
-        # load_config validates the on-disk file; the single mutation is a
-        # literal bool, so the merged result cannot fail validation — but the
-        # reload below re-runs the full validator over what we actually wrote.
+    for value_name, clear_name in (
+        ("max_rounds", "clear_max_rounds"),
+        ("max_minutes", "clear_max_minutes"),
+        ("max_tokens", "clear_max_tokens"),
+        ("deadline", "clear_deadline"),
+    ):
+        if getattr(args, clear_name):
+            if value_name in requested:
+                return emit_result(
+                    args, False,
+                    "[ERROR] --{} and --{} are mutually exclusive.".format(
+                        value_name.replace("_", "-"), clear_name.replace("_", "-")
+                    ),
+                )
+            requested[value_name] = None
+    if args.deadline is not None:
+        resolved = io.parse_deadline(args.deadline)
+        if resolved is None:
+            io.append_log(repo, "config-set", "error", reason="unparsable deadline", value=args.deadline)
+            return emit_result(
+                args, False,
+                "[ERROR] Could not parse --deadline '{}'. Use an ISO timestamp "
+                "(2026-08-10T08:00:00), a relative duration (+8h / +30min / +1d), "
+                "or a local HH:MM wall-clock time.".format(args.deadline),
+            )
+        requested["deadline"] = resolved
+    for name in ("push", "scan_secrets", "report_lang"):
+        value = getattr(args, name)
+        if value is not None:
+            requested[name] = value
+    if args.expand_after_goals is not None:
+        requested["expand_after_goals"] = bool(args.expand_after_goals)
+    if getattr(args, "clear_check_commands", False):
+        if args.check_commands:
+            return emit_result(
+                args, False,
+                "[ERROR] --check-commands and --clear-check-commands are mutually exclusive.",
+            )
+        requested["check_commands"] = []
+    elif args.check_commands:
+        requested["check_commands"] = list(args.check_commands)
+
+    if not requested:
+        io.append_log(repo, "config-set", "error", reason="nothing to set")
+        return emit_result(
+            args, False,
+            "[ERROR] config-set requires at least one field to set "
+            "(--expand-after-goals/--no-expand-after-goals, --candidates-per-round, "
+            "--commit-every-rounds, --verify-every-rounds, --checkpoint-every, "
+            "--max-rounds/--clear-max-rounds, --max-minutes/--clear-max-minutes, "
+            "--max-tokens/--clear-max-tokens, --deadline/--clear-deadline, "
+            "--push/--no-push, --scan-secrets/--no-scan-secrets, --report-lang).",
+        )
+
+    with io.run_lock(repo):
+        # load_config validates the on-disk file; values above were parsed and
+        # range-checked already, and the reload below re-runs the full
+        # validator over what we actually wrote.
         cfg = config.load_config(repo)
         if getattr(args, "dry_run", False):
+            preview = ", ".join(
+                "{}={}".format(name, str(value).lower() if isinstance(value, bool) else value)
+                for name, value in sorted(requested.items())
+            )
             print(
-                "[DRY-RUN] Would set expand_after_goals={} in .autopilot/config.json "
-                "and refresh the state config fingerprint.".format(str(desired).lower()),
+                "[DRY-RUN] Would set {} in .autopilot/config.json and refresh the "
+                "state config fingerprint.".format(preview),
                 file=sys.stderr,
             )
             return 0
-        cfg["expand_after_goals"] = desired
+        cfg.update(requested)
         config.save_config(repo, cfg)
         reloaded = config.load_config(repo)
-        if bool(reloaded.get("expand_after_goals")) != desired:
-            io.append_log(repo, "config-set", "error", reason="reload mismatch", desired=desired)
+        mismatched = [
+            name for name, value in requested.items()
+            if reloaded.get(name) != value
+        ]
+        if mismatched:
+            io.append_log(repo, "config-set", "error", reason="reload mismatch", fields=mismatched)
             return emit_result(
                 args, False,
-                "[ERROR] config-set could not persist expand_after_goals={}.".format(str(desired).lower()),
+                "[ERROR] config-set could not persist: {}.".format(", ".join(mismatched)),
             )
         st = state.load_state(repo)
         st["config_fingerprint"] = io.file_sha256(config.config_path_for(repo))
         state.save_state(repo, st)
-        io.append_log(repo, "config-set", "success", expand_after_goals=desired)
+        summary = ", ".join(
+            "{}={}".format(name, str(value).lower() if isinstance(value, bool) else value)
+            for name, value in sorted(requested.items())
+        )
+        io.append_log(repo, "config-set", "success", fields={k: v for k, v in requested.items()})
         return emit_result(
             args, True,
-            "[OK] Config updated: expand_after_goals={}; config fingerprint refreshed (no config-drift warning).".format(
-                str(desired).lower()
-            ),
+            "[OK] Config updated: {}; config fingerprint refreshed (no config-drift warning).".format(summary),
         )
 
 
@@ -2267,10 +2344,13 @@ def cmd_detect_verify(args):
     return 0
 
 
-def _append_mining_run(st, findings_count, new_count, applied_count, kinds):
+def _append_mining_run(st, findings_count, new_count, applied_count, kinds, apply_mode=False):
     """Record one mine attempt (bounded). Used by the finish gate to tell
     'mining exhausted' from 'mining never tried'. Exhaustion counts NEW
-    findings: the raw count never reaches zero on repos with resident ones."""
+    findings: the raw count never reaches zero on repos with resident ones.
+    Read-only probes (no --apply) never touch the backlog, so their new-count
+    degenerates to the raw count and they are excluded from the exhaustion
+    sequence via the `apply` flag."""
     runs = st.setdefault("mining_runs", [])
     runs.append(
         {
@@ -2278,6 +2358,7 @@ def _append_mining_run(st, findings_count, new_count, applied_count, kinds):
             "findings": int(findings_count or 0),
             "new": int(new_count or 0),
             "applied": int(applied_count or 0),
+            "apply": bool(apply_mode),
             "kinds": list(kinds or []),
         }
     )
@@ -2296,8 +2377,15 @@ def _mining_run_new(run):
 def mining_exhausted(st):
     """True only after two consecutive mine runs added nothing new AND
     (when expansion waves exist) the last two waves added nothing either.
-    Never-mined is NOT exhausted — the supply side has not been tried."""
-    runs = [r for r in (st.get("mining_runs") or []) if isinstance(r, dict)]
+    Never-mined is NOT exhausted — the supply side has not been tried.
+    Read-only probes (no --apply) don't mutate the backlog, so when findings
+    exist their new-count degenerates to the raw count and misreads as churn;
+    such runs are excluded. A zero-finding probe IS real zero-new evidence and
+    still counts."""
+    runs = [
+        r for r in (st.get("mining_runs") or [])
+        if isinstance(r, dict) and (r.get("apply", True) or not int(r.get("findings") or 0))
+    ]
     if len(runs) < 2:
         return False
     if any(_mining_run_new(r) > 0 for r in runs[-2:]):
@@ -2397,11 +2485,12 @@ def cmd_mine(args):
                 )
             state.save_backlog(repo, backlog)
             st["last_activity_at"] = io.now_iso()
-            _append_mining_run(st, result["count"], len(new_findings), len(applied), result["kinds"])
+            _append_mining_run(st, result["count"], len(new_findings), len(applied), result["kinds"], apply_mode=True)
             state.save_state(repo, st)
         else:
             st = state.load_state(repo)
-            _append_mining_run(st, result["count"], len(new_findings), 0, result["kinds"])
+            _append_mining_run(st, result["count"], len(new_findings), 0, result["kinds"], apply_mode=False)
+            state.save_state(repo, st)
             state.save_state(repo, st)
 
         payload = {
@@ -2484,16 +2573,18 @@ def cmd_check(args):
         warnings.append("current_round is open; complete, block, or cancel it before starting a new round.")
 
     repo_has_commits = io.has_commits(repo)
+    # Probed once and shared by the detached-HEAD check and the feature-mode
+    # branch-drift warning below: check is the loop's hottest command.
+    head_branch = io.current_branch(repo) if repo_has_commits else None
     if not repo_has_commits:
         warnings.append("Repository has no commits yet; git log is unavailable and the first round creates the initial commit.")
-    elif io.current_branch(repo) == "HEAD":
+    elif head_branch == "HEAD":
         warnings.append("Detached HEAD; consider checking out a branch before starting.")
 
     # Branch drift in feature mode: the round commands will refuse (commit/
     # begin-round/complete-round), so say so here — check is the pre-flight.
     if cfg.get("branch_mode") == "feature" and st.get("branch"):
         expected = st["branch"]
-        head_branch = io.current_branch(repo)
         if head_branch == "HEAD":
             warnings.append(_check_text(
                 cfg,
@@ -2863,11 +2954,13 @@ def cmd_check(args):
 
 def cmd_diagnose(args):
     repo = Path(args.repo).resolve()
-    try:
-        git_dir = io.git_dir_for(repo)
-    except SystemExit:
-        print(json.dumps({"is_git_repo": False}, indent=2, ensure_ascii=False))
+    # Quiet probe: git_dir_for would print "[ERROR] Not a git repository" and
+    # exit 2, but diagnose is a health report — non-git is a *finding* here,
+    # reported as data with exit 0, not an error.
+    if io.run_git(repo, "rev-parse", "--is-inside-work-tree").returncode != 0:
+        print(json.dumps({"is_git_repo": False, "repo": str(repo)}, indent=2, ensure_ascii=False))
         return 0
+    git_dir = io.git_dir_for(repo)
 
     identity_ok, name, email = io.git_identity_ok(repo)
     has_commits = io.has_commits(repo)

@@ -1,5 +1,11 @@
 # Auto Iterate Project
 
+> Historical archive (1.3.3). This repository intentionally ships **no root
+> README.md**: skill folders must not ship one — the agent-facing overview
+> lives at [references/overview.md](../references/overview.md) and the
+> operating contract at [SKILL.md](../SKILL.md). A version-consistency test
+> enforces the absence, so do not reintroduce a root README.
+
 Version 1.3.3 — see [CHANGELOG.md](CHANGELOG.md) for release history.
 
 Automatically iterate any git project inside an agent session: analyze the repository, pick the next high-value improvement, implement small changes, verify, commit, and loop until a goal is met or configurable round/time/token limits are reached.

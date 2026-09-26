@@ -1,6 +1,6 @@
 ---
 name: auto-iterate-project
-version: 1.5.0
+version: 1.6.0
 description: Automatically iterate any git project inside the current agent session by analyzing the repository, choosing the next high-value improvement, implementing small changes, verifying, committing, and looping until a goal is met or configurable round/time/token limits are reached. Use when the user asks for autonomous project iteration, continuous self-improvement, auto-improve, keep improving this project, full-auto development, or wants the agent to keep making and committing improvements without per-step approval. Also use for Chinese requests like 全自动迭代这个项目, 自动改进并提交这个仓库, 连续自动开发, or 自动推进项目改进. Do NOT use for one-off bugfixes, single-file edits, doc-only changes, or when the user wants step-by-step approval of each change.
 ---
 
@@ -286,4 +286,4 @@ Full table: `references/troubleshooting.md`. Common ones:
 | All goals met, loop continues | `expand_after_goals: true` → `config-set --no-expand-after-goals` to stop at goal |
 | `action_hint: mine` | Run `mine --apply` now — do not idle |
 | `action_hint: expand` | Mine is fresh; Deep Expansion now |
-| `config-set` requires a field | Pass `--expand-after-goals` or `--no-expand-after-goals` |
+| `config-set` requires a field | Pass at least one field flag | e.g. `--expand-after-goals`, `--candidates-per-round N`, `--max-rounds N`/`--clear-max-rounds`, `--deadline EXPR`; see `references/config.md` |
