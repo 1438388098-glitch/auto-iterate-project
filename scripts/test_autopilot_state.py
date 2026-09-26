@@ -4392,6 +4392,7 @@ class ContractTests(RepoTest):
                 "backlog", "action_hint", "selected_count", "selected_empty_reason",
                 "wave_no", "lenses_used", "lenses_unused", "analysis", "mining",
                 "blocked_streak", "budget", "expansion_budget",
+                "round_progress",
             },
         )
         self.assertEqual(
