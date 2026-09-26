@@ -6292,6 +6292,22 @@ class RoundPrepTests(RepoTest):
         self.run_state("init")
         return [self._add("pend{}".format(i)) for i in range(count)]
 
+    def test_check_payload_carries_round_progress(self):
+        """轮次进度（预算可见性）：round_seq/max_rounds/remaining 在 brief
+        payload 可读——max_rounds 为 null 时 remaining 为 null。"""
+        self.run_state("init")
+        self.run_state("begin-round", "--title", "r", "--reason", "x")
+        self.add_file("a.py", "a = 1\n")
+        self.run_state("complete-round", "--summary", "done")
+        result = self.run_state("check", "--brief")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        import json as _json
+        payload = _json.loads(result.stdout)
+        progress = payload["round_progress"]
+        self.assertEqual(progress["round_seq"], 1)
+        self.assertEqual(progress["remaining"],
+                         progress["max_rounds"] - progress["round_seq"])
+
     def test_carries_every_check_brief_field(self):
         """Nothing the loop used to read from check may go missing."""
         self._seed()

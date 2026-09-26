@@ -3034,6 +3034,15 @@ def build_check_payload(repo, full=False):
         "warnings": warnings,
         "backlog": backlog_watch,
         "action_hint": action_hint,
+        # 轮次进度（预算可见性）：max_rounds 为 null 时 remain 亦为 null
+        "round_progress": {
+            "round_seq": st.get("round_seq", 0),
+            "max_rounds": cfg.get("max_rounds"),
+            "remaining": (
+                max(0, cfg["max_rounds"] - st.get("round_seq", 0))
+                if isinstance(cfg.get("max_rounds"), int) else None
+            ),
+        },
         "selected_count": len(selected_entries) if ranking_expected else None,
         "selected_empty_reason": selected_empty_reason,
         "wave_no": len(waves),
