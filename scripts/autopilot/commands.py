@@ -514,6 +514,10 @@ def _resolve_tokens(args, repo, st):
     persisted by _close_round. An explicit --tokens override skips estimation
     but still advances the water marks to the current totals, so the
     overridden round's real lines are never billed again by a later round.
+    Both branches advance the water marks with max(existing, current): a
+    round that OBSERVES a shrinking total (stash push, revert, reset --hard)
+    must never lower the marks, or the returning lines are billed a second
+    time.
     Negative overrides would silently refund the budget — refuse them.
     Returns (tokens, (billed_text, billed_binary))."""
     run_start_sha = st.get("run_start_sha")
@@ -530,7 +534,7 @@ def _resolve_tokens(args, repo, st):
     tokens, total_text, total_binary = io.estimate_tokens_for_round(
         repo, run_start_sha, billed_text, billed_binary
     )
-    return tokens, (total_text, total_binary)
+    return tokens, (max(billed_text, total_text), max(billed_binary, total_binary))
 
 
 def _refresh_type_stats(repo, st):
