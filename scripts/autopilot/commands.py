@@ -275,6 +275,14 @@ def cmd_init(args):
         # commits is measured from here (EMPTY_TREE on an unborn repo).
         init_head = io.run_git(repo, "rev-parse", "--verify", "-q", "HEAD")
         st["run_start_sha"] = init_head.stdout.strip() if init_head.returncode == 0 else io.EMPTY_TREE
+        # 项目总框架：init 扫描存档，观察台生长树据此绘制完整骨架。
+        # 扫描失败不阻塞 init——project_map 留空，树回退纯轮次叠加层。
+        try:
+            from . import dashboard_data
+            st["project_map"] = dashboard_data.scan_project_framework(
+                repo, (cfg.get("dashboard") or {}).get("domain_map"))
+        except Exception:
+            st["project_map"] = None
         state.save_state(repo, st)
         io.ensure_git_exclude(git_dir, cfg.get("track_state", False), to_stderr=getattr(args, "json", False))
         state.ensure_branch(repo, st, cfg, to_stderr=getattr(args, "json", False))
@@ -321,6 +329,15 @@ def cmd_begin_round(args):
         if drift is not None:
             io.append_log(repo, "begin-round", "error", reason="branch drift")
             return emit_result(args, False, drift)
+        if not st.get("project_map"):
+            # 旧 run 自愈：早于框架扫描特性的 state 在开轮时补扫一次，
+            # 让生长树也能画完整骨架（失败保持 None，树退回叠加层）。
+            try:
+                from . import dashboard_data
+                st["project_map"] = dashboard_data.scan_project_framework(
+                    repo, (cfg.get("dashboard") or {}).get("domain_map"))
+            except Exception:
+                pass
         stop_reason = state.compute_stop_reason(st, cfg)
         if stop_reason is not None:
             io.append_log(repo, "begin-round", "error", reason=stop_reason)

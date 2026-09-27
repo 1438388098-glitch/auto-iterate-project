@@ -7723,6 +7723,24 @@ class DashboardSnapshotTests(AutopilotTestBase):
         ap_io.save_json(self.repo / ".autopilot" / "state.json", st)
         return st
 
+    def test_snapshot_framework_keeps_tree_alive_when_growth_degraded(self):
+        """轮次叠加层完全降级（完成轮无锚点且无 touched_files）时，init 扫描
+        的项目框架仍让 growth.domains 非空——树活着，降级标记如实保留。"""
+        from autopilot import dashboard_data as dd
+        self._seed_state(
+            project_map={"scanned_at": "t", "domains": [
+                {"name": "工具与脚本", "meaning": "构建与辅助工具链", "modules": [
+                    {"name": "autopilot", "path": "scripts/autopilot", "files": 13}]}]},
+            history=[
+                {"round": 1, "status": "completed", "title": "t1", "summary": "s1",
+                 "review_score": 4, "commit_sha": None, "estimated_tokens": 0},
+            ])
+        snap = dd.build_snapshot(self.repo)
+        self.assertIn("growth", snap["meta"]["degraded"])       # 降级如实标注
+        names = [d["name"] for d in snap["growth"]["domains"]]
+        self.assertEqual(names, ["工具与脚本"])                  # 框架让树活着
+        self.assertEqual(snap["growth"]["domains"][0]["modules"][0]["total_files"], 13)
+
     def test_snapshot_no_run_reports_error(self):
         from autopilot import dashboard_data as dd
         self.assertEqual(dd.build_snapshot(self.repo), {"error": "no-run"})
@@ -7995,6 +8013,131 @@ class DashboardSnapshotTests(AutopilotTestBase):
                 return None
 
         self.assertIsNone(dd.compute_round_stats("R", history[:3], "000", gitio=FailingIO))
+
+
+class ProjectFrameworkTests(RepoTest):
+    """项目总框架（1.9.1）：init 扫描仓库产出 state.project_map（域→模块→
+    文件数），生长树据此绘制完整骨架；轮次活动按同名域 + 模块路径前缀叠加
+    其上。旧 run 无存档时 begin-round 自愈补扫。"""
+
+    def _scan(self, domain_map=None):
+        from autopilot import dashboard_data as dd
+        return dd.scan_project_framework(self.repo, domain_map)
+
+    def _add(self, name, content="x = 1\n"):
+        path = self.repo / name
+        path.parent.mkdir(parents=True, exist_ok=True)
+        self.add_file(name, content)
+
+    def test_scan_groups_domains_counts_files_and_excludes_noise(self):
+        self._add("scripts/autopilot/a.py")
+        self._add("scripts/autopilot/b.py")
+        self._add("scripts/test_a.py", "z = 3\n")
+        self._add("docs/guide.md", "guide\n")
+        self._add("node_modules/pkg/index.js", "m\n")   # 噪声目录不进骨架
+        fm = self._scan()
+        self.assertIsNotNone(fm)
+        self.assertTrue(fm["scanned_at"])
+        by = {d["name"]: d for d in fm["domains"]}
+        tools = by["工具与脚本"]
+        mods = {m["name"]: m for m in tools["modules"]}
+        self.assertEqual(mods["autopilot"]["files"], 2)     # 二级目录聚合
+        self.assertEqual(mods["autopilot"]["path"], "scripts/autopilot")
+        self.assertEqual(set(mods), {"autopilot"})          # test_* 不在工具域
+        # 深度不足的文件取文件名为模块（test_* 同时命中「测试」域）
+        self.assertEqual({m["name"] for m in by["测试"]["modules"]}, {"test_a.py"})
+        self.assertEqual({m["name"] for m in by["文档与知识"]["modules"]}, {"README.md", "guide.md"})
+        self.assertNotIn(".autopilot", by)                  # 运行目录永不入骨架
+        self.assertNotIn("node_modules", {d["name"] for d in fm["domains"]})
+
+    def test_scan_caps_modules_and_folds_overflow_into_other(self):
+        from autopilot import dashboard_data as dd
+        for i in range(12):
+            self._add("pkg{}/mod.py".format(i), "x = {}\n".format(i))
+        fm = self._scan()
+        by = {d["name"]: d for d in fm["domains"]}
+        core = by["核心实现"]                               # setUp 的 README 另属文档域
+        self.assertEqual(len(core["modules"]), dd.FRAMEWORK_MAX_MODULES + 1)
+        self.assertEqual(core["modules"][-1]["name"], "其他")
+        self.assertEqual(core["modules"][-1]["files"], 12 - dd.FRAMEWORK_MAX_MODULES)
+
+    def test_scan_caps_domains_via_domain_map(self):
+        from autopilot import dashboard_data as dd
+        for i in range(12):
+            self._add("pkg{}/mod.py".format(i), "x = {}\n".format(i))
+        dmap = {"pkg{}/".format(i): {"name": "域{}".format(i)} for i in range(12)}
+        fm = self._scan(dmap)
+        names = [d["name"] for d in fm["domains"]]
+        self.assertEqual(len(names), dd.FRAMEWORK_MAX_DOMAINS + 1)  # 10 + 「其他」
+        self.assertEqual(names[-1], "其他")
+
+    def test_init_stores_project_map(self):
+        self._add("scripts/autopilot/a.py")
+        self.git("commit", "-q", "-m", "seed")   # init 拒绝脏树，先落锚
+        result = self.run_state("init")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        st = self.read_json("state.json")
+        fm = st["project_map"]
+        self.assertTrue(fm and fm["domains"])
+        self.assertIn("工具与脚本", [d["name"] for d in fm["domains"]])
+
+    def test_begin_round_backfills_missing_project_map(self):
+        """早于框架特性的旧 run：开轮时补扫一次，观察台也能画完整骨架。"""
+        self.run_state("init")
+        st = self.read_json("state.json")
+        st["project_map"] = None
+        (self.repo / ".autopilot" / "state.json").write_text(
+            json.dumps(st, ensure_ascii=False), encoding="utf-8")
+        result = self.run_state("begin-round", "--title", "r1", "--reason", "x")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertTrue(self.read_json("state.json")["project_map"])
+
+    def test_merge_overlays_activity_on_framework(self):
+        from autopilot import dashboard_data as dd
+        fm = {"scanned_at": "t", "domains": [
+            {"name": "工具与脚本", "meaning": "", "modules": [
+                {"name": "autopilot", "path": "scripts/autopilot", "files": 13},
+                {"name": "cli.py", "path": "scripts/cli.py", "files": 1}]}]}
+        growth = [{"id": "工具与脚本", "name": "工具与脚本", "meaning": "构建与辅助工具链",
+                   "first_round": 2, "active_rounds": [2, 5], "weight": 1.0, "modules": [
+                       {"name": "a.py", "path": "scripts/autopilot/a.py", "first_round": 2,
+                        "churn": {"touches": 3, "insertions": 10, "deletions": 1},
+                        "files": ["scripts/autopilot/a.py"]},
+                       {"name": "new.py", "path": "scripts/new.py", "first_round": 5,
+                        "churn": {"touches": 1, "insertions": 2, "deletions": 0},
+                        "files": ["scripts/new.py"]}]}]
+        merged = dd.merge_project_framework(fm, growth)
+        self.assertEqual(len(merged), 1)
+        d = merged[0]
+        self.assertEqual(d["first_round"], 2)
+        self.assertEqual(d["weight"], 1.0)
+        self.assertEqual(d["framework_files"], 14)          # 框架文件数如实带出
+        mods = {m["path"]: m for m in d["modules"]}
+        auto = mods["scripts/autopilot"]
+        self.assertEqual(auto["first_round"], 2)            # 活动叠加到骨架
+        self.assertEqual(auto["churn"]["touches"], 3)
+        self.assertEqual(auto["total_files"], 13)
+        self.assertEqual(auto["files"], ["scripts/autopilot/a.py"])
+        newm = mods["scripts/new.py"]                       # run 新建文件：growth-only 追加
+        self.assertEqual(newm["total_files"], 1)
+        self.assertEqual(newm["first_round"], 5)
+        cli = mods["scripts/cli.py"]                        # 未触达骨架：仍在树上
+        self.assertIsNone(cli["first_round"])
+        self.assertEqual(cli["churn"]["touches"], 0)
+        paths = [m["path"] for m in d["modules"]]           # 触达排前、骨架压后
+        self.assertLess(paths.index("scripts/autopilot"), paths.index("scripts/cli.py"))
+
+    def test_merge_appends_run_created_domain_and_passthrough_without_map(self):
+        from autopilot import dashboard_data as dd
+        fm = {"domains": [{"name": "工具与脚本", "meaning": "", "modules": [
+            {"name": "cli.py", "path": "scripts/cli.py", "files": 1}]}]}
+        growth = [{"id": "测试", "name": "测试", "meaning": "回归防护网",
+                   "first_round": 1, "active_rounds": [1], "weight": 1.0, "modules": []}]
+        merged = dd.merge_project_framework(fm, growth)
+        by = {d["name"]: d for d in merged}
+        self.assertEqual(by["测试"]["framework_files"], 0)  # run 中长出来的域
+        self.assertEqual(by["工具与脚本"]["framework_files"], 1)
+        self.assertIs(dd.merge_project_framework(None, growth), growth)  # 无存档原样
 
 
 class DashboardPageContractTests(unittest.TestCase):
