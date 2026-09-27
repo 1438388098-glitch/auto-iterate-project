@@ -518,6 +518,155 @@ class BranchTests(RepoTest):
         current = self.git("rev-parse", "--abbrev-ref", "HEAD").stdout.strip()
         self.assertNotEqual(current, self.initial_branch)
 
+    def test_finish_deletes_run_branch_when_empty(self):
+        """A feature run with zero unique commits leaves an empty autopilot/*
+        branch sitting on origin — finish now deletes it instead of piling it up."""
+        self.run_state("init", "--branch-mode", "feature")
+        run_branch = self.read_json("state.json")["branch"]
+        result = self.run_state("finish", "--force", "--reason", "no work")
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertIn("已自动删除", result.stdout + result.stderr)
+        self.assertFalse(self._branch_exists(run_branch))
+
+    def test_finish_keeps_unmerged_run_branch(self):
+        self.run_state("init", "--branch-mode", "feature")
+        run_branch = self.read_json("state.json")["branch"]
+        self.run_state("begin-round", "--title", "r", "--reason", "x")
+        self.add_file()
+        self.run_state("commit", "--summary", "add feature")
+        sha = self.git("rev-parse", "HEAD").stdout.strip()
+        self.run_state("complete-round", "--summary", "done", "--commit-sha", sha)
+        result = self.run_state("finish", "--force", "--reason", "done")
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertIn("提交保留在分支", result.stdout + result.stderr)
+        self.assertTrue(self._branch_exists(run_branch))
+
+    def test_finish_deletes_run_branch_after_manual_merge(self):
+        """User (or agent) merged the run branch into origin before finish:
+        finish must reclaim it so the next run does not stack another leftover."""
+        self.run_state("init", "--branch-mode", "feature")
+        run_branch = self.read_json("state.json")["branch"]
+        self.run_state("begin-round", "--title", "r", "--reason", "x")
+        self.add_file()
+        self.run_state("commit", "--summary", "add feature")
+        sha = self.git("rev-parse", "HEAD").stdout.strip()
+        self.run_state("complete-round", "--summary", "done", "--commit-sha", sha)
+        self.git("checkout", "-q", self.initial_branch)
+        self.git("merge", "-q", "--no-edit", run_branch)
+        result = self.run_state("finish", "--force", "--reason", "merged")
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertIn("已自动删除", result.stdout + result.stderr)
+        self.assertFalse(self._branch_exists(run_branch))
+
+    def _branch_exists(self, name):
+        return self.git("rev-parse", "--verify", "--quiet", "refs/heads/" + name).returncode == 0
+
+
+class BranchGcTests(RepoTest):
+    """Lifecycle GC for leftover autopilot/* branches (repeated feature-mode
+    runs). Only fully-merged branches are reclaimed; unmerged work is sacred."""
+
+    def _seed_autopilot_branch(self, name, merge):
+        self.git("checkout", "-q", "-b", name)
+        path = "gc_{}.txt".format(name.replace("/", "_"))
+        (self.repo / path).write_text("work\n", encoding="utf-8")
+        self.git("add", path)
+        self.git("commit", "-q", "-m", "work on " + name)
+        self.git("checkout", "-q", self.initial_branch)
+        if merge:
+            self.git("merge", "-q", "--no-edit", name)
+
+    def test_branch_gc_deletes_merged_keeps_unmerged(self):
+        self._seed_autopilot_branch("autopilot/merged-run", merge=True)
+        self._seed_autopilot_branch("autopilot/live-run", merge=False)
+        result = self.run_state("branch-gc", "--json")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        data = json.loads(result.stdout)
+        self.assertIn("autopilot/merged-run", data["deleted"])
+        kept_names = [k["branch"] for k in data["kept"]]
+        self.assertIn("autopilot/live-run", kept_names)
+        self.assertFalse(self.git("rev-parse", "--verify", "--quiet",
+                                  "refs/heads/autopilot/merged-run").returncode == 0)
+        self.assertTrue(self.git("rev-parse", "--verify", "--quiet",
+                                 "refs/heads/autopilot/live-run").returncode == 0)
+
+    def test_branch_gc_keeps_checked_out_branch(self):
+        self._seed_autopilot_branch("autopilot/checked-out", merge=True)
+        self.git("checkout", "-q", "autopilot/checked-out")
+        # Merged into main, but it is HEAD — never delete the live worktree ref.
+        self.git("checkout", "-q", self.initial_branch)
+        self.git("merge", "-q", "--no-edit", "autopilot/checked-out")
+        self.git("checkout", "-q", "autopilot/checked-out")
+        result = self.run_state("branch-gc", "--json")
+        data = json.loads(result.stdout)
+        self.assertNotIn("autopilot/checked-out", data["deleted"])
+        self.assertTrue(self.git("rev-parse", "--verify", "--quiet",
+                                 "refs/heads/autopilot/checked-out").returncode == 0)
+
+    def test_branch_gc_never_touches_non_autopilot_names(self):
+        self.git("checkout", "-q", "-b", "feature/keep-me")
+        (self.repo / "keep.txt").write_text("k\n", encoding="utf-8")
+        self.git("add", "keep.txt")
+        self.git("commit", "-q", "-m", "keep")
+        self.git("checkout", "-q", self.initial_branch)
+        self.git("merge", "-q", "--no-edit", "feature/keep-me")
+        result = self.run_state("branch-gc", "--json")
+        data = json.loads(result.stdout)
+        self.assertEqual(data["deleted"], [])
+        self.assertTrue(self.git("rev-parse", "--verify", "--quiet",
+                                 "refs/heads/feature/keep-me").returncode == 0)
+
+    def test_branch_gc_dry_run_mutates_nothing(self):
+        self._seed_autopilot_branch("autopilot/merged-run", merge=True)
+        before = self.git("for-each-ref", "--format=%(refname:short)", "refs/heads/").stdout
+        result = self.run_state("branch-gc", "--dry-run")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("[DRY-RUN]", result.stderr)
+        after = self.git("for-each-ref", "--format=%(refname:short)", "refs/heads/").stdout
+        self.assertEqual(before, after)
+
+    def test_branch_gc_without_state(self):
+        """Leftovers from finished previous runs must be reclaimable before
+        the next init — no state.json required."""
+        self._seed_autopilot_branch("autopilot/merged-run", merge=True)
+        self.assertFalse((self.repo / ".autopilot" / "state.json").exists())
+        result = self.run_state("branch-gc", "--json")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        data = json.loads(result.stdout)
+        self.assertIn("autopilot/merged-run", data["deleted"])
+
+    def test_branch_gc_respects_explicit_base(self):
+        # Fork other-base BEFORE the merge so it does not contain the work.
+        self.git("checkout", "-q", "-b", "other-base")
+        self.git("checkout", "-q", self.initial_branch)
+        self._seed_autopilot_branch("autopilot/merged-run", merge=True)
+        result = self.run_state("branch-gc", "--base", "other-base", "--json")
+        data = json.loads(result.stdout)
+        self.assertEqual(data["deleted"], [])
+        self.assertTrue(self.git("rev-parse", "--verify", "--quiet",
+                                 "refs/heads/autopilot/merged-run").returncode == 0)
+
+    def test_init_prunes_merged_leftovers(self):
+        self._seed_autopilot_branch("autopilot/old-merged", merge=True)
+        self._seed_autopilot_branch("autopilot/old-live", merge=False)
+        result = self.run_state("init", "--branch-mode", "feature", "--force")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertFalse(self.git("rev-parse", "--verify", "--quiet",
+                                  "refs/heads/autopilot/old-merged").returncode == 0)
+        self.assertTrue(self.git("rev-parse", "--verify", "--quiet",
+                                 "refs/heads/autopilot/old-live").returncode == 0)
+        # The new run's own branch must survive the prune.
+        new_branch = self.read_json("state.json")["branch"]
+        self.assertTrue(self.git("rev-parse", "--verify", "--quiet",
+                                 "refs/heads/" + new_branch).returncode == 0)
+
+    def test_init_no_prune_keeps_leftovers(self):
+        self._seed_autopilot_branch("autopilot/old-merged", merge=True)
+        result = self.run_state("init", "--branch-mode", "feature", "--force", "--no-prune")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertTrue(self.git("rev-parse", "--verify", "--quiet",
+                                 "refs/heads/autopilot/old-merged").returncode == 0)
+
 
 class BeginRoundStopTests(RepoTest):
     def _complete_one_round(self, summary="done"):
@@ -2448,6 +2597,7 @@ class PredictedHardeningTests(RepoTest):
             ("backlog-update", ("--id", "candidate-001", "--value", "5")),
             ("ensure-branch", ()),
             ("push", ()),
+            ("branch-gc", ()),
         ):
             result = self.run_state(command, *args, "--dry-run")
             self.assertEqual(result.returncode, 0, (command, result.stderr))
@@ -5393,6 +5543,11 @@ class LifecycleStateFixTests(RepoTest):
 
     def test_finish_feature_branch_note_english(self):
         self.run_state("init", "--branch-mode", "feature", "--report-lang", "en")
+        self.run_state("begin-round", "--title", "r", "--reason", "x")
+        self.add_file()
+        self.run_state("commit", "--summary", "add feature")
+        sha = self.git("rev-parse", "HEAD").stdout.strip()
+        self.run_state("complete-round", "--summary", "done", "--commit-sha", sha)
         result = self.run_state("finish", "--force", "--reason", "done")
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
         combined = result.stdout + result.stderr

@@ -26,6 +26,7 @@
 | `complete-round` fails with "commit-sha does not resolve" | The SHA recorded by `commit` was not passed through | Use the exact SHA the `commit` helper printed |
 | `init` refuses with "Working tree is dirty" | Pre-existing uncommitted changes at run start | Commit/stash them, or pass `--allow-uncommitted-changes` / `--force` |
 | `ensure-branch`/`finish` fails with branch errors | `state.json` was hand-edited or the origin branch was deleted | Reset `.autopilot/state.json` and re-run; `finish` only warns when the origin branch is gone |
+| Too many leftover `autopilot/*` branches | Repeated feature-mode runs; older finishes kept unmerged/empty branches | `branch-gc` deletes only the merged ones; `init` auto-prunes merged leftovers (`--no-prune` opts out); never force-delete unmerged work |
 | `commit` fails with "violate allow_paths/deny_paths" | A staged file is outside the path whitelist | Only stage files the whitelist permits, or adjust `allow_paths`/`deny_paths` |
 | `undo-round` fails with "revert failed" | The revert conflicts with later commits | Resolve the conflict manually, commit, then record the round with `commit`/`complete-round` |
 | `detect-verify` reports nothing | No recognized build/test config | Set `check_commands` manually or pass `--check-commands` on init |

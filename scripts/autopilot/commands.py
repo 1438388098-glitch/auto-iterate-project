@@ -286,8 +286,30 @@ def cmd_init(args):
         state.save_state(repo, st)
         io.ensure_git_exclude(git_dir, cfg.get("track_state", False), to_stderr=getattr(args, "json", False))
         state.ensure_branch(repo, st, cfg, to_stderr=getattr(args, "json", False))
-        io.append_log(repo, "init", "success", run_id=run_id, branch_mode=cfg.get("branch_mode"))
-        return emit_result(args, True, "[OK] Initialized autopilot state.", data={"run_id": run_id})
+        # Branch hygiene: feature-mode runs leave autopilot/<run_id> behind on
+        # every finish (by design — work may be unmerged). Prune only the ones
+        # already fully merged into the base so repeated use of this skill does
+        # not pile up dead branches. Unmerged work is never touched.
+        pruned = {"deleted": [], "kept": []}
+        if not getattr(args, "no_prune", False):
+            try:
+                pruned = state.prune_merged_autopilot_branches(
+                    repo, keep=[st.get("branch")] if st.get("branch") else None)
+            except Exception:
+                pruned = {"deleted": [], "kept": []}
+        io.append_log(
+            repo, "init", "success", run_id=run_id,
+            branch_mode=cfg.get("branch_mode"),
+            pruned_branches=pruned.get("deleted") or [],
+        )
+        message = "[OK] Initialized autopilot state."
+        if pruned.get("deleted"):
+            message += " Pruned merged autopilot branch(es): {}.".format(
+                ", ".join(pruned["deleted"]))
+        return emit_result(
+            args, True, message,
+            data={"run_id": run_id, "pruned_branches": pruned.get("deleted") or []},
+        )
 def cmd_read(args):
     repo = Path(args.repo).resolve()
     # Validate git first: a non-git path must fail as "Not a git repository",
@@ -1255,6 +1277,7 @@ def cmd_finish(args):
         state.save_state(repo, st)
 
         returned_to = None
+        deleted_branch = None
         if not args.stay and cfg.get("branch_mode") == "feature":
             origin = st.get("origin_branch")
             if origin and origin != "HEAD" and io.branch_exists(repo, origin):
@@ -1279,6 +1302,27 @@ def cmd_finish(args):
                                 ),
                                 file=sys.stderr,
                             )
+            # Branch hygiene: if the run's feature branch is fully merged into
+            # where we returned (or into origin when already on it), delete it
+            # so repeated runs do not accumulate dead autopilot/* branches.
+            # Unmerged work is kept — finish still reports where it lives.
+            run_branch = st.get("branch")
+            if run_branch and run_branch.startswith("autopilot/"):
+                merge_target = returned_to or st.get("origin_branch") or io.current_branch(repo)
+                if (
+                    merge_target
+                    and merge_target != "HEAD"
+                    and io.branch_exists(repo, run_branch)
+                    and io.current_branch(repo) != run_branch
+                    and state.branch_fully_merged(repo, run_branch, merge_target)
+                ):
+                    del_result = io.run_git(repo, "branch", "-d", run_branch)
+                    if del_result.returncode == 0:
+                        deleted_branch = run_branch
+                        io.append_log(
+                            repo, "finish", "branch-pruned",
+                            branch=run_branch, merged_into=merge_target,
+                        )
         io.append_log(repo, "finish", "success", reason=args.reason, returned_to=returned_to)
         retrospective_path = None
         try:
@@ -1310,7 +1354,13 @@ def cmd_finish(args):
             except OSError as exc:
                 print("[WARN] Report archiving failed: {}".format(exc), file=sys.stderr)
         message = "[OK] Autopilot run finished."
-        if cfg.get("branch_mode") == "feature" and st.get("branch"):
+        if deleted_branch:
+            zh_msg = (cfg.get("report_lang") or "zh") == "zh"
+            if zh_msg:
+                message += " 分支 `{}` 已合并，已自动删除。".format(deleted_branch)
+            else:
+                message += " Branch `{}` was merged and has been deleted.".format(deleted_branch)
+        elif cfg.get("branch_mode") == "feature" and st.get("branch"):
             # The run's commits live on the autopilot branch and finish does
             # not merge (by design): say where the work landed, in the report
             # language, or the user discovers it only at merge time.
@@ -1321,12 +1371,18 @@ def cmd_finish(args):
             else:
                 origin_label = "原" if zh_msg else "the original"
             if zh_msg:
-                message += " 提交保留在分支 `{}`，未合并到 {} 分支。".format(st["branch"], origin_label)
-            else:
-                message += " Commits remain on branch `{}`; not merged into {}.".format(
+                message += " 提交保留在分支 `{}`，未合并到 {} 分支。合并后可运行 branch-gc 回收。".format(
                     st["branch"], origin_label
                 )
-        data = {"returned_to": returned_to, "retrospective": retrospective_path}
+            else:
+                message += " Commits remain on branch `{}`; not merged into {}. Run branch-gc after merging.".format(
+                    st["branch"], origin_label
+                )
+        data = {
+            "returned_to": returned_to,
+            "retrospective": retrospective_path,
+            "deleted_branch": deleted_branch,
+        }
         return emit_result(args, True, message, data=data)
 
 
@@ -1707,6 +1763,51 @@ def cmd_ensure_branch(args):
         branch = state.ensure_branch(repo, st, cfg, to_stderr=getattr(args, "json", False))
         io.append_log(repo, "ensure-branch", "success", branch=branch)
         return emit_result(args, True, "[OK] Autopilot branch ready: {}".format(branch or "current"), data={"branch": branch})
+
+
+def cmd_branch_gc(args):
+    """Garbage-collect local autopilot/* branches fully merged into --base.
+
+    Works without a run (no state.json required): leftover branches from
+    finished previous runs are exactly the pile this command exists for."""
+    repo = Path(args.repo).resolve()
+    io.git_dir_for(repo)
+    dry_run = bool(getattr(args, "dry_run", False))
+    base = getattr(args, "base", None)
+    keep = []
+    if config.state_path_for(repo).exists():
+        try:
+            st = state.load_state(repo)
+            if st.get("branch"):
+                keep.append(st["branch"])
+        except SystemExit:
+            pass
+    if dry_run:
+        planned = state.prune_merged_autopilot_branches(
+            repo, base=base, keep=keep, dry_run=True)
+        print(
+            "[DRY-RUN] Would delete {} merged autopilot branch(es) into {}: {}.".format(
+                len(planned["deleted"]), planned["base"] or "?",
+                ", ".join(planned["deleted"]) or "(none)",
+            ),
+            file=sys.stderr,
+        )
+        return emit_result(args, True, "[DRY-RUN] branch-gc planned.", data=planned)
+
+    result = state.prune_merged_autopilot_branches(repo, base=base, keep=keep)
+    if result["base"] and result["deleted"]:
+        io.append_log(
+            repo, "branch-gc", "success",
+            base=result["base"], deleted=result["deleted"],
+        )
+        message = "[OK] Deleted {} merged autopilot branch(es) into `{}`.".format(
+            len(result["deleted"]), result["base"])
+    elif result["base"] is None:
+        message = "[OK] No base branch found; nothing to prune."
+    else:
+        message = "[OK] No merged autopilot branches to prune ({} kept).".format(
+            len(result["kept"]))
+    return emit_result(args, True, message, data=result)
 
 
 def cmd_push(args):

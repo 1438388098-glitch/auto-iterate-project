@@ -2,6 +2,33 @@
 
 All notable changes to auto-iterate-project are documented here.
 
+## 1.10.0 (2026-09-27)
+
+Repeated feature-mode use piled up one dead `autopilot/<run_id>` branch per
+run: `finish` never merged or deleted (by design, so unmerged work stays
+recoverable), and nothing ever reclaimed the leftovers. This release adds a
+branch lifecycle so the pile-up stops.
+
+### Added
+
+- `branch-gc` — delete local `autopilot/*` branches whose commits are fully
+  merged into `--base` (default: current branch, then `main`/`master`).
+  Works without a run (no `state.json` required). Never deletes the
+  checked-out branch, the active run's branch, unmerged work, or names
+  outside `autopilot/`. `--dry-run` / `--json` supported.
+- `init` auto-prunes already-merged leftover `autopilot/*` branches before
+  the new run's branch is kept (`--no-prune` opts out). Repeated use of the
+  skill no longer stacks dead feature branches.
+- `finish` reclaims the run's feature branch when it is already fully merged
+  (empty run, or the user/agent merged it before finishing) and says so.
+  Unmerged work is untouched; the message now points at `branch-gc` for
+  after the merge.
+
+### Fixed
+
+- Version drift: `agents/openai.yaml` and `references/overview.md` lagged
+  `__version__` at 1.9.0 while the consistency test already expected a match.
+
 ## 1.9.1 (2026-09-27)
 
 Live user review of the observation dashboard, plus a two-agent debug sweep:

@@ -104,6 +104,8 @@ def build_parser():
     init_parser.add_argument("--deny-path", action="append", default=None, help="Glob of paths never allowed in commits (repeatable)")
     init_parser.add_argument("--report-lang", choices=["zh", "en"], default=None)
     init_parser.add_argument("--force", action="store_true")
+    init_parser.add_argument("--no-prune", dest="no_prune", action="store_true",
+                             help="Skip pruning already-merged leftover autopilot/* branches on init")
     add_json(init_parser)
     add_dry_run(init_parser)
     init_parser.set_defaults(func=commands.cmd_init)
@@ -498,6 +500,17 @@ def build_parser():
     add_json(ensure_branch_parser)
     add_dry_run(ensure_branch_parser)
     ensure_branch_parser.set_defaults(func=commands.cmd_ensure_branch)
+
+    branch_gc_parser = subparsers.add_parser(
+        "branch-gc",
+        help="Delete local autopilot/* branches fully merged into --base (default: current/main)",
+    )
+    branch_gc_parser.add_argument("--repo", default=".")
+    branch_gc_parser.add_argument("--base", default=None,
+                                  help="Ref that leftovers must be merged into (default: current branch, then main/master)")
+    add_json(branch_gc_parser)
+    add_dry_run(branch_gc_parser)
+    branch_gc_parser.set_defaults(func=commands.cmd_branch_gc)
 
     push_parser = subparsers.add_parser("push", help="Push the current branch to its remote (never force)")
     push_parser.add_argument("--repo", default=".")
