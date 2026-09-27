@@ -1,6 +1,6 @@
 ---
 name: auto-iterate-project
-version: 1.9.0
+version: 1.10.1
 description: Automatically iterate any git project inside the current agent session by analyzing the repository, choosing the next high-value improvement, implementing small changes, verifying, committing, and looping until a goal is met or configurable round/time/token limits are reached. Use when the user asks for autonomous project iteration, continuous self-improvement, auto-improve, keep improving this project, full-auto development, or wants the agent to keep making and committing improvements without per-step approval. Also use for Chinese requests like 全自动迭代这个项目, 自动改进并提交这个仓库, 连续自动开发, or 自动推进项目改进. Do NOT use for one-off bugfixes, single-file edits, doc-only changes, or when the user wants step-by-step approval of each change.
 ---
 
@@ -255,7 +255,7 @@ An empty or thin backlog is **never** an escalation.
 ## Finish
 
 1. If commits are batched and the last round did not commit, flush with `commit --round <n> --summary "flush accumulated changes"`.
-2. `finish --reason "<stop reason>"` (add `--stay` to remain on the feature branch). The gate refuses while no stop condition is reached and any of these remains: thin backlog needing expand/mine, any ready candidate (above **or below** `min_candidate_value`), a non-empty recommended batch, or mining not yet exhausted (never-mined ≠ exhausted). `--force` only when the user explicitly asked to stop. Auto-cancels any open round, writes `.autopilot/retrospective.md`, and in `feature` mode returns to the origin branch (commits remain on the autopilot branch, unmerged — the finish output and the retrospective say so).
+2. `finish --reason "<stop reason>"` (add `--stay` to remain on the feature branch). The gate refuses while no stop condition is reached and any of these remains: thin backlog needing expand/mine, any ready candidate (above **or below** `min_candidate_value`), a non-empty recommended batch, or mining not yet exhausted (never-mined ≠ exhausted). `--force` only when the user explicitly asked to stop. Auto-cancels any open round, writes `.autopilot/retrospective.md`, and in `feature` mode returns to the origin branch. If the run's branch is already fully merged (empty run or you merged it first) it is deleted; otherwise commits remain on the autopilot branch, unmerged — the finish output and the retrospective say so. After merging later, run `branch-gc` to reclaim leftovers.
 3. Write `.autopilot/last-summary.md` in the user's language (completed/blocked rounds, commits, branch, remaining goals, backlog, next likely improvement). Data: `report --repo <repo> [--lang zh|en] [--output <file>]`.
 4. Report a short summary to the user.
 
@@ -265,6 +265,7 @@ An empty or thin backlog is **never** an escalation.
 - `analysis-load` / `analysis-save` — repo analysis cache.
 - `secret-scan` — staged-diff secret scan (also automatic on `commit`).
 - `push` — manual push of the run branch via an explicit non-force refspec (refuses while `push: false`).
+- `branch-gc` — delete local `autopilot/*` branches fully merged into `--base` (default: current, then main/master). Safe on an uninitialized repo; `init` also auto-prunes merged leftovers (`--no-prune` opts out).
 - `backlog-list` / `backlog-update` / `backlog-remove` / `backlog-pick` — backlog housekeeping (see `references/config.md`).
 - `directive-add` / `directive-list` / `directive-remove` — standing rules.
 - `round-prep` — the loop's round start in one call (check fields + candidates + cached analysis + directives).

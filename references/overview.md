@@ -1,6 +1,6 @@
 # Auto Iterate Project
 
-Version 1.9.0 — see [../CHANGELOG.md](../CHANGELOG.md) for release history.
+Version 1.10.1 — see [../CHANGELOG.md](../CHANGELOG.md) for release history.
 
 Automatically iterate any git project inside an agent session: analyze the repository, pick the next high-value improvement, implement small changes, verify, commit, and loop until a goal is met or configurable round/time/token limits are reached.
 
@@ -20,6 +20,7 @@ Works with opencode, Claude Code, Codex, and other agent runtimes (auto-detected
 - **Early-stop hard gates**: `finish` is refused while budgets remain and ready work exists unless `--force`.
 - **Observation dashboard (1.8+)**: read-only web panel (`autopilot dashboard`) — an evolution tree (domain → module → file) beside a per-round card stream, with replay and a pending-direction board. Binds to 127.0.0.1 only, reads `.autopilot/` state and git history without writing, self-exits after 30 idle minutes; `config-set --dashboard` enables it and every `begin-round` then keeps it alive. Failures never block the loop.
 - **Safety rails**: refuses to commit user changes, never rewrites history, defaults to no pushing.
+- **Branch lifecycle (1.10+)**: feature-mode runs no longer pile up dead `autopilot/<run-id>` branches. `init` prunes already-merged leftovers; `finish` reclaims the run branch when it is already merged; `branch-gc` cleans up after you merge a kept branch later. Unmerged work is never deleted.
 
 ## Installation
 

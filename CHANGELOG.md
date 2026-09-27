@@ -2,6 +2,114 @@
 
 All notable changes to auto-iterate-project are documented here.
 
+## 1.10.1 (2026-09-27)
+
+Test-suite slim-down: 599 methods (~200s full / ~63s smoke) → 199 methods
+(~130s full / ~15s smoke), same critical contracts.
+
+### Changed
+
+- Consolidated the v1.3.2+ regression kitchen-sink classes
+  (`PredictedHardeningTests`, `SecurityFixRegressionTests`,
+  `LifecycleStateFixTests`, `OptimizationTests`, …) into table-driven methods
+  that keep the safety locks (secrets, branch guard, finish gate, dry-run
+  zero-mutation, version consistency) without one method per historical bug.
+- Dropped overlapping pure-unit and optional-feature test classes (dashboard
+  internals, predicted-origin/seed scoring, agent-detect matrix, miner scanner
+  edge lattice) that duplicated integration coverage or protected only
+  implementation details.
+- `SLOW_TEST_CLASSES` regenerated against the surviving set.
+
+### Fixed
+
+- Restored the 1.9.1 project-framework contracts (`ProjectFrameworkTests` +
+  the snapshot keep-alive case) that the first slim-down pass deleted along
+  with the dashboard internals: init scan → `project_map`, begin-round
+  backfill, domain/module merge overlay, and the tree staying alive when the
+  growth overlay degrades.
+
+### Removed
+
+- ~400 individual test methods that asserted the same contracts through
+  near-identical setups (each `RepoTest` method pays a full throwaway git
+  init — that, not assertion CPU, was the runtime).
+
+## 1.10.0 (2026-09-27)
+
+Repeated feature-mode use piled up one dead `autopilot/<run_id>` branch per
+run: `finish` never merged or deleted (by design, so unmerged work stays
+recoverable), and nothing ever reclaimed the leftovers. This release adds a
+branch lifecycle so the pile-up stops.
+
+### Added
+
+- `branch-gc` — delete local `autopilot/*` branches whose commits are fully
+  merged into `--base` (default: current branch, then `main`/`master`).
+  Works without a run (no `state.json` required). Never deletes the
+  checked-out branch, the active run's branch, unmerged work, or names
+  outside `autopilot/`. `--dry-run` / `--json` supported.
+- `init` auto-prunes already-merged leftover `autopilot/*` branches before
+  the new run's branch is kept (`--no-prune` opts out). Repeated use of the
+  skill no longer stacks dead feature branches.
+- `finish` reclaims the run's feature branch when it is already fully merged
+  (empty run, or the user/agent merged it before finishing) and says so.
+  Unmerged work is untouched; the message now points at `branch-gc` for
+  after the merge.
+
+### Fixed
+
+- Version drift: `agents/openai.yaml` and `references/overview.md` lagged
+  `__version__` at 1.9.0 while the consistency test already expected a match.
+
+## 1.9.1 (2026-09-27)
+
+Live user review of the observation dashboard, plus a two-agent debug sweep:
+the panel got honest about tokens, adaptive about window sizes, and the
+evolution tree now draws the whole project instead of only what a run touched.
+
+### Added
+
+- Project-framework scan: `init` walks the repo (`git ls-files`, noise and
+  `.autopilot` excluded) into `state.project_map` — domain → module → file
+  counts, classified by the same domain rules as the growth overlay so the
+  two layers merge by name. The evolution tree now renders the full project
+  skeleton (with per-module file counts) and overlays round activity on top;
+  modules the scan predates are appended honestly, untouched framework stays
+  visible. Old runs self-heal: `begin-round` backfills a missing map. The
+  tree also stays alive when the growth overlay degrades (no commit anchors),
+  with the degradation still flagged in `meta.degraded`.
+- Replay-axis design language promoted: a run-progress axis in the stats row
+  (visible when `max_rounds` is set, `r18 / r60` readout) and an accent fill
+  down the timeline to the latest completed round.
+- `?theme=light|dark` URL parameter for headless screenshots and shareable
+  links.
+
+### Fixed
+
+- dashboard.html: `renderTrend` referenced an undefined `maxScore` — the
+  ReferenceError silently killed every renderer after it — and a duplicated
+  `id="directions"` rendered the section twice (second copy always empty).
+  Card→domain highlight used indices into the truncated slice, so events
+  past the 20-card limit highlighted the wrong rounds.
+- Token accounting: the billed high-water marks could regress when a round
+  closed with a shrinking worktree (stash push, revert, `reset --hard`),
+  re-billing those lines when they returned. Both accounting branches now
+  advance the marks monotonically (`TokenWaterMarkTests`, red→green).
+- Layout: the story column's nowrap ellipsis lines blew up the grid's auto
+  minimum and crushed the tree panel to ~240px (columns are now
+  `minmax(0, …)`); the replay control moved into the tree panel so short
+  windows no longer get floating controls over content; responsive steps
+  re-graded (two columns >1000px, topbar/stats wrap ≤800px, phone ≤520px,
+  viewport meta added); tree SVG text is measured and ellipsized to the
+  panel width instead of overflowing.
+- Token stat relabelled 变更当量 (change-equivalent) with a hover note: the
+  number is a diff-line proxy (12/line + 100/binary + 500/round), not LLM
+  usage.
+- Replay playback smoothness: axis cursor/fill glide over 320ms instead of
+  jumping cell by cell (transitions suppressed while scrubbing), and a
+  playback step now re-renders only the replay-dependent sections instead of
+  the whole page.
+
 ## 1.9.0 (2026-09-26)
 
 Self-hosted night run #2: the loop iterated on itself with the 1.8

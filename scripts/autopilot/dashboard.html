@@ -572,7 +572,9 @@
     if (!snapshot) return;
     var growth = snapshot.growth || {};
     var meta = snapshot.meta || {};
-    if (!growth.domains || (meta.degraded || []).indexOf("growth") >= 0) {
+    // 框架存档（project_map）让树在轮次叠加层降级时也活着：只有真的一个
+    // 域都没有（init 早于扫描特性且未开轮）才退化为提示文案
+    if (!growth.domains || !growth.domains.length) {
       box.innerHTML = '<div style="color:var(--txt3);font-size:12.5px;padding:26px 2px">'
         + "进化树不可用：本轮次记录缺少提交锚点</div>";
       return;
@@ -648,10 +650,13 @@
           s += '<circle' + attr + ' cx="175" cy="' + mm.node.y + '" r="3" fill="var(--txt3)"/>';
           var born = (m.first_round === null || m.first_round === undefined) ? ""
             : '<tspan fill="var(--txt3)"> · r' + escapeHtml(m.first_round) + '</tspan>';
+          var total = m.total_files;
+          var count = (total !== null && total !== undefined && total > 1)
+            ? '<tspan fill="var(--txt3)"> · ' + escapeHtml(total) + ' 文件</tspan>' : "";
           s += '<text class="mono' + (fresh ? " grow" : "") + '"'
             + (fresh ? ' style="' + anim + '"' : "") + ' data-max="' + (w - 196)
             + '" x="188" y="' + (mm.node.y + 3.5)
-            + '" font-size="11" fill="var(--txt2)">' + escapeHtml(m.name) + born + '</text>';
+            + '" font-size="11" fill="var(--txt2)">' + escapeHtml(m.name) + born + count + '</text>';
         });
       }
       s += "</g>";

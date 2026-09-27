@@ -279,6 +279,131 @@ def _autopilot_dir(repo):
     return Path(repo) / io.AUTOPILOT_DIR
 
 
+# 项目总框架扫描（init 时一次）：树可读性优先，域/模块超出上限折叠进「其他」；
+# 隐藏条目与构建噪声目录不进骨架。
+FRAMEWORK_MAX_DOMAINS = 10
+FRAMEWORK_MAX_MODULES = 8
+FRAMEWORK_EXCLUDE_DIRS = {"node_modules", "__pycache__", "dist", "build",
+                          "venv", ".venv", "target", "vendor", "out"}
+
+
+def scan_project_framework(repo, domain_map=None, gitio=None):
+    """init 时扫描仓库，产出项目总框架（域→模块→文件数），生长树据此绘制
+    完整骨架而非只有轮次改过的文件。文件清单取 `git ls-files --cached
+    --others --exclude-standard`（已跟踪 + 未忽略的新文件）；排除 .autopilot
+    与隐藏/噪声目录。每个文件走与轮次叠加层同一套分类器（domain_map 最长
+    前缀 + 内置启发式）——框架域名与活动域名必然同名，合并时才对得上。
+    模块取二级目录（深度不足取文件名），聚合文件数；域按文件数降序，超
+    上限的域整体折叠进「其他」，域内超限模块同理。git 不可用返回 None：
+    调用方留空 project_map，树回退纯轮次叠加层。"""
+    run_git = _resolve_run_git(gitio)
+    raw = run_git(repo, "ls-files", "--cached", "--others", "--exclude-standard")
+    if raw is None:
+        return None
+    domains = {}
+    for path in raw.splitlines():
+        path = io._unquote_git_path(path.strip())
+        if not path or path.startswith(io.AUTOPILOT_DIR + "/"):
+            continue
+        segments = path.split("/")
+        if any(seg.startswith(".") or seg in FRAMEWORK_EXCLUDE_DIRS
+               for seg in segments):
+            continue
+        mapped = _match_domain_map(path, domain_map)
+        name = (mapped or {}).get("name") or _builtin_domain(path)
+        meaning = (mapped or {}).get("meaning") or BUILTIN_DOMAIN_MEANINGS.get(name, "")
+        domain = domains.setdefault(name, {"name": name, "meaning": meaning,
+                                           "modules": {}, "files": 0})
+        # ≥3 段（scripts/autopilot/a.py）→ 模块取二级目录；不足取文件名
+        module_key = "/".join(segments[:2]) if len(segments) >= 3 else path
+        module_name = segments[1] if len(segments) >= 3 else segments[-1]
+        module = domain["modules"].setdefault(
+            module_key, {"name": module_name, "path": module_key, "files": 0})
+        module["files"] += 1
+        domain["files"] += 1
+    if not domains:
+        return None
+    ranked = sorted(domains.values(), key=lambda d: (-d["files"], d["name"]))
+    result = []
+    for d in ranked[:FRAMEWORK_MAX_DOMAINS]:
+        mods = sorted(d["modules"].values(), key=lambda m: (-m["files"], m["path"]))
+        overflow = mods[FRAMEWORK_MAX_MODULES:]
+        if overflow:
+            mods = mods[:FRAMEWORK_MAX_MODULES] + [{
+                "name": "其他", "path": d["name"] + "/…",
+                "files": sum(m["files"] for m in overflow)}]
+        result.append({"name": d["name"], "meaning": d["meaning"], "modules": mods})
+    folded = ranked[FRAMEWORK_MAX_DOMAINS:]
+    if folded:
+        rest = []
+        for d in folded:
+            for m in d["modules"].values():
+                rest.append({"name": d["name"] + "/" + m["name"],
+                             "path": d["name"] + "/" + m["path"], "files": m["files"]})
+        rest.sort(key=lambda m: (-m["files"], m["path"]))
+        result.append({"name": "其他", "meaning": "",
+                       "modules": rest[:FRAMEWORK_MAX_MODULES]})
+    return {"scanned_at": io.now_iso(), "domains": result}
+
+
+def merge_project_framework(project_map, domains):
+    """项目总框架（state.project_map，init 扫描）并入轮次叠加层：树画出完
+    整骨架，轮次活动（first_round/active_rounds/churn）按域同名、模块路径
+    精确或前缀匹配叠加。run 中新建而无框架模块承载的文件作为 growth-only
+    模块追加（total_files=1）；框架扫描后新长出来的域整体追加（framework_
+    files=0）。无 project_map 时原样返回——纯叠加层行为不变。"""
+    if not isinstance(project_map, dict) or not project_map.get("domains"):
+        return domains
+    growth = {d["name"]: d for d in domains}
+    merged = []
+    for fd in project_map["domains"]:
+        name = fd["name"]
+        gd = growth.pop(name, None)
+        gmods = {m["path"]: m for m in (gd or {}).get("modules", [])}
+        modules = []
+        claimed = set()
+        for fm in fd.get("modules") or []:
+            children = [(p, m) for p, m in gmods.items()
+                        if p == fm["path"] or p.startswith(fm["path"] + "/")]
+            claimed.update(p for p, _ in children)
+            first_round = None
+            touches = insertions = deletions = 0
+            for _, m in children:
+                if m["first_round"] is not None and (
+                        first_round is None or m["first_round"] < first_round):
+                    first_round = m["first_round"]
+                touches += m["churn"]["touches"]
+                insertions += m["churn"]["insertions"]
+                deletions += m["churn"]["deletions"]
+            modules.append({
+                "name": fm["name"], "path": fm["path"],
+                "first_round": first_round,
+                "churn": {"touches": touches, "insertions": insertions,
+                          "deletions": deletions},
+                "files": [f for _, c in children for f in c["files"]],
+                "total_files": fm["files"],
+            })
+        for p, m in gmods.items():
+            if p not in claimed:
+                modules.append(dict(m, total_files=1))
+        modules.sort(key=lambda m: (-(m["churn"]["touches"] or 0), m["path"]))
+        merged.append({
+            "id": name, "name": name,
+            "meaning": (gd or {}).get("meaning") or fd.get("meaning") or "",
+            "first_round": (gd or {}).get("first_round"),
+            "active_rounds": (gd or {}).get("active_rounds", []),
+            "weight": (gd or {}).get("weight", 0),
+            "framework_files": sum(fm["files"] for fm in fd.get("modules") or []),
+            "modules": modules,
+        })
+    for d in domains:
+        if d["name"] in growth:
+            merged.append(dict(d, framework_files=0))
+    merged.sort(key=lambda d: (-(d.get("weight") or 0),
+                               -(d.get("framework_files") or 0), d["name"]))
+    return merged
+
+
 def compute_touched_file_changes(history):
     """Batch-mode fallback #2 (seed-002): complete-round records each round's
     touched_files (worktree names minus pre-round dirty files), giving
@@ -449,6 +574,9 @@ def build_snapshot(repo, gitio=None):
                 "insertions": st["insertions"] if st else 0,
                 "deletions": st["deletions"] if st else 0,
             })
+    # 项目总框架并入：即使轮次叠加层完全降级（无提交锚点），init 扫描的
+    # 骨架也让树保持可用——降级标记只影响活动叠加，不灭整棵树。
+    domains = merge_project_framework(state.get("project_map"), domains)
     completed = [h for h in history if h.get("status") == "completed"]
     return {
         "meta": {

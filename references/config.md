@@ -80,6 +80,8 @@ Boolean. Default `false`. The skill commits locally and does not push. When `tru
 
 String. Default `"current"`. When set to `"feature"`, the skill creates or checks out an `autopilot/<run-id>` branch so autonomous commits do not pollute the user's current branch. On `finish` it returns to the branch active at init unless `--stay` is passed.
 
+Branch lifecycle (1.10.0): `finish` deletes the run's `autopilot/<run-id>` branch when it is already fully merged into the origin branch (empty run, or you merged it first). Unmerged work is kept. `init` auto-prunes already-merged leftover `autopilot/*` branches (`--no-prune` opts out) so repeated runs do not stack dead branches. After merging a kept branch later, run `branch-gc` to reclaim it.
+
 ### commit_message_prefix
 
 String. Default `"autopilot"`. The `commit` helper builds messages as `<prefix>(round-<N>): <summary>` and enforces git identity and `max_round_scope` at commit time.
@@ -388,6 +390,7 @@ Anti-noise scoring (刀 B): a promoted candidate carries `origin: "predicted"`, 
 - `secret-scan` — scan the staged diff for secret-like content and report findings (exit non-zero on a match).
 - `backlog-add`, `backlog-update`, `backlog-remove`, `backlog-list`, `backlog-rank`, `backlog-pick` — backlog management (candidates carry `type`, `risk`, and `depends_on`; ranking defaults to expected value per round — see `ranking_mode`). `backlog-add --from-seed <id>` promotes a direction seed (see Direction Seeds above). `backlog-add` also refreshes `last_activity_at` so expansion scouting does not burn `max_minutes` without progress.
 - `ensure-branch` — create or check out the autopilot feature branch
+- `branch-gc` — delete local `autopilot/*` branches fully merged into `--base` (default: current branch, then `main`/`master`). Never deletes the checked-out branch, the active run's branch, unmerged work, or non-`autopilot/` names. Works without `state.json`. `init` also auto-prunes merged leftovers (`--no-prune` opts out).
 - `push` — push the current branch to its remote using an explicit non-force refspec; refuses to run when `push: false`
 - `dashboard` — the read-only observation panel's local server: `--serve` runs it in the foreground (the default; `--port N`, `--no-open` skips the browser tab) and `--stop` shuts a running server down. Bound to 127.0.0.1 only; it exits itself after 30 idle minutes. `begin-round` spawns it automatically (detached, reusing a live server, cleaning stale pid files) when `dashboard.enabled` is set — the loop never depends on it, a failed spawn is only a warning.
 

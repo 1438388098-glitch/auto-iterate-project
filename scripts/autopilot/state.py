@@ -56,6 +56,7 @@ def default_state(repo, goals=None, config_fingerprint=None):
         "cancelled_rounds": 0,
         "reverted_rounds": 0,
         "estimated_tokens_used": 0,
+        "project_map": None,
         "run_start_sha": None,
         "billed_text": 0,
         "billed_binary": 0,
@@ -89,6 +90,7 @@ def migrate_state(state):
         "cancelled_rounds": 0,
         "reverted_rounds": 0,
         "estimated_tokens_used": 0,
+        "project_map": None,
         "type_stats": {},
         "goal_events": [],
         "goal_seeds": [],
@@ -645,6 +647,83 @@ def ensure_branch(repo, state, cfg, to_stderr=False):
 
     say("[OK] Active branch: {}".format(branch))
     return branch
+
+
+def list_local_autopilot_branches(repo):
+    """Local branch short-names under refs/heads/autopilot/ (sorted)."""
+    result = io.run_git(
+        repo, "for-each-ref", "--format=%(refname:short)", "refs/heads/autopilot/"
+    )
+    if result.returncode != 0:
+        return []
+    return sorted(
+        line.strip() for line in result.stdout.splitlines() if line.strip()
+    )
+
+
+def branch_fully_merged(repo, branch, base):
+    """True when `branch` is an ancestor of `base` (its commits are all in base)."""
+    if not branch or not base or branch == base:
+        return branch == base if branch and base else False
+    result = io.run_git(repo, "merge-base", "--is-ancestor", branch, base)
+    return result.returncode == 0
+
+
+def default_gc_base(repo, preferred=None):
+    """Pick the ref that leftover autopilot/* branches must be merged into.
+
+    Order: explicit preferred → current branch (when not detached) → main →
+    master. Returns None when nothing suitable exists (unborn repo)."""
+    for candidate in (preferred, io.current_branch(repo), "main", "master"):
+        if candidate and candidate != "HEAD" and io.branch_exists(repo, candidate):
+            return candidate
+    return None
+
+
+def prune_merged_autopilot_branches(repo, base=None, keep=None, dry_run=False):
+    """Delete local `autopilot/*` branches whose commits are fully in `base`.
+
+    Repeated feature-mode runs leave one `autopilot/<run_id>` branch per run;
+    finish never merges or deletes them. This is the lifecycle GC. Safety:
+    never deletes the checked-out branch, anything in `keep`, unmerged work,
+    or non-`autopilot/` names. Uses `git branch -d` (refuses unmerged even if
+    the ancestor check races). Returns
+    {"base", "deleted", "kept", "dry_run"} where kept entries carry a reason
+    ("keep" / "checked-out" / "unmerged" / "base-missing" / "delete-failed")."""
+    base = default_gc_base(repo, preferred=base)
+    keep_set = set(keep or ())
+    current = io.current_branch(repo)
+    if current and current != "HEAD":
+        keep_set.add(current)
+
+    deleted = []
+    kept = []
+    branches = list_local_autopilot_branches(repo)
+    if base is None:
+        for branch in branches:
+            kept.append({"branch": branch, "reason": "base-missing"})
+        return {"base": None, "deleted": deleted, "kept": kept, "dry_run": dry_run}
+
+    for branch in branches:
+        if branch in keep_set:
+            kept.append({"branch": branch, "reason": "keep"})
+            continue
+        if not branch_fully_merged(repo, branch, base):
+            kept.append({"branch": branch, "reason": "unmerged"})
+            continue
+        if dry_run:
+            deleted.append(branch)
+            continue
+        result = io.run_git(repo, "branch", "-d", branch)
+        if result.returncode != 0:
+            kept.append({
+                "branch": branch,
+                "reason": "delete-failed",
+                "error": (result.stderr or result.stdout or "").strip(),
+            })
+            continue
+        deleted.append(branch)
+    return {"base": base, "deleted": deleted, "kept": kept, "dry_run": dry_run}
 
 
 _GOAL_CONNECTORS = ("并且", "以及", "同时", "另外", "还有")
