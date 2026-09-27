@@ -2,6 +2,7 @@
 <html lang="zh-CN">
 <head>
 <meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
 <title>auto·iterate 观察台</title>
 <style>
   :root {
@@ -27,7 +28,7 @@
   body {
     background:var(--bg); color:var(--txt);
     font-family:"Segoe UI","PingFang SC","Microsoft YaHei UI",system-ui,sans-serif;
-    padding:32px 44px 130px; max-width:1280px; margin:0 auto;
+    padding:32px 44px 48px; max-width:1280px; margin:0 auto;
   }
   .mono { font-family:"Cascadia Code",Consolas,monospace; }
 
@@ -50,7 +51,7 @@
 
   /* ---- 统计行 ---- */
   .stats { display:flex; gap:56px; padding:24px 0 26px; }
-  .stat .n { font-size:24px; font-weight:600; letter-spacing:-.4px; }
+  .stat .n { font-size:24px; font-weight:600; letter-spacing:-.4px; white-space:nowrap; }
   .stat .n small { font-size:13px; color:var(--txt3); font-weight:400; }
   .stat .l { font-size:9.5px; letter-spacing:1.8px; color:var(--txt3); text-transform:uppercase; margin-top:3px; }
 
@@ -61,11 +62,14 @@
   .panel { background:var(--surface); border-radius:12px; padding:22px 24px; }
   .panel h3 { font-size:10px; letter-spacing:1.6px; text-transform:uppercase; color:var(--txt3); font-weight:600; white-space:nowrap; }
   .gran { font-size:9.5px; color:var(--txt3); border:1px solid var(--line); border-radius:99px; padding:2px 9px; font-weight:400; letter-spacing:.5px; }
-  .panel-tree { display:flex; flex-direction:column; align-self:start; position:sticky; top:20px; height:calc(100vh - 42px); }
+  /* 左栏视口卡片：高度跟内容走、封顶在首屏内——回放条（面板底部）
+     在任何窗口高度都不折进折叠线之下，树过长时容器内部滚动 */
+  .panel-tree { display:flex; flex-direction:column; align-self:start; position:sticky; top:20px; max-height:calc(100vh - 200px); }
   .tree-cap { display:flex; justify-content:space-between; align-items:center; margin-bottom:10px; }
   .tree-cap > div:first-child { display:flex; align-items:center; gap:10px; }
-  .tree-wrap { flex:1; display:flex; align-items:center; }
-  #tree { width:100%; }
+  /* 树容器吃掉剩余高度：空间足则垂直居中，不够则面板内滚动（不裁不溢） */
+  .tree-wrap { flex:1; min-height:0; overflow-y:auto; overflow-x:hidden; display:flex; flex-direction:column; }
+  #tree { width:100%; margin:auto 0; }
   svg { display:block; width:100%; }
   #tree .drow { cursor:pointer; }
   #tree g.domain { transition:opacity 200ms cubic-bezier(.22,1,.36,1); }
@@ -116,14 +120,10 @@
   .dirrow .ve { color:var(--txt3); font-size:10px; flex:none; }
   .dirrow .ty { margin-left:auto; color:var(--txt3); font-size:10px; flex:none; }
 
-  /* ---- 回放胶囊（悬浮底部居中） ---- */
+  /* ---- 回放条（树面板底部：随卡片停靠，永不悬浮遮内容） ---- */
   .replay {
-    position:fixed; left:50%; bottom:22px; transform:translateX(-50%);
-    width:min(720px,86vw); display:flex; align-items:center; gap:14px;
-    padding:10px 18px; border-radius:999px;
-    background:color-mix(in srgb, var(--surface) 80%, transparent);
-    border:1px solid var(--line); backdrop-filter:blur(14px); -webkit-backdrop-filter:blur(14px);
-    box-shadow:0 10px 32px rgba(0,0,0,.30); z-index:60;
+    flex:none; display:flex; align-items:center; gap:14px;
+    margin-top:12px; padding-top:14px; border-top:1px solid var(--line);
   }
   .play {
     width:32px; height:32px; border-radius:50%; border:1px solid var(--line);
@@ -152,12 +152,39 @@
   /* ---- 生长动画：新节点/卡片浮现（只动 opacity/transform） ---- */
   @keyframes grow-in { from { opacity:0; transform:translateY(8px); } to { opacity:1; transform:translateY(0); } }
 
-  /* 窄屏：单列堆叠，树在上、叙事在下；sticky 视口卡片退化为自然高度 */
+  /* 中窄窗口（901-1160）：收窄左栏比例，右栏保住卡片标题可读宽度 */
+  @media (min-width: 901px) and (max-width: 1160px) {
+    .main { grid-template-columns: minmax(0,1.3fr) minmax(0,1fr); gap:16px; }
+    .panel { padding:18px 20px; }
+    .stats { gap:40px; }
+  }
+
+  /* 窄屏（≤900）：单列堆叠，树在上、叙事在下；sticky 视口卡片退化为自然高度 */
   @media (max-width: 900px) {
-    body { padding: 24px 20px 120px; }
-    .stats { flex-wrap: wrap; gap: 24px; }
+    body { padding: 24px 20px 44px; }
     .main { grid-template-columns: minmax(0,1fr); }
-    .panel-tree { position:static; height:auto; min-height:420px; }
+    .panel-tree { position:static; max-height:none; }
+    .tree-wrap { overflow:visible; }
+  }
+
+  /* 顶栏/统计行（≤800）：允许换行不溢出，meta 整行落到品牌下方 */
+  @media (max-width: 800px) {
+    .topbar { flex-wrap:wrap; row-gap:10px; }
+    .topmeta { flex-wrap:wrap; margin-left:0; width:100%; gap:10px 14px; }
+    .stats { flex-wrap:wrap; gap:20px 32px; padding:18px 0 20px; }
+  }
+
+  /* 手机宽度（≤520）：字阶、内边距、回放条整体收敛 */
+  @media (max-width: 520px) {
+    body { padding: 18px 14px 36px; }
+    .panel { padding: 16px 14px; border-radius:10px; }
+    .stats { gap: 16px 24px; }
+    .stat .n { font-size:20px; }
+    .brand { font-size:15.5px; }
+    .replay { gap:10px; }
+    .play { width:28px; height:28px; }
+    .axislbl { font-size:10px; }
+    .ev { padding-left:14px; }
   }
   /* 动效降级——全文件唯一的全局声明处，新增动画/过渡无需另写 reduce 分支 */
   @media (prefers-reduced-motion: reduce) {
@@ -188,7 +215,7 @@
       <div class="stat"><div class="n" id="stat-rounds-big">—</div><div class="l">轮次</div></div>
       <div class="stat"><div class="n" id="stat-completed">—</div><div class="l">完成</div></div>
       <div class="stat"><div class="n" id="stat-scale">—</div><div class="l">生长规模</div></div>
-      <div class="stat"><div class="n" id="stat-tokens">—</div><div class="l">tokens</div></div>
+      <div class="stat"><div class="n" id="stat-tokens" title="变更当量：按代码变更行数×12 + 二进制文件×100 + 每轮基础值500 估算的代理值，非 LLM 真实 token 消耗">—</div><div class="l">变更当量</div></div>
     </div>
 
     <div class="main">
@@ -198,6 +225,11 @@
           <span class="mode"><b id="mode-label">当前</b></span>
         </div>
         <div class="tree-wrap"><div id="tree"></div></div>
+        <div class="replay" id="replay" hidden>
+          <button class="play" id="play" title="回放">▶</button>
+          <div class="axis" id="axis"><div class="fill" id="axis-fill"></div><div class="cursor" id="axis-cursor"></div></div>
+          <div class="axislbl mono" id="axis-label">r1 — r1</div>
+        </div>
       </section>
 
       <section class="panel panel-story">
@@ -231,13 +263,7 @@
     </div>
   </div>
 
-  <div class="replay" id="replay" hidden>
-    <button class="play" id="play" title="回放">▶</button>
-    <div class="axis" id="axis"><div class="fill" id="axis-fill"></div><div class="cursor" id="axis-cursor"></div></div>
-    <div class="axislbl mono" id="axis-label">r1 — r1</div>
-  </div>
-
-<script>
+  <script>
 (function () {
   var root = document.documentElement;
   // 主题：localStorage 优先；?theme= 供无头截图/分享直链测试
@@ -479,6 +505,25 @@
     return { nodes: nodes, edges: edges, trunkEnd: trunkEnd };
   }
 
+  // SVG 文本防裁切：data-max 给出该行可用宽度（svg 宽 − 起点 x − 边距），
+  // 实测超宽则逐字去尾加省略号。getComputedTextLength 量真实字形宽，中英混排也准。
+  function fitSvgTexts(svg) {
+    if (!svg) return;
+    var texts = svg.querySelectorAll("text[data-max]");
+    for (var i = 0; i < texts.length; i++) {
+      var t = texts[i];
+      var max = parseFloat(t.getAttribute("data-max"));
+      var txt;
+      try { if (t.getComputedTextLength() <= max) continue; txt = t.textContent; }
+      catch (err) { continue; }
+      while (txt.length > 1) {
+        txt = txt.slice(0, -1);
+        t.textContent = txt + "…";
+        try { if (t.getComputedTextLength() <= max) break; } catch (err2) { return; }
+      }
+    }
+  }
+
   function renderTree() {
     var box = $("tree");
     if (!snapshot) return;
@@ -491,7 +536,8 @@
     }
     var domains = viewDomains();
     var t = layoutTree(domains);
-    var w = Math.max(box.clientWidth || 0, 560);
+    // 宽度跟面板走（不再设 560 下限）：窄面板靠文本截断适配，宽了也不浪费
+    var w = Math.max(box.clientWidth || 0, 300);
     var byDomain = {};
     t.nodes.forEach(function (n) {
       if (n.kind === "domain") byDomain[n.domain.name] = { y: n.y, open: n.open, branch: null, hang: null, modules: [] };
@@ -525,13 +571,16 @@
         + " L " + row.branch.x2 + " " + row.branch.y2
         + '" stroke="var(--line)" stroke-width="' + row.branch.w + '" fill="none"/>';
       s += '<circle class="dot" cx="152" cy="' + y + '" r="4.5" fill="var(--txt3)"/>';
-      s += '<text x="166" y="' + (y + 4) + '" font-size="12" font-weight="600" fill="var(--txt)">'
+      s += '<text data-max="' + (w - 206) + '" x="166" y="' + (y + 4)
+        + '" font-size="12" font-weight="600" fill="var(--txt)">'
         + escapeHtml(d.name) + '</text>';
       var note = [];
       if (d.first_round !== null && d.first_round !== undefined) note.push("r" + escapeHtml(d.first_round));
       if (d.meaning) note.push(escapeHtml(d.meaning));
-      if (note.length) {
-        s += '<text class="mono" x="284" y="' + (y + 4) + '" font-size="10" fill="var(--txt3)">'
+      // 注释列固定从 x=284 起：窄面板放不下（剩 ~120px 以下）时整段省略，防溢出被裁
+      if (note.length && w - 284 > 120) {
+        s += '<text class="mono" data-max="' + (w - 290) + '" x="284" y="' + (y + 4)
+          + '" font-size="10" fill="var(--txt3)">'
           + note.join(" · ") + '</text>';
       }
       if (!row.open && (d.modules || []).length) {
@@ -557,7 +606,8 @@
           var born = (m.first_round === null || m.first_round === undefined) ? ""
             : '<tspan fill="var(--txt3)"> · r' + escapeHtml(m.first_round) + '</tspan>';
           s += '<text class="mono' + (fresh ? " grow" : "") + '"'
-            + (fresh ? ' style="' + anim + '"' : "") + ' x="188" y="' + (mm.node.y + 3.5)
+            + (fresh ? ' style="' + anim + '"' : "") + ' data-max="' + (w - 196)
+            + '" x="188" y="' + (mm.node.y + 3.5)
             + '" font-size="11" fill="var(--txt2)">' + escapeHtml(m.name) + born + '</text>';
         });
       }
@@ -565,6 +615,7 @@
     });
     s += "</svg>";
     box.innerHTML = s;
+    fitSvgTexts(box.querySelector("svg"));
     applyHighlight();
   }
 
