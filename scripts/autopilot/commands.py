@@ -351,15 +351,15 @@ def cmd_begin_round(args):
         if drift is not None:
             io.append_log(repo, "begin-round", "error", reason="branch drift")
             return emit_result(args, False, drift)
-        if not st.get("project_map"):
-            # 旧 run 自愈：早于框架扫描特性的 state 在开轮时补扫一次，
-            # 让生长树也能画完整骨架（失败保持 None，树退回叠加层）。
-            try:
-                from . import dashboard_data
-                st["project_map"] = dashboard_data.scan_project_framework(
+        try:
+            from . import dashboard_data as dd_scan
+            # 缺失（旧 run 自愈）或文件集漂移（run 中结构大变）→ 重扫；
+            # 小改动不强制，避免每轮白扫。失败保持原 map / None。
+            if dd_scan.project_map_stale(st.get("project_map"), repo):
+                st["project_map"] = dd_scan.scan_project_framework(
                     repo, (cfg.get("dashboard") or {}).get("domain_map"))
-            except Exception:
-                pass
+        except Exception:
+            pass
         stop_reason = state.compute_stop_reason(st, cfg)
         if stop_reason is not None:
             io.append_log(repo, "begin-round", "error", reason=stop_reason)

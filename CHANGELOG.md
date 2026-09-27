@@ -2,6 +2,51 @@
 
 All notable changes to auto-iterate-project are documented here.
 
+## 1.11.0 (2026-09-27)
+
+Observation-dashboard review pass (A–E): the panel is as honest and as
+observable as the loop itself.
+
+### Fixed
+
+- `compute_round_stats` ignored `batch_commit_sha` while `compute_round_file_changes`
+  accepted it — a flush --round backfill made the stats walk look unanchored and
+  `build_snapshot` **discarded a healthy file walk** into the degraded ladder.
+  Both views now share one anchor walk (`walk_round_anchors`); a stats-only
+  failure can no longer wipe the tree.
+- `info_alive` treated any living pid as a live server (pid-reuse false
+  positive). It now also requires the recorded port to accept a 127.0.0.1
+  connect; dead servers respawn instead of being mistaken for live.
+- Snapshot cache key omitted git HEAD (design §2.3): a pure commit could serve
+  a stale growth walk for up to the TTL.
+
+### Added
+
+- Budget observability in the snapshot, same rules as `check --brief`:
+  `remaining_minutes`, `deadline_remaining_minutes`, `last_activity_at`,
+  `max_tokens`, and `round_progress` (round_seq / max_rounds / remaining).
+  The panel lights them only when they exist.
+- Decision visibility: `status.stop_reason` (via `state.compute_stop_reason`)
+  and a light `action_hint` (`stop` / `work` / `expand` / `mine`) so the panel
+  answers “why is the run here”, not only “what happened”.
+- `growth.totals` (files / insertions / deletions) — a static narrative when
+  replay is unavailable (run-level or degraded growth).
+- `project_map` staleness: `begin-round` rescans the framework when the live
+  file set drifts ≥20 files or ≥10% (small churn does not force a rescan);
+  archives carry `scanned_file_count`.
+- Explicit-port bind conflicts fall back to a random free port (up to 3
+  attempts) instead of failing the optional panel.
+- `_recent_log_events` reads only the last 64KB of `log.jsonl` (the log can
+  rotate to 5MB; full scans made the panel slower as the run grew).
+
+### Tests
+
+- `DashboardContractTests` (10): read-only guarantee, HTTP surface, ensure
+  never raises, page/snapshot key contract, batch-anchor symmetry, snapshot
+  shape + budget + outlook, degraded totals, project_map drift thresholds,
+  log tail, pid+port liveness. Replaces the 43 fine-grained dashboard methods
+  the 1.10.1 slim-down deleted, scoped to the safety boundaries.
+
 ## 1.10.1 (2026-09-27)
 
 Test-suite slim-down: 599 methods (~200s full / ~63s smoke) → 199 methods

@@ -460,8 +460,10 @@
     $("stat-runid").textContent = meta.run_id || "";
     var phase = st.phase;
     $("stat-phase").className = phase === "running" ? "live" : "";
-    $("stat-phase").textContent = phase === "running" ? "运行中"
+    var phaseTxt = phase === "running" ? "运行中"
       : (phase === "finished" ? "已完成" : "—");
+    if (st.stop_reason) phaseTxt += " · " + st.stop_reason;
+    $("stat-phase").textContent = phaseTxt;
     $("stat-version").textContent = meta.skill_version
       ? "v" + meta.skill_version : "";
 
@@ -472,7 +474,11 @@
     var modules = 0;
     domains.forEach(function (d) { modules += (d.modules || []).length; });
     $("stat-scale").innerHTML = domains.length + "<small> 域 · " + modules + " 模块</small>";
-    $("stat-tokens").innerHTML = (tokens / 1000).toFixed(1) + "<small>k</small>";
+    var tokLabel = (tokens / 1000).toFixed(1) + "<small>k</small>";
+    if (st.action_hint && phase === "running") {
+      tokLabel += '<small style="margin-left:6px;opacity:.85">' + escapeHtml(st.action_hint) + "</small>";
+    }
+    $("stat-tokens").innerHTML = tokLabel;
 
     // 轮次进度轴：max_rounds 已知才显形——回放轴的设计语言推广到统计行
     var prog = $("stat-progress");
@@ -484,11 +490,19 @@
       $("prog-label").textContent = "r" + st.round_seq + " / r" + max;
     } else prog.hidden = true;
 
-    // 粒度诚实标签：粗粒度口径只在不等价时出现，一词说明
+    // 粒度诚实标签：粗粒度口径只在不等价时出现；降级时附静态汇总替代叙事
     var tag = $("gran-tag");
-    if (growth.granularity === "run") { tag.hidden = false; tag.textContent = "run 级聚合"; }
-    else if (growth.granularity === "per-round-files") { tag.hidden = false; tag.textContent = "按文件归因"; }
-    else tag.hidden = true;
+    var totals = growth.totals;
+    var totalNote = (totals && (growth.granularity === "run" || (meta.degraded || []).indexOf("growth") >= 0))
+      ? " · " + fmt(totals.files) + " 文件 +" + fmt(totals.insertions) + "/-" + fmt(totals.deletions)
+      : "";
+    if ((meta.degraded || []).indexOf("growth") >= 0) {
+      tag.hidden = false; tag.textContent = "生长降级" + totalNote;
+    } else if (growth.granularity === "run") {
+      tag.hidden = false; tag.textContent = "run 级聚合" + totalNote;
+    } else if (growth.granularity === "per-round-files") {
+      tag.hidden = false; tag.textContent = "按文件归因";
+    } else tag.hidden = true;
 
     // 目标：total 为 0/缺省时整块隐藏，不渲染 0/0 空壳
     var goalSec = $("goal-sec");
@@ -500,6 +514,24 @@
       $("goal-side").textContent = "待办 " + fmt(st.backlog ? st.backlog.pending : null)
         + " · 波次 " + fmt(st.expansion_waves);
     } else goalSec.hidden = true;
+
+    // 预算剩余（与 check --brief 同源）：有时才亮，不造 0/0 空壳
+    var remBits = [];
+    if (budget.remaining_minutes !== null && budget.remaining_minutes !== undefined) {
+      remBits.push("剩 " + budget.remaining_minutes + " 分");
+    }
+    if (budget.deadline_remaining_minutes !== null && budget.deadline_remaining_minutes !== undefined) {
+      remBits.push("距截止 " + budget.deadline_remaining_minutes + " 分");
+    }
+    if (st.action_hint) remBits.push(st.action_hint);
+    if (remBits.length && goalSec.hidden) {
+      goalSec.hidden = false;
+      $("goal-label").textContent = remBits.join(" · ");
+      $("goal-fill").style.width = "0%";
+      $("goal-side").textContent = "待办 " + fmt(st.backlog ? st.backlog.pending : null);
+    } else if (remBits.length) {
+      $("goal-side").textContent += " · " + remBits.join(" · ");
+    }
 
     // 回放胶囊：无逐轮数据（含 degraded）→ 整体隐藏，不出死控件
     var bounds = roundBounds();
