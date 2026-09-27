@@ -4,8 +4,8 @@ All notable changes to auto-iterate-project are documented here.
 
 ## 1.10.1 (2026-09-27)
 
-Test-suite slim-down: 599 methods (~200s full / ~63s smoke) → 191 methods
-(~100s full / ~15s smoke), same critical contracts.
+Test-suite slim-down: 599 methods (~200s full / ~63s smoke) → 199 methods
+(~130s full / ~15s smoke), same critical contracts.
 
 ### Changed
 
@@ -19,6 +19,14 @@ Test-suite slim-down: 599 methods (~200s full / ~63s smoke) → 191 methods
   edge lattice) that duplicated integration coverage or protected only
   implementation details.
 - `SLOW_TEST_CLASSES` regenerated against the surviving set.
+
+### Fixed
+
+- Restored the 1.9.1 project-framework contracts (`ProjectFrameworkTests` +
+  the snapshot keep-alive case) that the first slim-down pass deleted along
+  with the dashboard internals: init scan → `project_map`, begin-round
+  backfill, domain/module merge overlay, and the tree staying alive when the
+  growth overlay degrades.
 
 ### Removed
 
