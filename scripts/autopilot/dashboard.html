@@ -56,20 +56,24 @@
   .stat .l { font-size:9.5px; letter-spacing:1.8px; color:var(--txt3); text-transform:uppercase; margin-top:3px; }
 
   /* ---- 主区 ---- */
-  /* minmax(0,·) 压掉 auto 最小宽度：右栏 nowrap 省略行不得把左栏挤瘪 */
-  .main { display:grid; grid-template-columns: minmax(0,1.72fr) minmax(0,1fr); gap:20px; align-items:stretch; }
+  /* 布局逻辑：左=状态侧（生长树+回放+态势小卡，整列 sticky），
+     右=叙事侧（时间线长内容）。两列都内容自适应高度，互不为对方留白。
+     minmax(0,·) 压掉 auto 最小宽度：nowrap 省略行不得把对侧挤瘪 */
+  .main { display:grid; grid-template-columns: minmax(0,1fr) minmax(0,1.15fr); gap:16px; align-items:start; }
   .main > * { min-width:0; }
+  .side {
+    position:sticky; top:20px; align-self:start;
+    display:flex; flex-direction:column; gap:16px;
+    max-height:calc(100vh - 40px); overflow-y:auto;
+    scrollbar-width:thin; scrollbar-color:var(--line) transparent;
+  }
   .panel { background:var(--surface); border-radius:12px; padding:22px 24px; }
   .panel h3 { font-size:10px; letter-spacing:1.6px; text-transform:uppercase; color:var(--txt3); font-weight:600; white-space:nowrap; }
   .gran { font-size:9.5px; color:var(--txt3); border:1px solid var(--line); border-radius:99px; padding:2px 9px; font-weight:400; letter-spacing:.5px; }
-  /* 左栏视口卡片：高度跟内容走、封顶在首屏内——回放条（面板底部）
-     在任何窗口高度都不折进折叠线之下，树过长时容器内部滚动 */
-  .panel-tree { display:flex; flex-direction:column; align-self:start; position:sticky; top:20px; max-height:calc(100vh - 200px); }
+  .panel-tree { display:flex; flex-direction:column; }
   .tree-cap { display:flex; justify-content:space-between; align-items:center; margin-bottom:10px; }
   .tree-cap > div:first-child { display:flex; align-items:center; gap:10px; }
-  /* 树容器吃掉剩余高度：空间足则垂直居中，不够则面板内滚动（不裁不溢） */
-  .tree-wrap { flex:1; min-height:0; overflow-y:auto; overflow-x:hidden; display:flex; flex-direction:column; }
-  #tree { width:100%; margin:auto 0; }
+  #tree { width:100%; }
   svg { display:block; width:100%; }
   #tree .drow { cursor:pointer; }
   #tree g.domain { transition:opacity 200ms cubic-bezier(.22,1,.36,1); }
@@ -78,9 +82,10 @@
   .halo { animation:halo 2.8s ease-in-out infinite; }
   @keyframes halo { 0%,100% { opacity:.5; } 50% { opacity:.06; } }
 
-  /* ---- 右栏：叙事时间线 + 数据在场的区块 ---- */
+  /* ---- 态势小卡（趋势/方向/目标/回顾/事件）：数据在场才显形 ---- */
   .panel-story h3 { margin-bottom:6px; }
   .sec { margin-top:18px; padding-top:16px; border-top:1px solid var(--line); }
+  #status-panel .sec:first-child { margin-top:0; padding-top:0; border-top:none; }
   .sec h3 .cnt { color:var(--txt3); letter-spacing:0; text-transform:none; font-size:10px; margin-left:6px; }
   #events { border-left:2px solid var(--line); margin-left:6px; }
   .ev { position:relative; padding:11px 2px 13px 18px; }
@@ -108,7 +113,7 @@
   .goal-line > span:first-child { font-size:11.5px; color:var(--txt2); flex:none; }
   .goalbar { flex:1; height:3px; background:var(--surface2); border-radius:2px; overflow:hidden; }
   .goalbar i { display:block; height:100%; background:var(--accent); border-radius:2px; transition:width 400ms cubic-bezier(.22,1,.36,1); }
-  .goal-line .side { font-size:10px; color:var(--txt3); flex:none; }
+  .goal-line .goalmeta { font-size:10px; color:var(--txt3); flex:none; }
   #retro-excerpt {
     font-size:11px; color:var(--txt2); line-height:1.7; white-space:pre-wrap;
     display:-webkit-box; -webkit-line-clamp:4; -webkit-box-orient:vertical; overflow:hidden;
@@ -152,19 +157,11 @@
   /* ---- 生长动画：新节点/卡片浮现（只动 opacity/transform） ---- */
   @keyframes grow-in { from { opacity:0; transform:translateY(8px); } to { opacity:1; transform:translateY(0); } }
 
-  /* 中窄窗口（901-1160）：收窄左栏比例，右栏保住卡片标题可读宽度 */
-  @media (min-width: 901px) and (max-width: 1160px) {
-    .main { grid-template-columns: minmax(0,1.3fr) minmax(0,1fr); gap:16px; }
-    .panel { padding:18px 20px; }
-    .stats { gap:40px; }
-  }
-
-  /* 窄屏（≤900）：单列堆叠，树在上、叙事在下；sticky 视口卡片退化为自然高度 */
-  @media (max-width: 900px) {
+  /* 单列（≤1000）：状态侧与叙事侧纵向堆叠，sticky 侧栏退化为自然流 */
+  @media (max-width: 1000px) {
     body { padding: 24px 20px 44px; }
     .main { grid-template-columns: minmax(0,1fr); }
-    .panel-tree { position:static; max-height:none; }
-    .tree-wrap { overflow:visible; }
+    .side { position:static; max-height:none; overflow:visible; }
   }
 
   /* 顶栏/统计行（≤800）：允许换行不溢出，meta 整行落到品牌下方 */
@@ -219,46 +216,50 @@
     </div>
 
     <div class="main">
-      <section class="panel panel-tree">
-        <div class="tree-cap">
-          <div><h3>项目生长</h3><span class="gran" id="gran-tag" hidden></span></div>
-          <span class="mode"><b id="mode-label">当前</b></span>
-        </div>
-        <div class="tree-wrap"><div id="tree"></div></div>
-        <div class="replay" id="replay" hidden>
-          <button class="play" id="play" title="回放">▶</button>
-          <div class="axis" id="axis"><div class="fill" id="axis-fill"></div><div class="cursor" id="axis-cursor"></div></div>
-          <div class="axislbl mono" id="axis-label">r1 — r1</div>
-        </div>
-      </section>
+      <div class="side">
+        <section class="panel panel-tree">
+          <div class="tree-cap">
+            <div><h3>项目生长</h3><span class="gran" id="gran-tag" hidden></span></div>
+            <span class="mode"><b id="mode-label">当前</b></span>
+          </div>
+          <div class="tree-wrap"><div id="tree"></div></div>
+          <div class="replay" id="replay" hidden>
+            <button class="play" id="play" title="回放">▶</button>
+            <div class="axis" id="axis"><div class="fill" id="axis-fill"></div><div class="cursor" id="axis-cursor"></div></div>
+            <div class="axislbl mono" id="axis-label">r1 — r1</div>
+          </div>
+        </section>
+
+        <section class="panel" id="status-panel" hidden>
+          <div class="sec" id="trend-sec" hidden>
+            <h3>趋势</h3>
+            <div id="trend"></div>
+          </div>
+          <div class="sec" id="dir-sec" hidden>
+            <h3>迭代方向<span class="cnt mono" id="dir-cnt"></span></h3>
+            <div id="directions"></div>
+          </div>
+          <div class="sec" id="goal-sec" hidden>
+            <div class="goal-line">
+              <span id="goal-label"></span>
+              <div class="goalbar"><i id="goal-fill"></i></div>
+              <span id="goal-side" class="goalmeta mono"></span>
+            </div>
+          </div>
+          <div class="sec" id="retro-sec" hidden>
+            <h3>回顾</h3>
+            <div id="retro-excerpt" class="mono"></div>
+          </div>
+          <div class="sec" id="log-sec" hidden>
+            <h3>运行事件</h3>
+            <div id="events-log" class="mono"></div>
+          </div>
+        </section>
+      </div>
 
       <section class="panel panel-story">
         <h3>进化叙事</h3>
         <div id="events"></div>
-
-        <div class="sec" id="trend-sec" hidden>
-          <h3>趋势</h3>
-          <div id="trend"></div>
-        </div>
-        <div class="sec" id="dir-sec" hidden>
-          <h3>迭代方向<span class="cnt mono" id="dir-cnt"></span></h3>
-          <div id="directions"></div>
-        </div>
-        <div class="sec" id="goal-sec" hidden>
-          <div class="goal-line">
-            <span id="goal-label"></span>
-            <div class="goalbar"><i id="goal-fill"></i></div>
-            <span id="goal-side" class="side mono"></span>
-          </div>
-        </div>
-        <div class="sec" id="retro-sec" hidden>
-          <h3>回顾</h3>
-          <div id="retro-excerpt" class="mono"></div>
-        </div>
-        <div class="sec" id="log-sec" hidden>
-          <h3>运行事件</h3>
-          <div id="events-log" class="mono"></div>
-        </div>
       </section>
     </div>
   </div>
@@ -411,6 +412,17 @@
     renderTrend();
     renderLog();
     renderRetro();
+    renderStatusPanel();
+  }
+
+  // 态势卡：所有小节都无数据时整卡隐藏，不留空壳
+  function renderStatusPanel() {
+    var ids = ["trend-sec", "dir-sec", "goal-sec", "retro-sec", "log-sec"];
+    var any = false;
+    for (var i = 0; i < ids.length; i++) {
+      if (!$(ids[i]).hidden) { any = true; break; }
+    }
+    $("status-panel").hidden = !any;
   }
 
   // ---- 统计行 / 顶栏 / 目标 / 回放胶囊 ----
