@@ -77,36 +77,38 @@ def _resolve_run_git(gitio):
     return run_git
 
 
-def compute_round_file_changes(repo, history, run_start_sha, gitio=None):
-    """Per-round `git diff --numstat` over each round's commit anchor: every
-    anchored round diffs prev-anchor..sha and advances the anchor. Rounds
-    closed without a commit legitimately (see NO_ANCHOR_STATUSES) consume no
-    diff and leave the anchor untouched; any OTHER shaless round (completed /
-    legacy statusless) cannot anchor its work, so the whole growth view
-    degrades to None rather than showing a partial picture — the same for a
-    failed git diff, which must never render as an empty one. The ``gitio``
-    seam exposes run_git(repo, *args) -> stdout text with None on failure
-    (the default path wraps io.run_git's CompletedProcess). Returns
-    {path: {first_round, touches, insertions, deletions, rounds}} where
-    touches counts round appearances, rounds dedups, first_round is the min."""
+def walk_round_anchors(repo, history, run_start_sha, gitio=None):
+    """Single anchor walk producing BOTH views at once (file_changes +
+    round_stats). `commit_sha` and `batch_commit_sha` are interchangeable
+    anchors — a flush --round backfill must not look unanchored to either
+    view. Rounds closed without a commit legitimately (see
+    NO_ANCHOR_STATUSES) consume no diff and leave the anchor untouched; any
+    OTHER shaless round cannot anchor its work, so BOTH views degrade to
+    (None, None) rather than a partial picture — same for a failed git diff.
+    A same-batch shared sha (prev == sha) contributes no new rows: file
+    attribution stays on the batch boundary, per-round stats get zeros from
+    the caller. Returns ({path: agg}, [round_stats]) or (None, None)."""
     run_git = _resolve_run_git(gitio)
-
     changes = {}
+    stats = []
     prev = run_start_sha
     for entry in history:
-        # batch_commit_sha（flush --round 回填）与 commit_sha 同为合法锚点；
-        # 同批多轮共享同一 sha，随后各轮 prev==sha 产生空 diff——行数归属在
-        # 批次边界，依然真实。
         sha = entry.get("commit_sha") or entry.get("batch_commit_sha")
         if sha and sha == prev:
-            # 同批多轮共享同一回填 sha：无新改动可 diff，静默跳过
             continue
         if sha:
             base = prev or io.EMPTY_TREE
             raw = run_git(repo, "diff", "--numstat", "{}..{}".format(base, sha))
             if raw is None:
-                return None
-            for item in parse_numstat(raw):
+                return None, None
+            rows = parse_numstat(raw)
+            stats.append({
+                "round": entry.get("round"), "status": entry.get("status"),
+                "files_changed": len(rows),
+                "insertions": sum(r["insertions"] for r in rows),
+                "deletions": sum(r["deletions"] for r in rows),
+            })
+            for item in rows:
                 agg = changes.setdefault(item["path"], {
                     "first_round": entry.get("round"), "touches": 0,
                     "insertions": 0, "deletions": 0, "rounds": [],
@@ -123,46 +125,22 @@ def compute_round_file_changes(repo, history, run_start_sha, gitio=None):
         elif entry.get("status") in NO_ANCHOR_STATUSES:
             continue
         else:
-            return None
-    return changes
+            return None, None
+    return changes, stats
+
+
+def compute_round_file_changes(repo, history, run_start_sha, gitio=None):
+    """{path: {first_round, touches, insertions, deletions, rounds}} from the
+    shared anchor walk; None when that walk degrades. touches counts round
+    appearances, rounds dedups, first_round is the min."""
+    return walk_round_anchors(repo, history, run_start_sha, gitio=gitio)[0]
 
 
 def compute_round_stats(repo, history, run_start_sha, gitio=None):
-    """Per-round churn for the rounds chart, walking the same anchors as
-    compute_round_file_changes (identical seam, anchor advance and
-    NO_ANCHOR_STATUSES skip; any other shaless round or a failed diff degrades
-    the whole view to None). Returns [{round, status, files_changed,
-    insertions, deletions}] in history order, one entry per anchored round,
-    counted from that round's own numstat rows — a path touched in several
-    rounds contributes to each of them, so nothing is double-counted across
-    rounds (the per-path lifetime aggregate lives in
-    compute_round_file_changes; running the anchor walk twice keeps both
-    contracts intact at the cost of doubled — and cheap — numstat diffs).
-    Unanchored NO_ANCHOR rounds produce no entry; build_snapshot renders them
-    as zeros."""
-    run_git = _resolve_run_git(gitio)
-    stats = []
-    prev = run_start_sha
-    for entry in history:
-        sha = entry.get("commit_sha")
-        if sha:
-            base = prev or io.EMPTY_TREE
-            raw = run_git(repo, "diff", "--numstat", "{}..{}".format(base, sha))
-            if raw is None:
-                return None
-            rows = parse_numstat(raw)
-            stats.append({
-                "round": entry.get("round"), "status": entry.get("status"),
-                "files_changed": len(rows),
-                "insertions": sum(r["insertions"] for r in rows),
-                "deletions": sum(r["deletions"] for r in rows),
-            })
-            prev = sha
-        elif entry.get("status") in NO_ANCHOR_STATUSES:
-            continue
-        else:
-            return None
-    return stats
+    """Per-round churn rows from the SAME anchor walk as file changes (one
+    numstat per round, no second git pass). Unanchored NO_ANCHOR rounds
+    produce no entry; build_snapshot renders them as zeros."""
+    return walk_round_anchors(repo, history, run_start_sha, gitio=gitio)[1]
 
 
 # 内置通用启发式：(路径前缀, 域名)，按列表序匹配；用户 domain_map 最长前缀
@@ -301,6 +279,7 @@ def scan_project_framework(repo, domain_map=None, gitio=None):
     if raw is None:
         return None
     domains = {}
+    scanned_files = 0
     for path in raw.splitlines():
         path = io._unquote_git_path(path.strip())
         if not path or path.startswith(io.AUTOPILOT_DIR + "/"):
@@ -321,6 +300,7 @@ def scan_project_framework(repo, domain_map=None, gitio=None):
             module_key, {"name": module_name, "path": module_key, "files": 0})
         module["files"] += 1
         domain["files"] += 1
+        scanned_files += 1
     if not domains:
         return None
     ranked = sorted(domains.values(), key=lambda d: (-d["files"], d["name"]))
@@ -343,7 +323,37 @@ def scan_project_framework(repo, domain_map=None, gitio=None):
         rest.sort(key=lambda m: (-m["files"], m["path"]))
         result.append({"name": "其他", "meaning": "",
                        "modules": rest[:FRAMEWORK_MAX_MODULES]})
-    return {"scanned_at": io.now_iso(), "domains": result}
+    return {"scanned_at": io.now_iso(), "scanned_file_count": scanned_files,
+            "domains": result}
+
+
+def project_map_stale(project_map, repo, gitio=None):
+    """True when the archived framework no longer matches the tree: missing
+    map, no scanned_file_count (older archives), or the live file count
+    drifted by ≥5% / ≥20 files (tiny churn does not force a rescan)."""
+    if not isinstance(project_map, dict) or not project_map.get("domains"):
+        return True
+    recorded = project_map.get("scanned_file_count")
+    if not isinstance(recorded, int):
+        return True
+    run_git = _resolve_run_git(gitio)
+    raw = run_git(repo, "ls-files", "--cached", "--others", "--exclude-standard")
+    if raw is None:
+        return False
+    live = 0
+    for path in raw.splitlines():
+        path = io._unquote_git_path(path.strip())
+        if not path or path.startswith(io.AUTOPILOT_DIR + "/"):
+            continue
+        segments = path.split("/")
+        if any(seg.startswith(".") or seg in FRAMEWORK_EXCLUDE_DIRS
+               for seg in segments):
+            continue
+        live += 1
+    drift = abs(live - recorded)
+    if drift >= 20:
+        return True
+    return recorded >= 10 and drift >= recorded * 0.1
 
 
 def merge_project_framework(project_map, domains):
@@ -459,13 +469,19 @@ def compute_run_file_changes(repo, run_start_sha, gitio=None):
 
 def _recent_log_events(repo, limit=10):
     """log.jsonl 尾部事件（可观测性）：每条 {ts, event, status}，坏行跳过。
+    只读文件尾部约 64KB（log 可轮转到 5MB，全文件扫会让面板越跑越慢）。
     无日志（新 run）→ 空列表；绝不抛错打断快照。"""
     path = _autopilot_dir(repo) / "log.jsonl"
     events = []
+    tail_bytes = 64 * 1024
     try:
-        with open(path, encoding="utf-8", errors="replace") as fh:
-            for line in fh:
-                line = line.strip()
+        size = path.stat().st_size
+        with open(path, "rb") as fh:
+            if size > tail_bytes:
+                fh.seek(size - tail_bytes)
+                fh.readline()  # 丢弃可能被截断的首行
+            for raw in fh:
+                line = raw.decode("utf-8", "replace").strip()
                 if not line:
                     continue
                 try:
@@ -526,11 +542,13 @@ def build_snapshot(repo, gitio=None):
         config = None
     history = state.get("history") or []
     run_start_sha = state.get("run_start_sha")
-    changes = compute_round_file_changes(repo, history, run_start_sha, gitio=gitio)
-    round_stats = compute_round_stats(repo, history, run_start_sha, gitio=gitio)
+    # One anchor walk (commit_sha | batch_commit_sha) feeds both views. A
+    # stats-only failure must NOT discard a successful file walk — only a
+    # missing file walk triggers the fallback ladder.
+    changes, round_stats = walk_round_anchors(repo, history, run_start_sha, gitio=gitio)
     degraded = []
     granularity = "per-round"
-    if changes is None or round_stats is None:
+    if changes is None:
         # Batch-commit runs (default cadence) carry no per-round shas: fall
         # back so the tree stays alive, honestly labelled. First per-round
         # file attribution from touched_files (seed-002), then a coarse
@@ -548,6 +566,10 @@ def build_snapshot(repo, gitio=None):
             domains, round_domains, rounds = [], {}, []
         else:
             round_domains, rounds = {}, []
+    elif round_stats is None:
+        # Defensive: walk_round_anchors degrades both together, but a future
+        # seam might return stats-only None — keep the file picture.
+        round_stats = []
     if granularity is not None:
         dash_cfg = (config.get("dashboard") or {}) if isinstance(config, dict) else {}
         domain_map = dash_cfg.get("domain_map")
@@ -578,6 +600,10 @@ def build_snapshot(repo, gitio=None):
     # 骨架也让树保持可用——降级标记只影响活动叠加，不灭整棵树。
     domains = merge_project_framework(state.get("project_map"), domains)
     completed = [h for h in history if h.get("status") == "completed"]
+    cfg = config if isinstance(config, dict) else {}
+    budget = _budget_view(state, cfg)
+    backlog_summary = _backlog_summary(_autopilot_dir(repo) / io.BACKLOG_FILENAME)
+    stop_reason, action_hint = _loop_outlook(state, cfg, backlog_summary)
     return {
         "meta": {
             "generated_at": io.now_iso(),
@@ -591,23 +617,28 @@ def build_snapshot(repo, gitio=None):
             "completed_rounds": len(completed),   # 从 history 统计，不照抄 state 键
             "blocked_rounds": state.get("blocked_rounds") or 0,
             "cancelled_rounds": state.get("cancelled_rounds") or 0,
-            "budget": {
-                "max_minutes": (config.get("max_minutes")
-                                if isinstance(config, dict) else None),
-                "estimated_tokens_used": state.get("estimated_tokens_used") or 0,
-                "max_rounds": (config.get("max_rounds")
-                               if isinstance(config, dict) else None),
-            },
+            "budget": budget,
+            "round_progress": budget["round_progress"],
             "goals": {"total": len(state.get("goals") or []),
                       "met": len(state.get("completed_goals") or [])},
-            "backlog": _backlog_summary(_autopilot_dir(repo) / io.BACKLOG_FILENAME),
+            "backlog": backlog_summary,
             "expansion_waves": len(state.get("expansion_waves") or []),
+            # 决策可见性（与 check --brief 同源语义，轻量重算）：面板从
+            # 「发生了什么」也能读到「下一步为何」。
+            "stop_reason": stop_reason,
+            "action_hint": action_hint,
         },
         "growth": {
             "granularity": granularity,
             "domains": domains,
             "events": correlate_events(history, round_domains),
             "rounds": rounds,
+            # 降级/粗粒度时的静态汇总：回放不可用也要有替代叙事。
+            "totals": {
+                "files": len(changes or {}),
+                "insertions": sum(c.get("insertions") or 0 for c in (changes or {}).values()),
+                "deletions": sum(c.get("deletions") or 0 for c in (changes or {}).values()),
+            },
         },
         "narrative": {
             # SKILL.md 流程把上一轮总结落在 .autopilot/last-summary.md。
@@ -628,6 +659,65 @@ def _read_head(path, limit=600):
         return path.read_text(encoding="utf-8", errors="replace")[:limit]
     except OSError:
         return None
+
+
+def _budget_view(state, cfg):
+    """Budget observability matching check --brief (same wall-clock rules:
+    max_minutes measures since last activity; deadline is absolute). Also
+    carries round_progress so the panel's progress axis and the loop see one
+    story. max_tokens stays on the parent key set (change-equivalent proxy)."""
+    from datetime import datetime, timezone
+    max_minutes = cfg.get("max_minutes")
+    remaining_minutes = None
+    if max_minutes is not None:
+        last_activity = io.parse_time(
+            state.get("last_activity_at") or state.get("started_at"))
+        if last_activity is not None:
+            elapsed = (datetime.now(timezone.utc) - last_activity).total_seconds() / 60
+            remaining_minutes = round(max(0.0, max_minutes - elapsed), 1)
+    deadline_remaining = None
+    deadline_at = io.parse_time(cfg.get("deadline"))
+    if deadline_at is not None:
+        deadline_remaining = round(
+            (deadline_at - datetime.now(timezone.utc)).total_seconds() / 60, 1)
+    max_rounds = cfg.get("max_rounds")
+    round_seq = state.get("round_seq") or 0
+    return {
+        "max_minutes": max_minutes,
+        "remaining_minutes": remaining_minutes,
+        "deadline_remaining_minutes": deadline_remaining,
+        "estimated_tokens_used": state.get("estimated_tokens_used") or 0,
+        "max_tokens": cfg.get("max_tokens"),
+        "max_rounds": max_rounds,
+        "last_activity_at": state.get("last_activity_at"),
+        "round_progress": {
+            "round_seq": round_seq,
+            "max_rounds": max_rounds,
+            "remaining": (
+                max(0, max_rounds - round_seq)
+                if isinstance(max_rounds, int) else None
+            ),
+        },
+    }
+
+
+def _loop_outlook(state, cfg, backlog_summary):
+    """stop_reason + action_hint for the panel (decision-level, not the full
+    check warning catalog). stop_reason reuses state.compute_stop_reason so
+    the loop and the panel never disagree on why a run is stopped."""
+    from . import state as ap_state
+    stop_reason = None
+    try:
+        stop_reason = ap_state.compute_stop_reason(state, cfg)
+    except Exception:
+        stop_reason = state.get("stop_reason")
+    if stop_reason is not None:
+        return stop_reason, "stop"
+    pending = backlog_summary.get("pending") or 0
+    ready = backlog_summary.get("ready") or 0
+    if pending == 0 or ready == 0:
+        return None, "expand" if pending == 0 else "mine"
+    return None, "work"
 
 
 def _backlog_summary(path):

@@ -85,7 +85,12 @@ autopilot dashboard --serve   ← 独立常驻进程（ThreadingHTTPServer）
     "round": 22, "round_seq": 24,
     "completed_rounds": 20, "blocked_rounds": 0, "cancelled_rounds": 2,
     "budget": {"max_minutes": null, "remaining_minutes": null,
-               "deadline_remaining_minutes": null, "estimated_tokens_used": 4200},
+               "deadline_remaining_minutes": null, "estimated_tokens_used": 4200,
+               "max_tokens": null, "max_rounds": null, "last_activity_at": null,
+               "round_progress": {"round_seq": 0, "max_rounds": null, "remaining": null}},
+    "round_progress": {"…与 budget.round_progress 同对象…"},
+    "stop_reason": null, "action_hint": "work",   // 决策可见性（1.11）
+    …
     "goals": {"total": 5, "met": 3},
     "backlog": {"total": 93, "pending": 16, "ready": 4},
     "expansion_waves": 2
@@ -113,7 +118,8 @@ autopilot dashboard --serve   ← 独立常驻进程（ThreadingHTTPServer）
     "rounds": [{                     // 趋势与回放轴数据
       "round": 22, "status": "completed", "score": 4,
       "files_changed": 3, "insertions": 41, "deletions": 7
-    }]
+    }],
+    "totals": {"files": 12, "insertions": 400, "deletions": 80}  // 降级/粗粒度替代叙事（1.11）
   },
   "narrative": {                     // 成果回顾
     "has_last_summary": true,

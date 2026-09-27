@@ -1,8 +1,8 @@
 """Read-only observation dashboard: lifecycle (spawn/probe/stop), the local
 HTTP server, snapshot caching. Hard rule: dashboard problems must never block
-the iteration loop — callers wrap ensure_dashboard in try/except. Known limit:
-a dead server's pid may be reused by the OS, so info_alive can false-positive
-on an unrelated process; the info file is short-lived and probe-only."""
+the iteration loop — callers wrap ensure_dashboard in try/except. Liveness is
+pid + a 127.0.0.1 port connect (see info_alive): a recycled pid on a dead
+server no longer blocks respawn."""
 
 import json
 import os
@@ -51,10 +51,25 @@ def read_info(repo):
 
 
 def info_alive(repo):
-    """True when the recorded pid still exists (io._pid_alive fails closed on
-    probe trouble; see the pid-reuse note in the module docstring)."""
+    """True when the recorded server is actually serving: pid lives AND the
+    recorded port accepts a TCP connect on 127.0.0.1 (cheap, 0.3s timeout).
+    The socket probe closes the pid-reuse window in the module docstring —
+    a recycled pid on a dead server no longer blocks respawn. Probe trouble
+    fails closed to False only when the port is configured and refused; a
+    missing port falls back to the pid check alone."""
     info = read_info(repo)
-    return bool(info) and io._pid_alive(info.get("pid"))
+    if not info or not io._pid_alive(info.get("pid")):
+        return False
+    port = info.get("port")
+    if not isinstance(port, int) or not (0 < port < 65536):
+        return True
+    import socket
+    try:
+        sock = socket.create_connection(("127.0.0.1", port), timeout=0.3)
+        sock.close()
+        return True
+    except OSError:
+        return False
 
 
 def clear_stale_info(repo):
@@ -122,10 +137,13 @@ def ensure_dashboard(repo, config):
     dash = config.get("dashboard") or {}
     if not dash.get("enabled"):
         return None
-    clear_stale_info(repo)
-    if info_alive(repo):
-        return read_info(repo)
-    return spawn_server(repo, config)
+    try:
+        clear_stale_info(repo)
+        if info_alive(repo):
+            return read_info(repo)
+        return spawn_server(repo, config)
+    except Exception:
+        return None
 
 
 # ---- HTTP server (Task 8) ----
@@ -146,7 +164,9 @@ def invalidate_snapshot_cache():
 def _cache_key(repo):
     from . import dashboard_data as dd
     # Exactly the files build_snapshot reads (analysis.json is legacy state
-    # the pipeline never consumes; the narrative .md files it does).
+    # the pipeline never consumes; the narrative .md files it does), plus git
+    # HEAD — a pure commit without a state rewrite must not serve a stale
+    # growth walk (design §2.3).
     names = (io.STATE_FILENAME, io.BACKLOG_FILENAME, io.CONFIG_FILENAME,
              "last-summary.md", "retrospective.md")
     mtimes = []
@@ -156,7 +176,9 @@ def _cache_key(repo):
             mtimes.append(p.stat().st_mtime_ns)
         except OSError:
             mtimes.append(None)
-    return tuple(mtimes)
+    head = io.run_git(repo, "rev-parse", "--verify", "-q", "HEAD")
+    head_sha = head.stdout.strip().splitlines()[0].strip() if head.returncode == 0 and head.stdout else None
+    return (tuple(mtimes), head_sha)
 
 
 def get_snapshot(repo):
@@ -211,11 +233,28 @@ def _make_handler(repo):
     return Handler
 
 
+def _bind_server(host, port, handler, retries=3):
+    """Bind with recovery: an explicit port that is taken falls back to a
+    random free port (up to `retries` attempts) instead of dying — the
+    panel is optional and must come up (design §5). `port=0` lets the OS
+    pick and cannot collide."""
+    last_err = None
+    for attempt in range(max(1, retries)):
+        try:
+            return ThreadingHTTPServer((host, port), handler)
+        except OSError as err:
+            last_err = err
+            if port == 0:
+                break
+            port = 0
+    raise last_err
+
+
 def start_in_thread(repo, host="127.0.0.1"):
     """Test/dev entry: serve on a random port in a daemon thread. Returns
     (server, port) — caller must server.shutdown()."""
     handler = _make_handler(repo)
-    server = ThreadingHTTPServer((host, 0), handler)
+    server = _bind_server(host, 0, handler)
     port = server.server_address[1]
     write_info(repo, {"pid": os.getpid(), "port": port,
                       "started_at": io.now_iso(), "opened": False})
@@ -232,7 +271,7 @@ def serve(repo, port=0, auto_open=True, host="127.0.0.1"):
     also retires). Exit path shuts the server down, closes the socket and
     removes the info file."""
     handler = _make_handler(repo)
-    server = ThreadingHTTPServer((host, port), handler)
+    server = _bind_server(host, port, handler)
     port = server.server_address[1]
     write_info(repo, {"pid": os.getpid(), "port": port,
                       "started_at": io.now_iso(), "opened": False})

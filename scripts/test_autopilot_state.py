@@ -2901,6 +2901,185 @@ class SecurityFixRegressionTests(RepoTest):
             self.assertNotEqual(result.returncode, 0)
             self.assertIn("Refusing", result.stdout + result.stderr)
 
+class DashboardContractTests(RepoTest):
+    """观察台契约（2026-09-27 审查修复）：只读保证、HTTP 面、锚点对称、
+    快照 shape、预算/决策可见性。此前 Dashboard* 细碎用例被精简误删，
+    这里按安全边界重锁。"""
+
+    def _seed_run(self):
+        self.run_state("init")
+        self.run_state("begin-round", "--title", "r1", "--reason", "x")
+        self.add_file("work.py", "x = 1\n")
+        self.run_state("complete-round", "--summary", "did work")
+
+    def _autopilot_listing(self):
+        ap = self.repo / ".autopilot"
+        return sorted(p.name for p in ap.iterdir())
+
+    def test_build_snapshot_is_read_only(self):
+        self._seed_run()
+        before = self._autopilot_listing()
+        from autopilot import dashboard_data as dd
+        snap = dd.build_snapshot(self.repo)
+        self.assertIn("meta", snap)
+        self.assertEqual(self._autopilot_listing(), before)
+
+    def test_http_endpoints_and_404(self):
+        self._seed_run()
+        from autopilot import dashboard as ap_dash
+        import urllib.error
+        import urllib.request
+        server, port = ap_dash.start_in_thread(self.repo)
+        self.addCleanup(server.server_close)
+        self.addCleanup(server.shutdown)
+        base = "http://127.0.0.1:{}/".format(port)
+        page = urllib.request.urlopen(base, timeout=5)
+        self.assertEqual(page.status, 200)
+        self.assertIn("text/html", page.headers.get("Content-Type", ""))
+        body = urllib.request.urlopen(base + "api/snapshot", timeout=5)
+        self.assertEqual(body.status, 200)
+        payload = json.loads(body.read().decode("utf-8"))
+        self.assertIn("meta", payload)
+        try:
+            urllib.request.urlopen(base + "etc/passwd", timeout=5)
+            self.fail("unknown path must 404")
+        except urllib.error.HTTPError as err:
+            self.assertEqual(err.code, 404)
+
+    def test_ensure_dashboard_failure_never_raises(self):
+        self._seed_run()
+        from autopilot import dashboard as ap_dash
+        cfg = {"dashboard": {"enabled": True, "port": 0, "auto_open": False}}
+        with mock.patch.object(ap_dash, "spawn_server", side_effect=RuntimeError("boom")):
+            self.assertIsNone(ap_dash.ensure_dashboard(self.repo, cfg))  # 不抛
+
+    def test_page_snapshot_refs_subset_of_snapshot_keys(self):
+        import re
+        from autopilot import dashboard_data as dd
+        self._seed_run()
+        snap = dd.build_snapshot(self.repo)
+        page = (Path(autopilot.__file__).resolve().parent / "dashboard.html")
+        refs = {m.group(1).split(".")[0]
+                for m in re.finditer(r"\bsnapshot\.([A-Za-z_][A-Za-z0-9_]*)",
+                                     page.read_text(encoding="utf-8"))}
+        self.assertTrue(refs)
+        self.assertLessEqual(refs, set(snap) | {"error"})
+
+    def test_batch_commit_sha_is_a_first_class_anchor(self):
+        """flush --round 只写 batch_commit_sha 时，文件改动与逐轮 stats 必须
+        同时锚定成功——不得因 stats 缺锚而丢掉整棵生长树。"""
+        from autopilot import dashboard_data as dd
+        base = self.git("rev-parse", "HEAD").stdout.strip()
+        (self.repo / "a.py").write_text("a = 1\n", encoding="utf-8")
+        self.git("add", "a.py")
+        self.git("commit", "-q", "-m", "anchor")
+        sha = self.git("rev-parse", "HEAD").stdout.strip()
+        history = [{"round": 1, "status": "completed", "title": "t",
+                    "summary": "s", "review_score": 4,
+                    "commit_sha": None, "batch_commit_sha": sha,
+                    "estimated_tokens": 0}]
+        changes, stats = dd.walk_round_anchors(self.repo, history, base)
+        self.assertIsNotNone(changes)
+        self.assertIn("a.py", changes)
+        self.assertEqual(stats[0]["files_changed"], 1)
+        # build_snapshot 不得因 batch 锚点走降级
+        st = {
+            "run_id": "run-test", "history": history, "run_start_sha": base,
+            "project_map": None, "estimated_tokens_used": 0,
+            "goals": [], "completed_goals": [], "expansion_waves": [],
+            "round": 1, "round_seq": 1,
+        }
+        ap = self.repo / ".autopilot"
+        ap.mkdir(exist_ok=True)
+        ap_io.save_json(ap / "state.json", st)
+        snap = dd.build_snapshot(self.repo)
+        self.assertNotIn("growth", snap["meta"]["degraded"])
+        self.assertEqual(snap["growth"]["granularity"], "per-round")
+
+    def test_snapshot_shape_budget_and_outlook(self):
+        self._seed_run()
+        from autopilot import dashboard_data as dd
+        snap = dd.build_snapshot(self.repo)
+        self.assertIn("degraded", snap["meta"])
+        self.assertIn("granularity", snap["growth"])
+        self.assertIn("totals", snap["growth"])
+        self.assertGreaterEqual(snap["growth"]["totals"]["files"], 1)
+        budget = snap["status"]["budget"]
+        for key in ("max_minutes", "remaining_minutes",
+                    "deadline_remaining_minutes", "estimated_tokens_used",
+                    "max_rounds", "round_progress"):
+            self.assertIn(key, budget)
+        self.assertIn("stop_reason", snap["status"])
+        self.assertIn("action_hint", snap["status"])
+        self.assertIn(snap["status"]["action_hint"],
+                      ("stop", "work", "expand", "mine"))
+
+    def test_degraded_growth_ships_static_totals(self):
+        """无锚点且 run 级 diff 失败时 growth 如实降级，仍给静态汇总。"""
+        from autopilot import dashboard_data as dd
+        ap = self.repo / ".autopilot"
+        ap.mkdir(exist_ok=True)
+        ap_io.save_json(ap / "state.json", {
+            "run_id": "run-test",
+            "history": [{"round": 1, "status": "completed", "title": "t",
+                         "summary": "s", "review_score": 3,
+                         "commit_sha": None, "estimated_tokens": 0}],
+            "run_start_sha": "missing", "project_map": None,
+            "estimated_tokens_used": 0, "goals": [], "completed_goals": [],
+            "expansion_waves": [], "round": 1, "round_seq": 1,
+        })
+
+        class _FailGit(object):
+            @staticmethod
+            def run_git(repo, *args):
+                return None
+
+        snap = dd.build_snapshot(self.repo, gitio=_FailGit)
+        self.assertIn("growth", snap["meta"]["degraded"])
+        self.assertEqual(snap["growth"]["totals"]["files"], 0)
+
+    def test_project_map_stale_detects_drift_and_ignores_small_churn(self):
+        from autopilot import dashboard_data as dd
+
+        def add(name):
+            path = self.repo / name
+            path.parent.mkdir(parents=True, exist_ok=True)
+            self.add_file(name, "x = 1\n")
+
+        for i in range(5):
+            add("pkg{}/m.py".format(i))
+        self.git("commit", "-q", "-m", "seed")
+        fm = dd.scan_project_framework(self.repo)
+        self.assertIsNotNone(fm)
+        self.assertTrue(dd.project_map_stale(None, self.repo))
+        self.assertFalse(dd.project_map_stale(fm, self.repo))
+        add("pkg99/m.py")  # 单文件：未到阈值
+        self.assertFalse(dd.project_map_stale(fm, self.repo))
+        for i in range(30):
+            add("extra{}/m.py".format(i))
+        self.assertTrue(dd.project_map_stale(fm, self.repo))
+
+    def test_log_tail_read_only_returns_recent(self):
+        from autopilot import dashboard_data as dd
+        self._seed_run()
+        events = dd._recent_log_events(self.repo, limit=10)
+        self.assertTrue(events)
+        self.assertTrue(all("event" in e for e in events))
+
+    def test_info_alive_requires_listening_port(self):
+        from autopilot import dashboard as ap_dash
+        # 有 pid 无监听端口 → 不算活（防 pid 复用假活）
+        ap_dash.write_info(self.repo, {
+            "pid": os.getpid(), "port": 1,  # port 1 通常无人监听
+            "started_at": "t", "opened": False,
+        })
+        self.assertFalse(ap_dash.info_alive(self.repo))
+        server, port = ap_dash.start_in_thread(self.repo)
+        self.addCleanup(server.server_close)
+        self.addCleanup(server.shutdown)
+        self.assertTrue(ap_dash.info_alive(self.repo))
+
+
 class ProjectFrameworkTests(RepoTest):
     """项目总框架（1.9.1）：init 扫描仓库产出 state.project_map（域→模块→
     文件数），生长树据此绘制完整骨架；轮次活动按同名域 + 模块路径前缀叠加
@@ -3210,6 +3389,7 @@ SLOW_TEST_CLASSES = [
     "BudgetAccountingTests",
     "ConfigSetTests",
     "ContractTests",
+    "DashboardContractTests",
     "DirectiveTests",
     "ExpansionWaveTests",
     "FailurePathTests",
