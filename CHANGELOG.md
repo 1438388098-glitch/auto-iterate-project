@@ -2,6 +2,30 @@
 
 All notable changes to auto-iterate-project are documented here.
 
+## 1.10.1 (2026-09-27)
+
+Test-suite slim-down: 599 methods (~200s full / ~63s smoke) → 191 methods
+(~100s full / ~15s smoke), same critical contracts.
+
+### Changed
+
+- Consolidated the v1.3.2+ regression kitchen-sink classes
+  (`PredictedHardeningTests`, `SecurityFixRegressionTests`,
+  `LifecycleStateFixTests`, `OptimizationTests`, …) into table-driven methods
+  that keep the safety locks (secrets, branch guard, finish gate, dry-run
+  zero-mutation, version consistency) without one method per historical bug.
+- Dropped overlapping pure-unit and optional-feature test classes (dashboard
+  internals, predicted-origin/seed scoring, agent-detect matrix, miner scanner
+  edge lattice) that duplicated integration coverage or protected only
+  implementation details.
+- `SLOW_TEST_CLASSES` regenerated against the surviving set.
+
+### Removed
+
+- ~400 individual test methods that asserted the same contracts through
+  near-identical setups (each `RepoTest` method pays a full throwaway git
+  init — that, not assertion CPU, was the runtime).
+
 ## 1.10.0 (2026-09-27)
 
 Repeated feature-mode use piled up one dead `autopilot/<run_id>` branch per
