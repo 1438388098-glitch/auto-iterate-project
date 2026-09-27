@@ -54,6 +54,10 @@
   .stat .n { font-size:24px; font-weight:600; letter-spacing:-.4px; white-space:nowrap; }
   .stat .n small { font-size:13px; color:var(--txt3); font-weight:400; }
   .stat .l { font-size:9.5px; letter-spacing:1.8px; color:var(--txt3); text-transform:uppercase; margin-top:3px; }
+  /* 轮次进度：把回放轴的设计语言推广到统计行（max_rounds 已知才显形） */
+  .stat-progress { flex:1; max-width:300px; min-width:150px; display:flex; flex-direction:column; justify-content:center; gap:8px; }
+  .stat-progress .prog-line { display:flex; justify-content:flex-end; }
+  .stat-progress .prog-line span { font-size:11px; color:var(--txt3); }
 
   /* ---- 主区 ---- */
   /* 布局逻辑：左=状态侧（生长树+回放+态势小卡，整列 sticky），
@@ -88,6 +92,12 @@
   #status-panel .sec:first-child { margin-top:0; padding-top:0; border-top:none; }
   .sec h3 .cnt { color:var(--txt3); letter-spacing:0; text-transform:none; font-size:10px; margin-left:6px; }
   #events { border-left:2px solid var(--line); margin-left:6px; }
+  /* 轴线语言推广到时间线：accent 细线自顶端填充到最新完成轮的节点 */
+  .timeline { position:relative; }
+  .timeline-fill {
+    position:absolute; left:6px; top:0; width:2px; background:var(--accent);
+    opacity:.30; pointer-events:none; transition:height 320ms cubic-bezier(.22,1,.36,1);
+  }
   .ev { position:relative; padding:11px 2px 13px 18px; }
   .ev::before {
     content:""; position:absolute; left:-24px; top:17px; width:7px; height:7px; border-radius:50%;
@@ -138,11 +148,14 @@
   }
   .play:hover { border-color:var(--accent); color:var(--accent); }
   .axis { flex:1; height:3px; background:var(--surface2); border-radius:2px; position:relative; touch-action:none; }
-  .axis .fill { position:absolute; left:0; top:0; bottom:0; border-radius:2px; background:var(--accent); opacity:.35; }
+  /* 游标/填充滑动过渡：播放步进时游标滑行而非跳格；拖动 scrubbing 时禁用 */
+  .axis .fill { position:absolute; left:0; top:0; bottom:0; border-radius:2px; background:var(--accent); opacity:.35; transition:width 320ms cubic-bezier(.22,1,.36,1); }
   .axis .cursor {
     position:absolute; top:50%; transform:translate(50%,-50%); width:11px; height:11px; border-radius:50%;
-    background:var(--bg); border:2px solid var(--accent);
+    background:var(--bg); border:2px solid var(--accent); transition:right 320ms cubic-bezier(.22,1,.36,1);
   }
+  .scrubbing .fill, .scrubbing .cursor { transition:none; }
+  .axis.mini { flex:none; width:100%; height:3px; touch-action:auto; }
   .axislbl { font-size:11px; color:var(--txt3); flex:none; }
 
   /* ---- 无运行状态 ---- */
@@ -213,6 +226,11 @@
       <div class="stat"><div class="n" id="stat-completed">—</div><div class="l">完成</div></div>
       <div class="stat"><div class="n" id="stat-scale">—</div><div class="l">生长规模</div></div>
       <div class="stat"><div class="n" id="stat-tokens" title="变更当量：按代码变更行数×12 + 二进制文件×100 + 每轮基础值500 估算的代理值，非 LLM 真实 token 消耗">—</div><div class="l">变更当量</div></div>
+      <div class="stat stat-progress" id="stat-progress" hidden>
+        <div class="prog-line"><span class="mono" id="prog-label"></span></div>
+        <div class="axis mini" aria-hidden="true"><div class="fill" id="prog-fill"></div><div class="cursor" id="prog-cursor"></div></div>
+        <div class="l">轮次进度</div>
+      </div>
     </div>
 
     <div class="main">
@@ -259,7 +277,10 @@
 
       <section class="panel panel-story">
         <h3>进化叙事</h3>
-        <div id="events"></div>
+        <div class="timeline">
+          <div id="events"></div>
+          <i class="timeline-fill" id="timeline-fill" hidden></i>
+        </div>
       </section>
     </div>
   </div>
@@ -452,6 +473,16 @@
     domains.forEach(function (d) { modules += (d.modules || []).length; });
     $("stat-scale").innerHTML = domains.length + "<small> 域 · " + modules + " 模块</small>";
     $("stat-tokens").innerHTML = (tokens / 1000).toFixed(1) + "<small>k</small>";
+
+    // 轮次进度轴：max_rounds 已知才显形——回放轴的设计语言推广到统计行
+    var prog = $("stat-progress");
+    if (max && st.round_seq !== null && st.round_seq !== undefined) {
+      var pct = Math.min(100, st.round_seq / max * 100);
+      prog.hidden = false;
+      $("prog-fill").style.width = pct + "%";
+      $("prog-cursor").style.right = (100 - pct) + "%";
+      $("prog-label").textContent = "r" + st.round_seq + " / r" + max;
+    } else prog.hidden = true;
 
     // 粒度诚实标签：粗粒度口径只在不等价时出现，一词说明
     var tag = $("gran-tag");
@@ -721,6 +752,14 @@
       i--;
     }
     $("events").innerHTML = rows.join("");
+
+    // 时间线填充：accent 细线自顶端到最新完成轮节点（回放态隐藏——语义是"至今"）
+    var fill = $("timeline-fill");
+    var hotCard = $("events").querySelector(".ev.hot");
+    if (replayRound === null && hotCard) {
+      fill.style.height = (hotCard.offsetTop + 21) + "px";
+      fill.hidden = false;
+    } else fill.hidden = true;
   }
 
   // ---- 迭代方向：价值序待办；空供给时整块隐藏，不渲染占位文案 ----
@@ -820,7 +859,10 @@
     $("mode-label").textContent = "回放 r" + r;
     replayAnim = true;
     growSeq = 0;
-    renderAll();
+    // 轻量步进：只重渲染随回放轮变化的板块，避免整页重建的顿挫
+    renderStats();
+    renderTree();
+    renderEvents();
     replayAnim = false;
   }
 
@@ -881,6 +923,7 @@
       $("play").textContent = "▶";
     }
     scrubbing = true;
+    axis.parentElement.classList.add("scrubbing");   // 拖动中禁用滑行过渡，跟手
     e.preventDefault();
     if (axis.setPointerCapture) {
       try { axis.setPointerCapture(e.pointerId); } catch (err) { /* 忽略 */ }
@@ -888,8 +931,14 @@
     scrubTo(e);
   });
   axis.addEventListener("pointermove", function (e) { if (scrubbing) scrubTo(e); });
-  axis.addEventListener("pointerup", function () { scrubbing = false; });
-  axis.addEventListener("pointercancel", function () { scrubbing = false; });
+  axis.addEventListener("pointerup", function () {
+    scrubbing = false;
+    axis.parentElement.classList.remove("scrubbing");
+  });
+  axis.addEventListener("pointercancel", function () {
+    scrubbing = false;
+    axis.parentElement.classList.remove("scrubbing");
+  });
 
   document.addEventListener("visibilitychange", function () {
     if (!document.hidden) { clearTimeout(pollTimer); poll(); }
