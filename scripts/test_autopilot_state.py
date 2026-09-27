@@ -2770,6 +2770,42 @@ class TokenEstimateTests(RepoTest):
         self.assertLess(round2, 550)
 
 
+class TokenWaterMarkTests(RepoTest):
+    """Run-level token accounting must be monotonic: the billed high-water
+    marks may never regress, or lines already billed get billed again when
+    the worktree returns to its earlier size (stash round-trip, revert,
+    reset --hard then redo)."""
+
+    def test_water_marks_never_regress_on_shrinking_total(self):
+        self.run_state("init")
+        # R1: 3 new staged lines -> 500 base + 3*12 = 536, water mark at 3.
+        self.run_state("begin-round", "--title", "r1", "--reason", "x")
+        self.add_file("a.py", "1\n2\n3\n")
+        self.run_state("complete-round", "--summary", "a")
+        state = self.read_json("state.json")
+        self.assertEqual(state["billed_text"], 3)
+        self.assertEqual(state["estimated_tokens_used"], 536)
+
+        # R2 sees the stash: the total falls BELOW the water mark. The close
+        # must keep the water mark at 3 (no regression), not reset it to 0.
+        self.run_state("begin-round", "--title", "r2", "--reason", "x")
+        self.git("stash")
+        self.run_state("complete-round", "--summary", "stashed away")
+        state = self.read_json("state.json")
+        self.assertEqual(state["history"][-1]["estimated_tokens"], 0)
+        self.assertEqual(state["billed_text"], 3, "billed water mark regressed")
+
+        # R3 pops the stash: the same 3 lines return and must stay free —
+        # they were already billed in R1.
+        self.run_state("begin-round", "--title", "r3", "--reason", "x")
+        self.git("stash", "pop")
+        self.run_state("complete-round", "--summary", "stash popped")
+        state = self.read_json("state.json")
+        self.assertEqual(state["history"][-1]["estimated_tokens"], 0)
+        self.assertEqual(state["billed_text"], 3)
+        self.assertEqual(state["estimated_tokens_used"], 536)
+
+
 class BacklogManageTests(RepoTest):
     def test_backlog_update_and_remove(self):
         self.run_state("init")
