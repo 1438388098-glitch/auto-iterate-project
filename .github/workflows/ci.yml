@@ -27,6 +27,8 @@ jobs:
           python-version: ${{ matrix.python-version }}
       - name: Syntax check
         run: python -m py_compile scripts/autopilot_state.py scripts/autopilot/*.py
+        # Windows runner 默认 PowerShell 不展开 glob，通配符会以字面量传给 py_compile
+        shell: bash
       - name: Parallel smoke check
         run: python scripts/test_autopilot_state.py --jobs 4 --smoke
       - name: Run test suite
