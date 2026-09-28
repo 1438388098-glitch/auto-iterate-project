@@ -1,3 +1,5 @@
+English · [简体中文](./README.zh-CN.md)
+
 # Auto Iterate Project
 
 Version 1.11.0 — see [CHANGELOG.md](CHANGELOG.md) for release history.
