@@ -37,7 +37,7 @@ The skill's entry point is [SKILL.md](SKILL.md) — the agent reads it, runs `de
 - **Honest accounting**: unverified goals withhold the "all goals met" stop; zero-work cancels consume no budget; `finish` is refused while real work remains unless a stop condition (or you) says otherwise.
 - **Safety rails**: never rewrites git history, never pushes unless configured, refuses to absorb pre-existing user changes into autopilot commits, `allow_paths`/`deny_paths` whitelists, secret patterns (AWS / private keys / GitHub / Slack / Google / `sk-*` / JWT).
 - **Branch lifecycle**: feature-mode runs reclaim dead `autopilot/*` branches — `init` prunes merged leftovers, `finish` deletes the run branch when already merged, `branch-gc` cleans up after a later merge. Unmerged work is never deleted.
-- **Deterministic helper**: all of the above runs through `scripts/autopilot_state.py` (Python 3.6+, stdlib only), covered by a lean ~190-test suite on 3.8–3.13 across Linux and Windows (`--smoke` for a ~15s round-loop check).
+- **Deterministic helper**: all of the above runs through `scripts/autopilot_state.py` (Python 3.6+, stdlib only), covered by a lean ~190-test suite on 3.8–3.13 across Linux and Windows (`--smoke` for a ~1s, machine-dependent round-loop check).
 - **Observation dashboard (optional)**: a 127.0.0.1-only read-only web panel that opens when a run starts — an evolution tree (domain → module → file) beside a per-round card stream, with replay. The tree is seeded at init by a full project scan (state.project_map: the whole skeleton, per-module file counts) and rounds overlay activity on it; the token stat is a change-equivalent proxy, not LLM usage. Pure stdlib; the loop never depends on it (`dashboard --stop` shuts it down).
 
 ## Install
@@ -57,7 +57,7 @@ Copy (or link) the folder into your agent's skills directory — for example `~/
 ```bash
 # full suite (Windows example; use python3/python consistently elsewhere)
 py -3.13 scripts/test_autopilot_state.py
-# layered verification (1.9+): between-round fast check (~25s, fast classes)
+# layered verification (1.9+): between-round fast check (~1s, machine-dependent; fast classes)
 py -3.13 scripts/test_autopilot_state.py --smoke
 # parallel variants (full / smoke subset)
 py -3.13 scripts/test_autopilot_state.py --jobs 4
