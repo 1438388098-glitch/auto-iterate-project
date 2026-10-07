@@ -417,6 +417,11 @@ def build_parser():
     expansion_record_parser.add_argument("--repo", default=".")
     expansion_record_parser.add_argument("--lens", action="append", required=True,
                                          help="Lens used by this wave (repeatable; must be one of the EXPANSION_LENSES)")
+    expansion_record_parser.add_argument("--findings", type=int, default=None,
+                                         help="Candidates this wave's lenses proposed (optional yield stat, "
+                                              "same vocabulary as mine — makes lens waves comparable with mining runs)")
+    expansion_record_parser.add_argument("--applied", type=int, default=None,
+                                         help="Proposals that passed the value gate into the backlog (optional)")
     add_json(expansion_record_parser)
     add_dry_run(expansion_record_parser)
     expansion_record_parser.set_defaults(func=commands.cmd_expansion_record)

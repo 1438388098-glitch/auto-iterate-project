@@ -358,8 +358,10 @@ def cmd_begin_round(args):
             if dd_scan.project_map_stale(st.get("project_map"), repo):
                 st["project_map"] = dd_scan.scan_project_framework(
                     repo, (cfg.get("dashboard") or {}).get("domain_map"))
-        except Exception:
-            pass
+        except Exception as exc:
+            # 可选可观测路径：循环永不依赖 project map（软失败契约不变），
+            # 但纯静默会藏住真实损坏——降级为审计事件。
+            io.append_log(repo, "project-map", "warn", reason=str(exc)[:200])
         stop_reason = state.compute_stop_reason(st, cfg)
         if stop_reason is not None:
             io.append_log(repo, "begin-round", "error", reason=stop_reason)
@@ -833,6 +835,7 @@ def cmd_block_round(args):
                 file=sys.stderr,
             )
             return 0
+        blocked_ids = state.round_candidate_ids(current)
         _close_round(
             repo, st, current,
             status="blocked",
@@ -847,12 +850,25 @@ def cmd_block_round(args):
             },
             candidate_status="blocked",
             candidate_round=current["round"],
+            candidate_extra={"block_reason": args.reason or ""},
             seed_outcome="blocked",
             seed_notes=args.reason,
             billed=billed,
         )
-        io.append_log(repo, "block-round", "success", round=current["round"], reason=args.reason)
-        return emit_result(args, True, "[OK] Round blocked.")
+        # Field test Batch 6: the event carried no title and the candidates
+        # carried no block_reason — the block fact was smeared across
+        # state/log/backlog and only reconstructible by cross-file joins.
+        io.append_log(
+            repo, "block-round", "success",
+            round=current["round"], reason=args.reason,
+            title=args.title or current.get("title"),
+            candidate_ids=blocked_ids,
+        )
+        echo = ", ".join(blocked_ids) if blocked_ids else "no candidates attached"
+        return emit_result(
+            args, True,
+            "[OK] Round {} blocked. Blocked candidates: {}".format(current["round"], echo),
+        )
 
 
 def cmd_cancel_round(args):
@@ -1448,6 +1464,17 @@ def cmd_backlog_add(args):
         title = args.title or (seed or {}).get("title")
         if not title:
             return emit_result(args, False, "[ERROR] --title is required (unless --from-seed supplies it).")
+        if getattr(args, "evidence", None) is None and seed is None:
+            # Deep Expansion protocol requires one concrete evidence note per
+            # candidate (field test Batch 3: five lens candidates all landed
+            # evidence-less because nothing reminded the operator). A seed
+            # promotion is exempt — the seed carries the hypothesis.
+            print(
+                "[WARN] No --evidence given: the protocol requires one concrete evidence note "
+                "per candidate (file:line or probe output). Accepted anyway; the candidate will "
+                "show as evidence-less in report/replay.",
+                file=sys.stderr,
+            )
         origin = getattr(args, "origin", None)
         if origin is not None and origin not in ("observed", "predicted", "expansion"):
             return emit_result(args, False, "[ERROR] --origin must be one of observed|predicted|expansion.")
@@ -1802,8 +1829,13 @@ def cmd_branch_gc(args):
             # reported "kept" forever).
             if st.get("branch") and not st.get("finished_at"):
                 keep.append(st["branch"])
-        except SystemExit:
-            pass
+        except (SystemExit, ValueError) as exc:
+            # state.json 不可读时 fail-open（gc 的对象是遗留分支，不是本 run
+            # 的活动分支），但不再静默——留一条审计事件。
+            io.append_log(
+                repo, "branch-gc", "warn",
+                reason="state unreadable; run-branch keep skipped: {}".format(str(exc)[:120]),
+            )
     if dry_run:
         planned = state.prune_merged_autopilot_branches(
             repo, base=base, keep=keep, dry_run=True)
@@ -2497,6 +2529,11 @@ def cmd_expansion_record(args):
         previous = st.get("expansion_waves") or []
         previous_set = set(previous[-1].get("lenses") or []) if previous else None
         wave = state.append_expansion_wave(st, lenses)
+        # Per-wave yield (candidate-272): mine runs record findings/applied,
+        # lens waves recorded nothing — the two supply channels were not
+        # comparable. Optional flags; absent stays None (old records clean).
+        wave["findings"] = getattr(args, "findings", None)
+        wave["applied"] = getattr(args, "applied", None)
         st["last_activity_at"] = io.now_iso()
         state.save_state(repo, st)
         repeated = previous_set is not None and set(wave["lenses"]) == previous_set
@@ -2510,7 +2547,11 @@ def cmd_expansion_record(args):
                 repo, "expansion-wave", "warn",
                 reason="same lens set as previous wave", lenses=wave["lenses"],
             )
-        io.append_log(repo, "expansion-wave", "success", lenses=wave["lenses"], wave_no=len(st.get("expansion_waves") or []))
+        io.append_log(
+            repo, "expansion-wave", "success",
+            lenses=wave["lenses"], wave_no=len(st.get("expansion_waves") or []),
+            findings=wave["findings"], applied=wave["applied"],
+        )
         message = "[OK] Expansion wave {} recorded (lenses: {}).".format(
             len(st.get("expansion_waves") or []), ", ".join(wave["lenses"])
         )
@@ -2861,7 +2902,15 @@ def cmd_mine(args):
             st = state.load_state(repo)
             _append_mining_run(st, result["count"], len(new_findings), 0, result["kinds"], apply_mode=False)
             state.save_state(repo, st)
-            state.save_state(repo, st)
+        # Audit event for the mining RUN itself (field test Batch 4: the
+        # per-candidate backlog-add events were logged, but "when did mine
+        # run and what did it yield" was invisible in replay).
+        io.append_log(
+            repo, "mine", "success",
+            findings=result["count"], new=len(new_findings),
+            applied=len(applied), apply=bool(getattr(args, "apply", False)),
+            kinds=result["kinds"],
+        )
 
         payload = {
             "ok": True,

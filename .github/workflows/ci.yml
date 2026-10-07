@@ -26,7 +26,9 @@ jobs:
         with:
           python-version: ${{ matrix.python-version }}
       - name: Syntax check
-        run: python -m py_compile scripts/autopilot_state.py scripts/autopilot/*.py
+        # 测试运行器自身也要过编译门（1.12 轮实测：对它的改动此前只能靠
+        # smoke 步骤才暴露语法错误）
+        run: python -m py_compile scripts/autopilot_state.py scripts/autopilot/*.py scripts/test_autopilot_state.py
         # Windows runner 默认 PowerShell 不展开 glob，通配符会以字面量传给 py_compile
         shell: bash
       - name: Parallel smoke check
