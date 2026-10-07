@@ -1859,6 +1859,23 @@ class BudgetAccountingTests(RepoTest):
         self.assertIn("Refusing to finish", combined)
         self.assertNotIn("拒绝收尾", combined)
 
+    def test_en_report_lang_four_new_bilingual_pairs(self):
+        """轮 40（candidate-364）：新增双语串的 en 分支守卫（确定性子集）——
+        review_threshold 硬拒绝与 finish dry-run REFUSE 均走英文。"""
+        self.run_state("init", "--report-lang", "en", "--review-threshold", "3")
+        self.run_state("begin-round", "--title", "r", "--reason", "x")
+        self.add_file("a.py", "a = 1\n")
+        # review-score 必传拒绝（en 分支）
+        result = self.run_state("complete-round", "--summary", "s", "--review-score", "1")
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("Self-review score 1 is below review_threshold 3", result.stdout + result.stderr)
+        # finish dry-run REFUSE（en 分支）
+        result = self.run_state("finish", "--dry-run", "--reason", "probe")
+        self.assertEqual(result.returncode, 2)
+        combined = result.stdout + result.stderr
+        self.assertIn("Would REFUSE to finish", combined)
+        self.assertNotIn("拒绝收尾", combined)
+
     def test_paused_run_stops_on_first_check(self):
         self.run_state("init", "--max-minutes", "1")
         self.run_state("begin-round", "--title", "r", "--reason", "x")
