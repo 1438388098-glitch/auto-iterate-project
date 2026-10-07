@@ -1162,6 +1162,20 @@ class ExpansionWaveTests(RepoTest):
             args.extend(["--lens", lens])
         return self.run_state(*args)
 
+    def test_lens_catalog_matches_constant(self):
+        """轮 21（candidate-324）：expansion-lenses.md 表与 EXPANSION_LENSES
+        同序同名（文档明文契约）——漂移会让 expansion-record 在 wave 中途
+        拒绝 agent 正在使用的 lens 名，打断自主运行。"""
+        catalog = []
+        doc = (Path(__file__).resolve().parent.parent / "references" / "expansion-lenses.md")
+        for line in doc.read_text(encoding="utf-8").splitlines():
+            m = re.match(r"^\| ([a-z0-9-]+) \|", line.strip())
+            if m:
+                catalog.append(m.group(1))
+        from autopilot import state as ap_state
+        self.assertTrue(catalog)
+        self.assertEqual(catalog, list(ap_state.EXPANSION_LENSES))
+
     def test_expansion_record_optional_yield_stats(self):
         """每波产出统计（candidate-272）：lens 波与 mine 通道可比的
         findings/applied 账；不带旗标时保持 None（旧记录干净）。
@@ -1991,6 +2005,7 @@ class PredictedHardeningTests(RepoTest):
             ("agents/openai.yaml", "version: {}".format(version)),
             ("references/overview.md", "Version {}".format(version)),
             ("README.md", "Version {}".format(version)),
+            ("README.zh-CN.md", "版本 {}".format(version)),
             ("CHANGELOG.md", "## {} (".format(version)),
         ):
             self.assertIn(needle, (repo_root / rel).read_text(encoding="utf-8"), rel)
@@ -2436,6 +2451,17 @@ class OptimizationTests(RepoTest):
 
 class FeatureTests(RepoTest):
     """End-to-end feature contracts (consolidated from 17 methods)."""
+
+    def test_subcommand_version_probe(self):
+        """轮 22（candidate-325）：--version 在子命令后也可用（装机后确认
+        「装的是哪个版本」的基础探针；此前报 unrecognized arguments）。"""
+        result = subprocess.run(
+            [sys.executable, str(SCRIPT), "init", "--version"],
+            stdout=subprocess.PIPE, stderr=subprocess.PIPE, universal_newlines=True,
+            encoding="utf-8", errors="replace", timeout=60,
+        )
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("auto-iterate-project", result.stdout)
 
     def test_backlog_pick_guard_and_stats_sync(self):
         """轮 14（candidate-295）：backlog-pick 不得改写 completed/blocked

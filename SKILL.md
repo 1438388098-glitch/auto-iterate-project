@@ -309,4 +309,4 @@ Full table: `references/troubleshooting.md`. Common ones:
 | `action_hint: expand` | Mine is fresh; Deep Expansion now |
 | A real-work round records `estimated_tokens: 0` | Water marks are monotonic — an earlier round billed the lines while uncommitted, then the content was rewritten smaller; see `max_tokens` in `references/config.md` |
 | `commit` warns "Run-deferred files are still uncommitted" | The flush staged only part of what the run's rounds left behind — stage and commit the named files (same `--round`), or leave them knowingly |
-| `config-set` requires a field | Pass at least one field flag | e.g. `--expand-after-goals`, `--candidates-per-round N`, `--max-rounds N`/`--clear-max-rounds`, `--deadline EXPR`; see `references/config.md` |
+| `config-set` requires a field | Pass at least one field flag — e.g. `--expand-after-goals`, `--candidates-per-round N`, `--max-rounds N`/`--clear-max-rounds`, `--deadline EXPR`; see `references/config.md` |

@@ -83,8 +83,10 @@ def _config_error(path, message, source=None):
             file=sys.stderr,
         )
     else:
+        # path 参数自诘认知：非 init-flag 来源的错误把真实文件名带上
+        # （轮 21 dead-code 候选 321——收了不用的参数要么用要么删）。
         print(
-            "[ERROR] Invalid .autopilot/config.json: {}. Fix the value or delete the file and run init again.".format(message),
+            "[ERROR] Invalid .autopilot/config.json: {}. Fix the value or delete the file and run init again. (file: {})".format(message, path),
             file=sys.stderr,
         )
     raise SystemExit(2)

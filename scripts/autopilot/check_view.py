@@ -101,6 +101,21 @@ def _check_text(cfg, zh_text, en_text):
     return zh_text if (cfg.get("report_lang") or "zh") == "zh" else en_text
 
 
+def rank_for_selection(backlog, st, cfg):
+    """rank_candidates + 选中批次提取的单一出处（轮 24 candidate-317）：
+    check 的契约「check 与 rank_candidates 不许给出矛盾答案」由同一次计算
+    保证，不再靠四处手写维持（classic 判断曾出现两种等价拼写）。
+    classic 模式仍返回完整 ranked（classic 评分在 rank_candidates 内部），
+    但 selected 概念不存在 → 计数 0。返回 (ranked, selected_count)。"""
+    ranked = state.rank_candidates(
+        backlog, cfg, progress=state.progress_from_state(st, cfg),
+        completed_goals=list(st.get("completed_goals") or []),
+    )
+    if (cfg.get("ranking_mode", "expected") or "expected") == "classic":
+        return ranked, 0
+    return ranked, len([e for e in ranked if e.get("selected")])
+
+
 def build_check_payload(repo, full=False):
     """Build the check payload without printing it. `check` and `round-prep`
     share this: round-prep is check's loop-driving fields plus the ranked
@@ -242,9 +257,12 @@ def build_check_payload(repo, full=False):
         and st.get("completed_rounds", 0) >= 3
         and all((entry.get("review_n") or 0) == 0 for entry in (st.get("type_stats") or {}).values())
     ):
-        warnings.append(
-            "价值校准未激活，候选 value 自评未经验证；每轮 complete-round 传 --review-score"
-        )
+        warnings.append(_check_text(
+            cfg,
+            "价值校准未激活，候选 value 自评未经验证；每轮 complete-round 传 --review-score",
+            "Value calibration is inactive: candidate value self-scores are unverified; pass "
+            "--review-score on every complete-round",
+        ))
 
     backlog = state.load_backlog(repo)
     backlog_watch = _backlog_watch(backlog, cfg)
@@ -258,11 +276,13 @@ def build_check_payload(repo, full=False):
     goals_unverified = state.unverified_goals(st, cfg)
     ready_floor = _ready_valuable_count(backlog, cfg.get("min_candidate_value"))
     if goals_unverified and ready_floor > 0:
-        warnings.append(
+        warnings.append(_check_text(
+            cfg,
             "goal {} 未关联到已完成轮次（--round）；尚有 {} 条 value>=floor 的 ready 候选，不得 finish".format(
-                ", ".join(goals_unverified), ready_floor
-            )
-        )
+                ", ".join(goals_unverified), ready_floor),
+            "goal {} has no completed-round anchor (--round); {} ready candidates at value>=floor "
+            "remain, so finishing is withheld".format(", ".join(goals_unverified), ready_floor),
+        ))
     # Lens-rotation observability: Deep Expansion runs in BOTH phases (thin
     # backlog and post-goal expansion), so the rotation keys live at the top
     # level rather than inside the expand-only payload. lenses_used is the
@@ -281,19 +301,10 @@ def build_check_payload(repo, full=False):
             "analysis cache is {} commits stale; run analysis-load + analysis-save with a "
             "fresh scan before the next expansion wave".format(commits_behind)
         )
-    ranking_expected = cfg.get("ranking_mode", "expected") == "expected"
-    ranked = None
-    selected_entries = []
+    ranked, selected_count = rank_for_selection(backlog, st, cfg)
+    selected_entries = [e for e in ranked if e.get("selected")]
     selected_empty_reason = None
-    if ranking_expected:
-        # One rank pass shared with the batch contract: check must never say
-        # "work" while rank_candidates would mark an empty selection — the two
-        # answers come from the same computation, not two drifted ones.
-        ranked = state.rank_candidates(
-            backlog, cfg, progress=state.progress_from_state(st, cfg),
-            completed_goals=list(st.get("completed_goals") or []),
-        )
-        selected_entries = [e for e in ranked if e.get("selected")]
+    if (cfg.get("ranking_mode", "expected") or "expected") != "classic":
         if not selected_entries:
             ready_pool = [e for e in ranked
                           if e.get("status") == "pending" and e.get("ready") and not e.get("below_floor")]
@@ -317,7 +328,7 @@ def build_check_payload(repo, full=False):
     )
     if (
         action_hint == "work"
-        and ranking_expected
+        and (cfg.get("ranking_mode", "expected") or "expected") != "classic"
         and not selected_entries
         and backlog_watch["ready"] > 0
     ):
@@ -410,7 +421,7 @@ def build_check_payload(repo, full=False):
                 if isinstance(cfg.get("max_rounds"), int) else None
             ),
         },
-        "selected_count": len(selected_entries) if ranking_expected else None,
+        "selected_count": len(selected_entries),
         "selected_empty_reason": selected_empty_reason,
         "wave_no": len(waves),
         "lenses_used": lenses_used,

@@ -22,6 +22,7 @@ from .check_view import (
     brief_rank_entry,
     build_check_payload,
     mining_exhausted,
+    rank_for_selection,
     _ready_valuable_count,
 )
 
@@ -352,8 +353,13 @@ def cmd_dashboard(args):
     try:
         ap_dash.serve(repo, port=args.port, auto_open=auto_open)
     except OSError as err:
-        print("[ERROR] dashboard: 端口 {} 无法绑定（可能被占用）——用 --port 0 换随机端口重试。（{}）".format(
-            args.port, err), file=sys.stderr)
+        print(_check_text(
+            cfg,
+            "[ERROR] dashboard: 端口 {} 无法绑定（可能被占用）——用 --port 0 换随机端口重试。（{}）".format(
+                args.port, err),
+            "[ERROR] dashboard: port {} could not bind (probably in use) — retry with --port 0 "
+            "for a random port. ({})".format(args.port, err),
+        ), file=sys.stderr)
         return 2
 
 
@@ -393,9 +399,15 @@ def cmd_begin_round(args):
                 n = _ready_valuable_count(state.load_backlog(repo), cfg.get("min_candidate_value"))
                 return emit_result(
                     args, False,
-                    "[ERROR] Autopilot is stopped: all goals met (expand_after_goals=false)。"
-                    "backlog 尚有 {} 条 value>=min_candidate_value 的 ready 候选；"
-                    "要继续探索请运行 config-set --expand-after-goals 或修改 .autopilot/config.json。".format(n),
+                    _check_text(
+                        cfg,
+                        "[ERROR] Autopilot is stopped: all goals met (expand_after_goals=false)。"
+                        "backlog 尚有 {} 条 value>=min_candidate_value 的 ready 候选；"
+                        "要继续探索请运行 config-set --expand-after-goals 或修改 .autopilot/config.json。".format(n),
+                        "[ERROR] Autopilot is stopped: all goals met (expand_after_goals=false). "
+                        "{} ready candidates at value>=min_candidate_value remain; to keep exploring, "
+                        "run config-set --expand-after-goals or edit .autopilot/config.json.".format(n),
+                    ),
                 )
             return emit_result(args, False, "[ERROR] Autopilot is stopped: {}. Finish or adjust the config before opening a new round.".format(stop_reason))
 
@@ -1253,14 +1265,7 @@ def cmd_finish(args):
         watch = _backlog_watch(backlog, cfg)
         ready_floor = _ready_valuable_count(backlog, cfg.get("min_candidate_value"))
         ready_any = any_ready_candidates(backlog)
-        selected_count = 0
-        selected_empty_reason = None
-        if (cfg.get("ranking_mode", "expected") or "expected") != "classic":
-            ranked = state.rank_candidates(
-                backlog, cfg, progress=state.progress_from_state(st, cfg),
-                completed_goals=list(st.get("completed_goals") or []),
-            )
-            selected_count = len([e for e in ranked if e.get("selected")])
+        _, selected_count = rank_for_selection(backlog, st, cfg)
         # P0 anti-early-stop gate: an honest finish needs a reached stop
         # condition or an explicit --force. Refuse while ANY of the following
         # remains true — including below-floor ready work (the old gate only
@@ -1765,16 +1770,18 @@ def cmd_backlog_remove(args):
 
 def cmd_backlog_list(args):
     repo = Path(args.repo).resolve()
-    if not config.state_path_for(repo).exists():
-        return emit_result(args, False, "[ERROR] Autopilot not initialized. Run init first.")
+    refused = _require_initialized(args, repo, message="[ERROR] Autopilot not initialized. Run init first.")
+    if refused is not None:
+        return refused
     print(json.dumps(state.load_backlog(repo), indent=2, ensure_ascii=False))
     return 0
 
 
 def cmd_backlog_rank(args):
     repo = Path(args.repo).resolve()
-    if not config.state_path_for(repo).exists():
-        return emit_result(args, False, "[ERROR] Autopilot not initialized. Run init first.")
+    refused = _require_initialized(args, repo, message="[ERROR] Autopilot not initialized. Run init first.")
+    if refused is not None:
+        return refused
     top = getattr(args, "top", None)
     if top is not None and top < 1:
         return emit_result(args, False, "[ERROR] --top must be a positive integer.")
@@ -2223,8 +2230,9 @@ def cmd_commit(args):
 
 def cmd_secret_scan(args):
     repo = Path(args.repo).resolve()
-    if not config.state_path_for(repo).exists():
-        return emit_result(args, False, "[ERROR] Autopilot not initialized. Run init first.")
+    refused = _require_initialized(args, repo, message="[ERROR] Autopilot not initialized. Run init first.")
+    if refused is not None:
+        return refused
     cfg = config.load_config(repo)
     findings = scan_staged_diff(repo, cfg.get("secret_patterns"))
     payload = {"findings": findings, "clean": not findings}
@@ -2318,8 +2326,9 @@ def cmd_report(args):
 
 def cmd_retrospective(args):
     repo = Path(args.repo).resolve()
-    if not config.state_path_for(repo).exists():
-        return emit_result(args, False, "[ERROR] Autopilot not initialized. Run init first.")
+    refused = _require_initialized(args, repo, message="[ERROR] Autopilot not initialized. Run init first.")
+    if refused is not None:
+        return refused
     # 锁内读取（轮 16 candidate-307）：迁移写与活跃 run 互斥。
     with io.run_lock(repo):
         st = state.load_state(repo)
@@ -2373,8 +2382,9 @@ def cmd_analysis_save(args):
 
 def cmd_analysis_load(args):
     repo = Path(args.repo).resolve()
-    if not config.state_path_for(repo).exists():
-        return emit_result(args, False, "[ERROR] Autopilot not initialized. Run init first.")
+    refused = _require_initialized(args, repo, message="[ERROR] Autopilot not initialized. Run init first.")
+    if refused is not None:
+        return refused
     validity, reason = state.analysis_validity(repo)
     data = state.load_analysis(repo)
     io.append_log(repo, "analysis-load", "success" if validity == "fresh" else "warn", validity=validity)
@@ -2675,8 +2685,9 @@ def cmd_directive_add(args):
 
 def cmd_directive_list(args):
     repo = Path(args.repo).resolve()
-    if not config.state_path_for(repo).exists():
-        return emit_result(args, False, "[ERROR] Autopilot not initialized. Run init first.")
+    refused = _require_initialized(args, repo, message="[ERROR] Autopilot not initialized. Run init first.")
+    if refused is not None:
+        return refused
     directives = state.load_directives(repo)
     # Each entry carries its 1-based index so directive-remove --index has an
     # unambiguous source (the error message points here).
@@ -2687,7 +2698,6 @@ def cmd_directive_list(args):
         ]
     }
     print(json.dumps(payload, indent=2, ensure_ascii=False))
-    return 0
     return 0
 
 
@@ -3036,8 +3046,9 @@ def cmd_round_prep(args):
     reading it. round-prep is one call and one JSON.
     """
     repo = Path(args.repo).resolve()
-    if not config.state_path_for(repo).exists():
-        return emit_result(args, False, "[ERROR] Autopilot not initialized. Run init first.")
+    refused = _require_initialized(args, repo, message="[ERROR] Autopilot not initialized. Run init first.")
+    if refused is not None:
+        return refused
     top = getattr(args, "top", None)
     if top is not None and top < 1:
         return emit_result(args, False, "[ERROR] --top must be a positive integer.")
@@ -3054,10 +3065,7 @@ def cmd_round_prep(args):
         cfg = config.load_config(repo)
         st = state.load_state(repo)
         backlog = state.load_backlog(repo)
-        ranked = state.rank_candidates(
-            backlog, cfg, progress=state.progress_from_state(st, cfg),
-            completed_goals=list(st.get("completed_goals") or []),
-        )
+        ranked, _ = rank_for_selection(backlog, st, cfg)
     if top is None:
         # The recommended batch plus one backup: enough to open a round and
         # absorb one candidate going stale between prep and begin-round,
