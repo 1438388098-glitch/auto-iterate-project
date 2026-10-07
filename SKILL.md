@@ -173,7 +173,7 @@ python <this-skill>/scripts/autopilot_state.py commit --repo <repo> --summary "<
 
 ### 8. Record the Round
 
-- Success: `complete-round --summary ... [--commit-sha <sha>] --review-score <1-5> [--review-notes ...]`. Omit `--commit-sha` on deferred rounds. `--review-score` is always required in spirit (feeds ranking calibration); `review_threshold` only decides enforcement. `--below-threshold` records a low score as completed (not blocked). Tokens are estimated incrementally against the run's waterline (see `references/config.md` → `max_tokens`) unless `--tokens` is passed.
+- Success: `complete-round --summary ... [--commit-sha <sha>] --review-score <1-5> [--review-notes ...]`. Omit `--commit-sha` on deferred rounds. `--review-score` is always required in spirit (feeds ranking calibration); `review_threshold` only decides enforcement. `--below-threshold` records a low score as completed (not blocked). Summary counts (tests passed, files touched) come from the on-disk log, same discipline as §6 — write them from the log file, not from memory. Tokens are estimated incrementally against the run's waterline (see `references/config.md` → `max_tokens`) unless `--tokens` is passed.
 - Blocked: `block-round --title ... --reason ...` (do not commit).
 - Abandon without blocked count: `cancel-round` (candidates return to `pending`).
 - Every 10 completed rounds the helper writes a phase report to `.autopilot/phase-report-round-<N>.md` (`report_lang`, default `zh`). Read it, report the summary, continue.
