@@ -784,18 +784,28 @@ def cmd_complete_round(args):
                 io.append_log(repo, "complete-round", "error", reason="review score required")
                 return emit_result(
                     args, False,
-                    "[ERROR] review_threshold is {} but no --review-score was provided. "
-                    "Self-review the round on a 1-5 scale and pass --review-score.".format(review_threshold),
+                    _check_text(
+                        cfg,
+                        "[ERROR] 已配置 review_threshold={} 但未提供 --review-score。请对本轮做 1-5 自评并传 --review-score。".format(review_threshold),
+                        "[ERROR] review_threshold is {} but no --review-score was provided. "
+                        "Self-review the round on a 1-5 scale and pass --review-score.".format(review_threshold),
+                    ),
                 )
             if args.review_score < review_threshold:
                 if not getattr(args, "below_threshold", False):
                     io.append_log(repo, "complete-round", "error", reason="review score below threshold")
                     return emit_result(
                         args, False,
-                        "[ERROR] Self-review score {} is below review_threshold {}. "
-                        "Rework the round and re-verify, run block-round, or pass "
-                        "--below-threshold to record the low score without blocking the run.".format(
-                            args.review_score, review_threshold
+                        _check_text(
+                            cfg,
+                            "[ERROR] 自评 {} 低于 review_threshold {}（below review_threshold）。"
+                            "返工并重新验证、改用 block-round，或传 --below-threshold 以低分完成收口（不计受阻）。".format(
+                                args.review_score, review_threshold),
+                            "[ERROR] Self-review score {} is below review_threshold {}. "
+                            "Rework the round and re-verify, run block-round, or pass "
+                            "--below-threshold to record the low score without blocking the run.".format(
+                                args.review_score, review_threshold
+                            ),
                         ),
                     )
                 # Explicit quality admit-down: the round stays completed (it
@@ -1290,13 +1300,17 @@ def cmd_finish(args):
             # Dry-run honesty（轮 15 候选 296）：预检必须回答真实调用会发生
             # 什么——gate 会拒的 dry-run 也报拒，而不是谎报「会成功」。
             if gate_blocks and not getattr(args, "force", False):
-                print(
+                print(_check_text(
+                    cfg,
+                    "[DRY-RUN] Would REFUSE to finish（预检：真实调用将被拒绝）：未达任何停止条件"
+                    "且仍有工作（ready_any={}，ready_floor={}，selected={}，mining_exhausted={}）。".format(
+                        ready_any, ready_floor, selected_count, mining_ok
+                    ),
                     "[DRY-RUN] Would REFUSE to finish: no stop condition reached; work remains "
                     "(ready_any={}, ready_floor={}, selected={}, mining_exhausted={}).".format(
                         ready_any, ready_floor, selected_count, mining_ok
                     ),
-                    file=sys.stderr,
-                )
+                ), file=sys.stderr)
                 return 2
             print(
                 "[DRY-RUN] Would finish the run (reason={}, stay={}, open_round={}).".format(
@@ -1317,10 +1331,18 @@ def cmd_finish(args):
                 )
                 return emit_result(
                     args, False,
-                    "[ERROR] Refusing to finish: no stop condition reached; work remains "
-                    "(ready_any={}, ready_floor={}, selected={}, mining_exhausted={}). "
-                    "Run `mine --apply` / Deep Expansion, or pass --force to override.".format(
-                        ready_any, ready_floor, selected_count, mining_ok
+                    _check_text(
+                        cfg,
+                        "[ERROR] Refusing to finish（拒绝收尾）：未达任何停止条件且仍有工作"
+                        "（ready_any={}，ready_floor={}，selected={}，mining_exhausted={}）。"
+                        "先跑 `mine --apply` / Deep Expansion 补供给，或用 --force 覆盖。".format(
+                            ready_any, ready_floor, selected_count, mining_ok
+                        ),
+                        "[ERROR] Refusing to finish: no stop condition reached; work remains "
+                        "(ready_any={}, ready_floor={}, selected={}, mining_exhausted={}). "
+                        "Run `mine --apply` / Deep Expansion, or pass --force to override.".format(
+                            ready_any, ready_floor, selected_count, mining_ok
+                        ),
                     ),
                 )
             io.append_log(repo, "finish-forced", "success", reason=args.reason, ready=ready_floor, ready_any=ready_any)

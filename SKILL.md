@@ -260,12 +260,12 @@ Unattended runs have nobody to ask: when one of the scenes above fires without a
 1. If commits are batched and the last round did not commit, flush with `commit --round <n> --summary "flush accumulated changes"`.
 2. `finish --reason "<stop reason>"` (add `--stay` to remain on the feature branch). The gate refuses while no stop condition is reached and any of these remains: thin backlog needing expand/mine, any ready candidate (above **or below** `min_candidate_value`), a non-empty recommended batch, or mining not yet exhausted (never-mined ≠ exhausted). `--force` only when the user explicitly asked to stop. Auto-cancels any open round, writes `.autopilot/retrospective.md`, and in `feature` mode returns to the origin branch. If the run's branch is already fully merged (empty run or you merged it first) it is deleted; otherwise commits remain on the autopilot branch, unmerged — the finish output and the retrospective say so. After merging later, run `branch-gc` to reclaim leftovers.
    **Unattended runs** (nobody will be asked): stranding all deliverables on an unmerged `autopilot/*` branch is not an acceptable end state. After a normal finish, merge the run branch into the origin branch yourself — a regular merge commit, never force — then run `branch-gc`, and state in the summary that the merge was made autonomously.
-3. Write `.autopilot/last-summary.md` in the user's language (completed/blocked rounds, commits, branch, remaining goals, backlog, next likely improvement). Data: `report --repo <repo> [--lang zh|en] [--output <file>]`.
+3. Write `.autopilot/last-summary.md` in the user's language (completed/blocked rounds, commits, branch, remaining goals, backlog, next likely improvement). Data: `report --repo <repo> [--lang zh|en] [--output <file>]`. Unattended runs that merge their own branch should also pass `--archive-reports` on `finish` — it copies the phase reports and the retrospective into `docs/autopilot/` so the run's record survives in the repo (`.autopilot/` itself stays out of version control).
 4. Report a short summary to the user.
 
 ## Reports & Dry-Run
 
-- `report` / `retrospective` — deterministic markdown (goals, rounds, backlog, commits, next improvement / type stats).
+- `report` / `retrospective` — deterministic markdown (goals, rounds, backlog, commits, next improvement / type stats). `finish --archive-reports` copies the phase reports and retrospective into `docs/autopilot/`.
 - `analysis-load` / `analysis-save` — repo analysis cache.
 - `secret-scan` — staged-diff secret scan (also automatic on `commit`).
 - `push` — manual push of the run branch via an explicit non-force refspec (refuses while `push: false`).

@@ -787,7 +787,7 @@ class FinishGateTests(RepoTest):
         self.assertIn("Refusing to finish", result.stderr)
         self.assertIn("Refusing to finish", result.stderr)
         self.assertIn("ready_floor=1", result.stderr)
-        self.assertIn("pass --force", result.stderr)
+        self.assertIn("--force", result.stderr)
         state = self.read_json("state.json")
         self.assertIsNone(state["finished_at"])
         data = json.loads(self.run_state("check", "--brief").stdout)
@@ -1468,13 +1468,142 @@ class BudgetAccountingTests(RepoTest):
         self.assertEqual(tokens, [620, 620, 0])
         self.assertEqual(state["estimated_tokens_used"], 1240)
 
+    def test_rank_for_selection_direct(self):
+        """轮 25（candidate-338，mine 自挖）：rank_for_selection 直测——
+        expected 返回完整 ranked 与 selected 计数；classic 计数 0 但 ranked
+        仍完整（classic 评分在 rank_candidates 内部）。"""
+        from autopilot import check_view
+        self.run_state("init")
+        self.run_state("backlog-add", "--title", "A", "--reason", "r", "--value", "4", "--effort", "2")
+        self.run_state("backlog-add", "--title", "B", "--reason", "r", "--value", "3", "--effort", "3")
+        backlog = self.read_json("backlog.json")
+        st = self.read_json("state.json")
+        cfg = self.read_json("config.json")
+        ranked, selected_count = check_view.rank_for_selection(backlog, st, cfg)
+        self.assertEqual(len(ranked), 2)
+        self.assertEqual(selected_count, len([e for e in ranked if e.get("selected")]))
+        # classic：selected 概念不存在 → 计数 0，ranked 仍完整
+        # （init --force 保留 backlog.json——旧候选仍在，属预期）
+        self.run_state("init", "--force", "--ranking-mode", "classic")
+        self.run_state("backlog-add", "--title", "A", "--reason", "r", "--value", "4", "--effort", "2")
+        backlog = self.read_json("backlog.json")
+        st = self.read_json("state.json")
+        cfg = self.read_json("config.json")
+        ranked, selected_count = check_view.rank_for_selection(backlog, st, cfg)
+        self.assertTrue(ranked)
+        self.assertEqual(selected_count, 0)
+
+    def test_token_staged_delete_double_count_documented(self):
+        """轮 25（candidate-340）：staged-add 后 worktree-delete 同文件——
+        --cached（+10）与 --diff（-10）两路各计一次，净零变更计 20 行。
+        金样钉住现状：这是估算器的已知边缘（净零变更多计），若未来修复
+        应同步更新本测试与 config.md 的 max_tokens 说明。"""
+        self.run_state("init")
+        self.run_state("begin-round", "--title", "r", "--reason", "x")
+        self._touch_staged("w.py")  # 10 行 staged
+        (self.repo / "w.py").unlink()  # worktree 删除，index 仍持有
+        self.run_state("complete-round", "--summary", "net-zero")
+        state = self.read_json("state.json")
+        self.assertEqual(state["history"][-1]["estimated_tokens"], 500 + 20 * 12)  # 740
+        self.assertEqual(state["billed_text"], 20)
+
+    def test_token_billing_counts_binary_files(self):
+        """轮 26（candidate-332）：delta_binary * TOKENS_PER_BINARY_FILE(100)
+        项此前零断言——回归丢失时预算对二进制改动静默少记。"""
+        self.run_state("init")
+        self.run_state("begin-round", "--title", "r", "--reason", "x")
+        (self.repo / "asset.bin").write_bytes(b"\x00" * 64)
+        self.git("add", "asset.bin")
+        self.run_state("complete-round", "--summary", "binary")
+        state = self.read_json("state.json")
+        self.assertEqual(state["history"][-1]["estimated_tokens"], 600)  # 500 base + 100 binary
+        self.assertEqual(state["billed_binary"], 1)
+
+    def test_token_watermark_never_lowers_on_shrink(self):
+        """轮 26（candidate-333）：内容回到曾观测状态 → 复观测零计费
+        （max(billed, total) 水位线防的正是这种重复计费；若 max 被回归删掉，
+        本测试的 r3 会再计一次 12 行）。SKILL.md/troubleshooting 承诺的金样。"""
+        self.run_state("init")
+        self.run_state("begin-round", "--title", "r1", "--reason", "x")
+        self._touch_staged("w.py")
+        self.run_state("complete-round", "--summary", "r1")
+        after_r1 = self.read_json("state.json")["billed_text"]
+        self.run_state("begin-round", "--title", "r2", "--reason", "x")
+        (self.repo / "w.py").write_text("a\nb\n", encoding="utf-8")
+        self.run_state("complete-round", "--summary", "shrink")
+        self.run_state("begin-round", "--title", "r3", "--reason", "x")
+        (self.repo / "w.py").write_text("x = 1\n" * 10, encoding="utf-8")
+        self.run_state("complete-round", "--summary", "back to observed")
+        state = self.read_json("state.json")
+        tokens = [entry["estimated_tokens"] for entry in state["history"]]
+        self.assertEqual(tokens[2], 0)
+        self.assertGreaterEqual(state["billed_text"], after_r1)
+
+    def test_backlog_watch_pure_contract(self):
+        """轮 30（candidate-341）：backlog_watch 纯契约——needs_expansion
+        驱动 action_hint，两条触发路径（ready==0 / pending<min）与默认值
+        必须逐点锁定。"""
+        from autopilot import check_view
+        min3 = {"min_pending_candidates": 3}
+        # 空池：pending 0 / ready 0 → 扩展
+        watch = check_view._backlog_watch({"candidates": []}, min3)
+        self.assertEqual((watch["pending"], watch["ready"], watch["min_pending_candidates"]), (0, 0, 3))
+        self.assertTrue(watch["needs_expansion"])
+        # ready>0 但 pending < min → 仍扩展（薄池）
+        backlog = {"candidates": [
+            {"id": "a", "status": "pending", "depends_on": []},
+        ]}
+        watch = check_view._backlog_watch(backlog, min3)
+        self.assertEqual((watch["pending"], watch["ready"]), (1, 1))
+        self.assertTrue(watch["needs_expansion"])
+        # pending >= min 且 ready>0 → 不扩展
+        backlog = {"candidates": [
+            {"id": "a", "status": "pending", "depends_on": []},
+            {"id": "b", "status": "pending", "depends_on": []},
+            {"id": "c", "status": "pending", "depends_on": []},
+        ]}
+        watch = check_view._backlog_watch(backlog, min3)
+        self.assertFalse(watch["needs_expansion"])
+        # 全部被依赖卡住：ready==0 即扩展（即便 pending 充足）
+        backlog = {"candidates": [
+            {"id": "a", "status": "pending", "depends_on": ["ghost"]},
+            {"id": "b", "status": "pending", "depends_on": ["ghost"]},
+            {"id": "c", "status": "pending", "depends_on": ["ghost"]},
+        ]}
+        watch = check_view._backlog_watch(backlog, min3)
+        self.assertEqual(watch["pending"], 3)
+        self.assertEqual(watch["ready"], 0)
+        self.assertTrue(watch["needs_expansion"])
+        # min_pending 未配置 → 默认 3
+        watch = check_view._backlog_watch({"candidates": []}, {})
+        self.assertEqual(watch["min_pending_candidates"], 3)
+
+    def test_parse_numstat_rename_forms(self):
+        """轮 26（candidate-334）：diff.renames=on 的改名行归一到新路径——
+        候选-302 后生长树走单遍 log numstat，解析错会把文件挂错模块。"""
+        from autopilot import dashboard_data as dd
+        raw = (
+            "5\t2\tsrc/old_name.py\n"
+            "3\t1\tsrc/{old_a.py => new_a.py}\n"
+            "2\t0\told_b.py => new_b.py\n"
+            "-\t-\tbin.dat\n"
+        )
+        rows = dd.parse_numstat(raw)
+        self.assertEqual(
+            [r["path"] for r in rows],
+            ["src/old_name.py", "src/new_a.py", "new_b.py", "bin.dat"],
+        )
+        self.assertTrue(rows[1]["renamed"])
+        self.assertFalse(rows[0]["renamed"])
+        self.assertTrue(rows[3]["binary"])
+
     def test_check_reports_blocked_streak(self):
         self.run_state("init")
         self.run_state("begin-round", "--title", "a", "--reason", "x")
         self.run_state("block-round", "--reason", "b1")
         data = json.loads(self.run_state("check", "--brief").stdout)
         self.assertEqual(data["blocked_streak"], 1)
-        self.assertTrue(any("one more blocked round stops the run" in w for w in data["warnings"]))
+        self.assertTrue(any("blocked streak" in w for w in data["warnings"]))
         # Second blocked round fires max_blocked_in_a_row (default 2).
         self.run_state("begin-round", "--title", "b", "--reason", "x")
         self.run_state("block-round", "--reason", "b2")

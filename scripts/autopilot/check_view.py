@@ -227,7 +227,11 @@ def build_check_payload(repo, full=False):
     ):
         warnings.append("expand_after_goals is true but no other stop condition is configured; the expansion phase has no automatic stopping point.")
     if cfg.get("review_threshold") is not None:
-        warnings.append("review_threshold is set; complete-round will require --review-score >= {}.".format(cfg["review_threshold"]))
+        warnings.append(_check_text(
+            cfg,
+            "review_threshold 已配置；complete-round 将要求 --review-score >= {}。".format(cfg["review_threshold"]),
+            "review_threshold is set; complete-round will require --review-score >= {}.".format(cfg["review_threshold"]),
+        ))
 
     if not cfg.get("scan_secrets", True):
         warnings.append(_check_text(
@@ -245,12 +249,15 @@ def build_check_payload(repo, full=False):
     blocked_streak = state.count_consecutive_blocked(st)
     max_blocked = cfg.get("max_blocked_in_a_row")
     if max_blocked is not None and 1 <= blocked_streak < max_blocked:
-        warnings.append(
+        warnings.append(_check_text(
+            cfg,
+            "受阻连击 blocked streak {}/{}：再有一次受阻即停止 run；质量未达标的一轮可用 complete-round "
+            "--below-threshold 以完成态收口".format(blocked_streak, max_blocked),
             "blocked streak {}/{}: one more blocked round stops the run; a quality-failed "
             "round can complete instead via complete-round --below-threshold".format(
                 blocked_streak, max_blocked
-            )
-        )
+            ),
+        ))
 
     if (
         cfg.get("review_threshold") is None
@@ -383,28 +390,41 @@ def build_check_payload(repo, full=False):
         ) + seed_hint)
     elif stop_reason is None and backlog_watch["needs_expansion"]:
         if backlog_watch["pending"] == 0:
-            warnings.append(
+            warnings.append(_check_text(
+                cfg,
+                "backlog 无 pending 候选且确定性挖掘已新鲜。禁止空转等 deadline：立即 Deep Expansion"
+                "（派探索 subagent，用 backlog-add 补 3-5 条带证据候选）。空 backlog 是扩展触发器，"
+                "不是停止理由。"
+                + seed_hint,
                 "Backlog has no pending candidates and deterministic mining is already fresh. "
                 "Do NOT idle or wait for the deadline: run Deep Expansion now (spawn explore "
                 "subagents, add 3-5 candidates with backlog-add). Empty backlog is an expansion "
                 "trigger, not a reason to stop."
-                + seed_hint
-            )
+                + seed_hint,
+            ))
         elif backlog_watch["ready"] == 0:
-            warnings.append(
+            warnings.append(_check_text(
+                cfg,
+                "backlog 有 {} 条 pending 但 0 条依赖就绪。解开 depends-on 链，或对可独立开工的"
+                "候选做 Deep Expansion；禁止空转。".format(backlog_watch["pending"]),
                 "Backlog has {} pending candidates but 0 are dependency-ready. "
                 "Unblock depends-on chains or Deep Expansion for independent work; "
-                "do not idle.".format(backlog_watch["pending"])
-            )
+                "do not idle.".format(backlog_watch["pending"]),
+            ))
         else:
-            warnings.append(
+            warnings.append(_check_text(
+                cfg,
+                "backlog pending（{}）低于 min_pending_candidates（{}）。下轮 begin 前先 Deep "
+                "Expansion（subagent 侦察）补池；不要硬磨最后几条瘦候选或空转——可同时 begin "
+                "既有 ready 候选并行扩展。".format(
+                    backlog_watch["pending"], backlog_watch["min_pending_candidates"]),
                 "Backlog pending candidates ({}) is below min_pending_candidates ({}). "
                 "Top up via Deep Expansion (subagent scout) before the next begin-round; "
                 "do not grind the last thin candidates or idle. You may still begin-round "
                 "with existing ready candidates while expanding in parallel.".format(
                     backlog_watch["pending"], backlog_watch["min_pending_candidates"]
-                )
-            )
+                ),
+            ))
 
     payload = {
         "continue": stop_reason is None,
@@ -541,12 +561,16 @@ def build_check_payload(repo, full=False):
     }
     if max_waves is not None and waves_used >= max_waves and stop_reason is None:
         # `warnings` is the same list object already bound into payload.
-        warnings.append(
+        warnings.append(_check_text(
+            cfg,
+            "扩展波上限已达（{}/{}）：停止扩展、把剩余 backlog 做到停止条件，或用 `config-set "
+            "--max-expansion-waves N` 提额。注意 max_tokens 看不到 subagent 开销（按 diff 估算），"
+            "此上限是扩展成本唯一的硬约束。".format(waves_used, max_waves),
             "Expansion wave cap reached ({}/{}): stop expanding and work the remaining backlog to a "
             "stop condition, or raise the cap with `config-set --max-expansion-waves N`. Note that "
             "max_tokens does not see subagent spend (it estimates from diffs), so this cap is the "
-            "only hard bound on expansion cost.".format(waves_used, max_waves)
-        )
+            "only hard bound on expansion cost.".format(waves_used, max_waves),
+        ))
     if full:
         payload["state"] = st
         payload["config"] = cfg
