@@ -2,6 +2,35 @@
 
 All notable changes to auto-iterate-project are documented here.
 
+## 1.12.2 (2026-10-07)
+
+Observability pass from the second validation batch (both the executor and
+the post-hoc independent monitor converged on the same two findings; neither
+was critical, both degraded replay/checkout fidelity).
+
+### Fixed
+
+- A multi-candidate round's history entry kept only the FIRST `candidate_id`
+  — the round could not be replayed from history alone without
+  cross-referencing the backlog. Every history entry now carries the full
+  `candidate_ids` array (legacy scalar kept for older consumers).
+- `check --brief` still emitted the feature-mode branch-drift warning for
+  FINISHED runs — noise with recovery advice ("ensure-branch / checkout")
+  that can point at a branch `branch-gc` already reclaimed. Finished runs
+  are skipped; active runs warn as before (test covers both).
+
+### Docs
+
+- config.md State File: documented the history capture semantics — on a
+  flush round where `commit` ran before `complete-round`, `touched_files`
+  is empty by design (batch attribution lives in `batch_commit_sha` plus
+  the deferred rounds' `deferred_dirty_files`).
+
+### Tests
+
+- Full candidate batch recorded in history (`candidate_ids` + legacy scalar).
+- No drift warning after finish; active off-branch runs still warn.
+
 ## 1.12.1 (2026-10-07)
 
 Validation-batch fixes: the 1.12.0 field-test repair pass was re-run on a
