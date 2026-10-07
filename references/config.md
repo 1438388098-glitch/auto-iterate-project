@@ -41,7 +41,7 @@ Hard stop based on wall-clock time elapsed since the most recent round activity 
 
 Timer (定时器) stop: a hard stop at an **absolute** point in time, independent of how many rounds have run or how much time has passed since the last activity. This complements the `max_minutes` countdown (倒计时): countdown measures duration since the last round; the deadline stops the run at a fixed wall-clock moment, so "iterate until tomorrow morning" is expressed as a deadline instead of a guessable minute count.
 
-The value stored in `config.json` is a normalized **ISO-8601 timestamp** (for example `"2026-08-10T08:00:00+08:00"`). Set it on `init` with `--deadline <expr>`, which accepts:
+The value stored in `config.json` is a normalized **ISO-8601 timestamp** (for example `"2026-08-10T08:00:00+08:00"`). Set it on `init` with `--deadline <expr>`, or at runtime via `config-set --deadline <expr>` — both accept:
 
 | Expression | Meaning |
 |---|---|
@@ -56,7 +56,7 @@ python <this-skill>/scripts/autopilot_state.py init --repo <repo> --deadline "08
 python <this-skill>/scripts/autopilot_state.py init --repo <repo> --deadline "2026-08-10T08:00:00+08:00"
 ```
 
-The expression is resolved to an absolute UTC timestamp once at `init` time, so re-reading the config never shifts the timer. Because the stored value must be absolute, hand-editing `config.json` requires a full ISO timestamp (the relative `+8h`/`HH:MM` forms are only expanded by `init --deadline`). A deadline in the past stops the run on the first `check`; remove it (set `"deadline": null`) to disable. `null` means no deadline.
+The expression is resolved to an absolute UTC timestamp once at `init` time, so re-reading the config never shifts the timer. Because the stored value must be absolute, hand-editing `config.json` requires a full ISO timestamp (the relative `+8h`/`HH:MM` forms are expanded by `init --deadline` and `config-set --deadline`). A deadline in the past stops the run on the first `check`; remove it (set `"deadline": null`) to disable. `null` means no deadline.
 
 ### max_tokens
 

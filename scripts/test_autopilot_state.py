@@ -1791,8 +1791,10 @@ class BudgetAccountingTests(RepoTest):
         checks = [e for e in events if e.get("event") == "check" and e.get("status") == "success"]
         self.assertGreaterEqual(len(checks), 2)
         for event in checks:
-            for key in ("action_hint", "stop_reason", "pending", "ready", "selected_count", "phase"):
+            for key in ("via", "action_hint", "stop_reason", "pending", "ready", "selected_count", "phase"):
                 self.assertIn(key, event)
+        # via 区分真实 check 与 round-prep（candidate-365 契约）
+        self.assertLessEqual({"check", "round-prep"} - {e.get("via") for e in checks}, set())
         # max_rounds 用满的 run：stop_reason 非 None 更硬
         self.assertTrue(any(e.get("stop_reason") for e in checks))
 
@@ -1807,6 +1809,39 @@ class BudgetAccountingTests(RepoTest):
             with self.assertRaises(OSError):
                 _io._create_lock_exclusive(lock, "tok-123")
         self.assertFalse(lock.exists())  # 残骸已清理：不会留无 token 空锁
+
+    def test_redos_probe_accepts_fast_matching_pattern(self):
+        """轮 39（candidate-373）：「命中但快」的合法宽模式必须被接受——
+        修复前探针 assert not match 会把 a+ 类模式 SystemExit(2) 硬拒。"""
+        self.run_state("init", "--secret-pattern", "a+")
+        self.add_file("a.py", "aaa\n")
+        result = self.run_state("secret-scan")
+        self.assertNotIn("too dangerous", result.stderr)
+        self.assertNotIn("Traceback", result.stderr)
+
+    def test_lock_corrupt_stat_race_retries(self):
+        """轮 39（candidate-359 回归 pin）：corrupt 分支的 stat 竞态守卫——
+        锁在 read 与 stat 之间被收割时重试获胜而非裸 FileNotFoundError。"""
+        from autopilot import io as _io
+        from unittest import mock
+        lock = self.repo / ".autopilot" / "lock"
+        lock.parent.mkdir(parents=True, exist_ok=True)
+        original_read = _io._read_lock_file
+
+        def _read_then_delete(p):
+            original_read(p)
+            try:
+                p.unlink()
+            except OSError:
+                pass
+            return None
+
+        with mock.patch.object(_io, "_read_lock_file", side_effect=_read_then_delete), \
+                mock.patch.object(_io, "_sleep"):
+            path, token = _io._acquire_lock(self.repo)
+        self.assertTrue(path.exists())
+        self.assertEqual(_io._read_lock_file(path).get("token"), token)
+        _io._release_lock(path, token)
 
     def test_en_report_lang_english_refusals(self):
         """轮 33（candidate-347）：report_lang=en 的关键拒绝走英文分支——

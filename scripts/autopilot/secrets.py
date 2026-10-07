@@ -43,11 +43,18 @@ _PROBE_SNIPPET = (
 _PATTERN_PROBE_TIMEOUT = 2.0
 
 
+_probe_verdicts = {}
+
+
 def _pattern_compiles_in_time(pattern, timeout=_PATTERN_PROBE_TIMEOUT):
     """True unless a probe subprocess matching a fixed 64-char adversarial
-    sample against the pattern does not finish within `timeout` seconds.
+    sample against the pattern finishes within `timeout` seconds. Results are
+    memoized per pattern (one subprocess per distinct pattern per process).
     Environment failures fail OPEN (a missing python must not break secret
     scanning — the probe is a guard, not the scan itself)."""
+    cached = _probe_verdicts.get(pattern)
+    if cached is not None:
+        return cached
     import subprocess
     try:
         proc = subprocess.run(
@@ -57,8 +64,10 @@ def _pattern_compiles_in_time(pattern, timeout=_PATTERN_PROBE_TIMEOUT):
     except subprocess.TimeoutExpired:
         return False
     except OSError:
-        return True
-    return proc.returncode == 0 and b"ok" in (proc.stdout or b"")
+        return True  # fail-open 是文档化选择（探测是守卫不是扫描本体）
+    verdict = proc.returncode == 0 and b"ok" in (proc.stdout or b"")
+    _probe_verdicts[pattern] = verdict
+    return verdict
 
 
 def compile_patterns(extra_patterns=None):

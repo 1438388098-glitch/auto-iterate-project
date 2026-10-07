@@ -493,7 +493,12 @@ def _release_lock(path, token=None):
     """Only unlink when the lock still belongs to THIS process (token match).
     An unconditional unlink deleted the lock of whoever stole/re-acquired it
     after a stale takeover, turning one steal into a three-process concurrency
-    chain (field test round 16, candidate-306)."""
+    chain (field test round 16, candidate-306). Residual TOCTOU window: the
+    token compare and the unlink are still two steps — a stealer landing
+    exactly between them keeps its lock lost. The unconditional unlink this
+    replaced was strictly wider; fully closing the gap needs an OS-level
+    atomic compare-and-delete, out of scope — the 2s stale takeover already
+    admits breakthrough by design."""
     try:
         holder = _read_lock_file(path)
         if holder is not None and token is not None and holder.get("token") != token:

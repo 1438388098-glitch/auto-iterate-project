@@ -409,7 +409,14 @@ def cmd_begin_round(args):
                         "run config-set --expand-after-goals or edit .autopilot/config.json.".format(n),
                     ),
                 )
-            return emit_result(args, False, "[ERROR] Autopilot is stopped: {}. Finish or adjust the config before opening a new round.".format(stop_reason))
+            return emit_result(
+                args, False,
+                _check_text(
+                    cfg,
+                    "[ERROR] Autopilot 已停止（stopped）：{}。请 finish 或调整 config 后再开新轮。".format(stop_reason),
+                    "[ERROR] Autopilot is stopped: {}. Finish or adjust the config before opening a new round.".format(stop_reason),
+                ),
+            )
 
         # Round numbers come from a monotonic sequence, not from the round
         # counters: zero-work aborted rounds do not advance max_rounds's
@@ -1862,7 +1869,7 @@ def cmd_backlog_pick(args):
                 args, False,
                 _check_text(
                     cfg,
-                    "[ERROR] Candidate {} is already '{}'（已 {}）——重复 pick 会静默改写完成/受阻账本"
+                    "[ERROR] Candidate {} is already '{}'（状态已是 {}）——重复 pick 会静默改写完成/受阻账本"
                     "并使 state.type_stats 漂移。如需重新开工，请用 backlog-update --status pending。".format(
                         args.id, candidate.get("status"),
                         "已完成" if candidate.get("status") == "completed" else "受阻"),
