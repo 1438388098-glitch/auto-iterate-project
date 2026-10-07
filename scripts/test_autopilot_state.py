@@ -1737,6 +1737,93 @@ class BudgetAccountingTests(RepoTest):
                     offenders.append("{}:{}".format(py.name, lineno))
         self.assertEqual(offenders, [])
 
+    def test_validate_config_deadline_and_goals_guards(self):
+        """轮 32（candidate-342/343）：手改坏 deadline 得到干净错误而非
+        NameError；goals 非字符串项被项级校验拦下（不再成为死目标）。"""
+        self.run_state("init")
+        config_path = self.repo / ".autopilot" / "config.json"
+        config_path.write_text(
+            json.dumps({"deadline": "tomorrow"}), encoding="utf-8")
+        result = self.run_state("check")
+        self.assertNotEqual(result.returncode, 0)
+        self.assertNotIn("Traceback", result.stderr)
+        self.assertIn("absolute ISO-8601", result.stderr)
+        config_path.write_text(
+            json.dumps({"goals": [42, None]}), encoding="utf-8")
+        result = self.run_state("check")
+        self.assertNotEqual(result.returncode, 0)
+        self.assertNotIn("Traceback", result.stderr)
+        self.assertIn("array of strings", result.stderr)
+
+    def test_config_set_max_blocked_in_a_row_round_trip(self):
+        """轮 33（candidate-344）：同族停机预算补齐 config-set 运行时旗标
+        （set/clear 往返 + hint 清单提及）。"""
+        self.run_state("init")
+        result = self.run_state("config-set", "--max-blocked-in-a-row", "5")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(self.read_json("config.json")["max_blocked_in_a_row"], 5)
+        result = self.run_state("config-set", "--clear-max-blocked-in-a-row")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIsNone(self.read_json("config.json")["max_blocked_in_a_row"])
+        result = self.run_state("config-set", "--max-blocked-in-a-row", "-1")
+        self.assertNotEqual(result.returncode, 0)
+        # 0 = run 立即停机（0/0 即满足条件），config-set 与 init 一致收 0
+        result = self.run_state("config-set", "--max-blocked-in-a-row", "0")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(self.read_json("config.json")["max_blocked_in_a_row"], 0)
+
+    def test_check_decision_audit_event_logged(self):
+        """轮 33（candidate-345）：check/round-prep 的循环决策审计事件——
+        回放「每轮为什么选 work/expand/mine/stop」的唯一数据源。"""
+        self.run_state("init", "--max-rounds", "1")
+        self.run_state("begin-round", "--title", "r", "--reason", "x")
+        self.add_file("a.py", "a = 1\n")
+        self.run_state("commit", "--summary", "w")
+        sha = self.git("rev-parse", "HEAD").stdout.strip()
+        self.run_state("complete-round", "--summary", "done", "--commit-sha", sha)
+        self.run_state("check", "--brief")
+        self.run_state("round-prep")
+        events = [
+            json.loads(line)
+            for line in (self.repo / ".autopilot" / "log.jsonl").read_text(encoding="utf-8").splitlines()
+            if line.strip()
+        ]
+        checks = [e for e in events if e.get("event") == "check" and e.get("status") == "success"]
+        self.assertGreaterEqual(len(checks), 2)
+        for event in checks:
+            for key in ("action_hint", "stop_reason", "pending", "ready", "selected_count", "phase"):
+                self.assertIn(key, event)
+        # max_rounds 用满的 run：stop_reason 非 None 更硬
+        self.assertTrue(any(e.get("stop_reason") for e in checks))
+
+    def test_lock_create_write_failure_cleans_up(self):
+        """轮 33（candidate-346）：O_EXCL 成功但 token 写失败 → 残骸清理后
+        上抛——若吞异常返回成功，锁文件无 token，互斥归属证明失效。"""
+        from autopilot import io as _io
+        from unittest import mock
+        lock = self.repo / ".autopilot" / "lock"
+        lock.parent.mkdir(parents=True, exist_ok=True)
+        with mock.patch.object(_io.os, "fdopen", side_effect=OSError("disk full")):
+            with self.assertRaises(OSError):
+                _io._create_lock_exclusive(lock, "tok-123")
+        self.assertFalse(lock.exists())  # 残骸已清理：不会留无 token 空锁
+
+    def test_en_report_lang_english_refusals(self):
+        """轮 33（candidate-347）：report_lang=en 的关键拒绝走英文分支——
+        zh/en 实参写反时现有 zh 测试全部照绿，en 用户静默拿中文。"""
+        self.run_state("init", "--report-lang", "en", "--review-threshold", "3")
+        self.run_state("begin-round", "--title", "r", "--reason", "x")
+        self.add_file("a.py", "a = 1\n")
+        result = self.run_state("complete-round", "--summary", "s", "--review-score", "1")
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("Self-review score", result.stdout + result.stderr)
+        self.run_state("block-round", "--title", "b", "--reason", "skip")
+        result = self.run_state("finish", "--reason", "probe")
+        self.assertNotEqual(result.returncode, 0)
+        combined = result.stdout + result.stderr
+        self.assertIn("Refusing to finish", combined)
+        self.assertNotIn("拒绝收尾", combined)
+
     def test_paused_run_stops_on_first_check(self):
         self.run_state("init", "--max-minutes", "1")
         self.run_state("begin-round", "--title", "r", "--reason", "x")

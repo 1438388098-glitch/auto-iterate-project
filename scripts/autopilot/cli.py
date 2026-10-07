@@ -377,6 +377,11 @@ def build_parser():
     budgets.add_argument("--clear-max-expansion-waves", dest="clear_max_expansion_waves",
                          action="store_true", default=False,
                          help="Remove the expansion wave cap")
+    budgets.add_argument("--max-blocked-in-a-row", dest="max_blocked_in_a_row", type=int, metavar="N",
+                         help="Consecutive-blocked stop budget (0 = the run stops immediately: a 0/0 streak satisfies the condition before any round opens)")
+    budgets.add_argument("--clear-max-blocked-in-a-row", dest="clear_max_blocked_in_a_row",
+                         action="store_true", default=False,
+                         help="Remove the consecutive-blocked budget")
     deadline = config_set_parser.add_mutually_exclusive_group()
     deadline.add_argument("--deadline", dest="deadline", metavar="EXPR",
                           help="Absolute stop time (ISO timestamp, +8h duration, or HH:MM)")

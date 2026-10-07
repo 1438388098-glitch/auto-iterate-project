@@ -2443,9 +2443,20 @@ def cmd_config_set(args):
         ("max_minutes", args.max_minutes),
         ("max_tokens", args.max_tokens),
     )
+    # max_blocked_in_a_row 允许 0（=run 立即停机，0/0 即满足停止条件），
+    # 不走 positive_int 门——与 init 的非负校验对齐（轮 34 candidate-351）。
     requested = {name: value for name, value in positive_int_fields if value is not None}
+    if args.max_blocked_in_a_row is not None:
+        if args.max_blocked_in_a_row < 0:
+            io.append_log(repo, "config-set", "error", reason="negative value",
+                          field="max_blocked_in_a_row", value=args.max_blocked_in_a_row)
+            return emit_result(
+                args, False,
+                "[ERROR] --max-blocked-in-a-row must be a non-negative integer (got {}).".format(args.max_blocked_in_a_row),
+            )
+        requested["max_blocked_in_a_row"] = args.max_blocked_in_a_row
     for name, value in requested.items():
-        if value < 1:
+        if value < 1 and name != "max_blocked_in_a_row":
             io.append_log(repo, "config-set", "error", reason="non-positive value", field=name, value=value)
             return emit_result(
                 args, False,
@@ -2456,6 +2467,7 @@ def cmd_config_set(args):
         ("max_minutes", "clear_max_minutes"),
         ("max_tokens", "clear_max_tokens"),
         ("deadline", "clear_deadline"),
+        ("max_blocked_in_a_row", "clear_max_blocked_in_a_row"),
     ):
         if getattr(args, clear_name):
             if value_name in requested:
@@ -2544,6 +2556,7 @@ def cmd_config_set(args):
             "--push/--no-push, --scan-secrets/--no-scan-secrets, --report-lang, "
             "--check-commands/--clear-check-commands, --smoke-commands/--clear-smoke-commands, "
             "--max-expansion-waves/--clear-max-expansion-waves, "
+            "--max-blocked-in-a-row/--clear-max-blocked-in-a-row, "
             "--dashboard/--no-dashboard, --dashboard-port).",
         )
 

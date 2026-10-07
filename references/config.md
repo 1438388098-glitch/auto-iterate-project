@@ -195,7 +195,7 @@ Non-negative integer, default `null` (unlimited). Caps how many Deep Expansion w
 
 ### max_blocked_in_a_row
 
-Integer. Default `2`. Hard stop after this many consecutive blocked rounds, checked by the state helper rather than only by agent judgment. `0` means the run stops on the FIRST blocked round (a legal but harsh choice — the configurator owns that); a negative value is rejected by validation.
+Integer. Default `2`. Hard stop after this many consecutive blocked rounds, checked by the state helper rather than only by agent judgment. `0` means the run is born stopped — the 0/0 streak satisfies the condition before the first round can open (a legal but harsh choice — the configurator owns that); a negative value is rejected by validation. Settable at runtime: `init --max-blocked-in-a-row N` and `config-set --max-blocked-in-a-row N` / `--clear-max-blocked-in-a-row`.
 
 ### check_commands
 

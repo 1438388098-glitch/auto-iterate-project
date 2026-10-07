@@ -393,6 +393,12 @@ def _create_lock_exclusive(path, token):
         with os.fdopen(fd, "w", encoding="utf-8") as handle:
             handle.write(payload)
     except OSError:
+        # fdopen 失败时 fd 仍开着——Windows 上不关闭就无法 unlink，残留的
+        # 空 token 锁会让互斥归属证明失效（轮 33 candidate-346 测试钉住）。
+        try:
+            os.close(fd)
+        except OSError:
+            pass
         try:
             os.unlink(str(path))
         except OSError:
