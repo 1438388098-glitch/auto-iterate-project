@@ -599,6 +599,27 @@ class BranchGcTests(RepoTest):
         )
         self.assertIn(run_branch, data["deleted"])
 
+    def test_check_brief_no_drift_warning_after_finish(self):
+        """A finished run no longer issues round commands; the drift warning's
+        recovery advice is noise there and can point at an already-reclaimed
+        branch (1.12 field test)."""
+        self.run_state("init", "--branch-mode", "feature", "--max-rounds", "1")
+        self.run_state("begin-round", "--title", "r", "--reason", "x")
+        self.add_file("w.py", "w = 1\n")
+        self.run_state("commit", "--summary", "work")
+        sha = self.git("rev-parse", "HEAD").stdout.strip()
+        self.run_state("complete-round", "--summary", "done", "--commit-sha", sha)
+        result = self.run_state("finish", "--reason", "max_rounds reached")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        data = json.loads(self.run_state("check", "--brief").stdout)
+        self.assertFalse(any("漂移" in w or "drift" in w.lower() for w in data["warnings"]))
+        # An ACTIVE run still gets the warning when the repo leaves the branch.
+        self.run_state("init", "--force", "--branch-mode", "feature")
+        self.git("checkout", "-q", self.initial_branch)
+        data = json.loads(self.run_state("check", "--brief").stdout)
+        self.assertTrue(any("漂移" in w or "drift" in w.lower() for w in data["warnings"]))
+        self.run_state("ensure-branch")
+
     def test_branch_gc_respects_explicit_base(self):
         # Fork other-base BEFORE the merge so it does not contain the work.
         self.git("checkout", "-q", "-b", "other-base")
@@ -2431,6 +2452,20 @@ class BatchCommitTests(RepoTest):
         result = self.run_state("commit", "--round", "1", "--summary", "rest of the batch")
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
         self.assertNotIn("Run-deferred files", result.stderr)
+
+    def test_history_records_full_candidate_batch(self):
+        """A multi-candidate round's history entry must replay the whole batch
+        (1.12 field test: only the first candidate_id survived there)."""
+        self.run_state("init")
+        self.run_state("backlog-add", "--title", "A", "--reason", "r", "--value", "4", "--effort", "2")
+        self.run_state("backlog-add", "--title", "B", "--reason", "r", "--value", "3", "--effort", "1")
+        self.run_state("begin-round", "--title", "r", "--reason", "x",
+                       "--candidate-id", "candidate-001", "--candidate-id", "candidate-002")
+        self.add_file("a.py", "a = 1\n")
+        self.run_state("complete-round", "--summary", "both")
+        entry = self.read_json("state.json")["history"][-1]
+        self.assertEqual(entry["candidate_ids"], ["candidate-001", "candidate-002"])
+        self.assertEqual(entry["candidate_id"], "candidate-001")
 
 
 class DirectiveTests(RepoTest):

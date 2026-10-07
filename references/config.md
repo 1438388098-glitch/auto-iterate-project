@@ -372,6 +372,8 @@ Anti-noise scoring (刀 B): a promoted candidate carries `origin: "predicted"`, 
 
 `repo` is refreshed to the path used on each invocation, so a moved or re-cloned repository resumes correctly. Older state files are migrated automatically on read. Do not hand-edit `state.json` while a run is active; use the helper commands.
 
+`history` entry capture semantics: `touched_files`/`deferred_dirty_files` reflect what was still uncommitted at round close. On a flush round where `commit` ran before `complete-round`, `touched_files` is empty by design — batch attribution lives in `batch_commit_sha` (backfilled onto the deferred rounds by the flush) plus each deferred round's own `deferred_dirty_files`; `candidate_ids` (since 1.12.2) carries the round's full candidate batch so a round replays from history alone.
+
 ## State Helper Commands
 
 - `init` — create config + state (+ optional feature branch). Flags cover every config field: `--goal`, `--goals-from-prompt`, `--max-rounds`, `--max-minutes`, `--deadline`, `--max-tokens`, `--max-round-scope`, `--branch-mode`, `--allow-uncommitted-changes`, `--track-state`, `--check-commands`, `--smoke-commands`, `--push`, `--commit-message-prefix`, `--retries-per-round`, `--candidates-per-round`, `--commit-every-rounds`, `--verify-every-rounds`, `--checkpoint-every`, `--expand-after-goals`, `--review-threshold`, `--scan-secrets`/`--no-scan-secrets`, `--secret-pattern`, `--type-saturation-threshold`, `--ranking-mode`, `--min-candidate-value`, `--max-same-type-per-round`, `--min-pending-candidates`, `--max-predicted-per-round`, `--max-expansion-per-round`, `--max-expansion-waves`, `--max-blocked-in-a-row`, `--allow-path`, `--deny-path`, `--report-lang`, `--force`.

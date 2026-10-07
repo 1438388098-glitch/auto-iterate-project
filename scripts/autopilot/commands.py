@@ -652,6 +652,12 @@ def _close_round(repo, st, current, status, counter_key, tokens, history_entry,
     except SystemExit:
         history_entry["deferred_dirty_files"] = []
     history_entry.setdefault("status", status)
+    # Full candidate batch beside the legacy scalar (1.12 field test: a
+    # multi-candidate round's history entry kept only the FIRST id, so the
+    # round could not be replayed from history alone).
+    history_entry.setdefault(
+        "candidate_ids", list(current.get("candidate_ids") or []) if isinstance(current, dict) else []
+    )
     state.append_history(st, history_entry)
     st["current_round"] = None
     state.update_candidates_status(
@@ -2940,7 +2946,10 @@ def build_check_payload(repo, full=False):
 
     # Branch drift in feature mode: the round commands will refuse (commit/
     # begin-round/complete-round), so say so here — check is the pre-flight.
-    if cfg.get("branch_mode") == "feature" and st.get("branch"):
+    # A FINISHED run no longer issues round commands; the recovery advice is
+    # noise there and can point at a branch finish already reclaimed
+    # (1.12 field test: finished runs warned about their deleted branch).
+    if cfg.get("branch_mode") == "feature" and st.get("branch") and not st.get("finished_at"):
         expected = st["branch"]
         if head_branch == "HEAD":
             warnings.append(_check_text(
