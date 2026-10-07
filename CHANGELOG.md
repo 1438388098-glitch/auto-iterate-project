@@ -2,6 +2,19 @@
 
 All notable changes to auto-iterate-project are documented here.
 
+## 1.12.5 (2026-10-07)
+
+Docs-only pass from the fifth validation batch (branch_mode=current with
+all-default cadences — zero defects found; two low-risk suggestions).
+
+### Docs
+
+- config.md: `expansion-record` documented as wave-granular with no
+  per-lens notes field (field test: the missing `--notes` flag cost one
+  failed invocation before the round-summary convention was recalled).
+- troubleshooting: new row for the harmless "LF will be replaced by CRLF"
+  noise every `git add` prints on Windows `core.autocrlf` setups.
+
 ## 1.12.4 (2026-10-07)
 
 Cold-resume pass: the fourth validation batch interrupted a run on purpose
