@@ -2,6 +2,70 @@
 
 All notable changes to auto-iterate-project are documented here.
 
+## 1.12.0 (2026-10-07)
+
+Field-test pass: a fresh project was iterated unattended through the full
+loop (executor + independent monitor subagents, 10/10 rounds, 0 blocked,
+26 tests green), and every fix below traces to an observed failure or a
+code-verified defect from that run.
+
+### Fixed
+
+- Schedule boundary fields (`next_verify_round` / `next_commit_round` /
+  `next_checkpoint_round`) kept pointing at a boundary round AFTER it
+  closed (round 4 completed still reported `next_verify_round: 4`, so the
+  loop driver distrusted the field and re-derived the schedule by hand).
+  The anchor is now always the next round that will CLOSE — one formula
+  for the open and the closed state. The test that locked the stale
+  expectation was corrected and an open-boundary-round case added.
+- Batch flushes could silently miss round products: the run records each
+  round's uncommitted files (`deferred_dirty_files`) but `commit` never
+  reconciled against them — the field-test flush left a round-7 CI
+  workflow uncommitted until a manual `git status` caught it and a
+  supplementary commit repaired the batch. `commit` now warns (and audits)
+  the named leftovers before committing.
+- `detect-verify` ignored bare test directories: a fresh repo with
+  `tests/` but no packaging config got "No test/build configuration
+  detected" on the first probe and needed a manual `config-set`.
+  `tests/`-dir or root-level `test_*.py`/`*_test.py` now recommends
+  `pytest`, and `detect_smoke_commands` suggests `compileall` for the
+  same shape.
+- `detect-agent` reported `powershell` on every Windows host, including
+  Git Bash sessions whose interpreter cannot run PowerShell syntax —
+  "use the detected style" then produced dead commands.
+  `MSYSTEM`/bash-`SHELL` signals now report `bash` (with the matching
+  `command_style`).
+
+### Docs
+
+- Finish/Escalation: unattended-run guidance — after a normal finish,
+  merge the run branch back yourself (regular merge, never force) and run
+  `branch-gc` instead of stranding deliverables unmerged; escalation
+  scenes without a user resolve by the most conservative choice, recorded
+  ("verification cannot run" stays a hard stop).
+- Environment: a detected `python_cmd` proves the launcher runs, not that
+  the project's test tooling works under it — pin a working interpreter
+  for the helper AND the check/smoke commands.
+- `goal-met --seed-type/--seed-value/--seed-effort` apply to every seed
+  of the same call (observed: a feature seed typed `test`).
+- §7 Commit: commit inside the open round, `--round` flush after close,
+  and the meaning of the new deferred-reconciliation warning.
+- Checkpoints: disabling them unattended must be said in the finish
+  summary.
+- Deep Expansion: `expansion-record` is wave-granular — lens-level zero
+  yields go into the round summary.
+- `max_tokens`: monotonic water marks documented — a real-work round can
+  legitimately close with 0 when earlier rounds billed (then rewrote
+  smaller) the lines; end totals stay honest. Troubleshooting rows for
+  the flush warning, the 0-token round, and the symlinked `skill_dir`.
+
+### Tests
+
+- Schedule boundary: corrected expectations + open-boundary-round case.
+- Flush reconciliation warn (names the missed file; silent once staged).
+- Bare test-dir discovery for `detect-verify`.
+- Git Bash shell detection via `MSYSTEM`/`SHELL`.
+
 ## 1.11.0 (2026-09-27)
 
 Observation-dashboard review pass (A–E): the panel is as honest and as
