@@ -44,6 +44,8 @@ def detect_smoke_commands(repo):
     signals = []
     if (root / "pyproject.toml").exists() or (root / "setup.py").exists() or (root / "pytest.ini").exists() or (root / "setup.cfg").exists():
         signals.append(("python", "python -m compileall -q ."))
+    elif _has_pytest_test_files(root):
+        signals.append(("python", "python -m compileall -q ."))
     if (root / "package.json").exists():
         signals.append(("node", "npm run lint"))
     if (root / "Cargo.toml").exists():
@@ -53,11 +55,27 @@ def detect_smoke_commands(repo):
     return signals
 
 
+def _has_pytest_test_files(root):
+    """True when pytest-style test modules exist without any packaging config."""
+    tests_dir = root / "tests"
+    for pattern in ("test_*.py", "*_test.py"):
+        if any(root.glob(pattern)):
+            return True
+        if tests_dir.is_dir() and any(tests_dir.glob(pattern)):
+            return True
+    return False
+
+
 def detect_verify_commands(repo):
     """Return a list of (technology, command) pairs discovered from repo entry points."""
     root = Path(repo)
     signals = []
     if (root / "pyproject.toml").exists() or (root / "setup.py").exists() or (root / "pytest.ini").exists() or (root / "setup.cfg").exists():
+        signals.append(("python", "pytest"))
+    elif _has_pytest_test_files(root):
+        # Fresh projects grow tests/ before any packaging config lands; the
+        # test modules alone are already a pytest signal (1.11 实测：全新仓库
+        # 首轮 detect-verify 落空，被迫手动 config-set).
         signals.append(("python", "pytest"))
     if (root / "package.json").exists():
         signals.append(("node", "npm test"))

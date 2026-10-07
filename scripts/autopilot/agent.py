@@ -130,6 +130,19 @@ def detect_python():
     return "python"
 
 
+def detect_shell(default):
+    """The os.name-based profile guess misreports Git Bash sessions on Windows
+    as powershell, and "use the detected style" then yields commands the
+    running shell cannot execute. MSYSTEM (MINGW64/...) and a bash SHELL are
+    unambiguous Git Bash signals; anything else keeps the profile default."""
+    if os.name == "nt":
+        if os.environ.get("MSYSTEM"):
+            return "bash"
+        if "bash" in os.environ.get("SHELL", "").lower():
+            return "bash"
+    return default
+
+
 def agent_profile(agent):
     return AGENT_PROFILES.get(agent, AGENT_PROFILES["generic"])
 
@@ -146,11 +159,12 @@ def cmd_detect_agent(args):
     agent, detected_by = detect_agent(cwd=Path(args.repo).resolve(), home=args.home)
     profile = agent_profile(agent)
     python_cmd = detect_python()
+    shell = detect_shell(profile["default_shell"])
     payload = {
         "agent": agent,
         "label": profile["label"],
         "detected_by": detected_by,
-        "shell": profile["default_shell"],
+        "shell": shell,
         "python_cmd": python_cmd,
         # SKILL_DIR stays an explicit override; otherwise report where this
         # skill is actually installed (derived from the package location),
@@ -160,8 +174,8 @@ def cmd_detect_agent(args):
         "agent_config": profile["agent_config"],
         "adaptation": {
             "use_python": python_cmd,
-            "shell_syntax": profile["default_shell"],
-            "command_style": "powershell" if profile["default_shell"] == "powershell" else "bash",
+            "shell_syntax": shell,
+            "command_style": "powershell" if shell == "powershell" else "bash",
         },
     }
     print(json.dumps(payload, indent=2, ensure_ascii=False))

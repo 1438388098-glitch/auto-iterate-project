@@ -2014,6 +2014,37 @@ def cmd_commit(args):
         if not isinstance(start_dirty, list):
             warn_unverifiable = True
 
+        # Flush reconciliation: history records which files the run's own
+        # rounds left uncommitted (deferred_dirty_files). A batch flush that
+        # stages everything EXCEPT some of them is how round products get
+        # silently left behind — name them here instead of letting the agent
+        # rediscover them via git status after the fact (1.11 实测事故：
+        # 轮 7 的 ci.yml 轮 9 冲刷漏 stage，靠人工 git status 才发现).
+        try:
+            uncommitted_now = set(io.uncommitted_paths(repo))
+        except SystemExit:
+            uncommitted_now = set()
+        prior_deferred = set()
+        for entry in st.get("history") or []:
+            if isinstance(entry, dict):
+                prior_deferred.update(entry.get("deferred_dirty_files") or [])
+        deferred_not_staged = sorted(
+            p for p in (prior_deferred & uncommitted_now) if p not in set(staged_paths)
+        )
+        if deferred_not_staged:
+            print(
+                "[WARN] Run-deferred files are still uncommitted and not staged: {}. "
+                "This flush may be missing round products — stage and commit them "
+                "(same --round), or leave them knowingly for a later flush.".format(
+                    ", ".join(deferred_not_staged)
+                ),
+                file=sys.stderr,
+            )
+            io.append_log(
+                repo, "commit", "warn",
+                reason="deferred files not staged", paths=deferred_not_staged,
+            )
+
         message = "{}(round-{}): {}".format(prefix, round_no, args.summary)
 
         if warn_unverifiable:
@@ -3235,11 +3266,12 @@ def build_check_payload(repo, full=False):
         + st.get("cancelled_rounds", 0)
         + st.get("reverted_rounds", 0)
     )
-    current_number = completed_total + (1 if st.get("current_round") else 0)
-    # Boundary math: round k itself IS a boundary when k % every == 0, so the
-    # next boundary after round k is computed from k-1 (round 5 with
-    # commit_every_rounds 5 reports next_commit_round 5, not 10).
-    anchor = max(1, current_number)
+    # Boundary math: the anchor is the next round that will CLOSE (completed
+    # rounds plus the open one, if any). Round k is itself a boundary when
+    # k % every == 0 — with commit_every_rounds 5 the next boundary after 4
+    # closed rounds is 5, and once round 5 has closed the same formula points
+    # at 10 instead of re-reporting the finished round.
+    anchor = completed_total + 1
     verify_every = cfg.get("verify_every_rounds") or 1
     commit_every = cfg.get("commit_every_rounds") or 1
     payload["next_verify_round"] = ((anchor - 1) // verify_every + 1) * verify_every

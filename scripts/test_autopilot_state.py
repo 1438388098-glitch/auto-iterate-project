@@ -1415,15 +1415,25 @@ class BudgetAccountingTests(RepoTest):
         self.run_state("init", "--commit-every-rounds", "5", "--verify-every-rounds", "3",
                        "--checkpoint-every", "2")
         state_path = self.repo / ".autopilot" / "state.json"
-        for completed, expected_commit in ((4, 5), (5, 5), (6, 10)):
+        for completed, expected_commit in ((4, 5), (5, 10), (6, 10)):
             state = json.loads(state_path.read_text(encoding="utf-8"))
             state["completed_rounds"] = completed
             state_path.write_text(json.dumps(state), encoding="utf-8")
             data = json.loads(self.run_state("check", "--brief").stdout)
             self.assertEqual(data["next_commit_round"], expected_commit, completed)
-            self.assertEqual(data["next_verify_round"], ((max(1, completed) - 1) // 3 + 1) * 3)
-            self.assertEqual(data["next_checkpoint_round"], ((max(1, completed) - 1) // 2 + 1) * 2)
-        # A brand-new run (current_number 0) still points at the first boundary.
+            self.assertEqual(data["next_verify_round"], (completed // 3 + 1) * 3, completed)
+            self.assertEqual(data["next_checkpoint_round"], (completed // 2 + 1) * 2, completed)
+        # While the boundary round is still OPEN it remains the next boundary:
+        # completed=4 with round 5 open → next_commit_round 5 (the open round
+        # is the one that will close on the boundary).
+        state = json.loads(state_path.read_text(encoding="utf-8"))
+        state["completed_rounds"] = 4
+        state_path.write_text(json.dumps(state), encoding="utf-8")
+        self.run_state("begin-round", "--title", "r", "--reason", "x")
+        data = json.loads(self.run_state("check", "--brief").stdout)
+        self.assertEqual(data["next_commit_round"], 5)
+        self.run_state("cancel-round")
+        # A brand-new run (completed 0) still points at the first boundary.
         self.run_state("init", "--force", "--checkpoint-every", "2")
         data = json.loads(self.run_state("check", "--brief").stdout)
         self.assertEqual(data["next_checkpoint_round"], 2)
@@ -2220,6 +2230,19 @@ class FeatureTests(RepoTest):
         data = json.loads(result.stdout)
         self.assertIn("detected", data)
 
+    def test_detect_verify_discovers_bare_test_dir(self):
+        """Fresh projects grow tests/ before packaging config; the test
+        modules alone are already a pytest signal (1.11 实测回归：全新仓库
+        detect-verify 落空，被迫手动 config-set）。"""
+        tests_dir = self.repo / "tests"
+        tests_dir.mkdir()
+        (tests_dir / "test_app.py").write_text("def test_ok():\n    assert True\n", encoding="utf-8")
+        result = self.run_state("detect-verify", "--json")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        data = json.loads(result.stdout)
+        self.assertTrue(data["ok"])
+        self.assertEqual(data["commands"], ["pytest"])
+
     def test_goals_from_prompt_split(self):
         result = self.run_state("init", "--goals-from-prompt", "改进A，并且改进B。另外修C")
         self.assertEqual(result.returncode, 0, result.stderr)
@@ -2367,22 +2390,27 @@ class BatchCommitTests(RepoTest):
         self.assertGreaterEqual(round2, 500)
         self.assertLess(round2, 550)
 
-    def test_batch_commit_accumulates_changes(self):
+    def test_flush_warns_on_deferred_files_not_staged(self):
+        """冲刷对账（1.11 实测事故的机制修复）：history.deferred_dirty_files
+        在 commit 时与未提交集合对账，批内有未暂存的轮内产物 → WARN 点名，
+        而不是让 agent 事后靠 git status 自行发现。"""
         self.run_state("init")
         self.run_state("begin-round", "--title", "r1", "--reason", "x")
-        self.add_file("a.py", "a = 1\n")
-        self.run_state("complete-round", "--summary", "a")
-
+        # Written WITHOUT staging: a staged file cannot be missed by a flush.
+        (self.repo / "deferred-work.py").write_text("d = 1\n", encoding="utf-8")
+        self.run_state("complete-round", "--summary", "r1 leaves work uncommitted")
         self.run_state("begin-round", "--title", "r2", "--reason", "x")
-        self.add_file("b.py", "b = 2\n")
-        result = self.run_state("commit", "--summary", "batched")
+        self.add_file("flush-me.py", "f = 1\n")
+        self.git("add", "flush-me.py")
+        result = self.run_state("commit", "--summary", "stages only part of the batch")
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
-        sha = self.git("rev-parse", "HEAD").stdout.strip()
-        self.run_state("complete-round", "--summary", "b", "--commit-sha", sha)
-
-        files = self.git("show", "--stat", "--name-only", "--pretty=", "HEAD").stdout.strip().splitlines()
-        self.assertIn("a.py", files)
-        self.assertIn("b.py", files)
+        self.assertIn("deferred-work.py", result.stderr)
+        self.assertIn("Run-deferred files", result.stderr)
+        # Once the deferred file joins the batch, the warning goes quiet.
+        self.git("add", "deferred-work.py")
+        result = self.run_state("commit", "--round", "1", "--summary", "rest of the batch")
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertNotIn("Run-deferred files", result.stderr)
 
 
 class DirectiveTests(RepoTest):
@@ -2568,6 +2596,30 @@ class ContractTests(RepoTest):
             {"agent", "label", "detected_by", "shell", "python_cmd", "skill_dir",
              "project_marker", "agent_config", "adaptation"},
         )
+
+    def test_detect_agent_reports_bash_in_git_bash_session(self):
+        """MSYSTEM/SHELL are unambiguous Git Bash signals on Windows; the
+        os.name guess alone misreports such sessions as powershell and the
+        loop would then emit powershell syntax into a bash interpreter
+        (1.11 实测：Git Bash 宿主被报 powershell）。"""
+        env = dict(self.env)
+        for var in ("OPENCODE", "CLAUDE_CODE", "CODEX", "AUTOPILOT_AGENT", "SKILL_DIR"):
+            env.pop(var, None)
+        env["MSYSTEM"] = "MINGW64"
+        env["SHELL"] = "C:\\Program Files\\Git\\usr\\bin\\bash.exe"
+        result = subprocess.run(
+            [sys.executable, str(self.script), "detect-agent", "--repo", str(self.repo), "--home", str(self.tmp)],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            universal_newlines=True,
+            encoding="utf-8",
+            errors="replace",
+            env=env,
+        )
+        self.assertEqual(result.returncode, 0, result.stderr)
+        data = json.loads(result.stdout)
+        self.assertEqual(data["shell"], "bash")
+        self.assertEqual(data["adaptation"]["command_style"], "bash")
 
     def test_backlog_rank_entry_contract(self):
         self.run_state("init")
