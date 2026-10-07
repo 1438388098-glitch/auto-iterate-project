@@ -10,6 +10,7 @@ import socket
 import subprocess
 import sys
 import tempfile
+import uuid
 from contextlib import contextmanager
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
@@ -376,11 +377,13 @@ def _read_lock_file(path):
         return None
 
 
-def _create_lock_exclusive(path):
+def _create_lock_exclusive(path, token):
     """Atomically create the lock file (O_CREAT|O_EXCL). Returns False when the
-    file already exists — never overwrites another process's lock."""
+    file already exists — never overwrites another process's lock. The random
+    token is the ownership proof _release_lock checks before unlinking."""
     payload = json.dumps(
-        {"pid": os.getpid(), "started_at": now_iso(), "hostname": socket.gethostname()}
+        {"pid": os.getpid(), "started_at": now_iso(), "hostname": socket.gethostname(),
+         "token": token}
     )
     try:
         fd = os.open(str(path), os.O_CREAT | os.O_EXCL | os.O_WRONLY)
@@ -407,11 +410,20 @@ def _sleep(seconds):
 def _acquire_lock(repo):
     path = lock_path_for(repo)
     path.parent.mkdir(parents=True, exist_ok=True)
-    # Three attempts: create / grace-backoff (fresh corrupt-looking lock may
-    # be mid-creation by a live process) / steal-and-recreate.
-    for attempt in range(3):
-        if _create_lock_exclusive(path):
-            return path
+    token = uuid.uuid4().hex
+    # Eight attempts with 0.3s grace: a young empty lock (O_EXCL done, payload
+    # not yet written) may be mid-creation by a LIVE process, so the grace
+    # applies on EVERY attempt — honoring it only on attempt 0 let attempt 1
+    # steal the lock 0.1s later and break mutual exclusion entirely (field
+    # test round 16, candidate-306: three-process steal chain reproduced).
+    # Once the lock ages past 2.0s it is treated as stale and taken, so a
+    # dead creator still self-heals instead of wedging the repo.
+    # Eight grace attempts (0.3s each) + one final create after the last
+    # unlink: once the lock ages past 2.0s the corrupt branch unlinks it and
+    # the next attempt must get its chance, or a dead creator wedges the repo.
+    for attempt in range(9):
+        if _create_lock_exclusive(path, token):
+            return path, token
         holder = _read_lock_file(path)
         if isinstance(holder, dict):
             hostname = holder.get("hostname")
@@ -442,14 +454,16 @@ def _acquire_lock(repo):
                 file=sys.stderr,
             )
         else:
-            # A lock that was just created (O_EXCL done, payload not yet
-            # written) reads as corrupt. A file this young is almost surely
-            # mid-creation by a live process — back off once before stealing.
             age = datetime.now(timezone.utc).timestamp() - path.stat().st_mtime
-            if age < 2.0 and attempt == 0:
-                _sleep(0.1)
+            if age < 2.0:
+                _sleep(0.3)
                 continue
-            print("[WARN] Removing corrupt autopilot lock file at {}.".format(path), file=sys.stderr)
+            print(
+                "[WARN] Removing corrupt autopilot lock file at {} (age {:.1f}s).".format(
+                    path, age
+                ),
+                file=sys.stderr,
+            )
         try:
             path.unlink()
         except OSError:
@@ -461,8 +475,20 @@ def _acquire_lock(repo):
     raise SystemExit(2)
 
 
-def _release_lock(path):
+def _release_lock(path, token=None):
+    """Only unlink when the lock still belongs to THIS process (token match).
+    An unconditional unlink deleted the lock of whoever stole/re-acquired it
+    after a stale takeover, turning one steal into a three-process concurrency
+    chain (field test round 16, candidate-306)."""
     try:
+        holder = _read_lock_file(path)
+        if holder is not None and token is not None and holder.get("token") != token:
+            print(
+                "[WARN] Autopilot lock at {} is no longer ours (re-acquired after a stale "
+                "takeover); leaving it alone.".format(path),
+                file=sys.stderr,
+            )
+            return
         path.unlink()
     except OSError:
         pass
@@ -470,11 +496,11 @@ def _release_lock(path):
 
 @contextmanager
 def run_lock(repo):
-    path = _acquire_lock(repo)
+    path, token = _acquire_lock(repo)
     try:
         yield
     finally:
-        _release_lock(path)
+        _release_lock(path, token)
 
 
 def append_log(repo, event, status, **fields):

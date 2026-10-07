@@ -1523,6 +1523,77 @@ class BudgetAccountingTests(RepoTest):
         self.assertEqual(state["completed_rounds"], 1)
         self.assertEqual(state["history"][-1]["status"], "completed")
 
+    def test_lock_token_ownership_and_young_grace(self):
+        """轮 16（candidate-306）：释放只删自己的锁；年轻空锁获全宽限
+        （不再 0.1s 后即被偷——互斥击穿实测复现）；age≥2s 的死锁自动收割。"""
+        from autopilot import io as _io
+        import time as _time
+        lock = self.repo / ".autopilot" / "lock"
+        lock.parent.mkdir(parents=True, exist_ok=True)
+        lock.write_text(json.dumps({"pid": 999999, "token": "theirs", "hostname": "x"}), encoding="utf-8")
+        _io._release_lock(lock, "mine")
+        self.assertTrue(lock.exists())
+        _io._release_lock(lock, "theirs")
+        self.assertFalse(lock.exists())
+        lock.write_text("", encoding="utf-8")
+        t0 = _time.time()
+        path, token = _io._acquire_lock(self.repo)
+        elapsed = _time.time() - t0
+        # 年轻空锁必须吃满宽限（旧 bug：0.1s 后即被偷，互斥击穿）——
+        # age≥2s 后按 stale 自动收割，最终成功获取。
+        self.assertGreaterEqual(elapsed, 2.0)
+        self.assertEqual(_io._read_lock_file(path).get("token"), token)
+        _io._release_lock(path, token)
+        self.assertFalse(lock.exists())
+
+    def test_secret_pattern_redos_guard(self):
+        """轮 16（candidate-308）：嵌套量词模式编译期限时探测拒绝——
+        否则每次 commit 的逐行匹配会无限期挂起。"""
+        self.run_state("init", "--secret-pattern", "(a+)+b")
+        self.add_file("a.py", "x = 1\n")
+        result = self.run_state("secret-scan")
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("too dangerous", result.stderr)
+        self.assertNotIn("Traceback", result.stderr)
+
+    def test_report_output_autopilot_path_refused(self):
+        """轮 16（candidate-309）：--output 指向 .autopilot/ 运行态必须拒绝
+        （relative_to 只防外写，防不了内洞覆写 state.json）。"""
+        self.run_state("init")
+        self.run_state("begin-round", "--title", "r", "--reason", "x")
+        result = self.run_state("report", "--output", ".autopilot/state.json")
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn(".autopilot", result.stdout + result.stderr)
+        state_text = (self.repo / ".autopilot" / "state.json").read_text(encoding="utf-8")
+        self.assertNotIn("#", state_text[:5])  # 未被 markdown 覆写
+
+    def test_backlog_bak_created(self):
+        """轮 16（candidate-310）：backlog 与 state 同款单代 .bak——账本
+        损坏从「删除重来」变成「restore the backup」。首次落盘无前像可备，
+        .bak 从第二次保存起出现。"""
+        self.run_state("init")
+        self.run_state("backlog-add", "--title", "T", "--reason", "r", "--value", "4", "--effort", "2")
+        bak = self.repo / ".autopilot" / "backlog.json.bak"
+        self.assertFalse(bak.exists())
+        self.run_state("backlog-update", "--id", "candidate-001", "--value", "5")
+        self.assertTrue(bak.exists())
+        self.assertEqual(json.loads(bak.read_text(encoding="utf-8"))["candidates"][0]["value"], 4)
+        # 原子备份不留 tmp 残片（candidate-314）
+        leftovers = [p.name for p in (self.repo / ".autopilot").iterdir() if p.name.endswith(".tmp-bak")]
+        self.assertEqual(leftovers, [])
+
+    def test_package_imports_are_relative(self):
+        """轮 16（candidate-316）：包内一律相对导入——绝对导入依赖 sys.path
+        恰好把包装叫 autopilot，vendored 场景会静默产生第二个模块实例
+        （两份 _snapshot_cache，stop_server 杀不到对方起的服务）。"""
+        package_dir = SCRIPT.parent / "autopilot"
+        offenders = []
+        for py in sorted(package_dir.glob("*.py")):
+            for lineno, line in enumerate(py.read_text(encoding="utf-8").splitlines(), 1):
+                if re.match(r"\s*(?:from|import)\s+autopilot\b", line):
+                    offenders.append("{}:{}".format(py.name, lineno))
+        self.assertEqual(offenders, [])
+
     def test_paused_run_stops_on_first_check(self):
         self.run_state("init", "--max-minutes", "1")
         self.run_state("begin-round", "--title", "r", "--reason", "x")

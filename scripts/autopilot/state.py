@@ -2,6 +2,7 @@
 
 import json
 import math
+import os
 import re
 import sys
 import unicodedata
@@ -260,6 +261,26 @@ def load_state(repo):
     return state
 
 
+def _atomic_backup(path):
+    """单代 .bak，原子落盘（轮 16 candidate-314）：备份自身用截断式
+    write_bytes 的话，崩溃/磁盘满会产生撕碎的 .bak——安全网恰在需要时
+    失效。与 io.save_json 同款 tmp+replace；备份失败不阻塞主写入。"""
+    backup = path.with_suffix(path.suffix + ".bak")
+    try:
+        data = path.read_bytes()
+    except OSError:
+        return
+    tmp = path.with_name(path.name + ".tmp-bak")
+    try:
+        tmp.write_bytes(data)
+        os.replace(str(tmp), str(backup))
+    except OSError:
+        try:
+            tmp.unlink()
+        except OSError:
+            pass
+
+
 def save_state(repo, state):
     path = config.state_path_for(repo)
     # Keep the last known-good copy before overwriting: save_json's atomic
@@ -267,11 +288,7 @@ def save_state(repo, state):
     # was corrupted outside this process. A one-generation .bak turns
     # "state is unrecoverable, delete and re-init" into "restore the backup".
     if path.exists():
-        try:
-            backup = path.with_suffix(path.suffix + ".bak")
-            backup.write_bytes(path.read_bytes())
-        except OSError:
-            pass  # backup is best-effort; the write below must still proceed
+        _atomic_backup(path)
     io.save_json(path, state)
 
 
@@ -315,7 +332,13 @@ def _validate_backlog(repo, backlog):
 
 
 def save_backlog(repo, backlog):
-    io.save_json(config.backlog_path_for(repo), backlog)
+    # 与 save_state 同款单代 .bak（轮 16 candidate-310）：backlog 是 run 的
+    # 核心资产——候选、状态、review 校准、依赖边全在这里，进程外损坏时
+    # 「restore the backup」比「删除重来」强一个数量级。
+    path = config.backlog_path_for(repo)
+    if path.exists():
+        _atomic_backup(path)
+    io.save_json(path, backlog)
 
 
 def find_candidate(backlog, candidate_id):
