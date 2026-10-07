@@ -2,6 +2,44 @@
 
 All notable changes to auto-iterate-project are documented here.
 
+## 1.12.1 (2026-10-07)
+
+Validation-batch fixes: the 1.12.0 field-test repair pass was re-run on a
+fresh project (5/5 rounds unattended, all four 1.12.0 fixes verified live
+by both the executor and the independent monitor), and this batch fixes
+what that validation run itself exposed.
+
+### Fixed
+
+- `branch-gc` kept the current run's branch forever whenever state.json
+  existed — which it always does after a finish — dead-locking the
+  documented recovery path ("merge the kept branch later, then run
+  `branch-gc` to reclaim it") that three docs places promise and that
+  1.12.0's unattended-finish guidance puts on every unattended run's
+  closing path (field test: two `branch-gc` runs both reported the merged
+  branch "kept", contradicting the command's own docstring). Only an
+  UNFINISHED run's branch is protected now; a finished run's merged
+  branch is reclaimable.
+- `mine`'s hotspot scanner counted the run's own commits: files the run
+  had just written surfaced as "Review hotspot <file>" candidates that
+  the quality gate then had to reject (three such in the validation run).
+  Hotspot now reads pre-run history only, bounded by `run_start_sha`.
+- `analysis.cached` existed in `round-prep`'s analysis object but vanished
+  from `check --brief`'s — same-named fields are now present in both
+  payloads (None when the cache is not fresh).
+
+### Docs
+
+- §8: round-summary counts come from the on-disk log (the validation run
+  mis-recorded test counts twice from memory).
+
+### Tests
+
+- branch-gc reclaims a finished run's merged branch (regression for the
+  deadlock).
+- hotspot ignores the run's own commits, still finds pre-run churn.
+- `analysis.cached` key present in both `check --brief` and `round-prep`.
+
 ## 1.12.0 (2026-10-07)
 
 Field-test pass: a fresh project was iterated unattended through the full
