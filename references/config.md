@@ -372,7 +372,7 @@ Anti-noise scoring (刀 B): a promoted candidate carries `origin: "predicted"`, 
 
 `repo` is refreshed to the path used on each invocation, so a moved or re-cloned repository resumes correctly. Older state files are migrated automatically on read. Do not hand-edit `state.json` while a run is active; use the helper commands.
 
-`history` entry capture semantics: `touched_files`/`deferred_dirty_files` reflect what was still uncommitted at round close. On a flush round where `commit` ran before `complete-round`, `touched_files` is empty by design — batch attribution lives in `batch_commit_sha` (backfilled onto the deferred rounds by the flush) plus each deferred round's own `deferred_dirty_files`; `candidate_ids` (since 1.12.2) carries the round's full candidate batch so a round replays from history alone.
+`history` entry capture semantics: `touched_files`/`deferred_dirty_files` reflect what was still uncommitted at round close. On a flush round where `commit` ran before `complete-round`, `touched_files` is empty by design — batch attribution lives in `batch_commit_sha` (backfilled onto the deferred rounds by the flush) plus each deferred round's own `deferred_dirty_files`; `candidate_ids` (since 1.12.2) carries the round's full candidate batch so a round replays from history alone, and the legacy scalar `candidate_id` keeps only the FIRST id for older consumers — read `candidate_ids` for the batch.
 
 ## State Helper Commands
 

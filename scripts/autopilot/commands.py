@@ -487,11 +487,21 @@ def cmd_begin_round(args):
                     "[ERROR] Working tree is dirty and allow_uncommitted_changes is false. "
                     "Commit or stash user changes, or set allow_uncommitted_changes: true.",
                 )
-            print(
-                "[WARN] Working tree is dirty; uncommitted changes from earlier rounds will be "
-                "included if staged. Consider committing or reverting them first.",
-                file=sys.stderr,
-            )
+            if (cfg.get("commit_every_rounds") or 1) > 1:
+                # Batch mode defers commits on purpose: "commit them first"
+                # would be the WRONG advice here (1.12 field test round 2/3).
+                print(
+                    "[WARN] Working tree carries deferred work from earlier rounds — expected in "
+                    "batch mode (commit_every_rounds={}). Keep accumulating; the next flush round "
+                    "commits the batch.".format(cfg.get("commit_every_rounds")),
+                    file=sys.stderr,
+                )
+            else:
+                print(
+                    "[WARN] Working tree is dirty; uncommitted changes from earlier rounds will be "
+                    "included if staged. Consider committing or reverting them first.",
+                    file=sys.stderr,
+                )
         elif dirty and allow_dirty:
             print(
                 "[WARN] Working tree is dirty and allow_uncommitted_changes is true; pre-existing "
@@ -1377,11 +1387,11 @@ def cmd_finish(args):
             else:
                 origin_label = "原" if zh_msg else "the original"
             if zh_msg:
-                message += " 提交保留在分支 `{}`，未合并到 {} 分支。合并后可运行 branch-gc 回收。".format(
+                message += " 提交保留在分支 `{}`，未合并到 {} 分支（finish 时点快照；其后的合并以 git log 为准）。合并后可运行 branch-gc 回收。".format(
                     st["branch"], origin_label
                 )
             else:
-                message += " Commits remain on branch `{}`; not merged into {}. Run branch-gc after merging.".format(
+                message += " Commits remain on branch `{}`; not merged into {} as of finish (later merges: check git log). Run branch-gc after merging.".format(
                     st["branch"], origin_label
                 )
         data = {

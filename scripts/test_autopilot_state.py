@@ -592,6 +592,9 @@ class BranchGcTests(RepoTest):
         self.run_state("complete-round", "--summary", "done", "--commit-sha", sha)
         result = self.run_state("finish", "--reason", "max_rounds reached")
         self.assertEqual(result.returncode, 0, result.stderr)
+        # The unmerged notice is a finish-time snapshot (1.12 field test:
+        # unattended runs merge right after, and the notice read as stale).
+        self.assertIn("finish", result.stdout)
         self.assertTrue((self.repo / ".autopilot" / "state.json").exists())
         self.git("merge", "-q", "--no-edit", run_branch)
         data = json.loads(
@@ -2466,6 +2469,20 @@ class BatchCommitTests(RepoTest):
         entry = self.read_json("state.json")["history"][-1]
         self.assertEqual(entry["candidate_ids"], ["candidate-001", "candidate-002"])
         self.assertEqual(entry["candidate_id"], "candidate-001")
+
+    def test_begin_round_batch_dirty_warn_deferred_wording(self):
+        """Batch mode's dirty-tree warning must NOT advise 'commit them first'
+        — accumulating until the flush round IS the correct action there
+        (1.12 field test: rounds 2/3 got misleading advice)."""
+        self.run_state("init", "--commit-every-rounds", "3")
+        self.run_state("begin-round", "--title", "r1", "--reason", "x")
+        self.add_file("a.py", "a = 1\n")
+        self.run_state("complete-round", "--summary", "deferred")
+        result = self.run_state("begin-round", "--title", "r2", "--reason", "x")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("expected in", result.stderr.lower())
+        self.assertIn("flush", result.stderr)
+        self.assertNotIn("Consider committing or reverting", result.stderr)
 
 
 class DirectiveTests(RepoTest):

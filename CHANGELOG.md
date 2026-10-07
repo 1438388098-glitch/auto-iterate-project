@@ -2,6 +2,36 @@
 
 All notable changes to auto-iterate-project are documented here.
 
+## 1.12.3 (2026-10-07)
+
+Guidance-wording pass from the third validation batch (first goal-driven
+stop: the run halted on "all goals met" with half its round and time budget
+unused — the goal path, not a budget early stop). Three minor findings, no
+criticals.
+
+### Fixed
+
+- Batch mode's dirty-tree warning told the agent to "commit or revert"
+  the deferred work — the WRONG advice when `commit_every_rounds > 1`,
+  where accumulating until the flush round is precisely the contract
+  (field test: rounds 2 and 3 both got the misleading hint). Batch mode
+  now explains the deferral; single-round mode keeps the old text.
+- `finish`'s unmerged-branch notice read as current truth forever: an
+  unattended run merges right after finish, and the retrospective/output
+  gave no hint the statement was a snapshot. Both zh and en notices now
+  say "as of finish; later merges: check git log".
+
+### Docs
+
+- config.md: the legacy scalar `candidate_id` is annotated as
+  first-candidate-only — read `candidate_ids` for the batch.
+
+### Tests
+
+- Batch-mode dirty warning uses the deferred wording (no "commit them
+  first").
+- Finish notice carries the snapshot marker.
+
 ## 1.12.2 (2026-10-07)
 
 Observability pass from the second validation batch (both the executor and
