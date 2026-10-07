@@ -64,6 +64,8 @@ Soft stop based on `estimated_tokens_used` accumulated by `complete-round`, `blo
 
 The helper auto-estimates tokens per round when `--tokens` is omitted, using the heuristic `500 + 12 * changed lines + 100 * binary files`. Accounting is run-level monotonic: the run's total changed units are the committed diff from `run_start_sha` (anchored at `init`) to `HEAD` plus the current working-tree/index delta against `HEAD` — two disjoint measurements whose sum is the run's true total, so each line is billed exactly once no matter how many rounds it sat uncommitted before being committed. Each round is charged only the delta above the persisted high-water marks (`billed_text`/`billed_binary` in state); the 500-token base applies to every round closed with real work (a zero-work cancel is `aborted` and burns nothing). For a tighter estimate, pass `--tokens` with your own value from the session — the override still advances the water marks so the real lines are not billed again later.
 
+Water marks never move backward (`max` of observed totals): lines billed while uncommitted and later rewritten smaller keep their originally observed size in the marks, so a later round whose net additions fall under the marks legitimately closes with **0** — a 0 on a work round means earlier observations already covered those lines, not that nothing changed (1.11 实测：mdnote 轮 9 记 0；终局 marks 与 HEAD 实际行数一致). Per-round attribution shifts; the run's end total stays honest.
+
 ### max_round_scope
 
 Integer, default `null`. Maximum number of changed lines (added + removed) a single round's staged diff may contain; each binary file in the staged diff counts as one unit. The `commit` helper refuses to commit when exceeded, forcing the agent to split the round. `null` means no limit.
@@ -341,7 +343,7 @@ python <this-skill>/scripts/autopilot_state.py goal-met --repo <repo> --goal "<g
 - `--round <n>` — the round that completed this goal; must match a completed history entry. Without it the goal event is recorded `unverified: true` and the "all goals met" stop is withheld (`check` lists the goals under `goals_unverified`)
 - `--evidence` — audit-only note on how you know the goal is met (recorded on the goal event, not scored)
 - `--next-step` (repeatable) — one direction seed per occurrence; `type` defaults to the first non-saturated type, `value` to 4, `effort` to 2, `risk` to 1
-- `--seed-type` / `--seed-value` / `--seed-effort` — override the defaults
+- `--seed-type` / `--seed-value` / `--seed-effort` — override the defaults; the three flags apply to EVERY seed produced by the same `goal-met` call, so per-seed values need separate calls (or `backlog-update` after promotion)
 - `--no-auto-context` — skip the automatic snapshot (no goal event is recorded unless `--next-step`/`--unlocked-capability` also produced seeds or capabilities, in which case the event records just those links)
 - Repeating a `goal-met` with the same goal and the same `--next-step` titles does not duplicate seeds; each seed carries `source_event_id`, and the event records the last completed round's commit SHA(s) in `commit_shas`
 - `seed-reject --id <id> --reason "<why>"` — an open seed whose evidence died in the check is marked `rejected` (terminal) and leaves the open-seeds list, so the Wave 0 exception in `SKILL.md` can fire

@@ -61,6 +61,7 @@ If the host has no Task/Agent/explore tool, set an in-process lens mode (see Dee
 ## Environment
 
 - Use the `python_cmd` from `detect-agent`; if it fails, try `python3` then `py`. The helper targets Python 3.6+.
+- A detected `python_cmd` only proves the launcher runs, not that the project's test tooling works under it (a host's default `python` can carry a broken pytest). If checks fail with interpreter/tooling errors, probe for a working launcher (e.g. `py -3.13`) and pin it explicitly for BOTH the helper and every `check_commands`/`smoke_commands` entry — do not keep feeding a broken interpreter.
 - Translate PowerShell examples when `command_style` is `bash`.
 - git is the only external dependency.
 
@@ -158,7 +159,7 @@ On a verification round: run each `check_commands` entry (or the project's test/
 
 ### 7. Commit
 
-Commits flush every `commit_every_rounds` rounds (default 5) as one batch — `commit` on a non-flush round prints a WARN naming the next flush round; committing early is allowed, but later rounds must not assume the batch was flushed. On stop mid-batch, flush before `finish`. Never stage `.autopilot/` unless `track_state: true` (staged `.autopilot/**` is refused even via `git add -f`).
+Commits flush every `commit_every_rounds` rounds (default 5) as one batch — `commit` on a non-flush round prints a WARN naming the next flush round; committing early is allowed, but later rounds must not assume the batch was flushed. Committing belongs **inside the open round** (this step precedes step 8); once a round is closed, only `commit --round <n>` can flush staged leftovers (Finish step 1). On a batch flush the helper reconciles the staged set against the files the run's own rounds deferred (`deferred_dirty_files`) and WARN-names anything still uncommitted and unstaged — treat that warning as missed staging, not noise. On stop mid-batch, flush before `finish`. Never stage `.autopilot/` unless `track_state: true` (staged `.autopilot/**` is refused even via `git add -f`).
 
 1. `git status` and review scope.
 2. `git add <intentionally changed files>` for the whole batch.
@@ -184,7 +185,7 @@ python <this-skill>/scripts/autopilot_state.py commit --repo <repo> --summary "<
 python <this-skill>/scripts/autopilot_state.py goal-met --repo <repo> --goal "<exact goal text>" --round <n> [--evidence "..."] [--next-step "<predicted follow-up>"] [--unlocked-capability "<capability>"] [--seed-type ... --seed-value N --seed-effort N]
 ```
 
-`--round` must match a completed history entry; without it the goal is **unverified** and withholds the "all goals met" stop. Each `--next-step` creates one direction seed — see `references/wave0-prediction.md`. Prefer explicit `--seed-type`/`--seed-value`/`--seed-effort` over defaults.
+`--round` must match a completed history entry; without it the goal is **unverified** and withholds the "all goals met" stop. Each `--next-step` creates one direction seed — see `references/wave0-prediction.md`. Prefer explicit `--seed-type`/`--seed-value`/`--seed-effort` over defaults; these three flags apply to EVERY seed produced by the same `goal-met` call, so per-seed values need separate calls (or `backlog-update` after promoting).
 
 ### 10. Repeat
 
@@ -192,7 +193,7 @@ Run `check --brief` again after each round. Always pass `--brief`: it carries ev
 
 ## Human Checkpoints & Directives
 
-`checkpoint_every: N` pauses every N rounds (`next_checkpoint_round`). At a checkpoint: summarize progress (`backlog-rank` top, tokens, commits), read `directive-list`, then ask the user: continue / change goals / change budgets / stop. Record standing rules with `directive-add`. At the start of **every** round's Implement step, read `directive-list` and honor them.
+`checkpoint_every: N` pauses every N rounds (`next_checkpoint_round`). At a checkpoint: summarize progress (`backlog-rank` top, tokens, commits), read `directive-list`, then ask the user: continue / change goals / change budgets / stop. Record standing rules with `directive-add`. At the start of **every** round's Implement step, read `directive-list` and honor them. A run that disables checkpoints (or sets them beyond the run length) because nobody is available loses the human steering wheel by definition — say so in the finish summary instead of absorbing it silently.
 
 ## Post-Goal Direction Prediction (Wave 0)
 
@@ -224,7 +225,7 @@ When `action_hint: "expand"` (mine already fresh), the backlog is empty after mi
 
 0. Budget check: subagent spend is invisible to `max_tokens` (it estimates from diffs), so if the run has `max_expansion_waves` set, read `expansion_budget` and stop expanding at the cap (`expansion-record` refuses past it); with no cap, a run that expands repeatedly can outspend every configured budget while `check` reports it healthy.
 1. Pick 3-6 unused lenses from `check`'s `lenses_unused` (see `references/expansion-lenses.md`). Each subagent returns 2-5 candidates **with evidence**. Record with `expansion-record --lens ...`. Repeating the previous wave's exact set warns.
-2. Judge and ingest: one concrete user-facing sentence of value **and** evidence (file:line or probe output). Unevidenced proposals get one follow-up, then reject. `backlog-add` with explicit scores and `--evidence`. Do not reject solely for high effort.
+2. Judge and ingest: one concrete user-facing sentence of value **and** evidence (file:line or probe output). Unevidenced proposals get one follow-up, then reject. `backlog-add` with explicit scores and `--evidence`. Do not reject solely for high effort. `expansion-record` is wave-granular — it cannot record that a specific lens produced zero candidates; note lens-level zero yields in the round summary so later waves do not re-pick barren lenses without a reason.
 3. Still thin → escalate search depth (not the user): Wave 2 lower the value floor temporarily; Wave 3+ read hardest paths / real user journeys / public symbols; Wave 4+ widen scope (siblings, CI, packaging, examples). Keep spawning until `min_pending_candidates` ready items or a budget stop. **Never finish with "expansion exhausted" while budgets remain** — `finish` without `--force` is refused while stop conditions are unmet and ready work exists. Declaring exhaustion requires 2 consecutive recorded waves (≥3 subagents, ≥3 unused lenses each) with zero value-gated candidates — and even then the run stops only on a budget.
 4. **No-subagent fallback**: run the same lenses serially in-process (one lens per pass, `analysis-save` between passes). Do not claim "cannot expand".
 5. After goals are met, treat every thin backlog the same way.
@@ -252,10 +253,13 @@ Stop and ask the user when: a `check_commands` command does not exist / verifica
 
 An empty or thin backlog is **never** an escalation.
 
+Unattended runs have nobody to ask: when one of the scenes above fires without a user available, apply the most conservative choice consistent with the skill's intent, record the decision (and that it was made unattended) in the round summary, and keep going. "Verification cannot run" stays a hard stop even unattended.
+
 ## Finish
 
 1. If commits are batched and the last round did not commit, flush with `commit --round <n> --summary "flush accumulated changes"`.
 2. `finish --reason "<stop reason>"` (add `--stay` to remain on the feature branch). The gate refuses while no stop condition is reached and any of these remains: thin backlog needing expand/mine, any ready candidate (above **or below** `min_candidate_value`), a non-empty recommended batch, or mining not yet exhausted (never-mined ≠ exhausted). `--force` only when the user explicitly asked to stop. Auto-cancels any open round, writes `.autopilot/retrospective.md`, and in `feature` mode returns to the origin branch. If the run's branch is already fully merged (empty run or you merged it first) it is deleted; otherwise commits remain on the autopilot branch, unmerged — the finish output and the retrospective say so. After merging later, run `branch-gc` to reclaim leftovers.
+   **Unattended runs** (nobody will be asked): stranding all deliverables on an unmerged `autopilot/*` branch is not an acceptable end state. After a normal finish, merge the run branch into the origin branch yourself — a regular merge commit, never force — then run `branch-gc`, and state in the summary that the merge was made autonomously.
 3. Write `.autopilot/last-summary.md` in the user's language (completed/blocked rounds, commits, branch, remaining goals, backlog, next likely improvement). Data: `report --repo <repo> [--lang zh|en] [--output <file>]`.
 4. Report a short summary to the user.
 
@@ -303,4 +307,6 @@ Full table: `references/troubleshooting.md`. Common ones:
 | All goals met, loop continues | `expand_after_goals: true` → `config-set --no-expand-after-goals` to stop at goal |
 | `action_hint: mine` | Run `mine --apply` now — do not idle |
 | `action_hint: expand` | Mine is fresh; Deep Expansion now |
+| A real-work round records `estimated_tokens: 0` | Water marks are monotonic — an earlier round billed the lines while uncommitted, then the content was rewritten smaller; see `max_tokens` in `references/config.md` |
+| `commit` warns "Run-deferred files are still uncommitted" | The flush staged only part of what the run's rounds left behind — stage and commit the named files (same `--round`), or leave them knowingly |
 | `config-set` requires a field | Pass at least one field flag | e.g. `--expand-after-goals`, `--candidates-per-round N`, `--max-rounds N`/`--clear-max-rounds`, `--deadline EXPR`; see `references/config.md` |
