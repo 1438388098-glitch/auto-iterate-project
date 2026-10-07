@@ -36,6 +36,7 @@ skill 的入口是 [SKILL.md](SKILL.md) —— agent 读取它、运行 `detect-
 - **状态自有**：`.autopilot/`（config、state、backlog、directives、logs）——可恢复、可迁移、损坏时干净地失败，且每次状态写入都保留一代 `.bak`。
 - **诚实的记账**：未验证的目标会阻止"所有目标已达成"的停止；零工作量的取消不消耗预算；只要还有实际工作，`finish` 就会被拒绝，除非某个停止条件（或你本人）另有指示。
 - **安全护栏**：绝不重写 git 历史，未经配置绝不 push，拒绝把既有的用户改动吸收进 autopilot 提交；`allow_paths`/`deny_paths` 白名单；密钥模式（AWS / 私钥 / GitHub / Slack / Google / `sk-*` / JWT）。
+- **实测加固（1.12.x）**：调度字段跨边界轮不再回指、批量冲刷对账点名漏 stage 的轮内产物、branch-gc 可回收已完成 run 的分支、Git Bash 会话适配、每波扩展产出统计、运行报告附待办交接清单——每项修复都溯源到一次无人值守运行的实测失败。
 - **分支生命周期**：feature 模式的运行会回收失效的 `autopilot/*` 分支——`init` 清理已合并的遗留分支，`finish` 在运行分支已合并后将其删除，`branch-gc` 在后续合并之后清理。未合并的工作永不删除。
 - **确定性 helper**：以上一切通过 `scripts/autopilot_state.py`（Python 3.6+，仅标准库）运行，由一套精简的约 190 个测试覆盖，横跨 Linux 与 Windows 上的 3.8–3.13（`--smoke` 用于约 1 秒、视机器而定的轮循环检查）。
 - **观测面板（可选）**：一个仅限 127.0.0.1 访问的只读 web 面板，在运行开始时打开——进化树（domain → module → file）与逐轮卡片流并排展示，支持回放。树在 init 时由一次全项目扫描播种（state.project_map：完整骨架、每模块文件数），各轮再把活动叠加其上；token 统计是"变更等价"的代理指标，并非 LLM 用量。纯标准库实现；主循环从不依赖它（`dashboard --stop` 可将其关闭）。

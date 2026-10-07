@@ -2948,6 +2948,27 @@ class MiningAndFinishGateTests(RepoTest):
         self.assertEqual(mine_events[-1].get("apply"), True)
         self.assertGreaterEqual(mine_events[-1].get("findings", 0), 1)
 
+    def test_mining_exhausted_pure_contract(self):
+        """轮 6 test-gap：never-mined 不算枯竭；连续两次零新增才算；
+        只读探针（有 findings 未 apply）被排除在证据链外——不重置零新增链。"""
+        from autopilot import commands as _commands
+        exhausted = _commands.mining_exhausted
+        self.assertFalse(exhausted({}))
+        self.assertFalse(exhausted({"mining_runs": []}))
+        self.assertFalse(exhausted({"mining_runs": [{"apply": True, "new": 0}]}))
+        self.assertFalse(exhausted({"mining_runs": [
+            {"apply": True, "new": 3}, {"apply": True, "new": 0}]}))
+        self.assertTrue(exhausted({"mining_runs": [
+            {"apply": True, "new": 0}, {"apply": True, "new": 0}]}))
+        # 中间的只读探针被排除：首尾两次零新增依然构成连续证据链
+        self.assertTrue(exhausted({"mining_runs": [
+            {"apply": True, "new": 0},
+            {"apply": False, "findings": 5, "new": 5},
+            {"apply": True, "new": 0}]}))
+        self.assertTrue(exhausted({"mining_runs": [
+            {"apply": False, "findings": 0, "new": 0},
+            {"apply": True, "new": 0}]}))
+
     def test_mine_hotspot_ignores_run_commits(self):
         """Pre-run churn is the hotspot signal; the run's own commits are work
         in progress, not pre-existing hotspots (1.12 field test: the scanner
@@ -3243,6 +3264,146 @@ class DashboardContractTests(RepoTest):
     def _autopilot_listing(self):
         ap = self.repo / ".autopilot"
         return sorted(p.name for p in ap.iterdir())
+
+    def test_read_info_degrades_to_none(self):
+        """轮 6 test-gap：read_info 的退化路径（缺失/正常/非 dict/损坏），
+        任何一种都不得 raise——info_alive/stop_server 依赖这个契约。"""
+        from autopilot import dashboard
+        self.assertIsNone(dashboard.read_info(self.repo))
+        info_path = self.repo / ".autopilot" / "dashboard.json"
+        info_path.parent.mkdir(parents=True, exist_ok=True)
+        info_path.write_text('{"pid": 123, "port": 8123}', encoding="utf-8")
+        self.assertEqual(dashboard.read_info(self.repo), {"pid": 123, "port": 8123})
+        info_path.write_text("[]", encoding="utf-8")
+        self.assertIsNone(dashboard.read_info(self.repo))
+        info_path.write_text("{corrupt", encoding="utf-8")
+        self.assertIsNone(dashboard.read_info(self.repo))
+
+    def test_clear_stale_info_and_stop_server(self):
+        """轮 7 test-gap：clear_stale_info 只删死记录；stop_server 杀进程
+        且总是删 info 文件，无记录时返回 False。"""
+        from autopilot import dashboard
+        info_path = self.repo / ".autopilot" / "dashboard.json"
+        info_path.parent.mkdir(parents=True, exist_ok=True)
+        # 无记录：stop_server 返回 False
+        self.assertFalse(dashboard.stop_server(self.repo))
+        # 死服务记录：pid 大到不可活、port 1 必拒绝 → clear 删除文件
+        info_path.write_text('{"pid": 4000000000, "port": 1}', encoding="utf-8")
+        dashboard.clear_stale_info(self.repo)
+        self.assertFalse(info_path.exists())
+        # 活记录（本进程 + port 0 非法走 pid 兜底）：clear 保留
+        info_path.write_text('{"pid": %d, "port": 0}' % os.getpid(), encoding="utf-8")
+        dashboard.clear_stale_info(self.repo)
+        self.assertTrue(info_path.exists())
+        # stop_server：真实子进程被杀、info 总被删除
+        sleeper = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(60)"])
+        try:
+            info_path.write_text('{"pid": %d, "port": 0}' % sleeper.pid, encoding="utf-8")
+            self.assertTrue(dashboard.stop_server(self.repo))
+            self.assertFalse(info_path.exists())
+            sleeper.wait(timeout=10)
+            self.assertIsNotNone(sleeper.returncode)
+        finally:
+            if sleeper.poll() is None:
+                sleeper.kill()
+                sleeper.wait(timeout=5)
+
+    def test_invalidate_snapshot_cache_contract(self):
+        """轮 8 test-gap：显式失效接缝必须把缓存键打回 None。"""
+        from autopilot import dashboard
+        dashboard._snapshot_cache["key"] = "stale-key"
+        dashboard.invalidate_snapshot_cache()
+        self.assertIsNone(dashboard._snapshot_cache["key"])
+
+    def test_compute_round_file_changes_attributes_rounds(self):
+        """轮 8 test-gap：anchor walk 的文件归因——first_round 取最小、
+        touches 计出现、rounds 去重。"""
+        from autopilot import dashboard_data
+        self.run_state("init")
+        self.run_state("begin-round", "--title", "r1", "--reason", "x")
+        (self.repo / "a.py").write_text("x = 1\n", encoding="utf-8")
+        self.git("add", "a.py")
+        self.run_state("commit", "--summary", "add a")
+        sha1 = self.git("rev-parse", "HEAD").stdout.strip()
+        self.run_state("complete-round", "--summary", "r1", "--commit-sha", sha1)
+        self.run_state("begin-round", "--title", "r2", "--reason", "x")
+        (self.repo / "a.py").write_text("x = 2\n", encoding="utf-8")
+        (self.repo / "b.py").write_text("y = 1\n", encoding="utf-8")
+        self.git("add", "a.py", "b.py")
+        self.run_state("commit", "--summary", "touch a, add b")
+        sha2 = self.git("rev-parse", "HEAD").stdout.strip()
+        self.run_state("complete-round", "--summary", "r2", "--commit-sha", sha2)
+        state = self.read_json("state.json")
+        history = state["history"]
+        run_start_sha = state["run_start_sha"]
+        changes = dashboard_data.compute_round_file_changes(self.repo, history, run_start_sha)
+        self.assertIsNotNone(changes)
+        self.assertEqual(changes["a.py"]["first_round"], 1)
+        self.assertEqual(changes["a.py"]["touches"], 2)
+        self.assertEqual(len(changes["a.py"]["rounds"]), 2)
+        self.assertEqual(changes["b.py"]["first_round"], 2)
+        self.assertEqual(changes["b.py"]["touches"], 1)
+        self.assertGreaterEqual(changes["a.py"]["insertions"], 2)
+
+    def test_compute_round_stats_rows(self):
+        """轮 10 test-gap（candidate-289）：与 file changes 同一 anchor walk
+        的逐轮 churn 行——轮 1/2 各一行，insertions/files_changed 下界。"""
+        from autopilot import dashboard_data
+        self.run_state("init")
+        self.run_state("begin-round", "--title", "r1", "--reason", "x")
+        (self.repo / "a.py").write_text("x = 1\n", encoding="utf-8")
+        self.git("add", "a.py")
+        self.run_state("commit", "--summary", "add a")
+        sha1 = self.git("rev-parse", "HEAD").stdout.strip()
+        self.run_state("complete-round", "--summary", "r1", "--commit-sha", sha1)
+        self.run_state("begin-round", "--title", "r2", "--reason", "x")
+        (self.repo / "a.py").write_text("x = 2\n", encoding="utf-8")
+        (self.repo / "b.py").write_text("y = 1\n", encoding="utf-8")
+        self.git("add", "a.py", "b.py")
+        self.run_state("commit", "--summary", "touch a, add b")
+        sha2 = self.git("rev-parse", "HEAD").stdout.strip()
+        self.run_state("complete-round", "--summary", "r2", "--commit-sha", sha2)
+        state = self.read_json("state.json")
+        stats = dashboard_data.compute_round_stats(self.repo, state["history"], state["run_start_sha"])
+        by_round = {row["round"]: row for row in stats}
+        self.assertEqual(sorted(by_round), [1, 2])
+        self.assertGreaterEqual(by_round[1]["insertions"], 1)
+        self.assertEqual(by_round[1]["files_changed"], 1)
+        self.assertGreaterEqual(by_round[2]["insertions"], 2)
+        self.assertEqual(by_round[2]["files_changed"], 2)
+
+    def test_aggregate_modules_domains(self):
+        """轮 10 test-gap（candidate-290）：domain 聚合——内置启发式命中、
+        touches 降序与 weight 归一、domain_map 优先、空输入返回 []。"""
+        from autopilot import dashboard_data as dd
+        self.assertEqual(dd.aggregate_modules({}, None), [])
+        changes = {
+            "scripts/tool.py": {"first_round": 1, "touches": 4, "insertions": 10, "deletions": 2, "rounds": [1, 2, 3, 4]},
+            "tests/test_tool.py": {"first_round": 2, "touches": 2, "insertions": 6, "deletions": 0, "rounds": [2, 3]},
+            "README.md": {"first_round": 1, "touches": 1, "insertions": 5, "deletions": 1, "rounds": [1]},
+        }
+        domains = dd.aggregate_modules(changes, None)
+        self.assertEqual([d["name"] for d in domains], ["工具与脚本", "测试", "文档与知识"])
+        self.assertEqual(domains[0]["weight"], 1.0)
+        self.assertEqual(domains[0]["modules"][0]["path"], "scripts/tool.py")
+        mapped = dd.aggregate_modules(changes, {"scripts/": {"name": "引擎"}})
+        self.assertEqual([d["name"] for d in mapped][0], "引擎")
+
+    def test_correlate_events_cards(self):
+        """轮 10 test-gap（candidate-291）：history → 演化卡——输入序保留、
+        domains 排序、缺 review_score 记 None、commit_sha 透传。"""
+        from autopilot import dashboard_data as dd
+        history = [
+            {"round": 2, "status": "completed", "title": "b", "summary": "s2",
+             "review_score": 4, "commit_sha": "sha2"},
+            {"round": 1, "status": "completed", "title": "a", "summary": "s1",
+             "review_score": None, "commit_sha": "sha1"},
+        ]
+        events = dd.correlate_events(history, {1: ["测试", "工具与脚本"]})
+        self.assertEqual([e["round"] for e in events], [2, 1])
+        self.assertEqual(events[1]["domains"], ["工具与脚本", "测试"])
+        self.assertIsNone(events[1]["score"])
+        self.assertEqual(events[0]["commit_sha"], "sha2")
 
     def test_build_snapshot_is_read_only(self):
         self._seed_run()
