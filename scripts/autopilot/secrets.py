@@ -37,7 +37,7 @@ _COMPILED_DEFAULTS = [re.compile(pattern) for pattern in SECRET_PATTERNS]
 _PROBE_SNIPPET = (
     "import re,sys\n"
     "p = re.compile(sys.argv[1])\n"
-    "assert not p.search('a' * 64)\n"
+    "p.search('a' * 64)\n"
     "print('ok')\n"
 )
 _PATTERN_PROBE_TIMEOUT = 2.0
@@ -78,8 +78,8 @@ def compile_patterns(extra_patterns=None):
             raise SystemExit(2)
         if not _pattern_compiles_in_time(pattern):
             print(
-                "[ERROR] secret_patterns entry ({}) is too dangerous to run: a fixed adversarial "
-                "probe did not finish within {:.1f}s (catastrophic backtracking). Remove or fix the "
+                "[ERROR] secret_patterns entry ({}) is too dangerous to run: it did not finish matching a "
+                "64-char adversarial probe within {:.1f}s (possible catastrophic backtracking). Remove or fix the "
                 "pattern in .autopilot/config.json or on the init command line.".format(
                     pattern, _PATTERN_PROBE_TIMEOUT),
                 file=sys.stderr,

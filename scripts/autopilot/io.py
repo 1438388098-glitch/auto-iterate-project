@@ -460,7 +460,13 @@ def _acquire_lock(repo):
                 file=sys.stderr,
             )
         else:
-            age = datetime.now(timezone.utc).timestamp() - path.stat().st_mtime
+            # 锁可能在 read（→None）与 stat 之间被并发收割/释放——缺失即视为
+            # 可重试（轮 36 candidate-359：竞态下此处会裸 FileNotFoundError）。
+            try:
+                age = datetime.now(timezone.utc).timestamp() - path.stat().st_mtime
+            except OSError:
+                _sleep(0.3)
+                continue
             if age < 2.0:
                 _sleep(0.3)
                 continue
@@ -473,7 +479,9 @@ def _acquire_lock(repo):
         try:
             path.unlink()
         except OSError:
-            pass
+            # Windows 上文件被 AV/索引器短暂占住时 unlink 会失败——退避后
+            # 重试，让末尾的「after retrying」措辞名副其实（轮 36 candidate-360）。
+            _sleep(0.3)
     print(
         "[ERROR] Could not acquire the autopilot lock at {} after retrying.".format(path),
         file=sys.stderr,

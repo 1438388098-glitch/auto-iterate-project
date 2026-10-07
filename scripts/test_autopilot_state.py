@@ -739,7 +739,7 @@ class BeginRoundStopTests(RepoTest):
         self._complete_one_round()
         result = self.run_state("begin-round", "--title", "r2", "--reason", "y")
         self.assertNotEqual(result.returncode, 0)
-        self.assertIn("stopped", result.stderr.lower())
+        self.assertIn("max_rounds reached", result.stderr.lower())
 
     def test_refuses_after_goals_met(self):
         self.run_state("init", "--goal", "Ship")
@@ -747,7 +747,7 @@ class BeginRoundStopTests(RepoTest):
         self.run_state("goal-met", "--goal", "Ship", "--round", "1")
         result = self.run_state("begin-round", "--title", "r2", "--reason", "y")
         self.assertNotEqual(result.returncode, 0)
-        self.assertIn("stopped", result.stderr.lower())
+        self.assertIn("all goals met", result.stderr.lower())
 
     def test_refuses_after_max_blocked_in_a_row(self):
         self.run_state("init")
@@ -756,7 +756,7 @@ class BeginRoundStopTests(RepoTest):
             self.run_state("block-round", "--reason", "nope")
         result = self.run_state("begin-round", "--title", "b3", "--reason", "x")
         self.assertNotEqual(result.returncode, 0)
-        self.assertIn("stopped", result.stderr.lower())
+        self.assertIn("max_blocked_in_a_row reached", result.stderr.lower())
 
     def test_refuses_when_already_finished(self):
         self.run_state("init")

@@ -401,7 +401,7 @@ def cmd_begin_round(args):
                     args, False,
                     _check_text(
                         cfg,
-                        "[ERROR] Autopilot is stopped: all goals met (expand_after_goals=false)。"
+                        "[ERROR] Autopilot 已停止：目标已全部达成（all goals met，expand_after_goals=false）。"
                         "backlog 尚有 {} 条 value>=min_candidate_value 的 ready 候选；"
                         "要继续探索请运行 config-set --expand-after-goals 或修改 .autopilot/config.json。".format(n),
                         "[ERROR] Autopilot is stopped: all goals met (expand_after_goals=false). "
@@ -1844,6 +1844,7 @@ def cmd_backlog_pick(args):
         return refused
     with io.run_lock(repo):
         backlog = state.load_backlog(repo)
+        cfg = config.load_config(repo)
         candidate = state.find_candidate(backlog, args.id)
         if candidate is None:
             io.append_log(repo, "backlog-pick", "error", reason="candidate not found")
@@ -1859,9 +1860,16 @@ def cmd_backlog_pick(args):
                           candidate_status=candidate.get("status"))
             return emit_result(
                 args, False,
-                "[ERROR] Candidate {} is already '{}' — picking it again would silently rewrite "
-                "the completed/blocked ledger and drift state.type_stats.".format(
-                    args.id, candidate.get("status")),
+                _check_text(
+                    cfg,
+                    "[ERROR] Candidate {} is already '{}'（已 {}）——重复 pick 会静默改写完成/受阻账本"
+                    "并使 state.type_stats 漂移。如需重新开工，请用 backlog-update --status pending。".format(
+                        args.id, candidate.get("status"),
+                        "已完成" if candidate.get("status") == "completed" else "受阻"),
+                    "[ERROR] Candidate {} is already '{}' — picking it again would silently rewrite "
+                    "the completed/blocked ledger and drift state.type_stats. To reopen work, use "
+                    "backlog-update --status pending.".format(args.id, candidate.get("status")),
+                ),
             )
         candidate["status"] = "picked"
         candidate["updated_at"] = io.now_iso()
@@ -3044,13 +3052,15 @@ def cmd_mine(args):
         return emit_result(args, True, message, data=payload)
 
 
-def _audit_loop_decision(repo, payload):
+def _audit_loop_decision(repo, payload, source):
     """循环决策审计（轮 12 observability 候选）：check/round-prep 每轮算出的
     action_hint/stop_reason 此前只进 stdout 即蒸发——回放能看到每轮做了什么，
-    却看不到为什么选 work/expand/mine/stop。每次调用一行，log 轮转兜住量。"""
+    却看不到为什么选 work/expand/mine/stop。每次调用一行，log 轮转兜住量。
+    source 区分真实 check 与 round-prep 的决策（轮 36 candidate-365）。"""
     backlog = payload.get("backlog") or {}
     io.append_log(
         repo, "check", "success",
+        via=source,
         action_hint=payload.get("action_hint"),
         stop_reason=payload.get("stop_reason"),
         pending=backlog.get("pending"),
@@ -3064,7 +3074,7 @@ def cmd_check(args):
     repo = Path(args.repo).resolve()
     payload = build_check_payload(repo, full=not getattr(args, "brief", False))
     payload.pop("_ctx", None)
-    _audit_loop_decision(repo, payload)
+    _audit_loop_decision(repo, payload, "check")
     print(json.dumps(payload, indent=2, ensure_ascii=False))
     return 0
 
@@ -3136,7 +3146,7 @@ def cmd_round_prep(args):
         else None
     )
     payload.pop("_ctx", None)
-    _audit_loop_decision(repo, payload)
+    _audit_loop_decision(repo, payload, "round-prep")
     print(json.dumps(payload, indent=2, ensure_ascii=False))
     return 0
 
