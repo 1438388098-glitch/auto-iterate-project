@@ -2,6 +2,37 @@
 
 All notable changes to auto-iterate-project are documented here.
 
+## 1.12.4 (2026-10-07)
+
+Cold-resume pass: the fourth validation batch interrupted a run on purpose
+and had a fresh agent resume it from `state.json` with nothing but the
+skill text. The resume itself worked end to end (no re-init, continued at
+round 2, natural max_rounds stop, unattended merge + reclaim); this batch
+fixes the three snags that resume surfaced.
+
+### Fixed
+
+- `ensure-branch` dead-ended the documented resume step: with HEAD already
+  on the run branch and a deferred-dirty tree, the tracked-changes guard
+  (meant for branch SWITCHES) refused — contradicting Setup's "calling
+  again is safe". Already-on-branch is now an idempotent no-op success; a
+  real switch with tracked changes still refuses.
+- `check --brief`'s mid-run dirty warning still advised "Commit or stash
+  before starting the run" — contradicting begin-round's batch-deferred
+  wording from 1.12.3 in the same round (both sampled live in the field
+  test). Synced to the deferred semantics; "dirty" stays a stable token.
+- The retrospective's unmerged-branch line lacked the finish-time snapshot
+  qualifier that 1.12.3 gave the finish notice — and the retrospective is
+  generated exactly in the "after finish, before merge" window where the
+  stale reading bites (disk evidence: field-test retrospective line 9).
+  Both languages now carry "as of finish; later merges: check git log".
+
+### Tests
+
+- ensure-branch succeeds as a no-op on the run branch with deferred work;
+  check warning uses the batch-deferred wording; retrospective carries the
+  snapshot marker.
+
 ## 1.12.3 (2026-10-07)
 
 Guidance-wording pass from the third validation batch (first goal-driven
