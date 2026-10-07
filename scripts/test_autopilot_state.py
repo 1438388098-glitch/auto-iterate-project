@@ -595,6 +595,8 @@ class BranchGcTests(RepoTest):
         # The unmerged notice is a finish-time snapshot (1.12 field test:
         # unattended runs merge right after, and the notice read as stale).
         self.assertIn("finish", result.stdout)
+        retrospective = (self.repo / ".autopilot" / "retrospective.md").read_text(encoding="utf-8")
+        self.assertIn("时点快照", retrospective)
         self.assertTrue((self.repo / ".autopilot" / "state.json").exists())
         self.git("merge", "-q", "--no-edit", run_branch)
         data = json.loads(
@@ -2483,6 +2485,25 @@ class BatchCommitTests(RepoTest):
         self.assertIn("expected in", result.stderr.lower())
         self.assertIn("flush", result.stderr)
         self.assertNotIn("Consider committing or reverting", result.stderr)
+
+    def test_resume_on_run_branch_with_deferred_work(self):
+        """Cold-resume contract (Batch 4 field test): ensure-branch must be a
+        no-op success when HEAD already sits on the run branch, even with a
+        deferred-dirty tree — the tracked-changes refusal is for SWITCHES."""
+        self.add_file("base.py", "b = 0\n")
+        self.git("commit", "-q", "-m", "base")
+        self.run_state("init", "--branch-mode", "feature", "--commit-every-rounds", "3")
+        self.run_state("begin-round", "--title", "r1", "--reason", "x")
+        (self.repo / "base.py").write_text("b = 1\n", encoding="utf-8")
+        self.run_state("complete-round", "--summary", "deferred")
+        result = self.run_state("ensure-branch")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("Already on the run branch", result.stdout + result.stderr)
+        # check's dirty warning uses the batch-deferred wording too (1.12.3
+        # fixed begin-round; 1.12.4 syncs check).
+        data = json.loads(self.run_state("check", "--brief").stdout)
+        self.assertTrue(any("expected in batch mode" in w for w in data["warnings"]))
+        self.assertFalse(any("Commit or stash before starting the run" in w for w in data["warnings"]))
 
 
 class DirectiveTests(RepoTest):

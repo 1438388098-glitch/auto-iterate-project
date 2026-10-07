@@ -489,9 +489,10 @@ def cmd_begin_round(args):
                 )
             if (cfg.get("commit_every_rounds") or 1) > 1:
                 # Batch mode defers commits on purpose: "commit them first"
-                # would be the WRONG advice here (1.12 field test round 2/3).
+                # would be the WRONG advice here (Batch 3 field test; wording
+                # finalized 1.12.3/1.12.4 together with check's twin).
                 print(
-                    "[WARN] Working tree carries deferred work from earlier rounds — expected in "
+                    "[WARN] Working tree is dirty with deferred work from earlier rounds — expected in "
                     "batch mode (commit_every_rounds={}). Keep accumulating; the next flush round "
                     "commits the batch.".format(cfg.get("commit_every_rounds")),
                     file=sys.stderr,
@@ -2995,11 +2996,23 @@ def build_check_payload(repo, full=False):
     # emitted for the no-open-round case only.
     if st.get("current_round") is None and io.working_tree_dirty(repo):
         if not cfg.get("allow_uncommitted_changes"):
-            warnings.append(
-                "Working tree is dirty and allow_uncommitted_changes is false; only the first "
-                "begin-round refuses a dirty tree, later rounds only warn. Commit or stash before "
-                "starting the run, or set allow_uncommitted_changes: true."
-            )
+            if (cfg.get("commit_every_rounds") or 1) > 1:
+                # Batch mode defers commits on purpose — same wording
+                # contract as begin-round's warning (fixed 1.12.3 there,
+                # synced here in 1.12.4): do NOT advise "commit or stash".
+                # "dirty" stays a stable token for consumers grepping it.
+                warnings.append(
+                    "Working tree is dirty with deferred work from earlier rounds — expected in batch "
+                    "mode (commit_every_rounds={}); the next flush round commits the batch.".format(
+                        cfg.get("commit_every_rounds")
+                    )
+                )
+            else:
+                warnings.append(
+                    "Working tree is dirty and allow_uncommitted_changes is false; only the first "
+                    "begin-round refuses a dirty tree, later rounds only warn. Commit or stash before "
+                    "starting the run, or set allow_uncommitted_changes: true."
+                )
         else:
             warnings.append(
                 "Working tree is dirty and allow_uncommitted_changes is true; pre-existing user "

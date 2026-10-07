@@ -617,6 +617,17 @@ def ensure_branch(repo, state, cfg, to_stderr=False):
         raise SystemExit(2)
 
     if not cfg.get("allow_uncommitted_changes") and io.tracked_changes(repo):
+        # Resume path exception first: when HEAD already sits on the run
+        # branch there is nothing to switch, and refusing would dead-end the
+        # documented "calling again is safe" resume step on a deferred-dirty
+        # tree (1.12 field test, Batch 4). A real switch with tracked changes
+        # still refuses below.
+        try:
+            if branch and io.current_branch(repo) == branch:
+                say("[OK] Already on the run branch: {}".format(branch))
+                return branch
+        except SystemExit:
+            pass
         print(
             "[ERROR] Working tree has tracked changes and allow_uncommitted_changes is false; "
             "refusing to switch branches so user changes are not carried over.",
@@ -1534,9 +1545,9 @@ def build_retrospective(repo, state, cfg, lang="zh"):
         else:
             origin_label = "原" if zh else "the original"
         if zh:
-            feature_note = "- 提交保留在分支 `{}`，未合并到 {} 分支".format(state["branch"], origin_label)
+            feature_note = "- 提交保留在分支 `{}`，未合并到 {} 分支（finish 时点快照；其后的合并以 git log 为准）".format(state["branch"], origin_label)
         else:
-            feature_note = "- Commits remain on branch `{}`; not merged into {}.".format(
+            feature_note = "- Commits remain on branch `{}`; not merged into {} as of finish (later merges: check git log).".format(
                 state["branch"], origin_label
             )
     if zh:
