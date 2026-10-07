@@ -2050,7 +2050,7 @@ class PredictedHardeningTests(RepoTest):
         for command, args in (
             ("goal-met", ("--goal", "G", "--next-step", "N")),
             ("seed-reject", ("--id", "seed-001", "--reason", "x")),
-            ("finish", ()), ("undo-round", ("--sha", sha)),
+            ("undo-round", ("--sha", sha)),
             ("analysis-save", ("--content", "{}")),
             ("directive-remove", ("--index", "1")),
             ("backlog-update", ("--id", "candidate-001", "--value", "5")),
@@ -2060,6 +2060,11 @@ class PredictedHardeningTests(RepoTest):
             self.assertEqual(result.returncode, 0, (command, result.stderr))
             self.assertIn("[DRY-RUN]", result.stderr, command)
             self.assertEqual(snapshot(), before, command)
+        # finish --dry-run 会诚实回答 gate 结局（轮 15 candidate-296）：
+        # 有工作没停机条件时报 REFUSE（exit 2），无论 0 还是 2，零变更不变。
+        finish_dry = self.run_state("finish", "--dry-run")
+        self.assertIn(finish_dry.returncode, (0, 2), finish_dry.stderr)
+        self.assertEqual(snapshot(), before, "finish")
         self.assertFalse((self.repo / ".git" / "REVERT_HEAD").exists())
 
     def test_uninitialized_guard_matrix(self):
@@ -2069,11 +2074,17 @@ class PredictedHardeningTests(RepoTest):
             self.assertNotIn("Traceback", result.stderr, command)
             self.assertIn("not initialized", result.stderr, command)
         for command, args in (("read", ()), ("goal-met", ("--goal", "G")),
-                              ("seed-reject", ("--id", "seed-001", "--reason", "r")), ("report", ())):
+                              ("seed-reject", ("--id", "seed-001", "--reason", "r"))):
             result = self.run_state(command, *args)
             self.assertNotEqual(result.returncode, 0, command)
             self.assertNotIn("Traceback", result.stderr, command)
             self.assertIn("state.json not found", result.stderr, command)
+        # report 走同族守卫（轮 14 candidate-294）：未初始化时报
+        # "Autopilot not initialized" 且 JSON 模式仍是单对象
+        result = self.run_state("report")
+        self.assertNotEqual(result.returncode, 0)
+        self.assertNotIn("Traceback", result.stderr)
+        self.assertIn("not initialized", result.stderr)
 
     def test_complete_round_push_fail_and_backlog_guard(self):
         self.run_state("init", "--push")
@@ -2354,6 +2365,104 @@ class OptimizationTests(RepoTest):
 
 class FeatureTests(RepoTest):
     """End-to-end feature contracts (consolidated from 17 methods)."""
+
+    def test_backlog_pick_guard_and_stats_sync(self):
+        """轮 14（candidate-295）：backlog-pick 不得改写 completed/blocked
+        账本；pick 后 type_stats 与 backlog 保持同步。"""
+        self.run_state("init")
+        self.run_state("backlog-add", "--title", "T", "--reason", "r", "--value", "4", "--effort", "2")
+        self.run_state("begin-round", "--title", "r", "--reason", "x", "--candidate-id", "candidate-001")
+        self.add_file("a.py", "a = 1\n")
+        self.run_state("commit", "--summary", "w")
+        sha = self.git("rev-parse", "HEAD").stdout.strip()
+        self.run_state("complete-round", "--summary", "done", "--commit-sha", sha)
+        result = self.run_state("backlog-pick", "--id", "candidate-001")
+        self.assertNotEqual(result.returncode, 0)
+        # 非 JSON 模式的拒绝消息走 stderr（emit_result 契约）
+        self.assertIn("already 'completed'", result.stdout + result.stderr)
+        self.assertEqual(self.read_json("backlog.json")["candidates"][0]["status"], "completed")
+        self.run_state("backlog-add", "--title", "U", "--reason", "r", "--value", "4", "--effort", "2")
+        self.assertEqual(self.run_state("backlog-pick", "--id", "candidate-002").returncode, 0)
+        self.assertEqual(self.read_json("backlog.json")["candidates"][1]["status"], "picked")
+        stats = self.read_json("state.json").get("type_stats") or {}
+        self.assertEqual((stats.get("feature") or {}).get("completed"), 1)
+
+    def test_dashboard_ensure_warns_instead_of_silent_none(self):
+        """轮 15（candidate-304）：ensure_dashboard 失败必须留 warn 事件，
+        不再静默返回 None（「面板为什么没起来」要有答案）。"""
+        from autopilot import dashboard
+        from unittest import mock
+        self.run_state("init")
+        self.run_state("config-set", "--dashboard")
+        with mock.patch.object(dashboard, "read_info", side_effect=RuntimeError("boom")):
+            result = dashboard.ensure_dashboard(self.repo, {"dashboard": {"enabled": True}})
+        self.assertIsNone(result)
+        events = [
+            json.loads(line)
+            for line in (self.repo / ".autopilot" / "log.jsonl").read_text(encoding="utf-8").splitlines()
+            if line.strip()
+        ]
+        warns = [e for e in events if e.get("event") == "dashboard" and e.get("status") == "warn"]
+        self.assertTrue(warns)
+        self.assertIn("ensure failed", warns[-1].get("reason", ""))
+
+    def test_finish_dry_run_reports_gate_refusal(self):
+        """轮 15（candidate-296）：finish --dry-run 的预检必须回答真实
+        调用的结局——gate 会拒的 dry-run 报 REFUSE（exit 2），不谎报成功。"""
+        self.run_state("init")
+        self.run_state("backlog-add", "--title", "T", "--reason", "r", "--value", "4", "--effort", "2")
+        self.run_state("mine", "--apply", "--dry-run")
+        result = self.run_state("finish", "--dry-run", "--reason", "not yet")
+        self.assertEqual(result.returncode, 2)
+        self.assertIn("Would REFUSE to finish", result.stderr)
+
+    def test_init_dry_run_validates_secret_pattern(self):
+        """轮 15（candidate-296）：init --dry-run 也要过 validate_config——
+        坏 --secret-pattern 正则的预检必须失败而不是谎报成功。"""
+        result = self.run_state("init", "--dry-run", "--force",
+                                "--secret-pattern", "[")
+        self.assertNotEqual(result.returncode, 0)
+
+    def test_token_estimate_fails_closed_on_bad_base(self):
+        """轮 13（candidate-297）：numstat 读不出来时计费 fail-closed——
+        静默按 0 行会让 max_tokens 软预算失效且无警告。"""
+        self.run_state("init")
+        self.run_state("begin-round", "--title", "r", "--reason", "x")
+        self.add_file("a.py", "a = 1\n")
+        state_path = self.repo / ".autopilot" / "state.json"
+        state = json.loads(state_path.read_text(encoding="utf-8"))
+        state["run_start_sha"] = "0" * 40  # 不存在的提交：diff 必失败
+        state_path.write_text(json.dumps(state), encoding="utf-8")
+        result = self.run_state("complete-round", "--summary", "done")
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("refusing to treat the diff as empty", result.stderr)
+
+    def test_report_json_uninitialized_contract(self):
+        """轮 13（candidate-294）：report --json 未初始化时返回 ok:false 的
+        JSON 对象而非纯文本 stderr（与 retrospective 同族守卫）。"""
+        result = self.run_state("report", "--json")
+        self.assertNotEqual(result.returncode, 0)
+        payload = json.loads(result.stdout)
+        self.assertFalse(payload["ok"])
+        self.assertIn("not initialized", payload["message"])
+
+    def test_io_current_branch_and_has_commits(self):
+        """轮 11 test-gap（candidate-292/293）：io 层两个基础探测——
+        已提交/committed 分支名、detached 报 HEAD、unborn 仓库 has_commits False。
+        （RepoTest 基类自带 initial commit，unborn 场景用手工新仓库。）"""
+        from autopilot import io as _io
+        self.assertTrue(_io.has_commits(self.repo))
+        self.assertEqual(_io.current_branch(self.repo), self.initial_branch)
+        head_sha = self.git("rev-parse", "HEAD").stdout.strip()
+        self.git("checkout", "-q", "--detach", head_sha)
+        self.assertEqual(_io.current_branch(self.repo), "HEAD")
+        self.git("checkout", "-q", self.initial_branch)
+        fresh = Path(self.tmp) / "unborn"
+        fresh.mkdir()
+        subprocess.run(["git", "init", "-q"], cwd=str(fresh),
+                       stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+        self.assertFalse(_io.has_commits(str(fresh)))
+        self.assertTrue(len(_io.current_branch(str(fresh))) > 0)
 
     def test_report_and_undo_round(self):
         self.run_state("init")

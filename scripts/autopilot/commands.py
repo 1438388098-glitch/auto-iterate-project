@@ -239,6 +239,9 @@ def cmd_init(args):
         )
 
     if getattr(args, "dry_run", False):
+        # Dry-run honesty（轮 15 候选 296）：真实 init 会过的 validate_config
+        # （如坏 --secret-pattern 正则）dry-run 也要同样过，预检才算预检。
+        config.validate_config(cfg, source="values from init flags")
         print(
             "[DRY-RUN] Would initialize autopilot state in {} with run_id {}, {} rounds, goals={}.".format(
                 repo, uuid.uuid4().hex[:io.RUN_ID_LENGTH], cfg.get("max_rounds"), cfg.get("goals")
@@ -281,8 +284,12 @@ def cmd_init(args):
             from . import dashboard_data
             st["project_map"] = dashboard_data.scan_project_framework(
                 repo, (cfg.get("dashboard") or {}).get("domain_map"))
-        except Exception:
+        except Exception as exc:
+            # 扫描失败不阻塞 init，但不再静默（轮 13 吞异常治理漏网）：
+            # 空树只能看到轮次叠加层，得留一句为什么。
             st["project_map"] = None
+            io.append_log(repo, "project-map", "warn",
+                          reason="init scan failed: {}".format(str(exc)[:200]))
         state.save_state(repo, st)
         io.ensure_git_exclude(git_dir, cfg.get("track_state", False), to_stderr=getattr(args, "json", False))
         state.ensure_branch(repo, st, cfg, to_stderr=getattr(args, "json", False))
@@ -295,8 +302,11 @@ def cmd_init(args):
             try:
                 pruned = state.prune_merged_autopilot_branches(
                     repo, keep=[st.get("branch")] if st.get("branch") else None)
-            except Exception:
+            except Exception as exc:
+                # 该删的分支没删时不能再静默（轮 13 吞异常治理漏网）。
                 pruned = {"deleted": [], "kept": []}
+                io.append_log(repo, "init", "warn",
+                              reason="leftover branch prune failed: {}".format(str(exc)[:200]))
         io.append_log(
             repo, "init", "success", run_id=run_id,
             branch_mode=cfg.get("branch_mode"),
@@ -460,7 +470,10 @@ def cmd_begin_round(args):
                     file=sys.stderr,
                 )
 
-        dirty = io.working_tree_dirty(repo)
+        # 一次 porcelain 解析同时供 dirty 布尔与 start_dirty_files 使用
+        # （轮 12 perf 候选：两者背靠背各 spawn 一次 status，输出必然相同）。
+        uncommitted = io.uncommitted_paths(repo)
+        dirty = bool(uncommitted)
         # Snapshot of what was already uncommitted when the round started (same
         # .autopilot/ filter as working_tree_dirty), EXCLUDING the leftovers the
         # run's own prior rounds deliberately left uncommitted (batch mode
@@ -471,8 +484,7 @@ def cmd_begin_round(args):
             if isinstance(entry, dict):
                 prior_deferred.update(entry.get("deferred_dirty_files") or [])
         start_dirty_files = (
-            [p for p in io.uncommitted_paths(repo) if p not in prior_deferred]
-            if dirty else []
+            [p for p in uncommitted if p not in prior_deferred] if dirty else []
         )
         allow_dirty = cfg.get("allow_uncommitted_changes", False)
         first_round = (
@@ -541,7 +553,11 @@ def cmd_begin_round(args):
         st["current_round"] = current
         st["last_activity_at"] = current["started_at"]
         state.save_state(repo, st)
-        io.append_log(repo, "begin-round", "success", round=round_number, candidate_id=candidate_ids)
+        io.append_log(
+            repo, "begin-round", "success",
+            round=round_number, candidate_id=candidate_ids,
+            title=args.title, start_sha=start_sha,
+        )
     # Observation dashboard (1.8.0): fire-and-forget spawn AFTER the run lock
     # is released — first enable busy-waits up to 5s inside ensure (spawn
     # handshake) and must never extend the lock hold. Hard rule: the loop must
@@ -638,13 +654,15 @@ def _resolve_round_seeds_in_state(repo, st, current, outcome, notes=None):
 
 def _close_round(repo, st, current, status, counter_key, tokens, history_entry,
                  candidate_status, candidate_round=None, candidate_extra=None,
-                 seed_outcome=None, seed_notes=None, billed=None):
+                 seed_outcome=None, seed_notes=None, billed=None, uncommitted=None):
     """Shared round-closing bookkeeping: bump the round counter, append tokens,
     record bounded history, release the round, update candidates in one backlog
     pass, resolve this round's seeds into the SAME state save, refresh type
     stats, and persist state. `billed` is the run's advanced (text, binary)
     water-mark tuple from _resolve_tokens; run_start_sha is already on state
-    and is persisted along with it."""
+    and is persisted along with it. `uncommitted` lets a caller that already
+    holds a fresh porcelain listing share it (complete-round's touched_files
+    and the deferred capture below read the same snapshot)."""
     if counter_key:
         st[counter_key] = st.get(counter_key, 0) + 1
     if tokens:
@@ -659,11 +677,20 @@ def _close_round(repo, st, current, status, counter_key, tokens, history_entry,
     # Zero-work aborts leave exactly the inherited set, so they carve nothing.
     try:
         inherited = set(current.get("start_dirty_files") or [])
+        if uncommitted is None:
+            uncommitted = io.uncommitted_paths(repo)
         history_entry["deferred_dirty_files"] = [
-            p for p in io.uncommitted_paths(repo) if p not in inherited
+            p for p in uncommitted if p not in inherited
         ]
-    except SystemExit:
+    except SystemExit as exc:
+        # git 抖动一次不该永久丢失该轮遗留清单（轮 13 吞异常治理漏网）：
+        # 清空是原降级语义，但现在留审计——否则后续 flush 对账告警永不再
+        # 触发且查不到原因。
         history_entry["deferred_dirty_files"] = []
+        io.append_log(
+            repo, "deferred-files", "warn",
+            round=current.get("round"), reason=str(exc)[:200],
+        )
     history_entry.setdefault("status", status)
     # Full candidate batch beside the legacy scalar (1.12 field test: a
     # multi-candidate round's history entry kept only the FIRST id, so the
@@ -752,6 +779,9 @@ def cmd_complete_round(args):
                 # the low score still feeds the calibration ledger.
                 below_threshold = True
 
+        # 一次 porcelain 解析供 touched_files 与 deferred_dirty_files 共用
+        # （轮 12 perf 候选：两处背靠背各 spawn 一次 status）。
+        uncommitted_now = io.uncommitted_paths(repo)
         _close_round(
             repo, st, current,
             status="completed",
@@ -772,7 +802,7 @@ def cmd_complete_round(args):
                 # touched-file list (worktree minus pre-round dirty files)
                 # still gives the dashboard per-round domain attribution.
                 "touched_files": [
-                    p for p in io.uncommitted_paths(repo)
+                    p for p in uncommitted_now
                     if p not in set(current.get("start_dirty_files") or [])
                 ],
                 "review_score": getattr(args, "review_score", None),
@@ -784,6 +814,7 @@ def cmd_complete_round(args):
             candidate_extra=(
                 {"review_score": args.review_score} if getattr(args, "review_score", None) is not None else None
             ),
+            uncommitted=uncommitted_now,
             seed_outcome="completed",
             billed=billed,
         )
@@ -1201,15 +1232,6 @@ def cmd_finish(args):
         st = state.load_state(repo)
         cfg = config.load_config(repo)
 
-        if getattr(args, "dry_run", False):
-            print(
-                "[DRY-RUN] Would finish the run (reason={}, stay={}, open_round={}).".format(
-                    args.reason, bool(getattr(args, "stay", False)), st.get("current_round") is not None
-                ),
-                file=sys.stderr,
-            )
-            return 0
-
         # P0 anti-early-stop gate: an honest finish needs a reached stop
         # condition or an explicit --force. Budgets remaining plus actionable
         # (or expansion-needing) backlog is exactly the premature stop this
@@ -1247,6 +1269,25 @@ def cmd_finish(args):
                 or not mining_ok
             )
         )
+        if getattr(args, "dry_run", False):
+            # Dry-run honesty（轮 15 候选 296）：预检必须回答真实调用会发生
+            # 什么——gate 会拒的 dry-run 也报拒，而不是谎报「会成功」。
+            if gate_blocks and not getattr(args, "force", False):
+                print(
+                    "[DRY-RUN] Would REFUSE to finish: no stop condition reached; work remains "
+                    "(ready_any={}, ready_floor={}, selected={}, mining_exhausted={}).".format(
+                        ready_any, ready_floor, selected_count, mining_ok
+                    ),
+                    file=sys.stderr,
+                )
+                return 2
+            print(
+                "[DRY-RUN] Would finish the run (reason={}, stay={}, open_round={}).".format(
+                    args.reason, bool(getattr(args, "stay", False)), st.get("current_round") is not None
+                ),
+                file=sys.stderr,
+            )
+            return 0
         if gate_blocks:
             if not getattr(args, "force", False):
                 io.append_log(
@@ -1781,9 +1822,26 @@ def cmd_backlog_pick(args):
         if getattr(args, "dry_run", False):
             print("[DRY-RUN] Would mark candidate {} as picked.".format(args.id), file=sys.stderr)
             return 0
+        if candidate.get("status") in ("completed", "blocked"):
+            # 账本防护（轮 13 api-design 候选）：把已完成/受阻候选静默翻回
+            # picked 会改写完成账本并让 state.type_stats 漂移。
+            io.append_log(repo, "backlog-pick", "error",
+                          reason="candidate already resolved", candidate_id=args.id,
+                          candidate_status=candidate.get("status"))
+            return emit_result(
+                args, False,
+                "[ERROR] Candidate {} is already '{}' — picking it again would silently rewrite "
+                "the completed/blocked ledger and drift state.type_stats.".format(
+                    args.id, candidate.get("status")),
+            )
         candidate["status"] = "picked"
         candidate["updated_at"] = io.now_iso()
         state.save_backlog(repo, backlog)
+        # 与 backlog-update/remove 同一契约：backlog 变更后 type_stats 快照
+        # 必须重算，否则与 rank_candidates 的新鲜计算互相矛盾。
+        st = state.load_state(repo)
+        _refresh_type_stats(repo, st)
+        state.save_state(repo, st)
         io.append_log(repo, "backlog-pick", "success", candidate_id=args.id)
         return emit_result(args, True, "[OK] Picked candidate: {}".format(args.id))
 
@@ -2121,17 +2179,36 @@ def cmd_commit(args):
             print(result.stderr.strip(), file=sys.stderr)
             io.append_log(repo, "commit", "error", reason="git commit failed")
             return emit_result(args, False, "[ERROR] git commit failed. Check pre-commit hooks or staged files.")
-        sha = io.run_git(repo, "rev-parse", "HEAD").stdout.strip()
-        if round_no is not None:
-            # seed-002 延伸（1.9）：批量 flush 时把批次 sha 记入本批各轮
-            # （无独立 sha 的 completed 轮），观察台时间轴据此获得准逐轮锚点。
-            for entry in st.get("history") or []:
-                if (entry.get("status") == "completed"
-                        and not entry.get("commit_sha")
-                        and entry.get("round") is not None
-                        and entry["round"] <= round_no):
-                    entry.setdefault("batch_commit_sha", sha)
-            state.save_state(repo, st)
+        # Post-commit window（轮 15 候选 299）：commit 已落盘后 rev-parse/
+        # state 回填若失败，这次冲刷不能在 state/log 里「从未发生」——
+        # sha 尽力从 git commit 输出兜底，审计事件必然落一条。
+        sha = ""
+        try:
+            sha = io.run_git(repo, "rev-parse", "HEAD").stdout.strip()
+            if round_no is not None:
+                # seed-002 延伸（1.9）：批量 flush 时把批次 sha 记入本批各轮
+                # （无独立 sha 的 completed 轮），观察台时间轴据此获得准逐轮锚点。
+                for entry in st.get("history") or []:
+                    if (entry.get("status") == "completed"
+                            and not entry.get("commit_sha")
+                            and entry.get("round") is not None
+                            and entry["round"] <= round_no):
+                        entry.setdefault("batch_commit_sha", sha)
+                state.save_state(repo, st)
+        except SystemExit as exc:
+            for token in (result.stdout or "").replace("]", " ").split():
+                if len(token) >= 7 and all(c in "0123456789abcdef" for c in token.lower()):
+                    sha = sha or token
+                    break
+            io.append_log(repo, "commit", "warn",
+                          reason="post-commit bookkeeping failed: {}".format(str(exc)[:150]),
+                          sha=sha or None)
+            print(
+                "[WARN] The commit {} IS on disk, but post-commit bookkeeping failed ({}): "
+                "batch_commit_sha backfill skipped — reconcile per-round anchors via git log.".format(
+                    (sha or "?")[:10], str(exc)[:120]),
+                file=sys.stderr,
+            )
         if bypassed_secrets:
             # Audit trail for the --allow-secrets bypass (U: SEC-03).
             io.append_log(repo, "commit", "success", commit_sha=sha, message=message, round=round_no, secrets_bypassed=True)
@@ -2207,6 +2284,11 @@ def _write_report_output(args, repo, markdown, kind):
 
 def cmd_report(args):
     repo = Path(args.repo).resolve()
+    if not config.state_path_for(repo).exists():
+        # 与 retrospective 同族守卫（轮 13 api-design 候选）：JSON 模式的
+        # 契约是单个可解析对象——未初始化时 load_state 的纯文本报错会把
+        # 循环 agent 的解析器炸掉。
+        return emit_result(args, False, "[ERROR] Autopilot not initialized. Run init first.")
     st = state.load_state(repo)
     cfg = config.load_config(repo)
     lang = args.lang or cfg.get("report_lang", "zh")
@@ -3416,12 +3498,39 @@ def build_check_payload(repo, full=False):
     if full:
         payload["state"] = st
         payload["config"] = cfg
+    # Round-prep reuse channel (round 12 perf candidate): ranked/cfg/state/
+    # backlog are already computed here — round-prep used to re-load all
+    # three, re-rank, and re-run analysis validity (~4 extra git spawns and
+    # a full re-rank per round). cmd_check strips this private key before
+    # printing; the JSON contract does not change.
+    payload["_ctx"] = {
+        "st": st, "cfg": cfg, "backlog": backlog,
+        "ranked": ranked, "selected_entries": selected_entries,
+    }
     return payload
+
+
+def _audit_loop_decision(repo, payload):
+    """循环决策审计（轮 12 observability 候选）：check/round-prep 每轮算出的
+    action_hint/stop_reason 此前只进 stdout 即蒸发——回放能看到每轮做了什么，
+    却看不到为什么选 work/expand/mine/stop。每次调用一行，log 轮转兜住量。"""
+    backlog = payload.get("backlog") or {}
+    io.append_log(
+        repo, "check", "success",
+        action_hint=payload.get("action_hint"),
+        stop_reason=payload.get("stop_reason"),
+        pending=backlog.get("pending"),
+        ready=backlog.get("ready"),
+        selected_count=payload.get("selected_count"),
+        phase=payload.get("phase"),
+    )
 
 
 def cmd_check(args):
     repo = Path(args.repo).resolve()
     payload = build_check_payload(repo, full=not getattr(args, "brief", False))
+    payload.pop("_ctx", None)
+    _audit_loop_decision(repo, payload)
     print(json.dumps(payload, indent=2, ensure_ascii=False))
     return 0
 
@@ -3444,14 +3553,22 @@ def cmd_round_prep(args):
     if top is not None and top < 1:
         return emit_result(args, False, "[ERROR] --top must be a positive integer.")
     payload = build_check_payload(repo)
-    cfg = config.load_config(repo)
-    st = state.load_state(repo)
-    backlog = state.load_backlog(repo)
-
-    ranked = state.rank_candidates(
-        backlog, cfg, progress=state.progress_from_state(st, cfg),
-        completed_goals=list(st.get("completed_goals") or []),
-    )
+    # ctx 复用（轮 12 perf 候选）：ranked/cfg/state/backlog 在 build_check_payload
+    # 里已经算过——此前这里全部重载并重跑 rank_candidates，再跑一遍 analysis 有效性。
+    ctx = payload.pop("_ctx", None) or {}
+    if ctx:
+        cfg = ctx["cfg"]
+        st = ctx["st"]
+        backlog = ctx["backlog"]
+        ranked = ctx["ranked"]
+    else:
+        cfg = config.load_config(repo)
+        st = state.load_state(repo)
+        backlog = state.load_backlog(repo)
+        ranked = state.rank_candidates(
+            backlog, cfg, progress=state.progress_from_state(st, cfg),
+            completed_goals=list(st.get("completed_goals") or []),
+        )
     if top is None:
         # The recommended batch plus one backup: enough to open a round and
         # absorb one candidate going stale between prep and begin-round,
@@ -3462,9 +3579,13 @@ def cmd_round_prep(args):
     payload["recommended"] = [entry["id"] for entry in pending[:top] if entry.get("selected")]
     payload["withheld"] = max(0, len(pending) - len(payload["candidates"]))
 
-    validity, reason = state.analysis_validity(repo)
-    cached = state.load_analysis(repo) if validity == "fresh" else None
-    payload["analysis"]["cached"] = (cached or {}).get("analysis") if isinstance(cached, dict) else None
+    # 有效性与缓存内容：状态已在 payload["analysis"] 里（含 commits_behind），
+    # 只有 fresh 才需要读缓存文件本体。
+    if payload["analysis"].get("status") == "fresh":
+        cached = state.load_analysis(repo)
+        payload["analysis"]["cached"] = (cached or {}).get("analysis") if isinstance(cached, dict) else None
+    else:
+        payload["analysis"]["cached"] = None
     payload["directives"] = state.load_directives(repo).get("directives") or []
 
     open_round = st.get("current_round")
@@ -3482,7 +3603,8 @@ def cmd_round_prep(args):
         if open_round
         else None
     )
-
+    payload.pop("_ctx", None)
+    _audit_loop_decision(repo, payload)
     print(json.dumps(payload, indent=2, ensure_ascii=False))
     return 0
 

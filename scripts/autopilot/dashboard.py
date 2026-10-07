@@ -149,8 +149,16 @@ def ensure_dashboard(repo, config):
         clear_stale_info(repo)
         if info_alive(repo):
             return read_info(repo)
-        return spawn_server(repo, config)
-    except Exception:
+        spawned = spawn_server(repo, config)
+        if spawned is None:
+            # spawn 失败原先是静默 None——调用方的错误日志只在异常路径触发，
+            # 面板「为什么没起来」无处可查（轮 15 候选 304）。
+            io.append_log(repo, "dashboard", "warn",
+                          reason="spawn_server returned None (timeout or config rejected)")
+        return spawned
+    except Exception as exc:
+        io.append_log(repo, "dashboard", "warn",
+                      reason="ensure failed: {}".format(str(exc)[:200]))
         return None
 
 
@@ -193,11 +201,19 @@ def get_snapshot(repo):
     """build_snapshot with a one-slot cache: repeated browser polling between
     state writes returns the identical dict (stable generated_at) instead of
     re-running the growth pipeline per request; a changed mtime or the TTL
-    (SNAPSHOT_TTL_SECONDS) triggers one rebuild."""
-    key = _cache_key(repo)
+    (SNAPSHOT_TTL_SECONDS) triggers one rebuild. The TTL short-circuit runs
+    BEFORE the cache key: a fresh cached hit must not pay the rev-parse
+    spawn that _cache_key costs on every poll (field-test round 12)."""
     now = time.time()
-    if _snapshot_cache["key"] == key and _snapshot_cache["snapshot"] is not None \
+    if _snapshot_cache["key"] is not None and _snapshot_cache["snapshot"] is not None \
             and now - _snapshot_cache["at"] < SNAPSHOT_TTL_SECONDS:
+        return _snapshot_cache["snapshot"]
+    key = _cache_key(repo)
+    if _snapshot_cache["key"] == key and _snapshot_cache["snapshot"] is not None:
+        # Same key past the TTL: every input the pipeline reads is in the
+        # key, so a rebuild would produce identical output — refresh the
+        # window instead of re-running the pipeline.
+        _snapshot_cache.update(at=now)
         return _snapshot_cache["snapshot"]
     from . import dashboard_data as dd
     snapshot = dd.build_snapshot(repo)

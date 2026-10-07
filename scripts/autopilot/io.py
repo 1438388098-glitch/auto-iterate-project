@@ -529,8 +529,18 @@ def estimate_tokens_for_round(repo, run_start_sha, billed_text, billed_binary):
     base = run_start_sha or EMPTY_TREE
     if has_commits(repo):
         result = run_git(repo, "diff", "--numstat", base, "HEAD")
-        if result.returncode == 0:
-            committed_t, committed_b = _parse_numstat(result.stdout)
+        if result.returncode != 0:
+            # 同 _staged_numstat_lines 的不变量（轮 13 候选 297）：失败的
+            # numstat 不能被当成 0 行——否则 run_start_sha 被 gc/浅克隆裁剪
+            # 后 max_tokens 软预算静默失效、超支无任何警告。
+            print(
+                "[ERROR] Could not read committed numstat ({}); refusing to treat the diff as "
+                "empty — max_tokens accounting would silently stop applying.".format(
+                    (result.stderr or "").strip()[:200]),
+                file=sys.stderr,
+            )
+            raise SystemExit(2)
+        committed_t, committed_b = _parse_numstat(result.stdout)
     worktree_t, worktree_b = worktree_units(repo)
     total_text = committed_t + worktree_t
     total_binary = committed_b + worktree_b
@@ -547,15 +557,24 @@ def estimate_tokens_for_round(repo, run_start_sha, billed_text, billed_binary):
 
 def worktree_units(repo):
     """(text_lines, binary_files) changed in the working tree and the index
-    combined, measured against HEAD. Tuple form of worktree_change_lines."""
+    combined, measured against HEAD. Tuple form of worktree_change_lines.
+    A failed git diff fails closed (same invariant as estimate_tokens_for_round:
+    a silent zero would drain max_tokens of its teeth)."""
     text = 0
     binary = 0
     for diff_args in (("diff", "--numstat"), ("diff", "--cached", "--numstat")):
         result = run_git(repo, *diff_args)
-        if result.returncode == 0:
-            t, b = _parse_numstat(result.stdout)
-            text += t
-            binary += b
+        if result.returncode != 0:
+            print(
+                "[ERROR] Could not read worktree numstat ({}); refusing to treat the diff as "
+                "empty — max_tokens accounting would silently stop applying.".format(
+                    (result.stderr or "").strip()[:200]),
+                file=sys.stderr,
+            )
+            raise SystemExit(2)
+        t, b = _parse_numstat(result.stdout)
+        text += t
+        binary += b
     return text, binary
 
 
