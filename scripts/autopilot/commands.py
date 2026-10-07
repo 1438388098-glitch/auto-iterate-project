@@ -1778,7 +1778,12 @@ def cmd_branch_gc(args):
     if config.state_path_for(repo).exists():
         try:
             st = state.load_state(repo)
-            if st.get("branch"):
+            # Protect the ACTIVE run's branch only: a finished run keeps its
+            # state.json around, and an unconditional keep dead-locked the
+            # documented recovery path (merge the kept branch later, then
+            # branch-gc to reclaim it — the field test showed the branch was
+            # reported "kept" forever).
+            if st.get("branch") and not st.get("finished_at"):
                 keep.append(st["branch"])
         except SystemExit:
             pass
@@ -2758,11 +2763,17 @@ def cmd_mine(args):
     if refused is not None:
         return refused
     with io.run_lock(repo):
+        st = state.load_state(repo)
         kinds = list(args.kind) if getattr(args, "kind", None) else None
         limit = getattr(args, "limit", None)
         try:
             # None takes the default; an explicit 0 is honored as 0, not as the default.
-            result = miner.mine_repo(repo, kinds=kinds, per_kind_limit=20 if limit is None else limit)
+            # before_sha bounds hotspot to pre-run history: the run's own fresh
+            # commits are work in progress, not pre-existing hotspots.
+            result = miner.mine_repo(
+                repo, kinds=kinds, per_kind_limit=20 if limit is None else limit,
+                before_sha=st.get("run_start_sha"),
+            )
         except ValueError as exc:
             return emit_result(args, False, "[ERROR] {}".format(exc))
         backlog = state.load_backlog(repo)
@@ -2792,7 +2803,6 @@ def cmd_mine(args):
                     print("  [{}] {}".format(finding.get("kind"), finding.get("title")))
             return 0
         if getattr(args, "apply", False):
-            st = state.load_state(repo)
             now = io.now_iso()
             for finding in new_findings:
                 fields = miner.finding_to_candidate_fields(finding)
@@ -3211,6 +3221,10 @@ def build_check_payload(repo, full=False):
             "status": analysis_status,
             "reason": analysis_reason,
             "commits_behind": commits_behind,
+            # Same key set as round-prep's analysis object (which overwrites
+            # this when the cache is fresh) — same-named fields must not
+            # exist in one payload and vanish from the other.
+            "cached": None,
         },
     }
     goals_met = state.all_goals_met(cfg, st)

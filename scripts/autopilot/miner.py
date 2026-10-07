@@ -408,13 +408,19 @@ def scan_test_gap(repo, limit=25):
     return findings
 
 
-def scan_hotspot(repo, limit=10):
-    """Files with the most recent commit churn — where bugs hide."""
+def scan_hotspot(repo, limit=10, before_sha=None):
+    """Files with the most recent commit churn — where bugs hide.
+
+    before_sha (a run's run_start_sha) bounds the scan to pre-existing
+    history: the run's own fresh commits are the work in progress, not
+    pre-existing hotspots (1.12 field test: the scanner flagged files the
+    run had just written itself)."""
     # --name-status so deletions (D) can be skipped: suggesting a review of a
     # file that no longer exists is noise.
-    result = io.run_git(
-        repo, "-c", "core.quotepath=false", "log", "--name-status", "--pretty=format:", "-50"
-    )
+    log_args = ["log", "--name-status", "--pretty=format:", "-50"]
+    if before_sha:
+        log_args.append(before_sha)
+    result = io.run_git(repo, "-c", "core.quotepath=false", *log_args)
     if result.returncode != 0:
         return []
     counts = Counter()
@@ -535,8 +541,11 @@ SCANNERS = {
 }
 
 
-def mine_repo(repo, kinds=None, per_kind_limit=20):
-    """Run selected scanners; returns {findings, by_kind, kinds}."""
+def mine_repo(repo, kinds=None, per_kind_limit=20, before_sha=None):
+    """Run selected scanners; returns {findings, by_kind, kinds}.
+
+    before_sha bounds the hotspot scanner to pre-existing history (a run's
+    run_start_sha): the run's own commits are not pre-existing hotspots."""
     selected = list(kinds) if kinds else list(MINE_KINDS)
     unknown = [k for k in selected if k not in SCANNERS]
     if unknown:
@@ -546,7 +555,13 @@ def mine_repo(repo, kinds=None, per_kind_limit=20):
     for kind in selected:
         try:
             # An explicit 0 (or negative) limit yields 0 findings — honored as given.
-            got = SCANNERS[kind](repo, limit=per_kind_limit) if per_kind_limit and per_kind_limit > 0 else []
+            if per_kind_limit and per_kind_limit > 0:
+                if kind == "hotspot" and before_sha:
+                    got = SCANNERS[kind](repo, limit=per_kind_limit, before_sha=before_sha)
+                else:
+                    got = SCANNERS[kind](repo, limit=per_kind_limit)
+            else:
+                got = []
         except OSError:
             got = []
         by_kind[kind] = len(got)

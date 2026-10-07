@@ -579,6 +579,26 @@ class BranchGcTests(RepoTest):
         data = json.loads(result.stdout)
         self.assertIn("autopilot/merged-run", data["deleted"])
 
+    def test_branch_gc_reclaims_finished_runs_branch(self):
+        """A finished run keeps its state.json; the documented recovery path
+        (merge the kept branch later, then branch-gc) must still reclaim it
+        (1.12 field test: the state branch was reported "kept" forever)."""
+        self.run_state("init", "--branch-mode", "feature", "--max-rounds", "1")
+        run_branch = self.read_json("state.json")["branch"]
+        self.run_state("begin-round", "--title", "r", "--reason", "x")
+        self.add_file("w.py", "w = 1\n")
+        self.run_state("commit", "--summary", "work")
+        sha = self.git("rev-parse", "HEAD").stdout.strip()
+        self.run_state("complete-round", "--summary", "done", "--commit-sha", sha)
+        result = self.run_state("finish", "--reason", "max_rounds reached")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertTrue((self.repo / ".autopilot" / "state.json").exists())
+        self.git("merge", "-q", "--no-edit", run_branch)
+        data = json.loads(
+            self.run_state("branch-gc", "--base", self.initial_branch, "--json").stdout
+        )
+        self.assertIn(run_branch, data["deleted"])
+
     def test_branch_gc_respects_explicit_base(self):
         # Fork other-base BEFORE the merge so it does not contain the work.
         self.git("checkout", "-q", "-b", "other-base")
@@ -2621,6 +2641,16 @@ class ContractTests(RepoTest):
         self.assertEqual(data["shell"], "bash")
         self.assertEqual(data["adaptation"]["command_style"], "bash")
 
+    def test_check_brief_analysis_shape_stable(self):
+        """`analysis.cached` exists in BOTH round-prep and check --brief —
+        same-named fields must not appear in one payload and vanish from the
+        other (1.12 field-test friction)."""
+        self.run_state("init")
+        data = json.loads(self.run_state("check", "--brief").stdout)
+        self.assertIn("cached", data["analysis"])
+        prep = json.loads(self.run_state("round-prep").stdout)
+        self.assertIn("cached", prep["analysis"])
+
     def test_backlog_rank_entry_contract(self):
         self.run_state("init")
         self.run_state("backlog-add", "--title", "A", "--reason", "r", "--value", "4", "--effort", "2")
@@ -2695,6 +2725,30 @@ class ContractTests(RepoTest):
 
 class MiningAndFinishGateTests(RepoTest):
     """Mine supply + early-stop finish gate (consolidated from 23 methods)."""
+
+    def test_mine_hotspot_ignores_run_commits(self):
+        """Pre-run churn is the hotspot signal; the run's own commits are work
+        in progress, not pre-existing hotspots (1.12 field test: the scanner
+        flagged files the run itself had just written)."""
+        (self.repo / "a.py").write_text("a = 1\n", encoding="utf-8")
+        self.git("add", "a.py")
+        self.git("commit", "-q", "-m", "initial")
+        (self.repo / "a.py").write_text("a = 2\n", encoding="utf-8")
+        self.git("add", "a.py")
+        self.git("commit", "-q", "-m", "tune a")
+        self.run_state("init", "--commit-every-rounds", "1")
+        for i in range(2):
+            self.run_state("begin-round", "--title", "r%d" % i, "--reason", "x")
+            (self.repo / "b.py").write_text("b = %d\n" % i, encoding="utf-8")
+            self.git("add", "b.py")
+            self.run_state("commit", "--summary", "run work")
+            self.run_state("complete-round", "--summary", "done")
+        data = json.loads(
+            self.run_state("mine", "--kind", "hotspot", "--dry-run", "--json").stdout
+        )
+        titles = " | ".join(f.get("title", "") for f in data.get("findings", []))
+        self.assertIn("a.py", titles)
+        self.assertNotIn("b.py", titles)
 
     def test_mine_finds_and_records(self):
         (self.repo / "a.py").write_text("# TODO: fix this\n", encoding="utf-8")
