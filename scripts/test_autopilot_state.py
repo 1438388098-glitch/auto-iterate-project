@@ -1881,6 +1881,43 @@ class LedgerGuardTests(RepoTest):
         self.assertNotEqual(negative.returncode, 0)
         self.assertIn("non-negative integer", negative.stderr)
 
+    def test_predicted_calibration_uses_avg_value_not_count(self):
+        # wave13 candidate-414：校准 = review_avg / avg_value（与观测侧同式）。
+        # 修复前除以完成次数：6 完成评 4 值 4 → 0.67（应 1.0），管线越长折扣越狠。
+        backlog = {"candidates": [
+            {"id": "p{}".format(i), "origin": "predicted", "status": "completed",
+             "value": 4, "effort": 1, "review_score": 4} for i in range(6)
+        ]}
+        account = ap_state.compute_predicted_account(backlog)
+        self.assertEqual(account["calibration"], 1.0)
+        # 高分记录 → 加成上限 1.5；低分记录 → 折扣下限 0.6
+        backlog_hi = {"candidates": [
+            {"id": "q", "origin": "predicted", "status": "completed",
+             "value": 2, "effort": 1, "review_score": 5} for _ in range(4)
+        ]}
+        self.assertEqual(
+            ap_state.compute_predicted_account(backlog_hi)["calibration"], 1.5)
+        backlog_lo = {"candidates": [
+            {"id": "r", "origin": "predicted", "status": "completed",
+             "value": 5, "effort": 1, "review_score": 2} for _ in range(4)
+        ]}
+        self.assertEqual(
+            ap_state.compute_predicted_account(backlog_lo)["calibration"], 0.6)
+
+    def test_goal_chain_bonus_normalizes_goal_text(self):
+        # wave13 candidate-417：NFC/零宽/空白差异不得吞掉 ≤1.08 平局裁决加成。
+        goal = "修复登录超时"
+        zero_width = goal + "​"
+        backlog = {"candidates": [
+            {"id": "a", "origin": "observed", "status": "pending",
+             "title": "t", "value": 4, "effort": 1, "risk": 1, "type": "bugfix",
+             "based_on": zero_width},
+        ]}
+        ranked = ap_state.rank_candidates(
+            backlog, {"goals": [goal]}, completed_goals=[goal + " "])
+        breakdown = ranked[0]["score_breakdown"]
+        self.assertEqual(breakdown.get("goal_chain_factor"), 1.08)
+
     def test_secret_patterns_cover_common_ci_credentials(self):
         # wave12 candidate-413：四种常见 CI/配置密钥形态必须命中
         from autopilot.secrets import SECRET_PATTERNS
