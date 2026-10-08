@@ -2,6 +2,58 @@
 
 All notable changes to auto-iterate-project are documented here.
 
+## 1.13.0 (2026-10-08)
+
+Overnight self-iteration (rounds 26-41, 8 expansion waves, ~30 implemented
+candidates): field-test follow-through on waves 3-8 findings plus config-set
+completeness, decision-audit attribution, and bilingual copy coverage.
+
+### Fixed
+
+- `validate_config` deadline guard crashed with NameError on hand-edited
+  relative deadlines (referenced undefined `repo`); now emits the clean
+  error and the message points at `config-set --deadline` as the lighter
+  in-place fix.
+- `goals` items are type-checked (array of strings enforced) — a [42] item
+  used to become a permanently unsatisfiable dead goal.
+- ReDoS probe no longer false-kills legitimate broad patterns (hex/base64
+  classes match the adversarial sample by design; time-to-finish is the only
+  criterion) and verdicts are memoized per pattern.
+- Lock corrupt-branch stat() race guard (concurrent reclaim between read and
+  stat no longer crashes with a raw FileNotFoundError) and unlink-failure
+  backoff (0.3s, making "after retrying" honest).
+- `_create_lock_exclusive` closes the fd on write failure — a leaked open fd
+  blocked the stale-lock unlink on Windows, stranding a token-less lock.
+- config-set gains `--max-blocked-in-a-row` / `--clear-max-blocked-in-a-row`
+  (0 = run born stopped; negative rejected — aligned with init) and the
+  positive-int gate exempts it; help and config.md now state the real 0
+  semantics.
+- `backlog-pick` refusal is bilingual with a reopen hint; the zh copy keeps
+  the cross-language "already 'completed'" anchor.
+- begin-round's generic stop refusal is bilingual like its goals-met sibling.
+
+### Added
+
+- `check`/`round-prep` decision-audit events carry a `via` field (real check
+  vs round-prep) so replay can attribute decisions; documented in the audit
+  log section.
+- dashboard renders a "决策降级(loop-outlook)" badge when the decision
+  section degrades instead of silently showing stale values.
+- Tests: binary token billing, watermark never-lowers-on-shrink golden,
+  rename-numstat golden, backlog_watch pure contract, rank_for_selection
+  direct, lock token ownership / young grace / write-failure cleanup /
+  stat-race retry, ReDoS fast-match acceptance, decision-audit via fields,
+  en-branch coverage for the new bilingual pairs, config deadline/goals
+  guards (suite 190 → 262).
+
+### Docs
+
+- SKILL.md: troubleshooting table fixed (three-cell row), archive-reports
+  documented in Finish and the command list.
+- config.md: max_blocked 0 semantics corrected and entry points documented;
+  relative-deadline expansion attributed to both init and config-set;
+  infeasible goals item-type guard documented.
+
 ## 1.12.5 (2026-10-07)
 
 Docs-only pass from the fifth validation batch (branch_mode=current with
