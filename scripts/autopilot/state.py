@@ -321,14 +321,36 @@ def _validate_backlog(repo, backlog):
     candidates = backlog.get("candidates")
     if not isinstance(candidates, list):
         fail("'candidates' must be an array")
+    seen_ids = set()
     for candidate in candidates:
         if not isinstance(candidate, dict):
             fail("every candidate must be an object")
-        if not isinstance(candidate.get("id"), str) or not candidate.get("id"):
+        cid = candidate.get("id")
+        if not isinstance(cid, str) or not cid:
             fail("every candidate needs a non-empty string 'id'")
+        if cid in seen_ids:
+            # 重复 id 会让 find_candidate/update_candidates_status 命中第一处，
+            # 完成账本被静默改写到错误行上（wave9 candidate-379）。
+            fail("duplicate candidate id: {}".format(cid))
+        seen_ids.add(cid)
     next_id = backlog.get("next_id")
     if not isinstance(next_id, int) or isinstance(next_id, bool):
         fail("'next_id' must be a number")
+
+
+def mint_candidate_id(backlog):
+    """Mint the next unused candidate id and bump next_id past it. A merged or
+    restored backlog can carry a stale next_id (git merge, .bak restore);
+    minting blind would create a duplicate id and re-book completed work
+    against the wrong row (wave9 candidate-379), so skip ids already in use."""
+    used = {c.get("id") for c in backlog.get("candidates") or []}
+    next_id = backlog.get("next_id")
+    if not isinstance(next_id, int) or isinstance(next_id, bool):
+        next_id = 1
+    while "candidate-{:03d}".format(next_id) in used:
+        next_id += 1
+    backlog["next_id"] = next_id + 1
+    return "candidate-{:03d}".format(next_id)
 
 
 def save_backlog(repo, backlog):

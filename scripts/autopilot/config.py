@@ -131,8 +131,12 @@ _CONFIG_FIELD_RULES = (
         ("max_blocked_in_a_row", "retries_per_round"), "int_range",
         (0, None, "must be an integer or null", "must be a non-negative integer or null"),
     ),
+    # candidates_per_round 无 null 档（文档默认 4，消息无 or null；wave9
+    # candidate-384：null 曾通过 int_range 的跳过语义流到四个读者各自回退
+    # 3/1/1/5）——int_positive 连 null 一起拒。
+    (("candidates_per_round",), "int_positive", (1, "must be a positive integer")),
     (
-        ("candidates_per_round", "commit_every_rounds", "verify_every_rounds"), "int_range",
+        ("commit_every_rounds", "verify_every_rounds"), "int_range",
         (1, None, "must be a positive integer", "must be a positive integer"),
     ),
     (
@@ -182,13 +186,17 @@ _REGISTRY_EXEMPT_FIELDS = ("repo", "dashboard")
 
 
 def field_int_rule(name):
-    """(lo, hi) bounds of an int-registered field, or None when the field is
-    not in an int_range row. cmd_config_set validates its --flags against the
-    same bounds the validator enforces, so the two range mechanisms cannot
-    drift apart again (candidate-314)."""
+    """(lo, hi) bounds of an int-registered field (int_range or int_positive
+    rows), or None when the field carries no int bound. cmd_config_set
+    validates its --flags against the same bounds the validator enforces, so
+    the two range mechanisms cannot drift apart again (candidate-314)."""
     for fields, kind, spec in _CONFIG_FIELD_RULES:
-        if kind == "int_range" and name in fields:
+        if name not in fields:
+            continue
+        if kind == "int_range":
             return spec[0], spec[1]
+        if kind == "int_positive":
+            return spec[0], None
     return None
 
 
@@ -203,6 +211,10 @@ def _validate_registered_field(path, source, key, value, kind, spec):
             _config_error(path, "'{}' {}".format(key, type_msg), source)
         if value < lo or (hi is not None and value > hi):
             _config_error(path, "'{}' {}".format(key, range_msg), source)
+    elif kind == "int_positive":
+        lo, msg = spec
+        if isinstance(value, bool) or not isinstance(value, int) or value < lo:
+            _config_error(path, "'{}' {}".format(key, msg), source)
     elif kind == "finite_number":
         if value is not None and not isinstance(value, (int, float)):
             _config_error(path, "'{}' must be a number or null".format(key), source)

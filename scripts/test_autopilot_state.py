@@ -1522,6 +1522,85 @@ class SaturationThresholdTests(RepoTest):
         self.assertTrue(data["expansion"]["underused_types"])
 
 
+class LedgerGuardTests(RepoTest):
+    """wave9 三修复回归（candidate-379/380/384）：账本完整性——重复 id 干净
+    失败、铸造跳过 stale next_id、begin-round 拒绝已完成候选、candidates_
+    per_round 的 null 不再流入四个各说各话的读者。"""
+
+    def _add_candidate(self):
+        result = self.run_state(
+            "backlog-add", "--title", "t", "--reason", "r",
+            "--value", "3", "--effort", "1", "--type", "test")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        return result
+
+    def _write_backlog(self, backlog):
+        path = self.repo / ".autopilot" / "backlog.json"
+        path.write_text(json.dumps(backlog), encoding="utf-8")
+
+    def _read_backlog(self):
+        path = self.repo / ".autopilot" / "backlog.json"
+        return json.loads(path.read_text(encoding="utf-8"))
+
+    def test_backlog_duplicate_id_fails_clean(self):
+        self.run_state("init")
+        self._add_candidate()
+        backlog = self._read_backlog()
+        backlog["candidates"].append(dict(backlog["candidates"][0]))
+        self._write_backlog(backlog)
+        refused = self.run_state("check", "--brief")
+        self.assertNotEqual(refused.returncode, 0)
+        self.assertIn("Invalid .autopilot/backlog.json", refused.stderr)
+        self.assertIn("duplicate candidate id", refused.stderr)
+
+    def test_mint_skips_stale_next_id(self):
+        self.run_state("init")
+        self._add_candidate()  # candidate-001，backlog.json 随首次写入落盘
+        backlog = self._read_backlog()
+        backlog["candidates"].append({
+            "id": "candidate-003", "title": "restored", "reason": "merge artifact",
+            "type": "test", "value": 3, "effort": 1, "risk": 1, "status": "completed",
+        })
+        backlog["next_id"] = 3  # 恢复/合并后典型的 stale：003 已在表
+        self._write_backlog(backlog)
+        result = self._add_candidate()
+        self.assertIn("candidate-004", result.stdout)
+        ids = [c["id"] for c in self._read_backlog()["candidates"]]
+        self.assertEqual(len(ids), len(set(ids)))
+
+    def test_begin_round_refuses_resolved_candidate(self):
+        self.run_state("init")
+        self._add_candidate()
+        for status, zh_word in (("completed", "已完成"), ("blocked", "受阻"), ("picked", "已拾取")):
+            backlog = self._read_backlog()
+            backlog["candidates"][0]["status"] = status
+            self._write_backlog(backlog)
+            refused = self.run_state(
+                "begin-round", "--title", "r", "--reason", "x",
+                "--candidate-id", "candidate-001")
+            self.assertNotEqual(refused.returncode, 0, status)
+            self.assertIn("状态已是 {}".format(zh_word), refused.stderr, status)
+            self.assertIn("backlog-update --status pending", refused.stderr, status)
+        # 复位 pending 后可正常拾取（守卫不误伤合法路径）
+        backlog = self._read_backlog()
+        backlog["candidates"][0]["status"] = "pending"
+        self._write_backlog(backlog)
+        opened = self.run_state(
+            "begin-round", "--title", "r", "--reason", "x",
+            "--candidate-id", "candidate-001")
+        self.assertEqual(opened.returncode, 0, opened.stderr)
+
+    def test_candidates_per_round_null_rejected(self):
+        self.run_state("init")
+        config_path = self.repo / ".autopilot" / "config.json"
+        config = json.loads(config_path.read_text(encoding="utf-8"))
+        config["candidates_per_round"] = None
+        config_path.write_text(json.dumps(config), encoding="utf-8")
+        refused = self.run_state("check", "--brief")
+        self.assertNotEqual(refused.returncode, 0)
+        self.assertIn("'candidates_per_round' must be a positive integer", refused.stderr)
+
+
 class BudgetAccountingTests(RepoTest):
     """P1 budget/round accounting: zero-work cancels do not consume a round,
     tokens are billed monotonically per run, blocked streaks and budgets are

@@ -479,6 +479,27 @@ def cmd_begin_round(args):
                         args, False,
                         "[ERROR] Candidate not found in backlog: {}. Pending: {}".format(cid, hint),
                     )
+                status = candidate.get("status")
+                if status in ("picked", "completed", "blocked"):
+                    # 账本防护与 backlog-pick 同款（wave9 candidate-380）：已
+                    # 完成/受阻候选零缺依赖、能通过 deps 检查，重复拾取会双
+                    # 记账并漂移 state.type_stats。
+                    io.append_log(repo, "begin-round", "error",
+                                  reason="candidate already resolved", candidate_id=cid,
+                                  candidate_status=status)
+                    zh_status = {"picked": "已拾取", "completed": "已完成", "blocked": "受阻"}.get(status, status)
+                    return emit_result(
+                        args, False,
+                        _check_text(
+                            cfg,
+                            "[ERROR] Candidate {} is already '{}'（状态已是 {}）——begin-round 重复拾取会静默改写"
+                            "完成/受阻账本并使 state.type_stats 漂移。如需重新开工，请先 backlog-update --status pending。".format(
+                                cid, status, zh_status),
+                            "[ERROR] Candidate {} is already '{}' — begin-round would silently rewrite "
+                            "the completed/blocked ledger and drift state.type_stats. To reopen work, "
+                            "run backlog-update --status pending first.".format(cid, status),
+                        ),
+                    )
                 missing, ready = state.candidate_deps_status(backlog, candidate)
                 if not ready:
                     io.append_log(repo, "begin-round", "error", reason="candidate deps unresolved", deps=missing)
@@ -1591,7 +1612,7 @@ def cmd_backlog_add(args):
                     "[ERROR] --confidence for predicted/expansion work must be between 0.5 and 1.0 "
                     "(it discounts the score; observed work is always 1.0).",
                 )
-        candidate_id = "candidate-{:03d}".format(backlog["next_id"])
+        candidate_id = state.mint_candidate_id(backlog)
         value = args.value
         if value is None and seed is not None:
             value = _seed_num(seed, "value")
@@ -1667,7 +1688,6 @@ def cmd_backlog_add(args):
             )
             return 0
         backlog["candidates"].append(candidate)
-        backlog["next_id"] += 1
         state.save_backlog(repo, backlog)
         if seed is not None:
             st = state.load_state(repo)
@@ -3006,7 +3026,7 @@ def cmd_mine(args):
             now = io.now_iso()
             for finding in new_findings:
                 fields = miner.finding_to_candidate_fields(finding)
-                candidate_id = "candidate-{:03d}".format(backlog["next_id"])
+                candidate_id = state.mint_candidate_id(backlog)
                 candidate = {
                     "id": candidate_id,
                     "title": fields["title"],
@@ -3030,7 +3050,6 @@ def cmd_mine(args):
                     "line": finding.get("line"),
                 }
                 backlog["candidates"].append(candidate)
-                backlog["next_id"] += 1
                 applied.append(candidate_id)
                 io.append_log(
                     repo, "backlog-add", "success",
