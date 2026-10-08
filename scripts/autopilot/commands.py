@@ -1268,26 +1268,28 @@ def cmd_goal_met(args):
                    for existing in st["completed_goals"]):
             st["completed_goals"].append(goal)
         st["last_activity_at"] = io.now_iso()
-        goal_event = None
-        if not args.no_auto_context or seeds or unlocked:
-            goal_event = state.append_goal_event(st, {
-                "goal": goal,
-                "met_at": io.now_iso(),
-                "round": goal_round if goal_round is not None else (st.get("round") or 0),
-                "evidence": getattr(args, "evidence", None) or "",
-                # No completed-round anchor -> the claim stays unverified and
-                # compute_stop_reason withholds "all goals met" until a
-                # goal-met --round <completed round> lands.
-                "unverified": goal_round is None,
-                "commit_shas": _last_completed_round_shas(st) if not args.no_auto_context else [],
-                "candidate_ids": round_candidate_ids,
-                "unlocked_capabilities": unlocked,
-                "recent_commit_topics": recent_topics,
-                "saturated_types": saturated,
-                "seed_ids": [seed["id"] for seed in seeds],
-            })
-            for seed in seeds:
-                seed["source_event_id"] = goal_event["id"]
+        # 事件本体恒落（wave18 candidate-441）：--no-auto-context 的语义是跳
+        # 过自动上下文（commit_shas/topics/saturated 置空），不是跳过验证事
+        # 件——此前与 --round 组合时静默不落账，锚定验证被吞、目标沿用旧
+        # unverified 事件永久阻止 all-goals-met 且无任何提示。
+        goal_event = state.append_goal_event(st, {
+            "goal": goal,
+            "met_at": io.now_iso(),
+            "round": goal_round if goal_round is not None else (st.get("round") or 0),
+            "evidence": getattr(args, "evidence", None) or "",
+            # No completed-round anchor -> the claim stays unverified and
+            # compute_stop_reason withholds "all goals met" until a
+            # goal-met --round <completed round> lands.
+            "unverified": goal_round is None,
+            "commit_shas": _last_completed_round_shas(st) if not args.no_auto_context else [],
+            "candidate_ids": [] if args.no_auto_context else round_candidate_ids,
+            "unlocked_capabilities": unlocked,
+            "recent_commit_topics": [] if args.no_auto_context else recent_topics,
+            "saturated_types": [] if args.no_auto_context else saturated,
+            "seed_ids": [seed["id"] for seed in seeds],
+        })
+        for seed in seeds:
+            seed["source_event_id"] = goal_event["id"]
         state.save_state(repo, st)
         io.append_log(repo, "goal-met", "success", goal=goal, seeds=[seed["id"] for seed in seeds])
         if state.all_goals_met(cfg, st) and cfg.get("expand_after_goals"):
@@ -1772,6 +1774,17 @@ def cmd_backlog_add(args):
             # 种子标记未及写 state 的崩溃残留——重跑晋升复用既有行，不铸重复
             # 候选；下方照常补完种子标记（幂等）。
             candidate_id = prior_promotion["id"]
+            changed = [key for key in ("title", "value", "effort", "type")
+                       if key in candidate and prior_promotion.get(key) != candidate[key]]
+            if changed:
+                # 幂等复用保留持久化行（wave18 candidate-443）：调用方的新字段
+                # 被丢弃必须出声，否则操作者以为修正已生效。
+                print(
+                    "[WARN] Crash-recovery reuse: kept the persisted candidate's fields; "
+                    "this call's {} were ignored (id {}).".format(
+                        ", ".join(changed), candidate_id),
+                    file=sys.stderr,
+                )
         else:
             backlog["candidates"].append(candidate)
         state.save_backlog(repo, backlog)

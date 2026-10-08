@@ -2137,6 +2137,49 @@ class LedgerGuardTests(RepoTest):
         self.assertNotIn("已完成", report.stdout)
         self.assertIn("aborted", report.stdout)
 
+    def test_goal_met_no_auto_context_still_records_event(self):
+        # wave18 candidate-441：--no-auto-context 跳的是自动上下文不是验证
+        # 事件——与 --round 组合曾静默不落账，目标永久 unverified。
+        self.run_state("init", "--goal", "G")
+        self.run_state("begin-round", "--title", "r", "--reason", "x")
+        self.add_file()
+        self.run_state("commit", "--summary", "w")
+        sha = self.git("rev-parse", "HEAD").stdout.strip()
+        self.run_state("complete-round", "--summary", "done", "--commit-sha", sha)
+        result = self.run_state(
+            "goal-met", "--goal", "G", "--round", "1", "--no-auto-context")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        st = json.loads(
+            (self.repo / ".autopilot" / "state.json").read_text(encoding="utf-8"))
+        events = [e for e in st.get("goal_events") or [] if e.get("goal") == "G"]
+        self.assertEqual(len(events), 1)
+        self.assertFalse(events[0].get("unverified"))  # 锚定验证真实落账
+        data = json.loads(self.run_state("check", "--brief").stdout)
+        self.assertTrue(data["goals_met"])
+
+    def test_seed_reuse_warns_on_discarded_fields(self):
+        # wave18 candidate-443：幂等复用丢弃调用方新字段必须出声。
+        self.run_state("init", "--goal", "G")
+        self.run_state("begin-round", "--title", "r", "--reason", "x")
+        self.add_file()
+        self.run_state("commit", "--summary", "w")
+        sha = self.git("rev-parse", "HEAD").stdout.strip()
+        self.run_state("complete-round", "--summary", "done", "--commit-sha", sha)
+        self.run_state("goal-met", "--goal", "G", "--round", "1", "--next-step", "X")
+        self.run_state("backlog-add", "--from-seed", "seed-001",
+                       "--value", "3", "--effort", "1", "--type", "feature")
+        state_path = self.repo / ".autopilot" / "state.json"
+        st = json.loads(state_path.read_text(encoding="utf-8"))
+        for seed in st.get("goal_seeds") or []:
+            if seed.get("id") == "seed-001":
+                seed["status"] = "open"
+        state_path.write_text(json.dumps(st), encoding="utf-8")
+        rerun = self.run_state(
+            "backlog-add", "--from-seed", "seed-001", "--title", " Brand new plan",
+            "--value", "5", "--effort", "1", "--type", "feature")
+        self.assertEqual(rerun.returncode, 0, rerun.stderr)
+        self.assertIn("Crash-recovery reuse", rerun.stderr)
+
     def test_config_set_budget_domains_match_init(self):
         # wave12 candidate-409：同一字段两扇门同域——max_rounds 收 0（立即
         # 停机）、max_minutes 收小数，与 init/validator 一致。
