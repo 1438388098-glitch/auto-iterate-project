@@ -2078,6 +2078,40 @@ class LedgerGuardTests(RepoTest):
         # 样本量字段出现在预测子账行（[0-9] 避开转义层）
         self.assertRegex(report.stdout, "review 样本 [0-9]+/[0-9]+")
 
+    def test_cache_key_clock_bucket_changes_every_30s(self):
+        # wave18 candidate-439（轮 33 修复的二次审查）：时钟桶必须进键——
+        # 同桶内命中缓存，跨桶触发重建（倒计时刷新的最小粒度）。
+        from autopilot import dashboard as ap_dashboard
+        with mock.patch.object(ap_dashboard.time, "time", return_value=1000.0):
+            key_a = ap_dashboard._cache_key(self.repo)
+        with mock.patch.object(ap_dashboard.time, "time", return_value=1010.0):
+            key_b = ap_dashboard._cache_key(self.repo)
+        with mock.patch.object(ap_dashboard.time, "time", return_value=1031.0):
+            key_c = ap_dashboard._cache_key(self.repo)
+        self.assertEqual(key_a, key_b)   # 同 30s 桶
+        self.assertNotEqual(key_a, key_c)  # 跨桶
+
+    def test_mint_skips_only_collisions_keeps_gap(self):
+        # wave18 candidate-439（轮 4 修复的二次审查）：next_id 高于现有最大
+        # id 的合法间隙必须保留——跳号只针对真实碰撞。
+        self.run_state("init")
+        self._add_candidate()  # 候选文件随首次写入落盘
+        backlog_path = self.repo / ".autopilot" / "backlog.json"
+        backlog = json.loads(backlog_path.read_text(encoding="utf-8"))
+        backlog["candidates"].append({
+            "id": "candidate-003", "title": "t", "type": "test", "value": 3,
+            "effort": 1, "risk": 1, "status": "completed"})
+        backlog["next_id"] = 10  # 10 与 3 之间的空号是有意的
+        backlog_path.write_text(json.dumps(backlog), encoding="utf-8")
+        result = self.run_state(
+            "backlog-add", "--title", "t2", "--reason", "r",
+            "--value", "3", "--effort", "1", "--type", "test")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("candidate-010", result.stdout)  # 不回填间隙
+        ids = [c["id"] for c in json.loads(
+            backlog_path.read_text(encoding="utf-8"))["candidates"]]
+        self.assertEqual(len(ids), len(set(ids)))
+
     def test_config_set_budget_domains_match_init(self):
         # wave12 candidate-409：同一字段两扇门同域——max_rounds 收 0（立即
         # 停机）、max_minutes 收小数，与 init/validator 一致。
