@@ -3059,6 +3059,30 @@ class EstimateTokensUnitTests(RepoTest):
             ap_io.estimate_tokens_for_round(self.repo, "deadbeef" * 5 + "0000", 0, 0)
 
 
+class HeadProbeTests(RepoTest):
+    """candidate-390：io.head_sha 单探针契约 + analysis 探针复用预载文档。"""
+
+    def test_head_sha_none_without_commits(self):
+        bare = Path(tempfile.mkdtemp(prefix="autopilot-headsha-"))
+        self.addCleanup(shutil.rmtree, bare, ignore_errors=True)
+        self.assertIsNone(ap_io.head_sha(bare))  # 无 git/无提交 → None
+        self.git("commit", "-q", "--allow-empty", "-m", "init")
+        self.assertEqual(len(ap_io.head_sha(self.repo)), 40)
+
+    def test_analysis_validity_returns_parsed_doc(self):
+        self.run_state("init")
+        status, reason, doc = ap_state.analysis_validity(self.repo)
+        self.assertEqual(status, "missing")
+        self.assertIsNone(doc)
+        content = {"scanned": True}
+        self.run_state("analysis-save", "--content", json.dumps(content))
+        status, reason, doc = ap_state.analysis_validity(self.repo)
+        self.assertEqual(status, "fresh")
+        self.assertEqual(doc.get("analysis"), content)  # 解析结果随三元组带出
+        # commits_behind 接受预载文档，不再二次解析
+        self.assertIsNotNone(ap_state.analysis_commits_behind(self.repo, analysis=doc))
+
+
 class OptimizationTests(RepoTest):
     """Dirty-tree rules, budgets, deadline, JSON shapes, config errors."""
 

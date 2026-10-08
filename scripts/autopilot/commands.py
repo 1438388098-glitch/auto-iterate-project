@@ -2461,8 +2461,8 @@ def cmd_analysis_load(args):
     refused = _require_initialized(args, repo, message="[ERROR] Autopilot not initialized. Run init first.")
     if refused is not None:
         return refused
-    validity, reason = state.analysis_validity(repo)
-    data = state.load_analysis(repo)
+    validity, reason, doc = state.analysis_validity(repo)
+    data = doc
     io.append_log(repo, "analysis-load", "success" if validity == "fresh" else "warn", validity=validity)
     payload = {
         "valid": validity == "fresh",
@@ -3177,9 +3177,12 @@ def cmd_round_prep(args):
     payload["withheld"] = max(0, len(pending) - len(payload["candidates"]))
 
     # 有效性与缓存内容：状态已在 payload["analysis"] 里（含 commits_behind），
-    # 只有 fresh 才需要读缓存文件本体。
+    # 只有 fresh 才需要读缓存文件本体——ctx 带出的已解析文档优先，无 ctx
+    # 路径才落盘重读（wave10 candidate-390）。
     if payload["analysis"].get("status") == "fresh":
-        cached = state.load_analysis(repo)
+        cached = ctx.get("analysis_doc") if ctx else None
+        if cached is None:
+            cached = state.load_analysis(repo)
         payload["analysis"]["cached"] = (cached or {}).get("analysis") if isinstance(cached, dict) else None
     else:
         payload["analysis"]["cached"] = None

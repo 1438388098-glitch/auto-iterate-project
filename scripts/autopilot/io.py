@@ -226,6 +226,15 @@ def has_commits(repo):
     return run_git(repo, "rev-parse", "--verify", "-q", "HEAD").returncode == 0
 
 
+def head_sha(repo):
+    """Current HEAD SHA, or None when the repo has no commits yet. One probe
+    serving callers that need both has_commits and the SHA — check is the
+    loop's hottest command and used to spend two identical rev-parses on it
+    (wave10 candidate-390)."""
+    result = run_git(repo, "rev-parse", "--verify", "-q", "HEAD")
+    return result.stdout.strip() if result.returncode == 0 else None
+
+
 def _is_autopilot_path(path):
     if not path:
         return False

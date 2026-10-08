@@ -1559,39 +1559,44 @@ def config_mtime(repo):
         return None
 
 
-def analysis_validity(repo):
+def analysis_validity(repo, current_head=None):
     """Check whether the cached .autopilot/analysis.json can be reused. Returns
-    ('missing'|'fresh'|'stale', reason). A cache is stale when the repository HEAD
+    (status, reason, analysis_doc): status is 'missing'|'fresh'|'stale'; the
+    doc is the parsed cache (None when missing/corrupt) so callers reuse the
+    parse for commits_behind / the fresh-content read instead of re-reading
+    the file (wave10 candidate-390). A cache is stale when the repository HEAD
     moved since it was saved (the code the analysis described changed) or the
     autopilot config changed (commands/limits the analysis relied on changed).
     Corrupt JSON (io.load_json fails closed with SystemExit) is "stale", never
-    a crash in the caller's loop."""
+    a crash in the caller's loop. `current_head` accepts a precomputed HEAD
+    SHA so the caller's own probe is reused instead of spawning two more."""
     try:
         analysis = load_analysis(repo)
     except SystemExit:
-        return "stale", "cached analysis is corrupt"
+        return "stale", "cached analysis is corrupt", None
     if analysis is None:
-        return "missing", "no cached analysis"
+        return "missing", "no cached analysis", None
     if not isinstance(analysis, dict):
-        return "stale", "cached analysis is corrupt"
+        return "stale", "cached analysis is corrupt", None
     cached_head = analysis.get("git_head")
-    current_head = None
-    if io.has_commits(repo):
-        current_head = io.run_git(repo, "rev-parse", "HEAD").stdout.strip()
+    if current_head is None:
+        current_head = io.head_sha(repo)
     if cached_head != current_head:
-        return "stale", "HEAD changed since the analysis was saved"
+        return "stale", "HEAD changed since the analysis was saved", analysis
     cached_mtime = analysis.get("config_mtime")
     current_mtime = config_mtime(repo)
     if cached_mtime != current_mtime:
-        return "stale", "autopilot config changed since the analysis was saved"
-    return "fresh", "cached analysis is up to date"
+        return "stale", "autopilot config changed since the analysis was saved", analysis
+    return "fresh", "cached analysis is up to date", analysis
 
 
-def analysis_commits_behind(repo):
+def analysis_commits_behind(repo, analysis=None):
     """How many commits the cached analysis predates (None when there is no
     cache, no parseable git_head, or the count cannot be determined). Gives the
-    staleness a magnitude so the agent can judge whether a rescan is due."""
-    analysis = load_analysis(repo)
+    staleness a magnitude so the agent can judge whether a rescan is due.
+    `analysis` accepts the doc analysis_validity already parsed."""
+    if analysis is None:
+        analysis = load_analysis(repo)
     if not isinstance(analysis, dict):
         return None
     cached_head = analysis.get("git_head")

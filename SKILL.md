@@ -303,7 +303,7 @@ Full table: `references/troubleshooting.md`. Common ones:
 | Symptom | Fix |
 |---|---|
 | Git identity missing | `git config user.name` / `user.email`, retry |
-| Dirty tree at `init`/first `begin-round` | Commit/stash, or `allow_uncommitted_changes: true` / `init --force` |
+| Dirty tree at `init`/first `begin-round` | Commit/stash, or set `allow_uncommitted_changes: true` via `config-set` (`init --force` resets the run and does not set this flag) |
 | All goals met, loop continues | `expand_after_goals: true` → `config-set --no-expand-after-goals` to stop at goal |
 | `action_hint: mine` | Run `mine --apply` now — do not idle |
 | `action_hint: expand` | Mine is fresh; Deep Expansion now |

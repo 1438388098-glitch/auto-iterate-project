@@ -133,9 +133,11 @@ def build_check_payload(repo, full=False):
     if st.get("current_round") is not None:
         warnings.append("current_round is open; complete, block, or cancel it before starting a new round.")
 
-    repo_has_commits = io.has_commits(repo)
-    # Probed once and shared by the detached-HEAD check and the feature-mode
-    # branch-drift warning below: check is the loop's hottest command.
+    # Probed once and shared by the no-commits warning, the detached-HEAD
+    # check, the feature-mode branch-drift warning, and the analysis-validity
+    # helpers below: check is the loop's hottest command (wave10 candidate-390).
+    head_sha = io.head_sha(repo)
+    repo_has_commits = head_sha is not None
     head_branch = io.current_branch(repo) if repo_has_commits else None
     if not repo_has_commits:
         warnings.append("Repository has no commits yet; git log is unavailable and the first round creates the initial commit.")
@@ -301,8 +303,9 @@ def build_check_payload(repo, full=False):
         for lens in wave.get("lenses") or []:
             if lens not in lenses_used:
                 lenses_used.append(lens)
-    analysis_status, analysis_reason = state.analysis_validity(repo)
-    commits_behind = state.analysis_commits_behind(repo)
+    analysis_status, analysis_reason, analysis_doc = state.analysis_validity(
+        repo, current_head=head_sha)
+    commits_behind = state.analysis_commits_behind(repo, analysis=analysis_doc)
     if backlog_watch["needs_expansion"] and analysis_status == "stale" and (commits_behind or 0) >= 3:
         warnings.append(
             "analysis cache is {} commits stale; run analysis-load + analysis-save with a "
@@ -585,6 +588,9 @@ def build_check_payload(repo, full=False):
     payload["_ctx"] = {
         "st": st, "cfg": cfg, "backlog": backlog,
         "ranked": ranked, "selected_entries": selected_entries,
+        # 已解析的 analysis 文档（fresh 时非 None）：round-prep 的 cached 字段
+        # 直接复用，不再第三次解析同一文件（wave10 candidate-390）。
+        "analysis_doc": analysis_doc,
     }
     return payload
 
