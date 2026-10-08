@@ -90,11 +90,20 @@ def info_alive(repo):
         return False
 
 
+def _unlink_info(repo):
+    """Remove the info file, tolerating absence. The 3.8 unlink keyword is
+    off-limits: README pins the helper to Python 3.6+ (candidate-395)."""
+    try:
+        _info_path(repo).unlink()
+    except FileNotFoundError:
+        pass
+
+
 def clear_stale_info(repo):
     """Drop the info file when its server is gone, so ensure/spawn never
     mistake a dead server's record for a live one."""
     if _info_path(repo).exists() and not info_alive(repo):
-        _info_path(repo).unlink(missing_ok=True)
+        _unlink_info(repo)
 
 
 def _terminate(pid):
@@ -112,12 +121,13 @@ def stop_server(repo):
         return False
     try:
         if sys.platform == "win32":
+            # taskkill 输出无需回读：3.6 无一键捕获 kwargs，显式 PIPE（candidate-395）
             subprocess.run(["taskkill", "/PID", str(info["pid"]), "/F"],
-                           capture_output=True, timeout=10)
+                           stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=10)
         else:
             _terminate(info["pid"])
     finally:
-        _info_path(repo).unlink(missing_ok=True)
+        _unlink_info(repo)
     return True
 
 
@@ -337,4 +347,4 @@ def serve(repo, port=0, auto_open=True, host="127.0.0.1"):
             break
     server.shutdown()
     server.server_close()
-    _info_path(repo).unlink(missing_ok=True)
+    _unlink_info(repo)

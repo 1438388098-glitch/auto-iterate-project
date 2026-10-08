@@ -3113,6 +3113,25 @@ class HeadProbeTests(RepoTest):
         self.assertTrue(payload.get("ok", True))
 
 
+class Python36FloorTests(unittest.TestCase):
+    """directive：代码必须兼容 Python 3.6+。dashboard 曾用 3.8 的 unlink
+    missing-ok 旗标与 3.7 的 capture_output kwargs 打破 README 的 3.6+ 承诺
+    （candidate-395）——源码静态守卫防回归。token 扫描是粗粒度：
+    autopilot 包源码内不得出现这两个 token（含注释/文档串）。"""
+
+    FORBIDDEN_TOKENS = ("missing_ok", "capture_output")
+
+    def test_no_post36_only_apis_in_package(self):
+        pkg_dir = Path(autopilot.__file__).resolve().parent
+        offenders = []
+        for path in sorted(pkg_dir.glob("*.py")):
+            text = path.read_text(encoding="utf-8")
+            for token in self.FORBIDDEN_TOKENS:
+                if token in text:
+                    offenders.append("{}: {}".format(path.name, token))
+        self.assertEqual(offenders, [])
+
+
 class OptimizationTests(RepoTest):
     """Dirty-tree rules, budgets, deadline, JSON shapes, config errors."""
 
