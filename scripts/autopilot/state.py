@@ -569,9 +569,10 @@ EXPANSION_LENSES = (
 def append_expansion_wave(st, lenses):
     """Append one Deep Expansion wave record with bounded growth (oldest
     trimmed). Lenses are deduplicated and sorted — the record is a set
-    snapshot used to verify lens rotation across waves; `added` counts the
-    candidates the wave produced (0 at record time; the audit trail lives in
-    log.jsonl's backlog-add events between the two waves)."""
+    snapshot used to verify lens rotation across waves; `added` starts 0 at
+    record time and is backfilled by backlog-add per value-gated candidate of
+    origin predicted/expansion (candidate-386), so mining_exhausted's wave
+    term sees real wave yield."""
     waves = st.setdefault("expansion_waves", [])
     wave = {
         "at": io.now_iso(),
@@ -1347,7 +1348,9 @@ def _mark_selection(entries, cfg, progress=None):
         'late_run' | 'quota' | 'type' | 'cutoff', or 'batch_full' when the
         batch is already full (so consumers can tell why nothing was picked)
     """
-    n = cfg.get("candidates_per_round") or 3
+    # 防御回退对齐文档默认（candidate-387）：validator 已拒 null/0，此回退
+    # 只在键缺失类回归时兜底，值必须与 config.md 的默认 4 同源。
+    n = cfg.get("candidates_per_round") or 4
     max_per_type = cfg.get("max_same_type_per_round")
     if max_per_type is None:
         # 文档口径（config.md「Set to null to disable the quota」）：null 禁用

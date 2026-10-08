@@ -1651,6 +1651,37 @@ class LedgerGuardTests(RepoTest):
         self.assertNotEqual(refused2.returncode, 0)
         self.assertIn("'expansion_waves' must be an array", refused2.stderr)
 
+    def test_round_progress_remaining_matches_stop_gate(self):
+        self.run_state("init", "--max-rounds", "5")
+        self.run_state("begin-round", "--title", "r", "--reason", "x")
+        self.run_state("cancel-round", "--reason", "probe")  # 零工作 → aborted
+        data = json.loads(self.run_state("check", "--brief").stdout)
+        rp = data["round_progress"]
+        self.assertEqual(rp["round_seq"], 1)  # 序号推进
+        self.assertEqual(rp["remaining"], 5)  # 停止门分母：aborted 不烧预算
+
+    def test_expansion_wave_added_backfilled(self):
+        self.run_state("init")
+        self.run_state("expansion-record", "--lens", "tests")
+        added = self.run_state(
+            "backlog-add", "--title", "a", "--reason", "r", "--value", "3",
+            "--effort", "1", "--type", "test", "--origin", "expansion",
+            "--evidence", "file.py:1 probe")
+        self.assertEqual(added.returncode, 0, added.stderr)
+        state_path = self.repo / ".autopilot" / "state.json"
+        st = json.loads(state_path.read_text(encoding="utf-8"))
+        self.assertEqual(st["expansion_waves"][-1]["added"], 1)
+        st["mining_runs"] = [{"apply": True, "findings": 0, "new": 0},
+                             {"apply": True, "findings": 0, "new": 0}]
+        state_path.write_text(json.dumps(st), encoding="utf-8")
+        data = json.loads(self.run_state("check", "--brief").stdout)
+        self.assertFalse(data["mining"]["exhausted"])  # 波次仍在产出 → 不算枯竭
+        st = json.loads(state_path.read_text(encoding="utf-8"))
+        st["expansion_waves"][-1]["added"] = 0
+        state_path.write_text(json.dumps(st), encoding="utf-8")
+        data = json.loads(self.run_state("check", "--brief").stdout)
+        self.assertTrue(data["mining"]["exhausted"])  # 对照：零产出 + 零新增 mine
+
 
 class BudgetAccountingTests(RepoTest):
     """P1 budget/round accounting: zero-work cancels do not consume a round,

@@ -426,6 +426,15 @@ def build_check_payload(repo, full=False):
                 ),
             ))
 
+    # 与停止门（compute_stop_reason）同分母：四计数器之和。round_seq 含
+    # aborted 零工作取消的轮号，用它作分母会在有 abort 的 run 里提前假归零
+    # （candidate-385）。
+    completed_total = (
+        st.get("completed_rounds", 0)
+        + st.get("blocked_rounds", 0)
+        + st.get("cancelled_rounds", 0)
+        + st.get("reverted_rounds", 0)
+    )
     payload = {
         "continue": stop_reason is None,
         "stop_reason": stop_reason,
@@ -437,7 +446,7 @@ def build_check_payload(repo, full=False):
             "round_seq": st.get("round_seq", 0),
             "max_rounds": cfg.get("max_rounds"),
             "remaining": (
-                max(0, cfg["max_rounds"] - st.get("round_seq", 0))
+                max(0, cfg["max_rounds"] - completed_total)
                 if isinstance(cfg.get("max_rounds"), int) else None
             ),
         },
@@ -509,12 +518,6 @@ def build_check_payload(repo, full=False):
             "suggested_themes": suggested_themes,
             "min_pending_candidates": cfg.get("min_pending_candidates") if cfg.get("min_pending_candidates") is not None else 3,
         }
-    completed_total = (
-        st.get("completed_rounds", 0)
-        + st.get("blocked_rounds", 0)
-        + st.get("cancelled_rounds", 0)
-        + st.get("reverted_rounds", 0)
-    )
     # Boundary math: the anchor is the next round that will CLOSE (completed
     # rounds plus the open one, if any). Round k is itself a boundary when
     # k % every == 0 — with commit_every_rounds 5 the next boundary after 4

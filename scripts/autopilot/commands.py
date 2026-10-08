@@ -1689,6 +1689,15 @@ def cmd_backlog_add(args):
             return 0
         backlog["candidates"].append(candidate)
         state.save_backlog(repo, backlog)
+        if origin in ("predicted", "expansion"):
+            # 波次产量回填（candidate-386）：added 数本波经价值门产出的候选，
+            # mining_exhausted 的波次项据此与 SKILL 契约（连续两波零新增才许
+            # 枯竭）对齐——expansion-record 在波首记录，waves[-1] 即本波。
+            st = state.load_state(repo)
+            waves = st.get("expansion_waves") or []
+            if waves and isinstance(waves[-1], dict):
+                waves[-1]["added"] = int(waves[-1].get("added") or 0) + 1
+                state.save_state(repo, st)
         if seed is not None:
             st = state.load_state(repo)
             state.resolve_seed(st, seed["id"], "promoted", candidate_id=candidate_id)
