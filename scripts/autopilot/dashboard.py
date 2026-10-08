@@ -118,10 +118,15 @@ def _terminate(pid):
 
 def stop_server(repo):
     """Kill the recorded server (taskkill /F on Windows, SIGTERM elsewhere)
-    and always remove the info file. Returns False when nothing is recorded."""
+    and always remove the info file. Returns False when nothing is recorded.
+    A liveness probe runs before the kill (wave16 candidate-433): after a
+    reboot a recycled PID must not be force-killed by `dashboard --stop`."""
     info = read_info(repo)
     if not info:
         return False
+    if not info_alive(repo):
+        _unlink_info(repo)
+        return True
     try:
         if sys.platform == "win32":
             # taskkill 输出无需回读：3.6 无一键捕获 kwargs，显式 PIPE（candidate-395）

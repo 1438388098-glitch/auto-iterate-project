@@ -1928,15 +1928,23 @@ def build_report(repo, state, cfg, lang="en"):
                 ))
         if predicted_account.get("done"):
             out.append("")
+            sample = "（review 样本 {}/{}，校准 {}）".format(
+                predicted_account.get("review_n") or 0, predicted_account.get("done") or 0,
+                predicted_account.get("calibration"))
+            sample_en = " (review samples {}/{}, calibration {})".format(
+                predicted_account.get("review_n") or 0, predicted_account.get("done") or 0,
+                predicted_account.get("calibration"))
             if zh:
-                out.append("- 预测子账：已完成 {} / 受阻 {}（受阻率 {}%）".format(
+                # review 样本量（wave17 candidate-436）：调 max_predicted 的闭环
+                # 缺的就是这个数字——5/5 与 50/50 应可分辨。
+                out.append("- 预测子账：已完成 {} / 受阻 {}（受阻率 {}%）{}".format(
                     predicted_account["completed"], predicted_account["blocked"],
-                    round(predicted_account["blocked_rate"] * 100),
+                    round(predicted_account["blocked_rate"] * 100), sample,
                 ))
             else:
-                out.append("- Predicted sub-account: {} completed / {} blocked (blocked rate {}%)".format(
+                out.append("- Predicted sub-account: {} completed / {} blocked (blocked rate {}%){}".format(
                     predicted_account["completed"], predicted_account["blocked"],
-                    round(predicted_account["blocked_rate"] * 100),
+                    round(predicted_account["blocked_rate"] * 100), sample_en,
                 ))
     out.append("")
 

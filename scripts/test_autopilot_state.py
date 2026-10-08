@@ -2042,6 +2042,42 @@ class LedgerGuardTests(RepoTest):
         report = self.run_state("report")
         self.assertIn("空转取消: 1", report.stdout)
 
+    def test_stop_server_liveness_probe_before_kill(self):
+        # wave16 candidate-433：记录已死（重启后 PID 重用场景）只清记录，
+        # 不 taskkill 重用 PID 的无辜进程。
+        from autopilot import dashboard as ap_dashboard
+        self.assertFalse(ap_dashboard.stop_server(self.repo))  # 无记录
+        info_path = ap_dashboard._info_path(self.repo)
+        info_path.parent.mkdir(parents=True, exist_ok=True)
+        info_path.write_text('{"pid": 4000000000, "port": 1}', encoding="utf-8")
+        # 死 pid + 必拒端口：探活失败 → 只清记录不 kill（旧实现会 taskkill）
+        self.assertTrue(ap_dashboard.stop_server(self.repo))
+        self.assertFalse(info_path.exists())
+
+    def test_report_predicted_subaccount_shows_sample_size(self):
+        # wave17 candidate-436：调 max_predicted 的闭环需要 review 样本量。
+        self.run_state("init", "--goal", "G")
+        self.run_state("begin-round", "--title", "r", "--reason", "x")
+        self.add_file()
+        self.run_state("commit", "--summary", "w")
+        sha = self.git("rev-parse", "HEAD").stdout.strip()
+        self.run_state("complete-round", "--summary", "done", "--commit-sha", sha)
+        self.run_state("goal-met", "--goal", "G", "--round", "1", "--next-step", "X")
+        self.run_state("backlog-add", "--from-seed", "seed-001",
+                       "--value", "3", "--effort", "1", "--type", "feature")
+        # 补一条已完成预测候选，让预测子账段渲染
+        backlog_path = self.repo / ".autopilot" / "backlog.json"
+        backlog = json.loads(backlog_path.read_text(encoding="utf-8"))
+        backlog["candidates"].append({
+            "id": "candidate-090", "origin": "predicted", "status": "completed",
+            "title": "done prediction", "value": 4, "effort": 1, "risk": 1,
+            "type": "feature", "review_score": 5, "round": 1,
+        })
+        backlog_path.write_text(json.dumps(backlog), encoding="utf-8")
+        report = self.run_state("report")
+        # 样本量字段出现在预测子账行（[0-9] 避开转义层）
+        self.assertRegex(report.stdout, "review 样本 [0-9]+/[0-9]+")
+
     def test_config_set_budget_domains_match_init(self):
         # wave12 candidate-409：同一字段两扇门同域——max_rounds 收 0（立即
         # 停机）、max_minutes 收小数，与 init/validator 一致。
