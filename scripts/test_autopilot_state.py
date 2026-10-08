@@ -2180,6 +2180,28 @@ class LedgerGuardTests(RepoTest):
         self.assertEqual(rerun.returncode, 0, rerun.stderr)
         self.assertIn("Crash-recovery reuse", rerun.stderr)
 
+    def test_log_rotation_recovers_after_reader_releases(self):
+        # wave18 对抗审查 A3：读者压持期间轮转推迟（candidate-399），释放后
+        # 下一次超限 append 必须真正轮转——钉「推迟态可恢复」与条目不丢。
+        if sys.platform != "win32":
+            self.skipTest("Windows handle-lock semantics")
+        target = self.repo / ".autopilot" / "log.jsonl"
+        target.parent.mkdir(parents=True)
+        target.write_text("x" * 300, encoding="utf-8")
+        handle = open(target, "r")
+        with mock.patch.object(ap_io, "LOG_ROTATE_BYTES", 200):
+            with redirect_stderr(StringIO()):
+                ap_io.append_log(self.repo, "event", "warn", note="deferred-1")
+        handle.close()  # 读者释放
+        with mock.patch.object(ap_io, "LOG_ROTATE_BYTES", 200):
+            with redirect_stderr(StringIO()):
+                ap_io.append_log(self.repo, "event", "warn", note="after-release")
+        self.assertTrue(target.with_name(target.name + ".1").exists())  # 恢复轮转
+        text = target.read_text(encoding="utf-8")
+        self.assertIn("after-release", text)
+        self.assertIn("deferred-1", target.with_name(
+            target.name + ".1").read_text(encoding="utf-8"))  # 推迟期条目已归档
+
     def test_config_set_budget_domains_match_init(self):
         # wave12 candidate-409：同一字段两扇门同域——max_rounds 收 0（立即
         # 停机）、max_minutes 收小数，与 init/validator 一致。

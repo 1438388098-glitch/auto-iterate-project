@@ -559,16 +559,26 @@ def build_check_payload(repo, full=False):
         # checkpoint 绊线（wave13 candidate-420）：人工方向盘是唯一没有在环
         # 强制的安全特性——姊妹节奏（commit WARN / 扩展上限 / review 阈值）
         # 都在边界时刻出声，checkpoint 曾只算数字不出声。
-        warnings.append(_check_text(
-            cfg,
-            "下一轮（轮 {n}）是 checkpoint 轮（checkpoint_every={m}）：先汇总进度"
-            "（backlog 头部、token、提交数）并向用户请示继续/换向/改预算/停止。".format(
-                n=anchor, m=checkpoint_every),
-            "The next round (round {n}) is a checkpoint round (checkpoint_every={m}): "
-            "summarize progress (backlog top, tokens, commits) and consult the user — "
-            "continue / change goals / change budgets / stop — before continuing.".format(
-                n=anchor, m=checkpoint_every),
-        ))
+        open_now = st.get("current_round") is not None
+        zh_msg = (
+            ("当前开启的轮 {n} 是 checkpoint 轮（checkpoint_every={m}）：收轮前先汇总进度"
+             "（backlog 头部、token、提交数）并向用户请示继续/换向/改预算/停止。"
+             if open_now else
+             "下一轮（轮 {n}）是 checkpoint 轮（checkpoint_every={m}）：先汇总进度"
+             "（backlog 头部、token、提交数）并向用户请示继续/换向/改预算/停止。").format(
+                n=anchor, m=checkpoint_every)
+        )
+        en_msg = (
+            ("The OPEN round {n} is a checkpoint round (checkpoint_every={m}): summarize "
+             "progress (backlog top, tokens, commits) and consult the user — continue / "
+             "change goals / change budgets / stop — before closing it."
+             if open_now else
+             "The next round (round {n}) is a checkpoint round (checkpoint_every={m}): "
+             "summarize progress (backlog top, tokens, commits) and consult the user — "
+             "continue / change goals / change budgets / stop — before continuing.").format(
+                n=anchor, m=checkpoint_every)
+        )
+        warnings.append(_check_text(cfg, zh_msg, en_msg))
     payload["blocked_streak"] = blocked_streak
 
     # Budget observability: max_minutes measures wall-clock since the last
