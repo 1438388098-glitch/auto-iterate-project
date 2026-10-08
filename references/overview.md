@@ -10,6 +10,7 @@ Works with opencode, Claude Code, Codex, and other agent runtimes (auto-detected
 
 - **Self-owned loop**: deterministic state, backlog, branch, and budget management via `scripts/autopilot_state.py`; no host-specific tooling required.
 - **Efficiency-first defaults**: one round works on `candidates_per_round` (default 4) candidates, full verification runs every `verify_every_rounds` (default 3) rounds, and commits are flushed once every `commit_every_rounds` (default 5) rounds instead of per candidate.
+- **Deterministic supply first**: `mine` turns repository facts (markers, swallowed exceptions, syntax errors, test gaps, hotspots, dead exports, docs drift) into evidence-backed backlog candidates — the first move when the backlog is thin, before any judgment-based expansion. `round-prep` hands the loop its whole round start (stop condition, ranked candidates, directives) in one call.
 - **Smart backlog ranking**: candidates ranked by expected value per round (`ranking_mode: expected`) with type saturation, origin quotas, value floor, and effort cost. `classic` restores the legacy value/effort ratio.
 - **Repo analysis cache**: `.autopilot/analysis.json` auto-invalidates when HEAD or config changes.
 - **Secret guard**: `commit` scans the staged diff for secret-like content and refuses on a match.
@@ -43,7 +44,7 @@ Inside any git repository:
 python <skill-dir>/scripts/autopilot_state.py init --repo <repo> --max-rounds 5 --branch-mode feature
 ```
 
-Then run the loop in `SKILL.md`: check → analyze → backlog → begin-round → implement → verify → commit → complete-round.
+Then run the loop in `SKILL.md`: check → mine (when `action_hint: mine` — deterministic supply comes first) → backlog → begin-round → implement → verify → commit → complete-round. `round-prep` collapses the round start into one call.
 
 ## Configuration
 
