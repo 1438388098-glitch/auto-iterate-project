@@ -119,6 +119,22 @@ deterministic mine round). 26 implemented candidates, suite grown 261 → 302.
   round_seq), so aborted rounds no longer point them at already-spent
   numbers; a checkpoint boundary now WARNS in check/round-prep — the human
   steering wheel was the only safety feature with no in-loop tripwire.
+- Security & hardening tail: the `.autopilot/` run-state guard is
+  case-insensitive (case games on case-insensitive filesystems can no longer
+  bypass it); the dashboard's last raw innerHTML sink (candidate value/effort)
+  is escaped; the secret scanner covers Slack incoming webhooks, GitLab PATs,
+  Google OAuth client secrets and PyPI/npm publish tokens; `dashboard --stop`
+  probes liveness before taskkill (a recycled PID is no longer force-killed).
+- Observation dashboard: the snapshot cache key includes `log.jsonl` and a
+  30s clock bucket (the run-events panel and the budget countdown used to
+  freeze between round boundaries); replay filters events BEFORE taking the
+  render window (replaying an early round no longer blanks the timeline).
+- Report paths: phase-report trim and `finish --archive-reports` are scoped
+  to the current run (a previous run's stale reports used to be archived as
+  this run's record, and could push the fresh report out of the retention
+  window); aborted rounds get a counts line so the report arithmetic
+  reconciles with the history table; the predicted sub-account shows the
+  review sample size.
 - Supply-side audits (miner/verify/agent): `scan_swallowed` skips its own
   docstring (it minted two value-4 garbage candidates per mine run);
   `detect-verify` walks the whole tree for pytest layouts (a repo with its
