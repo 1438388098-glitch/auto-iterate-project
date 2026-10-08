@@ -366,7 +366,11 @@ def build_check_payload(repo, full=False):
         last_mine is None
         or (last_mine.get("findings") or 0) > (last_mine.get("applied") or 0)
     )
-    if stop_reason is None and mine_stale and action_hint in ("expand", "work"):
+    # mine 枯竭后提示让位（wave14 candidate-423）：mine_stale（去重后
+    # findings>applied 永真）与 exhausted 无联动，枯竭后 check 仍教人跑注定
+    # 零产的 mine——exhausted 时跳过降级，让位给 Deep Expansion 提示。
+    exhausted_now = mining_exhausted(st)
+    if stop_reason is None and mine_stale and not exhausted_now and action_hint in ("expand", "work"):
         min_pending = backlog_watch.get("min_pending_candidates")
         if min_pending is None:
             min_pending = 3

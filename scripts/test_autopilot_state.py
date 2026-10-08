@@ -1930,6 +1930,28 @@ class LedgerGuardTests(RepoTest):
         data = json.loads(self.run_state("check", "--brief").stdout)
         self.assertTrue(any("checkpoint" in w.lower() for w in data["warnings"]))
 
+    def test_mine_hint_defers_to_expansion_when_exhausted(self):
+        # wave14 candidate-423：连续两轮零新（exhausted=true）后 action_hint
+        # 不再降到 mine——本 run 实况亲历的卡死提示。
+        self.run_state("init")
+        state_path = self.repo / ".autopilot" / "state.json"
+        st = json.loads(state_path.read_text(encoding="utf-8"))
+        st["mining_runs"] = [
+            {"apply": True, "findings": 0, "new": 0},
+            {"apply": True, "findings": 0, "new": 0},
+        ]
+        state_path.write_text(json.dumps(st), encoding="utf-8")
+        data = json.loads(self.run_state("check", "--brief").stdout)
+        self.assertEqual(data["action_hint"], "expand")
+        self.assertTrue(any("Deep Expansion" in w for w in data["warnings"]))
+        self.assertFalse(any("mine --apply" in w for w in data["warnings"]))
+        # 对照：单轮零新未 exhaustion 且 findings>applied（stale）时仍教 mine
+        st = json.loads(state_path.read_text(encoding="utf-8"))
+        st["mining_runs"] = [{"apply": True, "findings": 58, "new": 0}]
+        state_path.write_text(json.dumps(st), encoding="utf-8")
+        data = json.loads(self.run_state("check", "--brief").stdout)
+        self.assertEqual(data["action_hint"], "mine")
+
     def test_config_set_budget_domains_match_init(self):
         # wave12 candidate-409：同一字段两扇门同域——max_rounds 收 0（立即
         # 停机）、max_minutes 收小数，与 init/validator 一致。
