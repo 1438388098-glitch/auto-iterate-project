@@ -344,12 +344,14 @@
     var g = (snapshot && snapshot.growth) || {};
     if (g.granularity === "run") return null;
     var rounds = g.rounds || [];
-    var maxTotal = 0, maxValid = 0;
+    var maxTotal = 0, maxValid = 0, minRound = 0;
     rounds.forEach(function (r) {
       if (r.round > maxTotal) maxTotal = r.round;
+      if (r.round && (minRound === 0 || r.round < minRound)) minRound = r.round;
       if (r.status === "completed" && r.round > maxValid) maxValid = r.round;
     });
-    return maxTotal ? { min: 1, max: maxTotal, valid: maxValid } : null;
+    // 窗口化（wave17 残留）：history 100 条裁剪后轴从窗口最小轮起，不谎称 r1
+    return maxTotal ? { min: minRound || 1, max: maxTotal, valid: maxValid } : null;
   }
 
   function passesReplay(ev) {
@@ -542,7 +544,9 @@
     var bounds = roundBounds();
     $("replay").hidden = !bounds;
     if (bounds) {
-      $("axis-label").textContent = "r1 — r" + bounds.max;
+      var windowed = snapshot && snapshot.growth && snapshot.growth.windowed;
+      $("axis-label").textContent = "r" + bounds.min + " — r" + bounds.max
+        + (windowed ? "（窗口）" : "");
       var cur = $("axis-cursor");
       if (replayRound === null) {
         $("axis-fill").style.width = Math.min(100, bounds.valid / bounds.max * 100) + "%";

@@ -1887,6 +1887,14 @@ def build_report(repo, state, cfg, lang="en"):
     history = state.get("history") or []
     out.append("## {}".format(L["history"]))
     out.append("")
+    if len(history) >= io.HISTORY_LIMIT:
+        # 窗口注记（wave17 残留）：计数器是全量的，表只是最近 100 条窗口。
+        zh = (cfg.get("report_lang") or "zh") == "zh"
+        out.append("- {}".format(
+            "（窗口注记：仅显示最近 {} 条；更早轮次已裁剪，以计数为准）".format(len(history))
+            if zh else
+            "(windowed: showing the last {} entries; older rounds are trimmed — trust the counters)".format(len(history))))
+        out.append("")
     if not history:
         out.append("- {}".format(L["none"]))
     else:
