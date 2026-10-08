@@ -1,7 +1,8 @@
 """Configuration schema, validation, and persistence for .autopilot/config.json.
 
-This module is the single source of truth for field defaults (default_config);
-references/config.md and README.md mirror it."""
+This module is the single source of truth for field defaults (default_config)
+and for per-field validation rules (_CONFIG_FIELD_RULES); references/config.md
+and README.md mirror it."""
 
 import math
 import re
@@ -113,23 +114,96 @@ def load_config(repo):
     return merged
 
 
-def validate_config(merged, source=None):
-    """Validate one fully merged config dict (defaults included). Raises
-    SystemExit(2) via _config_error on the first violation. Pure function:
-    load_config runs it after reading disk, and cmd_init runs it on the
-    command-line-built config BEFORE save_config, so an invalid init can never
-    write a config the next load would reject. `source` labels config errors
-    that trace back to init flags rather than an on-disk file."""
-    path = config_path_for(Path(merged.get("repo") or "."))
+# ---- 字段注册表（candidate-314，v1.14.0）----------------------------------
+# default_config 的每个旋钮在此声明校验规则：validate_config 按表序执行共享
+# 谓词，新增字段 = default_config 加默认值 + 这里加一行 + config.md 镜像，
+# 不再手写一段 if 链（1.12.x 的负数校验两套机制并存即此漂移的实录）。
+# 守卫测试 ConfigFieldRegistryTests 锁定「默认键集合 == 注册表 ∪ 豁免」。
+# 行序即历史校验顺序——多字段同时非法时的首报错误被测试锚定，勿重排。
+_CONFIG_FIELD_RULES = (
+    # goals 项级校验（轮 32 candidate-343）：[42] 这类项会变成 normalize 原样
+    # 返回、all_goals_met 恒 False 的死目标。
+    (("goals",), "string_array", None),
+    (("max_rounds", "max_minutes", "max_tokens", "max_round_scope"), "finite_number", None),
+    (("deadline",), "deadline", None),
+    # 负数会以零轮静默停机（0/-1 比较恒真）；0 是合法的「任一 blocked 即停」。
+    (
+        ("max_blocked_in_a_row", "retries_per_round"), "int_range",
+        (0, None, "must be an integer or null", "must be a non-negative integer or null"),
+    ),
+    (
+        ("candidates_per_round", "commit_every_rounds", "verify_every_rounds"), "int_range",
+        (1, None, "must be a positive integer", "must be a positive integer"),
+    ),
+    (
+        ("checkpoint_every",), "int_range",
+        (1, None, "must be a positive integer or null", "must be a positive integer or null"),
+    ),
+    (
+        ("review_threshold",), "int_range",
+        (1, 5, "must be an integer 1-5 or null", "must be an integer 1-5 or null"),
+    ),
+    (
+        ("type_saturation_threshold",), "int_range",
+        (0, None, "must be a non-negative integer", "must be a non-negative integer"),
+    ),
+    (("ranking_mode",), "choice", ("expected", "classic")),
+    (
+        ("min_candidate_value",), "int_range",
+        (1, 5, "must be an integer 1-5 or null", "must be an integer 1-5 or null"),
+    ),
+    (
+        ("max_same_type_per_round",), "int_range",
+        (1, None, "must be a positive integer or null", "must be a positive integer or null"),
+    ),
+    (
+        ("min_pending_candidates", "max_predicted_per_round",
+         "max_expansion_per_round", "max_expansion_waves"), "int_range",
+        (0, None, "must be a non-negative integer or null", "must be a non-negative integer or null"),
+    ),
+    # smoke_commands 与 check_commands 同形但分开成键：轮间的廉价检查不得被
+    # 循环当作正确性证明（见 references/config.md）。
+    (("check_commands",), "string_array", None),
+    (("smoke_commands",), "string_array", None),
+    (("allow_paths", "deny_paths"), "string_array", None),
+    (("secret_patterns",), "regex_array", None),
+    (("report_lang",), "choice", ("zh", "en")),
+    (("branch_mode",), "choice", ("current", "feature")),
+    (
+        ("push", "allow_uncommitted_changes", "track_state", "scan_secrets",
+         "expand_after_goals"), "bool", None,
+    ),
+    (("commit_message_prefix",), "string", None),
+)
 
-    if not isinstance(merged["goals"], list) or not all(
-        isinstance(goal, str) for goal in merged["goals"]
-    ):
-        # 项级校验（轮 32 candidate-343）：文案承诺 array of strings——
-        # [42] 这类项会变成 normalize 原样返回、all_goals_met 恒 False 的死目标。
-        _config_error(path, "'goals' must be an array of strings", source)
-    for key in ("max_rounds", "max_minutes", "max_tokens", "max_round_scope"):
-        value = merged.get(key)
+# 注册表豁免：repo 由 load_config 强制回填、dashboard 是嵌套对象且自带专项
+# 校验，均不走机械谓词。
+_REGISTRY_EXEMPT_FIELDS = ("repo", "dashboard")
+
+
+def field_int_rule(name):
+    """(lo, hi) bounds of an int-registered field, or None when the field is
+    not in an int_range row. cmd_config_set validates its --flags against the
+    same bounds the validator enforces, so the two range mechanisms cannot
+    drift apart again (candidate-314)."""
+    for fields, kind, spec in _CONFIG_FIELD_RULES:
+        if kind == "int_range" and name in fields:
+            return spec[0], spec[1]
+    return None
+
+
+def _validate_registered_field(path, source, key, value, kind, spec):
+    """One registry row, one field. Error texts are byte-identical to the
+    hand-written checks this table replaced."""
+    if kind == "int_range":
+        lo, hi, type_msg, range_msg = spec
+        if value is None:
+            return
+        if isinstance(value, bool) or not isinstance(value, int):
+            _config_error(path, "'{}' {}".format(key, type_msg), source)
+        if value < lo or (hi is not None and value > hi):
+            _config_error(path, "'{}' {}".format(key, range_msg), source)
+    elif kind == "finite_number":
         if value is not None and not isinstance(value, (int, float)):
             _config_error(path, "'{}' must be a number or null".format(key), source)
         if isinstance(value, (int, float)) and not isinstance(value, bool) and not math.isfinite(value):
@@ -138,98 +212,65 @@ def validate_config(merged, source=None):
             _config_error(path, "'{}' must be a finite number or null".format(key), source)
         if isinstance(value, bool) or (isinstance(value, (int, float)) and value < 0):
             _config_error(path, "'{}' must be a non-negative number or null".format(key), source)
-    deadline = merged.get("deadline")
-    if deadline is not None:
-        if not isinstance(deadline, str):
-            _config_error(path, "'deadline' must be an ISO-8601 timestamp string or null", source)
-        elif io.parse_time(deadline) is None:
-            _config_error(
-                path,
-                "'deadline' must be an absolute ISO-8601 timestamp (for example "
-                "'2026-08-10T08:00:00'). Use init --deadline to resolve relative "
-                "expressions like '+8h' or '08:00'. Or fix in place with "
-                "config-set --deadline.",
-                source,
-            )
-    if merged.get("max_blocked_in_a_row") is not None and (
-        not isinstance(merged["max_blocked_in_a_row"], int) or isinstance(merged["max_blocked_in_a_row"], bool)
-    ):
-        _config_error(path, "'max_blocked_in_a_row' must be an integer or null", source)
-    if isinstance(merged.get("max_blocked_in_a_row"), int) and merged["max_blocked_in_a_row"] < 0:
-        # Negative silently stops the loop with zero rounds (0/-1 comparisons
-        # are always true); 0 is a legal "stop after any blocked round" value.
-        _config_error(path, "'max_blocked_in_a_row' must be a non-negative integer or null", source)
-    if merged.get("retries_per_round") is not None and (
-        not isinstance(merged["retries_per_round"], int) or isinstance(merged["retries_per_round"], bool)
-    ):
-        _config_error(path, "'retries_per_round' must be an integer or null", source)
-    if isinstance(merged.get("retries_per_round"), int) and merged["retries_per_round"] < 0:
-        _config_error(path, "'retries_per_round' must be a non-negative integer or null", source)
-    cpr = merged.get("candidates_per_round")
-    if cpr is not None and (not isinstance(cpr, int) or isinstance(cpr, bool) or cpr < 1):
-        _config_error(path, "'candidates_per_round' must be a positive integer", source)
-    for key in ("commit_every_rounds", "verify_every_rounds"):
-        value = merged.get(key)
-        if value is not None and (not isinstance(value, int) or isinstance(value, bool) or value < 1):
-            _config_error(path, "'{}' must be a positive integer".format(key), source)
-    checkpoint = merged.get("checkpoint_every")
-    if checkpoint is not None and (not isinstance(checkpoint, int) or isinstance(checkpoint, bool) or checkpoint < 1):
-        _config_error(path, "'checkpoint_every' must be a positive integer or null", source)
-    review = merged.get("review_threshold")
-    if review is not None and (not isinstance(review, int) or isinstance(review, bool) or review < 1 or review > 5):
-        _config_error(path, "'review_threshold' must be an integer 1-5 or null", source)
-    threshold = merged.get("type_saturation_threshold")
-    if threshold is not None and (not isinstance(threshold, int) or isinstance(threshold, bool) or threshold < 0):
-        _config_error(path, "'type_saturation_threshold' must be a non-negative integer", source)
-    if merged.get("ranking_mode") not in ("expected", "classic"):
-        _config_error(path, "'ranking_mode' must be 'expected' or 'classic'", source)
-    mcv = merged.get("min_candidate_value")
-    if mcv is not None and (not isinstance(mcv, int) or isinstance(mcv, bool) or mcv < 1 or mcv > 5):
-        _config_error(path, "'min_candidate_value' must be an integer 1-5 or null", source)
-    mst = merged.get("max_same_type_per_round")
-    if mst is not None and (not isinstance(mst, int) or isinstance(mst, bool) or mst < 1):
-        _config_error(path, "'max_same_type_per_round' must be a positive integer or null", source)
-    mpc = merged.get("min_pending_candidates")
-    if mpc is not None and (not isinstance(mpc, int) or isinstance(mpc, bool) or mpc < 0):
-        _config_error(path, "'min_pending_candidates' must be a non-negative integer or null", source)
-    mpp = merged.get("max_predicted_per_round")
-    if mpp is not None and (not isinstance(mpp, int) or isinstance(mpp, bool) or mpp < 0):
-        _config_error(path, "'max_predicted_per_round' must be a non-negative integer or null", source)
-    mer = merged.get("max_expansion_per_round")
-    if mer is not None and (not isinstance(mer, int) or isinstance(mer, bool) or mer < 0):
-        _config_error(path, "'max_expansion_per_round' must be a non-negative integer or null", source)
-    mew = merged.get("max_expansion_waves")
-    if mew is not None and (not isinstance(mew, int) or isinstance(mew, bool) or mew < 0):
-        _config_error(path, "'max_expansion_waves' must be a non-negative integer or null", source)
-    if not isinstance(merged["check_commands"], list) or not all(isinstance(c, str) for c in merged["check_commands"]):
-        _config_error(path, "'check_commands' must be an array of strings", source)
-    # Declared cheap checks that run BETWEEN full verifications. Same shape as
-    # check_commands; separate key because the loop must not treat them as
-    # proof of correctness (see references/config.md).
-    smoke = merged.get("smoke_commands", [])
-    if not isinstance(smoke, list) or not all(isinstance(c, str) for c in smoke):
-        _config_error(path, "'smoke_commands' must be an array of strings", source)
-    for key in ("allow_paths", "deny_paths", "secret_patterns"):
-        if not isinstance(merged[key], list) or not all(isinstance(p, str) for p in merged[key]):
+    elif kind == "deadline":
+        if value is not None:
+            if not isinstance(value, str):
+                _config_error(path, "'deadline' must be an ISO-8601 timestamp string or null", source)
+            elif io.parse_time(value) is None:
+                _config_error(
+                    path,
+                    "'deadline' must be an absolute ISO-8601 timestamp (for example "
+                    "'2026-08-10T08:00:00'). Use init --deadline to resolve relative "
+                    "expressions like '+8h' or '08:00'. Or fix in place with "
+                    "config-set --deadline.",
+                    source,
+                )
+    elif kind == "regex_array":
+        if not isinstance(value, list) or not all(isinstance(p, str) for p in value):
             _config_error(path, "'{}' must be an array of strings".format(key), source)
-    for pattern in merged["secret_patterns"]:
-        try:
-            re.compile(pattern)
-        except re.error as exc:
+            return
+        for pattern in value:
+            try:
+                re.compile(pattern)
+            except re.error as exc:
+                _config_error(
+                    path,
+                    "'secret_patterns' contains an invalid regex ({}): {}".format(pattern, exc),
+                    source,
+                )
+    elif kind == "choice":
+        if value not in spec:
             _config_error(
                 path,
-                "'secret_patterns' contains an invalid regex ({}): {}".format(pattern, exc),
+                "'{}' must be {}".format(key, " or ".join("'{}'".format(c) for c in spec)),
                 source,
             )
-    if merged.get("report_lang") not in ("zh", "en"):
-        _config_error(path, "'report_lang' must be 'zh' or 'en'", source)
-    if merged.get("branch_mode") not in ("current", "feature"):
-        _config_error(path, "'branch_mode' must be 'current' or 'feature'", source)
-    for key in ("push", "allow_uncommitted_changes", "track_state", "scan_secrets", "expand_after_goals"):
-        if not isinstance(merged[key], bool):
+    elif kind == "string_array":
+        if not isinstance(value, list) or not all(isinstance(c, str) for c in value):
+            _config_error(path, "'{}' must be an array of strings".format(key), source)
+    elif kind == "bool":
+        if not isinstance(value, bool):
             _config_error(path, "'{}' must be true or false".format(key), source)
-    if not isinstance(merged["commit_message_prefix"], str):
-        _config_error(path, "'commit_message_prefix' must be a string", source)
+    elif kind == "string":
+        if not isinstance(value, str):
+            _config_error(path, "'{}' must be a string".format(key), source)
+
+
+def validate_config(merged, source=None):
+    """Validate one fully merged config dict (defaults included). Raises
+    SystemExit(2) via _config_error on the first violation. Pure function:
+    load_config runs it after reading disk, and cmd_init runs it on the
+    command-line-built config BEFORE save_config, so an invalid init can never
+    write a config the next load would reject. `source` labels config errors
+    that trace back to init flags rather than an on-disk file.
+
+    Mechanical checks are table-driven (_CONFIG_FIELD_RULES, candidate-314):
+    the walk order is the historical check order, so the first-reported error
+    for a multi-invalid config is unchanged."""
+    path = config_path_for(Path(merged.get("repo") or "."))
+    for fields, kind, spec in _CONFIG_FIELD_RULES:
+        for key in fields:
+            _validate_registered_field(path, source, key, merged.get(key), kind, spec)
     dash = merged.get("dashboard")
     if dash is not None:
         if not isinstance(dash, dict):

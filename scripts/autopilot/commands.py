@@ -1992,6 +1992,14 @@ def cmd_push(args):
         return emit_result(args, True, "[OK] Pushed to remote.")
 
 
+def _commit_refuse(args, repo, reason, message, **log_fields):
+    """Audit-and-refuse primitive for cmd_commit's guard chain: write the
+    error event, then return the emitted failure. Extra keyword arguments are
+    forwarded to the audit log (paths, round, findings...)."""
+    io.append_log(repo, "commit", "error", reason=reason, **log_fields)
+    return emit_result(args, False, message)
+
+
 def cmd_commit(args):
     repo = Path(args.repo).resolve()
     refused = _require_initialized(args, repo)
@@ -2003,22 +2011,22 @@ def cmd_commit(args):
 
         drift = _feature_branch_guard(repo, st, cfg, "commit")
         if drift is not None:
-            io.append_log(repo, "commit", "error", reason="branch drift")
-            return emit_result(args, False, drift)
+            return _commit_refuse(args, repo, "branch drift", drift)
 
         identity_ok, _, _ = io.git_identity_ok(repo)
         if not identity_ok:
-            io.append_log(repo, "commit", "error", reason="identity not configured")
-            return emit_result(
-                args, False,
+            return _commit_refuse(
+                args, repo, "identity not configured",
                 "[ERROR] Git identity is not configured. Run 'git config user.name ...' "
                 "and 'git config user.email ...' first.",
             )
 
         staged = io.run_git(repo, "diff", "--cached", "--quiet")
         if staged.returncode == 0:
-            io.append_log(repo, "commit", "error", reason="nothing staged")
-            return emit_result(args, False, "[ERROR] Nothing is staged. Run 'git add <files>' for the current round first.")
+            return _commit_refuse(
+                args, repo, "nothing staged",
+                "[ERROR] Nothing is staged. Run 'git add <files>' for the current round first.",
+            )
 
         bypassed_secrets = bool(cfg.get("scan_secrets", True) and getattr(args, "allow_secrets", False))
 
@@ -2036,14 +2044,14 @@ def cmd_commit(args):
         if not cfg.get("track_state"):
             forced_state = [p for p in staged_paths if io._is_autopilot_path(p)]
             if forced_state:
-                io.append_log(repo, "commit", "error", reason="autopilot state staged", paths=forced_state)
-                return emit_result(
-                    args, False,
+                return _commit_refuse(
+                    args, repo, "autopilot state staged",
                     "[ERROR] Staged files under .autopilot/ are run state, not product code "
                     "(track_state is false): {}. Unstage them ('git reset -q HEAD -- .autopilot/') "
                     "or set track_state: true if the state should be versioned.".format(
                         ", ".join(forced_state)
                     ),
+                    paths=forced_state,
                 )
 
         if cfg.get("allow_paths") or cfg.get("deny_paths"):
@@ -2052,10 +2060,10 @@ def cmd_commit(args):
                 if not path_allowed(path, cfg.get("allow_paths"), cfg.get("deny_paths"))
             ]
             if blocked:
-                io.append_log(repo, "commit", "error", reason="path whitelist violated", paths=blocked)
-                return emit_result(
-                    args, False,
+                return _commit_refuse(
+                    args, repo, "path whitelist violated",
                     "[ERROR] Staged files violate allow_paths/deny_paths: {}".format(", ".join(blocked)),
+                    paths=blocked,
                 )
 
         if cfg.get("scan_secrets", True) and not getattr(args, "allow_secrets", False):
@@ -2063,15 +2071,15 @@ def cmd_commit(args):
             if findings:
                 # Findings are masked (secrets.mask_secret_text) so the audit log
                 # never stores secret material.
-                io.append_log(repo, "commit", "error", reason="secrets detected", findings=findings)
                 detail = "; ".join(
                     "{}: {} (matched {})".format(f.get("file") or "?", f.get("text"), f.get("pattern"))
                     for f in findings[:5]
                 )
-                return emit_result(
-                    args, False,
+                return _commit_refuse(
+                    args, repo, "secrets detected",
                     "[ERROR] Secret-like content detected in the staged diff: {}. "
                     "Remove it, or commit with --allow-secrets / set scan_secrets: false.".format(detail),
+                    findings=findings,
                 )
 
         stat = io.run_git(repo, "diff", "--cached", "--stat")
@@ -2082,9 +2090,8 @@ def cmd_commit(args):
         if max_scope is not None:
             changed_lines = _staged_numstat_lines(repo)
             if changed_lines > max_scope:
-                io.append_log(repo, "commit", "error", reason="max_round_scope exceeded")
-                return emit_result(
-                    args, False,
+                return _commit_refuse(
+                    args, repo, "max_round_scope exceeded",
                     "[ERROR] Staged diff exceeds max_round_scope ({} lines > {}). "
                     "Split the change into smaller rounds.".format(changed_lines, max_scope),
                 )
@@ -2095,8 +2102,10 @@ def cmd_commit(args):
         start_dirty = None
         if args.round is not None:
             if args.round < 1:
-                io.append_log(repo, "commit", "error", reason="round out of range")
-                return emit_result(args, False, "[ERROR] --round must be a positive integer (got {}).".format(args.round))
+                return _commit_refuse(
+                    args, repo, "round out of range",
+                    "[ERROR] --round must be a positive integer (got {}).".format(args.round),
+                )
             # --round is a batch flush for changes belonging to an
             # ALREADY-completed round, not an arbitrary-commit escape hatch:
             # the number must exist in the run's completed history.
@@ -2108,17 +2117,17 @@ def cmd_commit(args):
                 (h for h in completed_history if h.get("round") == args.round), None
             )
             if round_entry is None:
-                io.append_log(repo, "commit", "error", reason="round not in completed history", round=args.round)
                 known = ", ".join(
                     str(h.get("round")) for h in completed_history if isinstance(h.get("round"), int)
                 )
-                return emit_result(
-                    args, False,
+                return _commit_refuse(
+                    args, repo, "round not in completed history",
                     "[ERROR] --round {}: no completed round with that number (completed rounds: {}). "
                     "--round is only for flushing staged changes that belong to already-completed "
                     "rounds; open a round with begin-round instead.".format(
                         args.round, known or "none"
                     ),
+                    round=args.round,
                 )
             round_no = args.round
             start_dirty = round_entry.get("start_dirty_files")
@@ -2126,9 +2135,8 @@ def cmd_commit(args):
             round_no = open_round.get("round")
             start_dirty = open_round.get("start_dirty_files")
         else:
-            io.append_log(repo, "commit", "error", reason="no open round")
-            return emit_result(
-                args, False,
+            return _commit_refuse(
+                args, repo, "no open round",
                 "[ERROR] No round is open. Use begin-round first, or pass --round <N> to flush "
                 "staged changes for an already-completed round (batch flush only; <N> must exist "
                 "in the run's completed history).",
@@ -2158,14 +2166,14 @@ def cmd_commit(args):
             start_dirty_set = set(start_dirty)
             preexisting = sorted(p for p in staged_paths if p in start_dirty_set)
         if preexisting:
-            io.append_log(repo, "commit", "error", reason="pre-existing user changes staged", paths=preexisting)
-            return emit_result(
-                args, False,
+            return _commit_refuse(
+                args, repo, "pre-existing user changes staged",
                 "[ERROR] Staged files were already uncommitted when round {} started (pre-existing "
                 "user changes, allow_uncommitted_changes is false): {}. Unstage them ('git reset "
                 "HEAD -- <file>'), or set allow_uncommitted_changes: true.".format(
                     round_no, ", ".join(preexisting)
                 ),
+                paths=preexisting,
             )
         if not isinstance(start_dirty, list):
             warn_unverifiable = True
@@ -2221,8 +2229,10 @@ def cmd_commit(args):
         result = io.run_git(repo, "commit", "-m", message)
         if result.returncode != 0:
             print(result.stderr.strip(), file=sys.stderr)
-            io.append_log(repo, "commit", "error", reason="git commit failed")
-            return emit_result(args, False, "[ERROR] git commit failed. Check pre-commit hooks or staged files.")
+            return _commit_refuse(
+                args, repo, "git commit failed",
+                "[ERROR] git commit failed. Check pre-commit hooks or staged files.",
+            )
         # Post-commit window（轮 15 候选 299）：commit 已落盘后 rev-parse/
         # state 回填若失败，这次冲刷不能在 state/log 里「从未发生」——
         # sha 尽力从 git commit 输出兜底，审计事件必然落一条。
@@ -2470,8 +2480,13 @@ def cmd_config_set(args):
                 "[ERROR] --max-blocked-in-a-row must be a non-negative integer (got {}).".format(args.max_blocked_in_a_row),
             )
         requested["max_blocked_in_a_row"] = args.max_blocked_in_a_row
+    # 数值边界问注册表（config.field_int_rule，candidate-314）：config-set 与
+    # validate_config 共享同一份下界，两套机制不再各自漂移。config-set 只暴露
+    # 正整数旗标；预算四键不在 int_range 行，回落 1 保持原行为。
     for name, value in requested.items():
-        if value < 1 and name != "max_blocked_in_a_row":
+        bounds = config.field_int_rule(name)
+        min_value = bounds[0] if bounds else 1
+        if value < min_value and name != "max_blocked_in_a_row":
             io.append_log(repo, "config-set", "error", reason="non-positive value", field=name, value=value)
             return emit_result(
                 args, False,

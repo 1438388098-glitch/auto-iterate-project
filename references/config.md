@@ -56,7 +56,13 @@ python <this-skill>/scripts/autopilot_state.py init --repo <repo> --deadline "08
 python <this-skill>/scripts/autopilot_state.py init --repo <repo> --deadline "2026-08-10T08:00:00+08:00"
 ```
 
-The expression is resolved to an absolute UTC timestamp once at `init` time, so re-reading the config never shifts the timer. Because the stored value must be absolute, hand-editing `config.json` requires a full ISO timestamp (the relative `+8h`/`HH:MM` forms are expanded by `init --deadline` and `config-set --deadline`). A deadline in the past stops the run on the first `check`; remove it (set `"deadline": null`) to disable. `null` means no deadline.
+The expression is resolved to an absolute UTC timestamp **once, at the moment it is set** — by `init --deadline` or by `config-set --deadline` (both call the same parser) — so re-reading the config never shifts the timer. Because the stored value must be absolute, hand-editing `config.json` requires a full ISO timestamp; the relative `+8h`/`HH:MM` forms are only accepted through the two commands. A deadline in the past stops the run on the first `check`; remove it (set `"deadline": null`, or `config-set --clear-deadline`) to disable. `null` means no deadline.
+
+```powershell
+python <this-skill>/scripts/autopilot_state.py config-set --repo <repo> --deadline "+8h"
+python <this-skill>/scripts/autopilot_state.py config-set --repo <repo> --deadline "07:00"
+python <this-skill>/scripts/autopilot_state.py config-set --repo <repo> --clear-deadline
+```
 
 ### max_tokens
 

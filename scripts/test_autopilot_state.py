@@ -1384,6 +1384,32 @@ class ConfigSetTests(RepoTest):
         self.assertIn("Could not parse --deadline", unparsable.stderr)
 
 
+class ConfigFieldRegistryTests(unittest.TestCase):
+    """candidate-314 守卫：default_config 的每个键必须被字段注册表覆盖或显式
+    豁免；config-set 的正整数边界与校验器同源。防「加旋钮忘同步」漂移
+    （1.12.x 连续三轮在付的税）。"""
+
+    def test_registry_covers_every_default_field(self):
+        defaults = config_module.default_config(Path("."))
+        registered = set()
+        for fields, _kind, _spec in config_module._CONFIG_FIELD_RULES:
+            registered.update(fields)
+        self.assertEqual(set(defaults), registered | set(config_module._REGISTRY_EXEMPT_FIELDS))
+
+    def test_config_set_int_flags_share_registry_bounds(self):
+        for name in ("candidates_per_round", "commit_every_rounds",
+                     "verify_every_rounds", "checkpoint_every"):
+            self.assertEqual(config_module.field_int_rule(name), (1, None))
+        # 预算四键走 finite_number 谓词，不在 int_range 行——config-set 回落 lo=1
+        self.assertIsNone(config_module.field_int_rule("max_rounds"))
+        # max_blocked_in_a_row 注册下界是 0（=run 立即停机），不是正整数
+        self.assertEqual(config_module.field_int_rule("max_blocked_in_a_row"), (0, None))
+
+    def test_registry_defaults_pass_validation(self):
+        # 全默认配置必须无告警通过整张注册表 walk（表本身的冒烟）
+        config_module.validate_config(config_module.default_config(Path(".")))
+
+
 class BudgetAccountingTests(RepoTest):
     """P1 budget/round accounting: zero-work cancels do not consume a round,
     tokens are billed monotonically per run, blocked streaks and budgets are
