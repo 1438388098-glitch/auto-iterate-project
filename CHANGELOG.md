@@ -135,6 +135,25 @@ deterministic mine round). 26 implemented candidates, suite grown 261 → 302.
   window); aborted rounds get a counts line so the report arithmetic
   reconciles with the history table; the predicted sub-account shows the
   review sample size.
+- Loop-command correctness tail: `goal-met --no-auto-context` still records
+  the verification event (the flag skips auto-context fields, not the event —
+  the old form silently swallowed an anchored verification); the crash-reuse
+  path of `backlog-add --from-seed` warns which caller fields were ignored;
+  `*_test.py` pytest layouts are detected again (the tree-walk rewrite broke
+  the stem check); the idempotent seed re-promotion no longer double-counts
+  wave yield or burns an id per retry; `load_state` anchors `run_start_sha` to
+  EMPTY_TREE only for genuinely unborn repos (transient git failures defer
+  billing with a warning instead of writing a poisoned anchor); `report
+  --lang en` no longer flips to Chinese labels after an aborted-round counts
+  line; `read`/`check --brief` expose a derived `aborted_rounds` counter so
+  machine consumers can reconcile round_seq without scanning history.
+- Documentation: config.md example block gains `smoke_commands`/
+  `max_expansion_waves`; the config-set settable-fields list gains the five
+  missing flag groups (incl. `--clear-check-commands`, documented nowhere
+  before); the `max_minutes` clock-reset list names all eleven refreshing
+  commands; check/state key enumerations include the 1.14 additions
+  (`deferred_paths`, `lenses_used_all`, `aborted_rounds`, `round_progress`);
+  README highlights refreshed to the 1.14 view (bilingual).
 - Supply-side audits (miner/verify/agent): `scan_swallowed` skips its own
   docstring (it minted two value-4 garbage candidates per mine run);
   `detect-verify` walks the whole tree for pytest layouts (a repo with its
