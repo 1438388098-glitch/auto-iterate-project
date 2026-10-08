@@ -238,9 +238,13 @@ def head_sha(repo):
 def _is_autopilot_path(path):
     if not path:
         return False
-    if path == AUTOPILOT_DIR:
+    # 大小写不敏感（wave12 candidate-411）：大小写不敏感盘（macOS APFS 默认）
+    # 上 `.Autopilot/...` 与 `.autopilot/...` 是同一个文件，case 敏感比对会让
+    # 运行态保护被 case 玩法绕过——与 guard.py 的双比对标准同一条线。
+    folded = str(path).casefold()
+    if folded == AUTOPILOT_DIR:
         return True
-    return path.startswith(AUTOPILOT_DIR + "/") or path.startswith(AUTOPILOT_DIR + "\\")
+    return folded.startswith(AUTOPILOT_DIR + "/") or folded.startswith(AUTOPILOT_DIR + "\\")
 
 
 _GIT_QUOTED_ESCAPE_RE = re.compile(r"\\([0-7]{3})|\\(.)")

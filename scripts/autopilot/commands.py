@@ -2617,11 +2617,21 @@ def cmd_config_set(args):
     for name, value in requested.items():
         bounds = config.field_int_rule(name)
         min_value = bounds[0] if bounds else 1
+        if name in ("max_rounds", "max_minutes"):
+            # init 同款：max_rounds 0 立即停机、max_minutes 仅拒负数（float
+            # 合法）——config-set 曾一概拒 0，同一字段两扇门两种域（candidate-409）。
+            min_value = 0
         if value < min_value and name != "max_blocked_in_a_row":
+            if name == "max_rounds":
+                expected = "a non-negative integer"
+            elif name == "max_minutes":
+                expected = "a non-negative number"
+            else:
+                expected = "a positive integer"
             io.append_log(repo, "config-set", "error", reason="non-positive value", field=name, value=value)
             return emit_result(
                 args, False,
-                "[ERROR] --{} must be a positive integer (got {}).".format(name.replace("_", "-"), value),
+                "[ERROR] --{} must be {} (got {}).".format(name.replace("_", "-"), expected, value),
             )
     for value_name, clear_name in (
         ("max_rounds", "clear_max_rounds"),

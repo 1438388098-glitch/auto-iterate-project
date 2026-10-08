@@ -22,6 +22,12 @@ SECRET_PATTERNS = [
     # \b: without it every long hyphenated word ending in "sk-" (task-, risk-,
     # disk-) blocked commits, training users to reach for --allow-secrets.
     r"\bsk-[A-Za-z0-9_-]{20,}",
+    # wave12 candidate-413 四种常见 CI/配置密钥形态：
+    r"https://hooks\.slack\.com/services/[A-Za-z0-9/_-]{20,}",  # Slack 入站 webhook
+    r"\bglpat-[A-Za-z0-9_-]{20,}",                              # GitLab PAT
+    r"\bGOCSPX-[A-Za-z0-9_-]{20,}",                             # Google OAuth client secret
+    r"\bpypi-AgEIcHlwaS5vcmc[A-Za-z0-9_-]{20,}",                # PyPI 发布 token
+    r"\bnpm_[A-Za-z0-9]{36,}",                                  # npm 发布/CI token
     # Scoped inline flag keeps this valid on Python 3.11+ where a bare (?i)
     # mid-pattern is rejected; the rest of the table stays case-sensitive.
     r"(?i:api[_-]?key\s*[:=]\s*[\"']?[A-Za-z0-9+/]{20,}[\"']?)",

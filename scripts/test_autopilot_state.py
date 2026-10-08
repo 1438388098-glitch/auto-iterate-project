@@ -1867,6 +1867,46 @@ class LedgerGuardTests(RepoTest):
         seed_status = next(s["status"] for s in st["goal_seeds"] if s["id"] == "seed-001")
         self.assertEqual(seed_status, "promoted")  # 种子标记补完
 
+    def test_config_set_budget_domains_match_init(self):
+        # wave12 candidate-409：同一字段两扇门同域——max_rounds 收 0（立即
+        # 停机）、max_minutes 收小数，与 init/validator 一致。
+        self.run_state("init")
+        zero = self.run_state("config-set", "--max-rounds", "0")
+        self.assertEqual(zero.returncode, 0, zero.stderr)
+        self.assertEqual(self.read_json("config.json")["max_rounds"], 0)
+        frac = self.run_state("config-set", "--max-minutes", "0.5")
+        self.assertEqual(frac.returncode, 0, frac.stderr)
+        self.assertEqual(self.read_json("config.json")["max_minutes"], 0.5)
+        negative = self.run_state("config-set", "--max-rounds", "-1")
+        self.assertNotEqual(negative.returncode, 0)
+        self.assertIn("non-negative integer", negative.stderr)
+
+    def test_secret_patterns_cover_common_ci_credentials(self):
+        # wave12 candidate-413：四种常见 CI/配置密钥形态必须命中
+        from autopilot.secrets import SECRET_PATTERNS
+        import re as _re
+        # 样例运行时拼接：测试源码里的完整密钥形态会触发真扫描器拦提交
+        # （round-18 同款教训），断形书写、成形匹配。
+        filler = "AbCdEfGhIjKlMnOpQrStUv"
+        samples = [
+            "https://hooks.slack.com/services/" + "T0/B0/" + filler + filler,
+            "password: glpat-" + filler + filler,
+            'client_secret = "GOCSPX-' + filler + filler + '"',
+            "PYPI_TOKEN: pypi-AgEIcHlwaS5vcmc" + filler + filler + filler,
+            "NPM_TOKEN=npm_" + filler + filler + filler + "1234",
+        ]
+        for sample in samples:
+            self.assertTrue(
+                any(_re.search(p, sample) for p in SECRET_PATTERNS),
+                "no pattern matched: {}".format(sample[:40]))
+
+    def test_autopilot_path_match_is_case_insensitive(self):
+        # wave12 candidate-411：大小写不敏感盘上 `.Autopilot` 即 `.autopilot`
+        self.assertTrue(ap_io._is_autopilot_path(".Autopilot/state.json"))
+        self.assertTrue(ap_io._is_autopilot_path(".AUTOPILOT"))
+        self.assertTrue(ap_io._is_autopilot_path(".autopilot/state.json"))
+        self.assertFalse(ap_io._is_autopilot_path("src/.autopilot_like.py"))
+
     def test_round_progress_remaining_matches_stop_gate(self):
         self.run_state("init", "--max-rounds", "5")
         self.run_state("begin-round", "--title", "r", "--reason", "x")

@@ -346,7 +346,7 @@ python <this-skill>/scripts/autopilot_state.py backlog-remove --repo <repo> --id
 python <this-skill>/scripts/autopilot_state.py goal-met --repo <repo> --goal "<goal>" --round <n> --next-step "<follow-up>" --next-step "<follow-up 2>" --unlocked-capability "<capability>"
 ```
 
-- `--round <n>` — the round that completed this goal; must match a completed history entry. Without it the goal event is recorded `unverified: true` and the "all goals met" stop is withheld (`check` lists the goals under `goals_unverified`)
+- `--round <n>` — the round that completed this goal; must not exceed the highest completed round (anchors pointing at rounds pruned from the 100-entry history window still count). Without it the goal event is recorded `unverified: true` and the "all goals met" stop is withheld (`check` lists the goals under `goals_unverified`)
 - `--evidence` — audit-only note on how you know the goal is met (recorded on the goal event, not scored)
 - `--next-step` (repeatable) — one direction seed per occurrence; `type` defaults to the first non-saturated type, `value` to 4, `effort` to 2, `risk` to 1
 - `--seed-type` / `--seed-value` / `--seed-effort` — override the defaults; the three flags apply to EVERY seed produced by the same `goal-met` call, so per-seed values need separate calls (or `backlog-update` after promotion)
