@@ -1766,7 +1766,8 @@ def cmd_backlog_add(args):
                 (c for c in backlog.get("candidates") or [] if c.get("from_seed") == seed["id"]),
                 None,
             )
-        if prior_promotion is not None:
+        reused = prior_promotion is not None
+        if reused:
             # 跨文件写序窗口自愈（wave11 candidate-401）：候选已落 backlog 而
             # 种子标记未及写 state 的崩溃残留——重跑晋升复用既有行，不铸重复
             # 候选；下方照常补完种子标记（幂等）。
@@ -1774,7 +1775,9 @@ def cmd_backlog_add(args):
         else:
             backlog["candidates"].append(candidate)
         state.save_backlog(repo, backlog)
-        if origin in ("predicted", "expansion"):
+        if origin in ("predicted", "expansion") and not reused:
+            # 复用路径不回填（wave18 candidate-445）：added 数本波新产候选，
+            # 崩溃重试的幂等复用不算新产量，否则枯竭判定被幻影产量推迟。
             # 波次产量回填（candidate-386）：added 数本波经价值门产出的候选，
             # mining_exhausted 的波次项据此与 SKILL 契约（连续两波零新增才许
             # 枯竭）对齐——expansion-record 在波首记录，waves[-1] 即本波。

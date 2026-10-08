@@ -1855,6 +1855,8 @@ class LedgerGuardTests(RepoTest):
             if seed.get("id") == "seed-001":
                 seed["status"] = "open"
         state_path.write_text(json.dumps(st), encoding="utf-8")
+        # 开一波再触发崩溃重试：复用路径不得重复回填波次产量（candidate-445）
+        self.run_state("expansion-record", "--lens", "tests")
         rerun = self.run_state(
             "backlog-add", "--from-seed", "seed-001",
             "--value", "3", "--effort", "1", "--type", "feature")
@@ -1864,6 +1866,8 @@ class LedgerGuardTests(RepoTest):
         rows = [c for c in backlog["candidates"] if c.get("from_seed") == "seed-001"]
         self.assertEqual(len(rows), 1)
         st = json.loads(state_path.read_text(encoding="utf-8"))
+        # 幂等：复用路径不得回填 added（修复前此处置 1，幻影产量推迟枯竭判定）
+        self.assertEqual(st["expansion_waves"][-1]["added"], 0)
         seed_status = next(s["status"] for s in st["goal_seeds"] if s["id"] == "seed-001")
         self.assertEqual(seed_status, "promoted")  # 种子标记补完
 
@@ -1968,6 +1972,11 @@ class LedgerGuardTests(RepoTest):
         (self.repo / "scripts" / "test_tool.py").write_text(
             "def test_a():\n    pass\n", encoding="utf-8")
         self.assertTrue(_has_pytest_test_files(self.repo))
+        # *_test.py 约定（candidate-444）：stem 判定，name 判定曾永假
+        alt = Path(tempfile.mkdtemp(prefix="autopilot-verify-alt-"))
+        self.addCleanup(shutil.rmtree, alt, ignore_errors=True)
+        (alt / "auth_test.py").write_text("def test_b():\n    pass\n", encoding="utf-8")
+        self.assertTrue(_has_pytest_test_files(alt))
         empty = Path(tempfile.mkdtemp(prefix="autopilot-verify-"))
         self.addCleanup(shutil.rmtree, empty, ignore_errors=True)
         self.assertFalse(_has_pytest_test_files(empty))

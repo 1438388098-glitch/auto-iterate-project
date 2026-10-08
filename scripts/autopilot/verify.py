@@ -73,8 +73,10 @@ def _has_pytest_test_files(root):
     5000-line suite lives in scripts/ (wave14 candidate-428). detect-verify is
     a manual command, so the full walk costs nothing in the round loop."""
     for path in root.rglob("*.py"):
-        name = path.name
-        if name.startswith("test_") or name.endswith("_test"):
+        # stem 判定（wave18 candidate-444）：name 恒以 .py 结尾，
+        # endswith("_test") 在 rglob 形态下永假——pytest 的 *_test.py 约定
+        # 曾因此不可检出（基线版本显式 glob 得到，属能力回退）。
+        if path.name.startswith("test_") or path.stem.endswith("_test"):
             return True
     return False
 
