@@ -1457,8 +1457,13 @@ def _mark_selection(entries, cfg, progress=None):
             if origin == "expansion" and expansion_count >= max_expansion:
                 continue
             if cutoff_base is not None and entry["score"] < 0.4 * cutoff_base and entry.get("below_floor"):
+                entry["cut_reason"] = "cutoff"  # 与池内循环同款标注（candidate-415）
                 break
             selected.append(entry)
+            if cutoff_base is None:
+                # 全 below-floor 批次的首选也定基（wave13 candidate-415）：
+                # 池子为空时 base 曾恒 None，40% 截断在收尾期永不生效。
+                cutoff_base = entry["score"]
             if origin == "predicted":
                 predicted_count += 1
             elif origin == "expansion":

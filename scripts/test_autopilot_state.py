@@ -1904,6 +1904,23 @@ class LedgerGuardTests(RepoTest):
         self.assertEqual(
             ap_state.compute_predicted_account(backlog_lo)["calibration"], 0.6)
 
+    def test_mark_selection_cutoff_fires_all_below_floor(self):
+        # wave13 candidate-415：收尾期只剩快赢时 40% 截断曾永不生效（base 恒
+        # None），Q2/Q3 被当同侪全选——文档口径应截到 [Q1]。
+        entries = [
+            {"id": "q1", "status": "pending", "ready": True, "below_floor": True,
+             "score": 1.2, "origin": "observed", "type": "bugfix"},
+            {"id": "q2", "status": "pending", "ready": True, "below_floor": True,
+             "score": 0.4, "origin": "observed", "type": "bugfix"},
+            {"id": "q3", "status": "pending", "ready": True, "below_floor": True,
+             "score": 0.3, "origin": "observed", "type": "bugfix"},
+        ]
+        ap_state._mark_selection(entries, {"candidates_per_round": 4, "min_candidate_value": 3})
+        self.assertTrue(entries[0]["selected"])
+        self.assertEqual(entries[1].get("cut_reason"), "cutoff")
+        self.assertFalse(entries[1]["selected"])
+        self.assertFalse(entries[2]["selected"])
+
     def test_goal_chain_bonus_normalizes_goal_text(self):
         # wave13 candidate-417：NFC/零宽/空白差异不得吞掉 ≤1.08 平局裁决加成。
         goal = "修复登录超时"
