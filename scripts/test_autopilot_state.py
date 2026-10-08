@@ -2221,6 +2221,76 @@ class LedgerGuardTests(RepoTest):
         data = json.loads(self.run_state("check", "--brief").stdout)
         self.assertEqual(data["aborted_rounds"], 1)
 
+    def test_deferred_paths_ledger_exit_and_reentry(self):
+        # wave21 candidate-452：ledger 出账（提交后）/再入账（重新编辑）的
+        # 完整生命周期——只进不出的回归会让真用户编辑被静默吸收进轮提交。
+        self.run_state("init", "--commit-every-rounds", "2")
+        state_path = self.repo / ".autopilot" / "state.json"
+        st = json.loads(state_path.read_text(encoding="utf-8"))
+        st["completed_rounds"] = 1  # 非首轮
+        state_path.write_text(json.dumps(st), encoding="utf-8")
+        self.run_state("begin-round", "--title", "r1", "--reason", "x")
+        (self.repo / "a.py").write_text("v1" + chr(10), encoding="utf-8")
+        self.run_state("complete-round", "--summary", "defer a.py")
+        st = json.loads(state_path.read_text(encoding="utf-8"))
+        self.assertEqual(st["deferred_paths"], ["a.py"])  # 入账
+        self.run_state("begin-round", "--title", "r2", "--reason", "x")
+        self.git("add", "a.py")
+        self.run_state("commit", "--summary", "flush")
+        self.run_state("complete-round", "--summary", "close r2")
+        st = json.loads(state_path.read_text(encoding="utf-8"))
+        self.assertEqual(st["deferred_paths"], [])  # 出账：已提交即出
+        # 再入账：出账后对同一文件的再次遗留重新入账（生命周期闭环）
+        self.run_state("begin-round", "--title", "r3", "--reason", "x")
+        (self.repo / "a.py").write_text("v2" + chr(10), encoding="utf-8")
+        self.run_state("complete-round", "--summary", "re-defer a.py")
+        st = json.loads(state_path.read_text(encoding="utf-8"))
+        self.assertEqual(st["deferred_paths"], ["a.py"])
+
+    def test_classic_ranking_honors_saturation_threshold(self):
+        # wave21 candidate-453：candidate-438 的 null 修复在 classic 分支的
+        # 防线——阈值经 effective_saturation_threshold 传入 0.85 幂衰减。
+        backlog = {"candidates": [
+            {"id": "done1", "origin": "observed", "status": "completed",
+             "type": "bugfix", "value": 4, "effort": 1},
+            {"id": "done2", "origin": "observed", "status": "completed",
+             "type": "bugfix", "value": 4, "effort": 1},
+            {"id": "pbug", "origin": "observed", "status": "pending",
+             "type": "bugfix", "value": 4, "effort": 1, "risk": 1},
+            {"id": "pfeat", "origin": "observed", "status": "pending",
+             "type": "feature", "value": 4, "effort": 1, "risk": 1},
+        ]}
+        ranked = ap_state.rank_candidates(
+            backlog, {"ranking_mode": "classic", "type_saturation_threshold": 1})
+        by_id = {e["id"]: e for e in ranked}
+        self.assertEqual(by_id["pfeat"]["score_breakdown"]["saturation_factor"], 1.0)
+        self.assertAlmostEqual(
+            by_id["pbug"]["score_breakdown"]["saturation_factor"], 0.85)
+        self.assertLess(ranked.index(by_id["pbug"]), 10**9)  # 存在性
+        self.assertGreater(
+            ranked.index(by_id["pfeat"]), -1)
+
+    def test_smoke_recommendation_python_branch(self):
+        # wave21 candidate-454：pyproject.toml → compileall 冒烟建议。
+        from autopilot.verify import detect_smoke_commands
+        (self.repo / "pyproject.toml").write_text(
+            "[project]" + chr(10) + "name = 't'" + chr(10), encoding="utf-8")
+        signals = detect_smoke_commands(str(self.repo))
+        self.assertIn(("python", "python -m compileall -q ."), signals)
+
+    def test_unicode_entry_survives_rotation_archive(self):
+        # wave21 candidate-455：unicode 经 os.replace 进 .1 归档后读回完好
+        # （append 编码回归在 Windows 是 ValueError，不被软失败捕获即崩）。
+        target = self.repo / ".autopilot" / "log.jsonl"
+        target.parent.mkdir(parents=True)
+        target.write_text("x" * 300, encoding="utf-8")
+        with mock.patch.object(ap_io, "LOG_ROTATE_BYTES", 200):
+            with redirect_stderr(StringIO()):
+                ap_io.append_log(self.repo, "begin-round", "success", note="注册表轮")
+        # 首次 append 即越过阈值：旧内容进 .1，unicode 落在新的 live 文件
+        self.assertIn("注册表轮", target.read_text(encoding="utf-8"))
+        self.assertIn("x", target.with_name(target.name + ".1").read_text(encoding="utf-8"))
+
     def test_config_set_budget_domains_match_init(self):
         # wave12 candidate-409：同一字段两扇门同域——max_rounds 收 0（立即
         # 停机）、max_minutes 收小数，与 init/validator 一致。
