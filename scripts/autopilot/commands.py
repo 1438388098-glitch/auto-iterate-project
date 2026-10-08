@@ -433,10 +433,11 @@ def cmd_begin_round(args):
         floor = cfg.get("min_candidate_value")
         ready_above = []
         ready_below = []
+        deps_by_id = state.candidates_by_id(backlog)  # 每 pending 一次 O(1) 依赖查（candidate-392）
         for candidate in backlog.get("candidates") or []:
             if candidate.get("status") != "pending":
                 continue
-            missing, is_ready = state.candidate_deps_status(backlog, candidate)
+            missing, is_ready = state.candidate_deps_status(backlog, candidate, by_id=deps_by_id)
             if not is_ready:
                 continue
             below = floor is not None and state._resolved_value(candidate) < floor
@@ -468,6 +469,7 @@ def cmd_begin_round(args):
                 file=sys.stderr,
             )
         if candidate_ids:
+            picked_by_id = state.candidates_by_id(backlog)
             for cid in candidate_ids:
                 candidate = state.find_candidate(backlog, cid)
                 if candidate is None:
@@ -500,7 +502,7 @@ def cmd_begin_round(args):
                             "run backlog-update --status pending first.".format(cid, status),
                         ),
                     )
-                missing, ready = state.candidate_deps_status(backlog, candidate)
+                missing, ready = state.candidate_deps_status(backlog, candidate, by_id=picked_by_id)
                 if not ready:
                     io.append_log(repo, "begin-round", "error", reason="candidate deps unresolved", deps=missing)
                     return emit_result(
@@ -1496,7 +1498,13 @@ def cmd_finish(args):
                     shutil.copy2(retrospective_path, archive_dir / io.RETROSPECTIVE_FILENAME)
                 for report in sorted((repo / io.AUTOPILOT_DIR).glob("phase-report-round-*.md")):
                     shutil.copy2(report, archive_dir / report.name)
-                print("[OK] Reports archived to docs/autopilot/.")
+                if getattr(args, "json", False):
+                    # JSON 模式信息行走 stderr（config.md 契约）：这是文档
+                    # 钦点的 finish --archive-reports --json 收官调用，
+                    # stdout 里混进 [OK] 行会炸掉循环 agent 的 json.loads。
+                    print("[OK] Reports archived to docs/autopilot/.", file=sys.stderr)
+                else:
+                    print("[OK] Reports archived to docs/autopilot/.")
             except OSError as exc:
                 print("[WARN] Report archiving failed: {}".format(exc), file=sys.stderr)
         message = "[OK] Autopilot run finished."

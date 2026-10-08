@@ -3082,6 +3082,36 @@ class HeadProbeTests(RepoTest):
         # commits_behind 接受预载文档，不再二次解析
         self.assertIsNotNone(ap_state.analysis_commits_behind(self.repo, analysis=doc))
 
+    def test_deps_status_by_id_equivalent_to_rescan(self):
+        backlog = {"candidates": [
+            {"id": "a", "status": "completed", "depends_on": []},
+            {"id": "b", "status": "pending", "depends_on": ["a"]},
+            {"id": "c", "status": "pending", "depends_on": ["b", "ghost"]},
+        ]}
+        by_id = ap_state.candidates_by_id(backlog)
+        for cid in ("a", "b", "c"):
+            candidate = ap_state.find_candidate(backlog, cid)
+            self.assertEqual(
+                ap_state.candidate_deps_status(backlog, candidate),
+                ap_state.candidate_deps_status(backlog, candidate, by_id=by_id), cid)
+        # 语义锚：完成依赖就绪、未完成阻塞、缺失标记 missing
+        self.assertEqual(ap_state.candidate_deps_status(backlog, by_id["b"]), ([], True))
+        self.assertEqual(
+            ap_state.candidate_deps_status(backlog, by_id["c"]),
+            (["b (pending)", "ghost (missing)"], False))
+
+    def test_finish_json_stdout_is_pure_json(self):
+        self.run_state("init", "--max-rounds", "1")  # 一轮后停止条件即达，finish 过门
+        self.run_state("begin-round", "--title", "r", "--reason", "x")
+        self.add_file()
+        self.run_state("commit", "--summary", "add feature")
+        sha = self.git("rev-parse", "HEAD").stdout.strip()
+        self.run_state("complete-round", "--summary", "done", "--commit-sha", sha)
+        result = self.run_state("finish", "--reason", "done", "--json", "--archive-reports")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        payload = json.loads(result.stdout)  # 信息行不得混入 stdout
+        self.assertTrue(payload.get("ok", True))
+
 
 class OptimizationTests(RepoTest):
     """Dirty-tree rules, budgets, deadline, JSON shapes, config errors."""

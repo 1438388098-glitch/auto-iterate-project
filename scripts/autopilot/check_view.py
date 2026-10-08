@@ -61,8 +61,9 @@ def _backlog_watch(backlog, cfg):
     candidates = backlog.get("candidates") or []
     pending = [c for c in candidates if c.get("status") == "pending"]
     ready = []
+    by_id = state.candidates_by_id(backlog)
     for candidate in pending:
-        missing, is_ready = state.candidate_deps_status(backlog, candidate)
+        missing, is_ready = state.candidate_deps_status(backlog, candidate, by_id=by_id)
         if is_ready:
             ready.append(candidate)
     min_pending = cfg.get("min_pending_candidates")
@@ -86,10 +87,11 @@ def _ready_valuable_count(backlog, floor):
     check's unverified-goal warning, and begin-round's goals-met refusal —
     "work remains" must mean the same thing in all three."""
     count = 0
+    by_id = state.candidates_by_id(backlog)
     for candidate in backlog.get("candidates") or []:
         if candidate.get("status") != "pending":
             continue
-        _, is_ready = state.candidate_deps_status(backlog, candidate)
+        _, is_ready = state.candidate_deps_status(backlog, candidate, by_id=by_id)
         if is_ready and (floor is None or state._resolved_value(candidate) >= floor):
             count += 1
     return count

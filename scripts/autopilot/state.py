@@ -1078,15 +1078,26 @@ def compute_type_stats(backlog):
     return stats
 
 
-def candidate_deps_status(backlog, candidate):
+def candidates_by_id(backlog):
+    """id -> candidate map, one pass over the backlog. First occurrence wins on
+    duplicate ids (same semantics as find_candidate). Shared by every caller
+    that resolves dependencies for many candidates at once."""
+    return {c.get("id"): c for c in reversed(backlog.get("candidates") or [])}
+
+
+def candidate_deps_status(backlog, candidate, by_id=None):
     """Return (missing_deps, ready). A candidate is ready when every candidate in its
-    depends_on list exists in the backlog and is completed."""
+    depends_on list exists in the backlog and is completed. `by_id` accepts a
+    prebuilt candidates_by_id map so per-candidate calls inside rank/begin-round
+    stop rescanning the backlog per dependency (wave10 candidate-392)."""
     deps = candidate.get("depends_on") or []
     if not deps:
         return [], True
+    if by_id is None:
+        by_id = candidates_by_id(backlog)
     missing = []
     for dep_id in deps:
-        dep = find_candidate(backlog, dep_id)
+        dep = by_id.get(dep_id)
         if dep is None:
             missing.append("{} (missing)".format(dep_id))
         elif dep.get("status") != "completed":
@@ -1465,6 +1476,7 @@ def rank_candidates(backlog, cfg, progress=None, completed_goals=None):
     for candidate in pending:
         pending_by_type[_candidate_type(candidate)] = pending_by_type.get(_candidate_type(candidate), 0) + 1
     unlocks = _unlocks_map(backlog)
+    by_id = candidates_by_id(backlog)  # 依赖解析 O(1) 查找，循环内不再线性扫（candidate-392）
 
     entries = []
     for candidate in backlog.get("candidates", []):
@@ -1482,7 +1494,7 @@ def rank_candidates(backlog, cfg, progress=None, completed_goals=None):
         )
         entry["score"] = round(score, 3)
         entry["score_breakdown"] = breakdown
-        missing, ready = candidate_deps_status(backlog, candidate)
+        missing, ready = candidate_deps_status(backlog, candidate, by_id=by_id)
         entry["ready"] = ready
         entry["blocked_by"] = missing
         entry["unlocks"] = unlocks.get(candidate.get("id"), 0)
