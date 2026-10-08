@@ -22,6 +22,12 @@ SECRET_PATTERNS = [
     # \b: without it every long hyphenated word ending in "sk-" (task-, risk-,
     # disk-) blocked commits, training users to reach for --allow-secrets.
     r"\bsk-[A-Za-z0-9_-]{20,}",
+    # wave12 candidate-413 四种常见 CI/配置密钥形态：
+    r"https://hooks\.slack\.com/services/[A-Za-z0-9/_-]{20,}",  # Slack 入站 webhook
+    r"\bglpat-[A-Za-z0-9_-]{20,}",                              # GitLab PAT
+    r"\bGOCSPX-[A-Za-z0-9_-]{20,}",                             # Google OAuth client secret
+    r"\bpypi-AgEIcHlwaS5vcmc[A-Za-z0-9_-]{20,}",                # PyPI 发布 token
+    r"\bnpm_[A-Za-z0-9]{36,}",                                  # npm 发布/CI token
     # Scoped inline flag keeps this valid on Python 3.11+ where a bare (?i)
     # mid-pattern is rejected; the rest of the table stays case-sensitive.
     r"(?i:api[_-]?key\s*[:=]\s*[\"']?[A-Za-z0-9+/]{20,}[\"']?)",
@@ -106,14 +112,17 @@ def mask_secret_text(text):
     return text[:6] + "..." + text[-4:]
 
 
-def scan_staged_diff(repo, extra_patterns=None):
+def scan_staged_diff(repo, extra_patterns=None, staged_numstat=None):
     """Scan the added lines of the staged diff for secret-like content. Returns a
     list of findings (pattern, file, masked text), deduplicated per pattern+line.
     Uses -U0 so context lines are not read, and core.quotepath=false so non-ASCII
     file names are reported literally. Fail-closed: if git diff fails, the scan
     reports a synthetic finding instead of pretending the tree is clean. Staged
     BINARY files also produce a finding: their content is unscannable, so a
-    binary can only be committed via --allow-secrets (same fail-closed promise)."""
+    binary can only be committed via --allow-secrets (same fail-closed promise).
+    `staged_numstat` accepts the caller's shared `git diff --cached --numstat`
+    pass (wave10 candidate-389) — it must carry core.quotepath=false for
+    literal file names; when given, the binary-detection spawn below is skipped."""
     diff = io.run_git(repo, "-c", "core.quotepath=false", "diff", "--cached", "-U0")
     if diff.returncode != 0:
         detail = (diff.stderr or diff.stdout or "git diff failed").strip()
@@ -165,7 +174,10 @@ def scan_staged_diff(repo, extra_patterns=None):
                         }
                     )
         prev_line = line
-    numstat = io.run_git(repo, "-c", "core.quotepath=false", "diff", "--cached", "--numstat")
+    if staged_numstat is not None:
+        numstat = staged_numstat
+    else:
+        numstat = io.run_git(repo, "-c", "core.quotepath=false", "diff", "--cached", "--numstat")
     if numstat.returncode == 0:
         for line in numstat.stdout.splitlines():
             parts = line.split("\t")

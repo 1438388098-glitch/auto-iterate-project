@@ -61,8 +61,9 @@ def _backlog_watch(backlog, cfg):
     candidates = backlog.get("candidates") or []
     pending = [c for c in candidates if c.get("status") == "pending"]
     ready = []
+    by_id = state.candidates_by_id(backlog)
     for candidate in pending:
-        missing, is_ready = state.candidate_deps_status(backlog, candidate)
+        missing, is_ready = state.candidate_deps_status(backlog, candidate, by_id=by_id)
         if is_ready:
             ready.append(candidate)
     min_pending = cfg.get("min_pending_candidates")
@@ -86,10 +87,11 @@ def _ready_valuable_count(backlog, floor):
     check's unverified-goal warning, and begin-round's goals-met refusal —
     "work remains" must mean the same thing in all three."""
     count = 0
+    by_id = state.candidates_by_id(backlog)
     for candidate in backlog.get("candidates") or []:
         if candidate.get("status") != "pending":
             continue
-        _, is_ready = state.candidate_deps_status(backlog, candidate)
+        _, is_ready = state.candidate_deps_status(backlog, candidate, by_id=by_id)
         if is_ready and (floor is None or state._resolved_value(candidate) >= floor):
             count += 1
     return count
@@ -133,9 +135,11 @@ def build_check_payload(repo, full=False):
     if st.get("current_round") is not None:
         warnings.append("current_round is open; complete, block, or cancel it before starting a new round.")
 
-    repo_has_commits = io.has_commits(repo)
-    # Probed once and shared by the detached-HEAD check and the feature-mode
-    # branch-drift warning below: check is the loop's hottest command.
+    # Probed once and shared by the no-commits warning, the detached-HEAD
+    # check, the feature-mode branch-drift warning, and the analysis-validity
+    # helpers below: check is the loop's hottest command (wave10 candidate-390).
+    head_sha = io.head_sha(repo)
+    repo_has_commits = head_sha is not None
     head_branch = io.current_branch(repo) if repo_has_commits else None
     if not repo_has_commits:
         warnings.append("Repository has no commits yet; git log is unavailable and the first round creates the initial commit.")
@@ -296,18 +300,27 @@ def build_check_payload(repo, full=False):
     # order-preserving union across recorded waves; lenses_unused is what the
     # next wave should draw from.
     waves = [w for w in (st.get("expansion_waves") or []) if isinstance(w, dict)]
+    # lenses_used 的出处是跨窗总账（candidate-403）：20 波窗口会裁掉早期
+    # 波次记录，只并窗口会把已用镜头重报成 unused、误导轮换。总账缺失时
+    # （旧 state）回退窗口并集，行为不劣于修复前。
     lenses_used = []
+    for lens in st.get("lenses_used_all") or []:
+        if lens not in lenses_used:
+            lenses_used.append(lens)
     for wave in waves:
         for lens in wave.get("lenses") or []:
             if lens not in lenses_used:
                 lenses_used.append(lens)
-    analysis_status, analysis_reason = state.analysis_validity(repo)
-    commits_behind = state.analysis_commits_behind(repo)
+    analysis_status, analysis_reason, analysis_doc = state.analysis_validity(
+        repo, current_head=head_sha)
+    commits_behind = state.analysis_commits_behind(repo, analysis=analysis_doc)
     if backlog_watch["needs_expansion"] and analysis_status == "stale" and (commits_behind or 0) >= 3:
-        warnings.append(
+        warnings.append(_check_text(
+            cfg,
+            "分析缓存落后 HEAD {n} 个提交：下一波扩展前先 analysis-load + 全新扫描 + analysis-save".format(n=commits_behind),
             "analysis cache is {} commits stale; run analysis-load + analysis-save with a "
-            "fresh scan before the next expansion wave".format(commits_behind)
-        )
+            "fresh scan before the next expansion wave".format(commits_behind),
+        ))
     ranked, selected_count = rank_for_selection(backlog, st, cfg)
     selected_entries = [e for e in ranked if e.get("selected")]
     selected_empty_reason = None
@@ -355,7 +368,11 @@ def build_check_payload(repo, full=False):
         last_mine is None
         or (last_mine.get("findings") or 0) > (last_mine.get("applied") or 0)
     )
-    if stop_reason is None and mine_stale and action_hint in ("expand", "work"):
+    # mine 枯竭后提示让位（wave14 candidate-423）：mine_stale（去重后
+    # findings>applied 永真）与 exhausted 无联动，枯竭后 check 仍教人跑注定
+    # 零产的 mine——exhausted 时跳过降级，让位给 Deep Expansion 提示。
+    exhausted_now = mining_exhausted(st)
+    if stop_reason is None and mine_stale and not exhausted_now and action_hint in ("expand", "work"):
         min_pending = backlog_watch.get("min_pending_candidates")
         if min_pending is None:
             min_pending = 3
@@ -426,6 +443,15 @@ def build_check_payload(repo, full=False):
                 ),
             ))
 
+    # 与停止门（compute_stop_reason）同分母：四计数器之和。round_seq 含
+    # aborted 零工作取消的轮号，用它作分母会在有 abort 的 run 里提前假归零
+    # （candidate-385）。
+    completed_total = (
+        st.get("completed_rounds", 0)
+        + st.get("blocked_rounds", 0)
+        + st.get("cancelled_rounds", 0)
+        + st.get("reverted_rounds", 0)
+    )
     payload = {
         "continue": stop_reason is None,
         "stop_reason": stop_reason,
@@ -437,13 +463,13 @@ def build_check_payload(repo, full=False):
             "round_seq": st.get("round_seq", 0),
             "max_rounds": cfg.get("max_rounds"),
             "remaining": (
-                max(0, cfg["max_rounds"] - st.get("round_seq", 0))
+                max(0, cfg["max_rounds"] - completed_total)
                 if isinstance(cfg.get("max_rounds"), int) else None
             ),
         },
         "selected_count": len(selected_entries),
         "selected_empty_reason": selected_empty_reason,
-        "wave_no": len(waves),
+        "wave_no": state.expansion_wave_count(st),  # 单调序号，窗口裁剪不再冻结（candidate-403）
         "lenses_used": lenses_used,
         "lenses_unused": [lens for lens in state.EXPANSION_LENSES if lens not in lenses_used],
         "mining": {
@@ -480,7 +506,7 @@ def build_check_payload(repo, full=False):
                 recent_types[candidate_type] = int(entry.get("completed") or 0)
             except (TypeError, ValueError, OverflowError):
                 recent_types[candidate_type] = 0
-        saturated = state.saturated_types(st, cfg.get("type_saturation_threshold", 2))
+        saturated = state.saturated_types(st, state.effective_saturation_threshold(cfg))
         underused = [t for t in state.VALID_CANDIDATE_TYPES if t not in saturated]
         suggested_themes = []
         for event in reversed(st.get("goal_events") or []):
@@ -509,18 +535,20 @@ def build_check_payload(repo, full=False):
             "suggested_themes": suggested_themes,
             "min_pending_candidates": cfg.get("min_pending_candidates") if cfg.get("min_pending_candidates") is not None else 3,
         }
-    completed_total = (
-        st.get("completed_rounds", 0)
-        + st.get("blocked_rounds", 0)
-        + st.get("cancelled_rounds", 0)
-        + st.get("reverted_rounds", 0)
-    )
-    # Boundary math: the anchor is the next round that will CLOSE (completed
-    # rounds plus the open one, if any). Round k is itself a boundary when
-    # k % every == 0 — with commit_every_rounds 5 the next boundary after 4
-    # closed rounds is 5, and once round 5 has closed the same formula points
-    # at 10 instead of re-reporting the finished round.
-    anchor = completed_total + 1
+    # Boundary math: the anchor is the NUMBER of the round that will close
+    # next — the open round's own number, else round_seq + 1. Round numbers
+    # come from the monotonic round_seq (aborted rounds consume numbers
+    # without advancing the counters), so anchoring on completed_total made
+    # the boundary fields point at already-spent numbers after any abort and
+    # desync them from commit's own round-number WARN (wave13 candidate-419).
+    # Round k is itself a boundary when k % every == 0.
+    open_round_entry = st.get("current_round") or {}
+    if open_round_entry:
+        anchor = open_round_entry.get("round")
+    else:
+        # max() 兼容两种状态形态：真实 run 的 round_seq ≥ 计数器（aborted 耗
+        # 号），测试/老 state 可能只推进 completed_rounds。
+        anchor = max(completed_total, st.get("round_seq", 0) or 0) + 1
     verify_every = cfg.get("verify_every_rounds") or 1
     commit_every = cfg.get("commit_every_rounds") or 1
     payload["next_verify_round"] = ((anchor - 1) // verify_every + 1) * verify_every
@@ -529,7 +557,35 @@ def build_check_payload(repo, full=False):
     payload["next_checkpoint_round"] = (
         ((anchor - 1) // checkpoint_every + 1) * checkpoint_every if checkpoint_every else None
     )
+    if checkpoint_every and anchor == payload["next_checkpoint_round"]:
+        # checkpoint 绊线（wave13 candidate-420）：人工方向盘是唯一没有在环
+        # 强制的安全特性——姊妹节奏（commit WARN / 扩展上限 / review 阈值）
+        # 都在边界时刻出声，checkpoint 曾只算数字不出声。
+        open_now = st.get("current_round") is not None
+        zh_msg = (
+            ("当前开启的轮 {n} 是 checkpoint 轮（checkpoint_every={m}）：收轮前先汇总进度"
+             "（backlog 头部、token、提交数）并向用户请示继续/换向/改预算/停止。"
+             if open_now else
+             "下一轮（轮 {n}）是 checkpoint 轮（checkpoint_every={m}）：先汇总进度"
+             "（backlog 头部、token、提交数）并向用户请示继续/换向/改预算/停止。").format(
+                n=anchor, m=checkpoint_every)
+        )
+        en_msg = (
+            ("The OPEN round {n} is a checkpoint round (checkpoint_every={m}): summarize "
+             "progress (backlog top, tokens, commits) and consult the user — continue / "
+             "change goals / change budgets / stop — before closing it."
+             if open_now else
+             "The next round (round {n}) is a checkpoint round (checkpoint_every={m}): "
+             "summarize progress (backlog top, tokens, commits) and consult the user — "
+             "continue / change goals / change budgets / stop — before continuing.").format(
+                n=anchor, m=checkpoint_every)
+        )
+        warnings.append(_check_text(cfg, zh_msg, en_msg))
     payload["blocked_streak"] = blocked_streak
+    payload["aborted_rounds"] = sum(
+        1 for entry in (st.get("history") or [])
+        if isinstance(entry, dict) and entry.get("status") == "aborted"
+    )
 
     # Budget observability: max_minutes measures wall-clock since the last
     # round activity (pausing burns it), deadline is an absolute moment.
@@ -582,6 +638,9 @@ def build_check_payload(repo, full=False):
     payload["_ctx"] = {
         "st": st, "cfg": cfg, "backlog": backlog,
         "ranked": ranked, "selected_entries": selected_entries,
+        # 已解析的 analysis 文档（fresh 时非 None）：round-prep 的 cached 字段
+        # 直接复用，不再第三次解析同一文件（wave10 candidate-390）。
+        "analysis_doc": analysis_doc,
     }
     return payload
 

@@ -190,6 +190,18 @@ def _validate_state_types(repo, state):
         _state_type_error(path, "'goal_events' must be an array")
     if not isinstance(state.get("goal_seeds", []), list):
         _state_type_error(path, "'goal_seeds' must be an array")
+    # 供给侧两键（wave9 candidate-383）：坏形状曾让 mine/expansion-record
+    # 以裸 AttributeError 崩溃（cli 只捕 ValueError/KeyError/TypeError/OSError）。
+    if not isinstance(state.get("mining_runs", []), list):
+        _state_type_error(path, "'mining_runs' must be an array")
+    if not isinstance(state.get("expansion_waves", []), list):
+        _state_type_error(path, "'expansion_waves' must be an array")
+    if not isinstance(state.get("deferred_paths", []), list):
+        # Run 级 deferred 账本（wave11 candidate-402）：跨 history 窗口存续
+        _state_type_error(path, "'deferred_paths' must be an array")
+    if not isinstance(state.get("lenses_used_all", []), list):
+        # 镜头跨窗总账（wave11 candidate-403）：≤16 项，order-preserving
+        _state_type_error(path, "'lenses_used_all' must be an array")
     current = state.get("current_round")
     if current is not None and not isinstance(current, dict):
         _state_type_error(path, "'current_round' must be an object or null")
@@ -244,7 +256,23 @@ def load_state(repo):
         # purpose. EMPTY_TREE (an existing value) is left alone so an unborn
         # repo does not churn the state file on every load.
         head = io.run_git(repo, "rev-parse", "--verify", "-q", "HEAD")
-        state["run_start_sha"] = head.stdout.strip() if head.returncode == 0 else io.EMPTY_TREE
+        if head.returncode == 0:
+            state["run_start_sha"] = head.stdout.strip()
+        else:
+            # 只对 unborn 仓（确有 .git 但无提交）回退 EMPTY_TREE；其他失败
+            # （.git 暂不可读等瞬时故障）保持 None——错锚会让下一轮把整仓
+            # diff 一次性记账并可能假触发 max_tokens（注释自述的不变量，
+            # wave18 candidate-442）。保持 None 时本次不计费，下次加载重试。
+            probe = io.run_git(repo, "rev-parse", "--is-inside-work-tree")
+            if probe.returncode == 0 and probe.stdout.strip() == "true":
+                state["run_start_sha"] = io.EMPTY_TREE
+            else:
+                print(
+                    "[WARN] Could not read HEAD ({}); run_start_sha stays unset and "
+                    "billing is deferred to the next load.".format(
+                        (head.stderr or head.stdout or "").strip()[:120]),
+                    file=sys.stderr,
+                )
         changed = True
     _validate_state_types(repo, state)
     if old_schema < io.SCHEMA_VERSION:
@@ -321,14 +349,36 @@ def _validate_backlog(repo, backlog):
     candidates = backlog.get("candidates")
     if not isinstance(candidates, list):
         fail("'candidates' must be an array")
+    seen_ids = set()
     for candidate in candidates:
         if not isinstance(candidate, dict):
             fail("every candidate must be an object")
-        if not isinstance(candidate.get("id"), str) or not candidate.get("id"):
+        cid = candidate.get("id")
+        if not isinstance(cid, str) or not cid:
             fail("every candidate needs a non-empty string 'id'")
+        if cid in seen_ids:
+            # 重复 id 会让 find_candidate/update_candidates_status 命中第一处，
+            # 完成账本被静默改写到错误行上（wave9 candidate-379）。
+            fail("duplicate candidate id: {}".format(cid))
+        seen_ids.add(cid)
     next_id = backlog.get("next_id")
     if not isinstance(next_id, int) or isinstance(next_id, bool):
         fail("'next_id' must be a number")
+
+
+def mint_candidate_id(backlog):
+    """Mint the next unused candidate id and bump next_id past it. A merged or
+    restored backlog can carry a stale next_id (git merge, .bak restore);
+    minting blind would create a duplicate id and re-book completed work
+    against the wrong row (wave9 candidate-379), so skip ids already in use."""
+    used = {c.get("id") for c in backlog.get("candidates") or []}
+    next_id = backlog.get("next_id")
+    if not isinstance(next_id, int) or isinstance(next_id, bool):
+        next_id = 1
+    while "candidate-{:03d}".format(next_id) in used:
+        next_id += 1
+    backlog["next_id"] = next_id + 1
+    return "candidate-{:03d}".format(next_id)
 
 
 def save_backlog(repo, backlog):
@@ -410,6 +460,20 @@ def round_candidate_ids(current):
 # stays a plain string array for backward compatibility.
 
 SEED_STATUSES = ("open", "promoted", "verified", "refuted", "rejected")
+
+
+def effective_saturation_threshold(cfg):
+    """type_saturation_threshold 落地值。validate_config 容忍显式 null（int_range
+    行的 null 跳过语义），但 null 顺着 cfg.get(key, 2) 流进来时默认值不生效，
+    到 saturated_types/评分函数里退化成阈值 0 = 全类型饱和（candidate-378 热点
+    复审发现）。null/缺失/非 int 一律回落默认 2，与键缺失路径同一条线。"""
+    value = (cfg or {}).get("type_saturation_threshold")
+    if value is None:
+        return 2
+    try:
+        return max(0, int(value))
+    except (TypeError, ValueError):
+        return 2
 
 
 def saturated_types(state, threshold=2):
@@ -527,9 +591,13 @@ EXPANSION_LENSES = (
 def append_expansion_wave(st, lenses):
     """Append one Deep Expansion wave record with bounded growth (oldest
     trimmed). Lenses are deduplicated and sorted — the record is a set
-    snapshot used to verify lens rotation across waves; `added` counts the
-    candidates the wave produced (0 at record time; the audit trail lives in
-    log.jsonl's backlog-add events between the two waves)."""
+    snapshot used to verify lens rotation across waves; `added` starts 0 at
+    record time and is backfilled by backlog-add per value-gated candidate of
+    origin predicted/expansion (candidate-386), so mining_exhausted's wave
+    term sees real wave yield. `lenses_used_all` (candidate-403) is the
+    order-preserving union across ALL waves ever recorded — the 20-entry
+    window forgets early waves, and the rotation guidance must not re-report
+    a used lens as unused."""
     waves = st.setdefault("expansion_waves", [])
     wave = {
         "at": io.now_iso(),
@@ -539,6 +607,13 @@ def append_expansion_wave(st, lenses):
     waves.append(wave)
     if len(waves) > io.EXPANSION_WAVES_LIMIT:
         del waves[: len(waves) - io.EXPANSION_WAVES_LIMIT]
+    used_all = st.get("lenses_used_all")
+    if not isinstance(used_all, list):
+        used_all = []
+    for lens in wave["lenses"]:
+        if lens not in used_all:
+            used_all.append(lens)
+    st["lenses_used_all"] = used_all
     # Monotonic total, independent of the rolling window above: the wave cap
     # (max_expansion_waves) must count every wave ever recorded, not just the
     # ones still inside the window (len(expansion_waves) saturates).
@@ -1035,15 +1110,26 @@ def compute_type_stats(backlog):
     return stats
 
 
-def candidate_deps_status(backlog, candidate):
+def candidates_by_id(backlog):
+    """id -> candidate map, one pass over the backlog. First occurrence wins on
+    duplicate ids (same semantics as find_candidate). Shared by every caller
+    that resolves dependencies for many candidates at once."""
+    return {c.get("id"): c for c in reversed(backlog.get("candidates") or [])}
+
+
+def candidate_deps_status(backlog, candidate, by_id=None):
     """Return (missing_deps, ready). A candidate is ready when every candidate in its
-    depends_on list exists in the backlog and is completed."""
+    depends_on list exists in the backlog and is completed. `by_id` accepts a
+    prebuilt candidates_by_id map so per-candidate calls inside rank/begin-round
+    stop rescanning the backlog per dependency (wave10 candidate-392)."""
     deps = candidate.get("depends_on") or []
     if not deps:
         return [], True
+    if by_id is None:
+        by_id = candidates_by_id(backlog)
     missing = []
     for dep_id in deps:
-        dep = find_candidate(backlog, dep_id)
+        dep = by_id.get(dep_id)
         if dep is None:
             missing.append("{} (missing)".format(dep_id))
         elif dep.get("status") != "completed":
@@ -1063,12 +1149,14 @@ def compute_predicted_account(backlog):
     completed = blocked = 0
     review_sum = 0.0
     review_n = 0
+    value_sum = 0.0
     for candidate in backlog.get("candidates", []):
         if candidate.get("origin") != "predicted":
             continue
         status = candidate.get("status")
         if status == "completed":
             completed += 1
+            value_sum += _resolved_value(candidate)
             review = candidate.get("review_score")
             if isinstance(review, (int, float)) and not isinstance(review, bool) and review == review:
                 review_sum += review
@@ -1086,8 +1174,8 @@ def compute_predicted_account(backlog):
         "review_n": review_n,
         "review_avg": round(review_sum / review_n, 2) if review_n else None,
         "calibration": (
-            round(max(0.6, min(1.5, (review_sum / review_n) / max(1, completed))), 2)
-            if review_n >= 3 and completed else 1.0
+            round(max(0.6, min(1.5, (review_sum / review_n) / (value_sum / completed))), 2)
+            if review_n >= 3 and completed and value_sum > 0 else 1.0
         ),
     }
 
@@ -1191,7 +1279,14 @@ def _score_expected(candidate, type_stats=None, saturation_threshold=2,
     confidence_factor = confidence
 
     based_on = candidate.get("based_on")
-    goal_chain_factor = 1.08 if (based_on and based_on in (completed_goals or [])) else 1.0
+    # 归一比较（wave13 candidate-417）：全文件其余目标比较都走
+    # normalize_goal_text——NFC/零宽/空白差异不该吞掉 ≤1.08 的平局裁决加成。
+    normalized_completed = [normalize_goal_text(goal) for goal in (completed_goals or [])]
+    goal_chain_factor = (
+        1.08
+        if based_on and normalize_goal_text(based_on) in normalized_completed
+        else 1.0
+    )
 
     unlock_bonus = 1.0 + 0.15 * unlocks
 
@@ -1305,8 +1400,15 @@ def _mark_selection(entries, cfg, progress=None):
         'late_run' | 'quota' | 'type' | 'cutoff', or 'batch_full' when the
         batch is already full (so consumers can tell why nothing was picked)
     """
-    n = cfg.get("candidates_per_round") or 3
-    max_per_type = cfg.get("max_same_type_per_round") or 2
+    # 防御回退对齐文档默认（candidate-387）：validator 已拒 null/0，此回退
+    # 只在键缺失类回归时兜底，值必须与 config.md 的默认 4 同源。
+    n = cfg.get("candidates_per_round") or 4
+    max_per_type = cfg.get("max_same_type_per_round")
+    if max_per_type is None:
+        # 文档口径（config.md「Set to null to disable the quota」）：null 禁用
+        # 配额，不是折叠回默认 2（wave9 candidate-381）——与下面
+        # max_predicted/max_expansion 的 None=不封顶同一条语义线。
+        max_per_type = len(entries)
     max_predicted = cfg.get("max_predicted_per_round")
     if max_predicted is None:
         max_predicted = len(entries)
@@ -1317,9 +1419,12 @@ def _mark_selection(entries, cfg, progress=None):
     for entry in entries:
         entry["selected"] = False
         entry.pop("cut_reason", None)
-    pool = [e for e in entries if e.get("status") == "pending" and e.get("ready") and not e.get("below_floor")]
-    below = [e for e in entries if e.get("status") == "pending" and e.get("ready") and e.get("below_floor")]
-    observed_ready = any((e.get("origin") or "observed") == "observed" for e in pool)
+    ready_pending = [e for e in entries if e.get("status") == "pending" and e.get("ready")]
+    pool = [e for e in ready_pending if not e.get("below_floor")]
+    below = [e for e in ready_pending if e.get("below_floor")]
+    # 尾期安全阀口径（wave13 candidate-416）：「observed 仍就绪」含 below-floor——
+    # 只看池子会让阀门恰在观测工作跌破价值下限时（收尾期常态）失效。
+    observed_ready = any((e.get("origin") or "observed") == "observed" for e in ready_pending)
     predicted_quota = 0 if (late_run and observed_ready) else max_predicted
     selected = []
     type_counts = {}
@@ -1371,14 +1476,33 @@ def _mark_selection(entries, cfg, progress=None):
             if origin == "expansion" and expansion_count >= max_expansion:
                 continue
             if cutoff_base is not None and entry["score"] < 0.4 * cutoff_base and entry.get("below_floor"):
+                entry["cut_reason"] = "cutoff"  # 与池内循环同款标注（candidate-415）
                 break
             selected.append(entry)
+            if cutoff_base is None:
+                # 全 below-floor 批次的首选也定基（wave13 candidate-415）：
+                # 池子为空时 base 曾恒 None，40% 截断在收尾期永不生效。
+                cutoff_base = entry["score"]
             if origin == "predicted":
                 predicted_count += 1
             elif origin == "expansion":
                 expansion_count += 1
     for entry in selected:
         entry["selected"] = True
+
+
+def _rank_sort_key(item):
+    """Deterministic rank order: pending first, ready first, score desc,
+    below-floor demoted at equal score (wave13 candidate-418), observed
+    before predicted/expansion, then id as the total-order tiebreak."""
+    return (
+        item.get("status") != "pending",
+        not item.get("ready"),
+        -item.get("score", 0.0),
+        bool(item.get("below_floor")),
+        (item.get("origin") or "observed") != "observed",
+        item.get("id") or "",
+    )
 
 
 def progress_from_state(state, cfg):
@@ -1405,7 +1529,7 @@ def rank_candidates(backlog, cfg, progress=None, completed_goals=None):
     cfg = cfg or {}
     type_stats = compute_type_stats(backlog)
     predicted_account = compute_predicted_account(backlog)
-    threshold = cfg.get("type_saturation_threshold", 2)
+    threshold = effective_saturation_threshold(cfg)
     floor = cfg.get("min_candidate_value")
     risk_weight = _risk_weight_for(cfg, progress)
 
@@ -1415,6 +1539,7 @@ def rank_candidates(backlog, cfg, progress=None, completed_goals=None):
     for candidate in pending:
         pending_by_type[_candidate_type(candidate)] = pending_by_type.get(_candidate_type(candidate), 0) + 1
     unlocks = _unlocks_map(backlog)
+    by_id = candidates_by_id(backlog)  # 依赖解析 O(1) 查找，循环内不再线性扫（candidate-392）
 
     entries = []
     for candidate in backlog.get("candidates", []):
@@ -1432,21 +1557,13 @@ def rank_candidates(backlog, cfg, progress=None, completed_goals=None):
         )
         entry["score"] = round(score, 3)
         entry["score_breakdown"] = breakdown
-        missing, ready = candidate_deps_status(backlog, candidate)
+        missing, ready = candidate_deps_status(backlog, candidate, by_id=by_id)
         entry["ready"] = ready
         entry["blocked_by"] = missing
         entry["unlocks"] = unlocks.get(candidate.get("id"), 0)
         entry["below_floor"] = bool(floor is not None and _resolved_value(candidate) < floor)
         entries.append(entry)
-    entries.sort(
-        key=lambda item: (
-            item.get("status") != "pending",
-            not item.get("ready"),
-            -item.get("score", 0.0),
-            (item.get("origin") or "observed") != "observed",
-            item.get("id") or "",
-        )
-    )
+    entries.sort(key=_rank_sort_key)
     if cfg.get("ranking_mode", "expected") != "classic":
         _mark_selection(entries, cfg, progress=progress)
     return entries
@@ -1509,39 +1626,44 @@ def config_mtime(repo):
         return None
 
 
-def analysis_validity(repo):
+def analysis_validity(repo, current_head=None):
     """Check whether the cached .autopilot/analysis.json can be reused. Returns
-    ('missing'|'fresh'|'stale', reason). A cache is stale when the repository HEAD
+    (status, reason, analysis_doc): status is 'missing'|'fresh'|'stale'; the
+    doc is the parsed cache (None when missing/corrupt) so callers reuse the
+    parse for commits_behind / the fresh-content read instead of re-reading
+    the file (wave10 candidate-390). A cache is stale when the repository HEAD
     moved since it was saved (the code the analysis described changed) or the
     autopilot config changed (commands/limits the analysis relied on changed).
     Corrupt JSON (io.load_json fails closed with SystemExit) is "stale", never
-    a crash in the caller's loop."""
+    a crash in the caller's loop. `current_head` accepts a precomputed HEAD
+    SHA so the caller's own probe is reused instead of spawning two more."""
     try:
         analysis = load_analysis(repo)
     except SystemExit:
-        return "stale", "cached analysis is corrupt"
+        return "stale", "cached analysis is corrupt", None
     if analysis is None:
-        return "missing", "no cached analysis"
+        return "missing", "no cached analysis", None
     if not isinstance(analysis, dict):
-        return "stale", "cached analysis is corrupt"
+        return "stale", "cached analysis is corrupt", None
     cached_head = analysis.get("git_head")
-    current_head = None
-    if io.has_commits(repo):
-        current_head = io.run_git(repo, "rev-parse", "HEAD").stdout.strip()
+    if current_head is None:
+        current_head = io.head_sha(repo)
     if cached_head != current_head:
-        return "stale", "HEAD changed since the analysis was saved"
+        return "stale", "HEAD changed since the analysis was saved", analysis
     cached_mtime = analysis.get("config_mtime")
     current_mtime = config_mtime(repo)
     if cached_mtime != current_mtime:
-        return "stale", "autopilot config changed since the analysis was saved"
-    return "fresh", "cached analysis is up to date"
+        return "stale", "autopilot config changed since the analysis was saved", analysis
+    return "fresh", "cached analysis is up to date", analysis
 
 
-def analysis_commits_behind(repo):
+def analysis_commits_behind(repo, analysis=None):
     """How many commits the cached analysis predates (None when there is no
     cache, no parseable git_head, or the count cannot be determined). Gives the
-    staleness a magnitude so the agent can judge whether a rescan is due."""
-    analysis = load_analysis(repo)
+    staleness a magnitude so the agent can judge whether a rescan is due.
+    `analysis` accepts the doc analysis_validity already parsed."""
+    if analysis is None:
+        analysis = load_analysis(repo)
     if not isinstance(analysis, dict):
         return None
     cached_head = analysis.get("git_head")
@@ -1679,6 +1801,7 @@ _STATUS_LABELS = {
         "handover": "待办交接（下一轮从这里接续）", "handover_total": "遗留 pending 候选",
         "handover_hint": "按 score 降序（ready 优先）；新 run 用显式 --candidate-id 接续，无需重新挖矿",
         "tokens": "估算 Token", "repo": "仓库", "none": "无",
+        "aborted": "空转取消",
         "deadline": "定时截止", "seeds": "方向假设（种子）",
         "seed_status": {"open": "待处理", "promoted": "已立项", "verified": "已验证",
                         "refuted": "已证伪", "rejected": "已否决", "pending": "待处理",
@@ -1694,6 +1817,7 @@ _STATUS_LABELS = {
         "handover": "Pending handover (next run starts here)", "handover_total": "pending candidates left",
         "handover_hint": "score-descending (ready first); a new run resumes with explicit --candidate-id — no re-mining needed",
         "tokens": "Estimated tokens", "repo": "Repo", "none": "none",
+        "aborted": "aborted rounds",
         "deadline": "Deadline timer", "seeds": "Direction seeds (predictions)",
         "seed_status": {"open": "open", "promoted": "promoted", "verified": "verified",
                         "refuted": "refuted", "rejected": "rejected", "pending": "pending",
@@ -1746,12 +1870,31 @@ def build_report(repo, state, cfg, lang="en"):
     out.append("- {}: {}".format(L["blocked"], state.get("blocked_rounds", 0)))
     out.append("- {}: {}".format(L["cancelled"], state.get("cancelled_rounds", 0)))
     out.append("- {}: {}".format(L["revert"], state.get("reverted_rounds", 0)))
+    # aborted 轮不进任何计数器（counter_key=None）但占历史表一行——
+    # 从窗口内统计使计数与下表可对账（wave17 candidate-435）。
+    history_entries = state.get("history") or []
+    aborted_n = sum(
+        1 for entry in history_entries
+        if isinstance(entry, dict) and entry.get("status") == "aborted"
+    )
+    if aborted_n:
+        out.append("- {}: {} ({})".format(
+            L.get("aborted", "aborted rounds"), aborted_n,
+            "零工作取消，不消耗预算" if zh else "zero-work cancels, no budget burned"))
     out.append("- {}: {}".format(L["tokens"], state.get("estimated_tokens_used", 0)))
     out.append("")
 
     history = state.get("history") or []
     out.append("## {}".format(L["history"]))
     out.append("")
+    if len(history) >= io.HISTORY_LIMIT:
+        # 窗口注记（wave17 残留）：计数器是全量的，表只是最近 100 条窗口。
+        zh = (cfg.get("report_lang") or "zh") == "zh"
+        out.append("- {}".format(
+            "（窗口注记：仅显示最近 {} 条；更早轮次已裁剪，以计数为准）".format(len(history))
+            if zh else
+            "(windowed: showing the last {} entries; older rounds are trimmed — trust the counters)".format(len(history))))
+        out.append("")
     if not history:
         out.append("- {}".format(L["none"]))
     else:
@@ -1808,15 +1951,23 @@ def build_report(repo, state, cfg, lang="en"):
                 ))
         if predicted_account.get("done"):
             out.append("")
+            sample = "（review 样本 {}/{}，校准 {}）".format(
+                predicted_account.get("review_n") or 0, predicted_account.get("done") or 0,
+                predicted_account.get("calibration"))
+            sample_en = " (review samples {}/{}, calibration {})".format(
+                predicted_account.get("review_n") or 0, predicted_account.get("done") or 0,
+                predicted_account.get("calibration"))
             if zh:
-                out.append("- 预测子账：已完成 {} / 受阻 {}（受阻率 {}%）".format(
+                # review 样本量（wave17 candidate-436）：调 max_predicted 的闭环
+                # 缺的就是这个数字——5/5 与 50/50 应可分辨。
+                out.append("- 预测子账：已完成 {} / 受阻 {}（受阻率 {}%）{}".format(
                     predicted_account["completed"], predicted_account["blocked"],
-                    round(predicted_account["blocked_rate"] * 100),
+                    round(predicted_account["blocked_rate"] * 100), sample,
                 ))
             else:
-                out.append("- Predicted sub-account: {} completed / {} blocked (blocked rate {}%)".format(
+                out.append("- Predicted sub-account: {} completed / {} blocked (blocked rate {}%){}".format(
                     predicted_account["completed"], predicted_account["blocked"],
-                    round(predicted_account["blocked_rate"] * 100),
+                    round(predicted_account["blocked_rate"] * 100), sample_en,
                 ))
     out.append("")
 
@@ -1870,19 +2021,32 @@ def build_report(repo, state, cfg, lang="en"):
 
 def write_phase_report(repo, state, cfg):
     """Write a phase report (every io.PHASE_REPORT_INTERVAL completed rounds) in the
-    configured language, keeping only the most recent io.PHASE_REPORT_KEEP files."""
+    configured language, keeping only the most recent io.PHASE_REPORT_KEEP files.
+
+    Trim scope is THIS run only (wave17 candidate-434): files older than the
+    run's started_at belong to a previous run — the old round-number trim
+    deleted this run's fresh low-numbered report while keeping a dead run's
+    files, and the "[PHASE] written" message lied."""
     lang = cfg.get("report_lang", "zh")
     completed = state.get("completed_rounds", 0)
     markdown = build_report(repo, state, cfg, lang)
     path = io.autopilot_file_for(repo, "{}{}.md".format(io.PHASE_REPORT_PREFIX, completed))
+    run_start = io.parse_time(state.get("started_at") or "")
     try:
         path.parent.mkdir(parents=True, exist_ok=True)
         path.write_text(markdown, encoding="utf-8")
         reports = []
         for old in path.parent.glob(io.PHASE_REPORT_PREFIX + "*.md"):
             suffix = old.name[len(io.PHASE_REPORT_PREFIX):-3]
-            if suffix.isdigit():
-                reports.append((int(suffix), old))
+            if not suffix.isdigit():
+                continue
+            if run_start is not None:
+                try:
+                    if old.stat().st_mtime < run_start.timestamp():
+                        continue  # 上役遗留：不动也不计入本 run 保留配额
+                except OSError:
+                    pass
+            reports.append((int(suffix), old))
         reports.sort()
         for _, old in reports[:-io.PHASE_REPORT_KEEP]:
             # Retention cleanup: failing to trim an old report must not fail

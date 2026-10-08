@@ -35,7 +35,7 @@ Hard stop after this many completed or blocked rounds. Default is `10`.
 
 ### max_minutes
 
-Hard stop based on wall-clock time elapsed since the most recent round activity (`init`, `begin-round`, `complete-round`, `block-round`, `cancel-round`, or `goal-met`). Pausing the run does not pause the clock: a pause longer than the remaining budget stops the resumed run on the first `check`. `null` means unlimited.
+Hard stop based on wall-clock time elapsed since the most recent round activity (`init`, `begin-round`, `complete-round`, `block-round`, `cancel-round`, `goal-met`, `backlog-add`, `expansion-record`, `mine --apply`, `undo-round`, or `seed-reject` — recording/supply work refreshes the clock too, so a run doing only mining and wave bookkeeping burns no idle budget). Pausing the run does not pause the clock: a pause longer than the remaining budget stops the resumed run on the first `check`. `null` means unlimited.
 
 ### deadline
 
@@ -56,7 +56,13 @@ python <this-skill>/scripts/autopilot_state.py init --repo <repo> --deadline "08
 python <this-skill>/scripts/autopilot_state.py init --repo <repo> --deadline "2026-08-10T08:00:00+08:00"
 ```
 
-The expression is resolved to an absolute UTC timestamp once at `init` time, so re-reading the config never shifts the timer. Because the stored value must be absolute, hand-editing `config.json` requires a full ISO timestamp (the relative `+8h`/`HH:MM` forms are expanded by `init --deadline` and `config-set --deadline`). A deadline in the past stops the run on the first `check`; remove it (set `"deadline": null`) to disable. `null` means no deadline.
+The expression is resolved to an absolute UTC timestamp **once, at the moment it is set** — by `init --deadline` or by `config-set --deadline` (both call the same parser) — so re-reading the config never shifts the timer. Because the stored value must be absolute, hand-editing `config.json` requires a full ISO timestamp; the relative `+8h`/`HH:MM` forms are only accepted through the two commands. A deadline in the past stops the run on the first `check`; remove it (set `"deadline": null`, or `config-set --clear-deadline`) to disable. `null` means no deadline.
+
+```powershell
+python <this-skill>/scripts/autopilot_state.py config-set --repo <repo> --deadline "+8h"
+python <this-skill>/scripts/autopilot_state.py config-set --repo <repo> --deadline "07:00"
+python <this-skill>/scripts/autopilot_state.py config-set --repo <repo> --clear-deadline
+```
 
 ### max_tokens
 
@@ -135,7 +141,12 @@ config-drift warning). Settable fields: `--expand-after-goals`/`--no-expand-afte
 `--checkpoint-every N`, `--max-rounds N`/`--clear-max-rounds`,
 `--max-minutes N`/`--clear-max-minutes`, `--max-tokens N`/`--clear-max-tokens`,
 `--deadline EXPR`/`--clear-deadline` (same expression parser as init),
-`--push`/`--no-push`, `--scan-secrets`/`--no-scan-secrets`, `--report-lang zh|en`.
+`--push`/`--no-push`, `--scan-secrets`/`--no-scan-secrets`, `--report-lang zh|en`,
+`--max-blocked-in-a-row N`/`--clear-max-blocked-in-a-row`,
+`--max-expansion-waves N`/`--clear-max-expansion-waves`,
+`--dashboard`/`--no-dashboard`/`--dashboard-port N`,
+`--check-commands CMD`/`--clear-check-commands`,
+`--smoke-commands CMD`/`--clear-smoke-commands`.
 Guard-rail fields (`branch_mode`, `allow_uncommitted_changes`, `allow_paths`/
 `deny_paths`, `secret_patterns`, `track_state`) are deliberately
 not settable at runtime — changing those mid-run requires editing the file by
@@ -158,7 +169,7 @@ Array of regex strings, default `[]`. Extra patterns appended to the built-in se
 
 ### type_saturation_threshold
 
-Integer, default `2`. After this many candidates of the same `type` have been completed, `backlog-rank` downweights further same-type pending candidates by logarithmic decay with a hard floor (`max(0.35, 1.0 - 0.12 * log2(1 + max(0, completed - threshold)))` in the default `ranking_mode: expected`; `0.85` power decay in `classic`). Saturation dents the diversity signal but must never veto a genuinely valuable candidate of the dominant type. This stops the loop from grinding out the same low-hanging-fruit category forever. Set to a large number to disable.
+Integer, default `2`. After this many candidates of the same `type` have been completed, `backlog-rank` downweights further same-type pending candidates by logarithmic decay with a hard floor (`max(0.35, 1.0 - 0.12 * log2(1 + max(0, completed - threshold)))` in the default `ranking_mode: expected`; `0.85` power decay in `classic`). Saturation dents the diversity signal but must never veto a genuinely valuable candidate of the dominant type. This stops the loop from grinding out the same low-hanging-fruit category forever. Set to a large number to disable. An explicit `null` falls back to the default `2` — the validator tolerates it, and it must not degrade to a zero threshold (which would saturate every type).
 
 ### ranking_mode
 
@@ -283,6 +294,8 @@ Dogfooding example (the mapping this repository uses for itself — `scripts/aut
   "review_threshold": 3,
   "max_blocked_in_a_row": 2,
   "check_commands": ["pytest", "npm run lint"],
+  "smoke_commands": ["py -3.13 scripts/test_autopilot_state.py --smoke"],
+  "max_expansion_waves": null,
   "track_state": false,
   "allow_paths": ["src/", "tests/"],
   "deny_paths": ["*.secret", "**/keys/**"],
@@ -340,7 +353,7 @@ python <this-skill>/scripts/autopilot_state.py backlog-remove --repo <repo> --id
 python <this-skill>/scripts/autopilot_state.py goal-met --repo <repo> --goal "<goal>" --round <n> --next-step "<follow-up>" --next-step "<follow-up 2>" --unlocked-capability "<capability>"
 ```
 
-- `--round <n>` — the round that completed this goal; must match a completed history entry. Without it the goal event is recorded `unverified: true` and the "all goals met" stop is withheld (`check` lists the goals under `goals_unverified`)
+- `--round <n>` — the round that completed this goal; must not exceed the highest completed round (anchors pointing at rounds pruned from the 100-entry history window still count). Without it the goal event is recorded `unverified: true` and the "all goals met" stop is withheld (`check` lists the goals under `goals_unverified`)
 - `--evidence` — audit-only note on how you know the goal is met (recorded on the goal event, not scored)
 - `--next-step` (repeatable) — one direction seed per occurrence; `type` defaults to the first non-saturated type, `value` to 4, `effort` to 2, `risk` to 1
 - `--seed-type` / `--seed-value` / `--seed-effort` — override the defaults; the three flags apply to EVERY seed produced by the same `goal-met` call, so per-seed values need separate calls (or `backlog-update` after promotion)
@@ -364,7 +377,8 @@ Anti-noise scoring (刀 B): a promoted candidate carries `origin: "predicted"`, 
 - `schema`, `run_id`, `repo`, `branch`, `origin_branch`
 - `started_at`, `last_activity_at` (rolling window for `max_minutes`)
 - `deadline` (config): absolute ISO-8601 timer stop; see the `deadline` field above
-- `round`, `completed_rounds`, `blocked_rounds`, `cancelled_rounds`, `reverted_rounds` (cancelled and reverted rounds advance the round-number counter so numbers are never reused)
+- `round`, `round_seq`, `completed_rounds`, `blocked_rounds`, `cancelled_rounds`, `reverted_rounds` (cancelled and reverted rounds advance the round-number counter so numbers are never reused; aborted zero-work rounds consume a number but appear only in `history`/`aborted_rounds`)
+- `deferred_paths` (run-level deferred-file ledger), `lenses_used_all` (cross-window lens union), `mining_runs`, `expansion_waves`, `expansion_wave_seq`
 - `current_round`, `history`, `completed_goals`, `goal_events`, `goal_seeds` (direction seeds — see the section above; migrated into older state files automatically)
 - `estimated_tokens_used`
 - `type_stats` (per-type completed/blocked/blocked-rate/avg-effort/avg-value, refreshed on every round close)
@@ -377,7 +391,7 @@ Anti-noise scoring (刀 B): a promoted candidate carries `origin: "predicted"`, 
 ## State Helper Commands
 
 - `init` — create config + state (+ optional feature branch). Flags cover every config field: `--goal`, `--goals-from-prompt`, `--max-rounds`, `--max-minutes`, `--deadline`, `--max-tokens`, `--max-round-scope`, `--branch-mode`, `--allow-uncommitted-changes`, `--track-state`, `--check-commands`, `--smoke-commands`, `--push`, `--commit-message-prefix`, `--retries-per-round`, `--candidates-per-round`, `--commit-every-rounds`, `--verify-every-rounds`, `--checkpoint-every`, `--expand-after-goals`, `--review-threshold`, `--scan-secrets`/`--no-scan-secrets`, `--secret-pattern`, `--type-saturation-threshold`, `--ranking-mode`, `--min-candidate-value`, `--max-same-type-per-round`, `--min-pending-candidates`, `--max-predicted-per-round`, `--max-expansion-per-round`, `--max-expansion-waves`, `--max-blocked-in-a-row`, `--allow-path`, `--deny-path`, `--report-lang`, `--force`.
-- `read`, `check`, `diagnose` — inspect state, stop conditions, and repository/git health. `check --brief` returns loop-driving fields only: `continue`/`stop_reason`/`warnings`/`goals_met`/`phase`/`backlog` (`pending`/`ready`/`min_pending_candidates`/`needs_expansion`)/`action_hint` (`work`|`mine`|`expand`|`stop`)/`next_verify_round`/`next_commit_round`/`next_checkpoint_round`/`blocked_streak`/`wave_no`/`lenses_used`/`lenses_unused`/`analysis`/`mining`/`budget` (`remaining_minutes`/`deadline_remaining_minutes`) (saves tokens in the loop). In the expand phase an `expansion` object with open seeds and type context is appended (see Direction Seeds above).
+- `read`, `check`, `diagnose` — inspect state, stop conditions, and repository/git health. `check --brief` returns loop-driving fields only: `continue`/`stop_reason`/`warnings`/`goals_met`/`phase`/`backlog` (`pending`/`ready`/`min_pending_candidates`/`needs_expansion`)/`action_hint` (`work`|`mine`|`expand`|`stop`)/`next_verify_round`/`next_commit_round`/`next_checkpoint_round`/`blocked_streak`/`aborted_rounds`/`round_progress`/`selected_count`/`selected_empty_reason`/`goals_unverified`/`expansion_budget`/`wave_no`/`lenses_used`/`lenses_unused`/`analysis`/`mining`/`budget` (`remaining_minutes`/`deadline_remaining_minutes`) (saves tokens in the loop). In the expand phase an `expansion` object with open seeds and type context is appended (see Direction Seeds above).
 - `detect-agent` — detect the runtime agent (opencode / claude-code / codex / generic) and print adaptation context. Honors a `SKILL_DIR` environment variable for the reported skill directory.
 - `begin-round`, `complete-round`, `block-round`, `cancel-round` — round lifecycle. `begin-round` enforces the clean-tree rule, refuses to pick candidates with unresolved `depends_on`, and refuses to reuse round numbers; `--candidate-id` is repeatable so one round can pick multiple backlog candidates (`candidates_per_round`). `complete-round` accepts an optional `--commit-sha` (omit it on deferred commit rounds when `commit_every_rounds > 1`), an optional `--review-score`/`--review-notes` (pass a score every round — it feeds the value calibration; enforced only when `review_threshold` is set) and `--below-threshold` (records a below-threshold round as completed with its low score, without counting blocked — the only in-run exit once `max_blocked_in_a_row` fires), auto-writes a phase report (`.autopilot/phase-report-round-<N>.md`, in the configured `report_lang` — Chinese by default) every 10 completed rounds, and refreshes `state.type_stats`. A `cancel-round` with zero work (no tree delta, no commit, under 10 minutes) records an `aborted` round that consumes no round budget and no token base.
 - `commit` — staged-change check, git identity check, path whitelist check (`allow_paths`/`deny_paths`), secret scan (`scan_secrets`, bypassable with `--allow-secrets`), scope guard (including binary files), open-round requirement (always enforced unless `--round <n>` is passed explicitly; what batched mode skips is only the dirty-start check), and prefix message building.
@@ -389,7 +403,7 @@ Anti-noise scoring (刀 B): a promoted candidate carries `origin: "predicted"`, 
 - `round-prep` — the loop's round start in one call: the `check` payload plus `candidates` (brief form, `candidates_per_round + 1`, with `recommended` ids and `withheld`), the cached analysis when fresh, the standing `directives`, `open_round` and `next_round_number` (from `round_seq`, the sequence `begin-round` uses). Replaces check + analysis-load + backlog-rank + directive-list for a round-opening agent; `check --brief` alone is still the cheapest stop-condition probe.
 - `mine` — deterministic repo mining into backlog candidates via seven scanners (`markers`/`swallowed`/`syntax`/`test-gap`/`hotspot`/`dead-export`/`docs-drift`; hotspot reads pre-run history only — the run's own commits are work in progress, not pre-existing churn); `--apply` writes deduped, evidence-backed candidates (`from_mine`, evidence `kind | file:line`), `--kind K` filters one scanner, `--limit N` caps per-kind results (explicit `0` returns nothing). Every non-dry-run invocation appends to `state.mining_runs` (bounded at 20; records `findings`/`applied`/`new`/`apply`); `check` surfaces the `mining` payload (`runs`/`last_findings`/`last_applied`/`exhausted`) and sets `action_hint: "mine"` when the backlog is thin and mining is stale or never ran. Exhaustion means two consecutive runs with zero **new** findings — a repo with resident findings is never exhausted, and never-mined is not exhausted. Read-only probes (no `--apply`) that found nothing still count as zero-new evidence, but probes that found something do not: without `--apply` nothing enters the backlog, so their new-count would misread as churn forever.
 - `analysis-save` / `analysis-load` — persist and read the repository-analysis cache in `.autopilot/analysis.json`; the cache auto-invalidates when HEAD or `.autopilot/config.json` changes. `check` surfaces the cache state in its `analysis` payload (`status`: missing/fresh/stale, `reason`, `commits_behind`) and warns when an expansion is due while the cache is >=3 commits stale.
-- `expansion-record` — record one Deep Expansion wave's lens set into `state.expansion_waves` (bounded at 20, oldest trimmed) and bump the monotonic `state.expansion_wave_seq`. Refused once `max_expansion_waves` is reached. Lenses must come from the fixed 16-lens list (`EXPANSION_LENSES`); an unknown lens exits 2. The record is wave-granular — there is no per-lens notes field, so lens-level zero yields go into the round summary (see SKILL.md, Deep Expansion). `check` reports `wave_no`, the order-preserving `lenses_used` union, and the ordered `lenses_unused` remainder so the next wave rotates lenses deliberately; repeating the previous wave's exact lens set warns (an `expansion-wave` warn event) but is not refused.
+- `expansion-record` — record one Deep Expansion wave's lens set into `state.expansion_waves` (bounded at 20, oldest trimmed) and bump the monotonic `state.expansion_wave_seq`. Refused once `max_expansion_waves` is reached. Lenses must come from the fixed 16-lens list (`EXPANSION_LENSES`); an unknown lens exits 2. Pass `--findings N --applied M` (proposals made vs proposals that passed the value gate) so lens waves are comparable with `mine` runs in the supply statistics — waves recorded without them show `null` yield. The record is wave-granular — there is no per-lens notes field, so lens-level zero yields go into the round summary (see SKILL.md, Deep Expansion). `check` reports `wave_no`, the order-preserving `lenses_used` union, and the ordered `lenses_unused` remainder so the next wave rotates lenses deliberately; repeating the previous wave's exact lens set warns (an `expansion-wave` warn event) but is not refused.
 - `directive-add` / `directive-list` / `directive-remove` — manage standing directives in `.autopilot/directives.json`; the loop must honor them in every round. `directive-list` prints each entry with its 1-based `index`; `directive-remove --index <n>` retires it (audit-logged).
 - `secret-scan` — scan the staged diff for secret-like content and report findings (exit non-zero on a match).
 - `backlog-add`, `backlog-update`, `backlog-remove`, `backlog-list`, `backlog-rank`, `backlog-pick` — backlog management (candidates carry `type`, `risk`, and `depends_on`; ranking defaults to expected value per round — see `ranking_mode`). `backlog-add --from-seed <id>` promotes a direction seed (see Direction Seeds above). `backlog-add` also refreshes `last_activity_at` so expansion scouting does not burn `max_minutes` without progress.

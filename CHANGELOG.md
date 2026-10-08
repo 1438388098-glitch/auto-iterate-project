@@ -2,6 +2,193 @@
 
 All notable changes to auto-iterate-project are documented here.
 
+## 1.14.0 (2026-10-09)
+
+Overnight self-iteration (16 rounds, waves 1-5: cross-command invariant and
+crash-atomicity audits, performance profiling, doc-accuracy review, plus one
+deterministic mine round). 26 implemented candidates, suite grown 261 → 302.
+
+### Fixed
+
+- Config validation is table-driven (`_CONFIG_FIELD_RULES`): 20 registry rows
+  cover every `default_config` key, error texts byte-identical; a guard test
+  locks "defaults == registry ∪ exemptions" and caught its first real drift
+  the same day. `config-set` asks the same registry for int bounds
+  (`field_int_rule`), retiring the duplicate range checks.
+- `type_saturation_threshold: null` (validator-tolerated) degraded to a zero
+  threshold — every type saturated, all scores discounted,
+  `underused_types` permanently empty. New single outlet
+  `effective_saturation_threshold` (null/absent/non-int → default 2).
+- `max_same_type_per_round: null` re-enabled the diversity quota at 2 while
+  the docs promised "disable" — null now means uncapped, matching the
+  sibling quota fields.
+- `candidates_per_round: null` passed validation and split into four
+  different effective values (3/1/1/5) across selection, ranking, check and
+  round-prep; the validator now rejects null (int_positive row).
+- Duplicate backlog candidate ids are rejected on load, and both id minting
+  sites (backlog-add, mine) go through `mint_candidate_id`, which skips past
+  stale `next_id` values from merged/restored files — a collision used to
+  re-book completed work against the wrong row.
+- `begin-round` refuses already-resolved candidates (picked/completed/
+  blocked) with the same bilingual ledger-guard copy backlog-pick uses.
+- Conversely, `picked` candidates with no open round (crash residue from the
+  two-write window) are reconciled back to `pending` at begin-round entry,
+  with a `reconciled` audit event — the residue used to deadlock against the
+  new guard.
+- `detect-verify --apply` refreshes the config fingerprint (like config-set):
+  a documented mid-run setup no longer plants a permanent config-drift false
+  alarm. It also runs under `run_lock` now — it was the only unlocked state
+  writer, able to erase `current_round`/counters in a lost-update race.
+- `mining_runs`/`expansion_waves` with corrupted shapes crashed `mine` and
+  `expansion-record` with raw AttributeErrors; both keys now fail cleanly
+  through state validation.
+- `mining_exhausted`'s expansion-wave term read a field documented as
+  always-0; waves now get `added` backfilled per value-gated candidate, so
+  the exhaustion verdict matches the SKILL contract.
+- `check`'s `round_progress.remaining` used `round_seq` (aborted rounds
+  included) as the denominator; it now matches the stop gate's four-counter
+  sum. Same fix applied to the dashboard.
+- `commit` shares one staged `--numstat` pass between the secret scan's
+  binary detection and `max_round_scope` accounting.
+- `check`/`round-prep` probe HEAD once (`io.head_sha`) and parse
+  `analysis.json` once (`analysis_validity` returns the doc; commits_behind
+  and round-prep's cached read reuse it) — two spawns and two parses saved
+  per round on the hottest command.
+- `_close_round` loads the backlog once: candidate status and type_stats
+  share the in-memory dict (halved round-close I/O, no stale window).
+- Dependency resolution takes a prebuilt id map (`candidates_by_id`) in
+  rank/begin-round/check — O(n·d) instead of O(n·d·n) as dep-using backlogs
+  grow.
+- `finish --archive-reports --json` keeps its informational line on stderr:
+  stdout is again a single parseable JSON object on the doc-sanctioned
+  end-of-run invocation.
+- `troubleshooting.md`/`SKILL.md` no longer recommend `init --force` for
+  mid-run recovery (it resets the run and never fixed the dirty-tree
+  refusal); the non-destructive `config-set` paths are documented instead.
+- Dashboard dropped back to Python 3.6 compatibility (explicit PIPE, a
+  `_unlink_info` helper); a static source guard locks the 3.6 floor. The
+  info-file unlink also tolerates Windows handle-release races (OSError).
+- `log.jsonl` rotation failure (reader holding the file on Windows) now
+  defers rotation and still writes the entry — a persistent reader can no
+  longer silently drop every audit event past 5MB.
+- `goal-met --round` accepts any round up to the highest completed round, so
+  the goals-based stop survives history trimming instead of bricking.
+- Deferred-file memory moved to a run-level `state.deferred_paths` ledger:
+  after 100 rounds the window union used to relabel the run's own deferred
+  products as pre-existing user changes and hard-refuse committing them.
+- Lens rotation memory (`state.lenses_used_all`) and monotonic wave
+  numbering: after 20 waves `lenses_unused` re-reported used lenses and
+  `wave_no` froze; check and expansion-record now read the cross-window
+  ledger. Dashboard counters (completed rounds / waves / remaining) read the
+  monotonic sources too, and the growth walk flags the trimmed-prefix chunk
+  (`trimmed_prefix` row + `windowed` marker) instead of attributing all
+  pre-window churn to the first surviving round.
+- Seed promotion is idempotent across the backlog/state crash window: a
+  re-run reuses the existing candidate row instead of minting a duplicate.
+- `io.append_log` tests lock the four contracts (JSONL shape, unicode,
+  3-generation rotation, soft-fail); `estimate_tokens_for_round` is directly
+  tested for the first time (7 contracts); `candidates_per_round: null`
+  split, saturation null, quota null, trim windows and the config-set flag
+  surface all have regression pins.
+
+- Refusal messages carry the fix: eight dead-end errors now name the next
+  command (push refusal points at `config-set --push` instead of inviting a
+  config.json hand-edit that trips the drift check; lock-acquisition,
+  no-open-round and sha-resolution errors give recovery paths).
+- JSON mode honors the documented `{ok, message}` contract: `secret-scan`
+  gains `ok`/`message` (named in config.md), `mine --json` carries the same
+  message as text mode, `analysis-save` reports machine-readable
+  `invalidated_by` instead of a prose `valid_until`, and block/complete-round
+  expose round/candidate/SHA fields instead of prose-only payloads.
+- Help strings aligned with behavior: `--confidence` default is 0.9 with
+  `--evidence`; `goal-met --round` states the monotonic bound (any round up
+  to the highest completed survives history trimming); `config-set
+  --max-rounds` accepts 0 and `--max-minutes` accepts fractions, matching
+  init and the validator (one field, one domain per door).
+- Ranking math fixes from the wave-13 audit: predicted calibration divides
+  review average by average VALUE (not the completion count — the old form
+  discounted the predicted pipeline harder the more it succeeded); the 40%
+  cutoff now fires on all-below-floor batches (cutoff_base was never set);
+  the late-run valve cuts predicted work while ANY observed candidate is
+  ready, including below-floor ones; the goal-chain bonus normalizes goal
+  text (NFC/zero-width/whitespace) like every other goal comparison; the
+  rank sort key demotes below-floor entries at equal score
+  (`_rank_sort_key` extracted).
+- Cadence/safety tripwires: `next_verify_round`/`next_commit_round`/
+  `next_checkpoint_round` anchor on round NUMBERS (max of counters and
+  round_seq), so aborted rounds no longer point them at already-spent
+  numbers; a checkpoint boundary now WARNS in check/round-prep — the human
+  steering wheel was the only safety feature with no in-loop tripwire.
+- Security & hardening tail: the `.autopilot/` run-state guard is
+  case-insensitive (case games on case-insensitive filesystems can no longer
+  bypass it); the dashboard's last raw innerHTML sink (candidate value/effort)
+  is escaped; the secret scanner covers Slack incoming webhooks, GitLab PATs,
+  Google OAuth client secrets and PyPI/npm publish tokens; `dashboard --stop`
+  probes liveness before taskkill (a recycled PID is no longer force-killed).
+- Observation dashboard: the snapshot cache key includes `log.jsonl` and a
+  30s clock bucket (the run-events panel and the budget countdown used to
+  freeze between round boundaries); replay filters events BEFORE taking the
+  render window (replaying an early round no longer blanks the timeline).
+- Report paths: phase-report trim and `finish --archive-reports` are scoped
+  to the current run (a previous run's stale reports used to be archived as
+  this run's record, and could push the fresh report out of the retention
+  window); aborted rounds get a counts line so the report arithmetic
+  reconciles with the history table; the predicted sub-account shows the
+  review sample size.
+- Loop-command correctness tail: `goal-met --no-auto-context` still records
+  the verification event (the flag skips auto-context fields, not the event —
+  the old form silently swallowed an anchored verification); the crash-reuse
+  path of `backlog-add --from-seed` warns which caller fields were ignored;
+  `*_test.py` pytest layouts are detected again (the tree-walk rewrite broke
+  the stem check); the idempotent seed re-promotion no longer double-counts
+  wave yield or burns an id per retry; `load_state` anchors `run_start_sha` to
+  EMPTY_TREE only for genuinely unborn repos (transient git failures defer
+  billing with a warning instead of writing a poisoned anchor); `report
+  --lang en` no longer flips to Chinese labels after an aborted-round counts
+  line; `read`/`check --brief` expose a derived `aborted_rounds` counter so
+  machine consumers can reconcile round_seq without scanning history.
+- Documentation: config.md example block gains `smoke_commands`/
+  `max_expansion_waves`; the config-set settable-fields list gains the five
+  missing flag groups (incl. `--clear-check-commands`, documented nowhere
+  before); the `max_minutes` clock-reset list names all eleven refreshing
+  commands; check/state key enumerations include the 1.14 additions
+  (`deferred_paths`, `lenses_used_all`, `aborted_rounds`, `round_progress`);
+  README highlights refreshed to the 1.14 view (bilingual).
+- Regression pins from the final test-gap audit: the deferred-paths ledger's
+  full lifecycle (defer → commit → exit → re-defer), classic-mode saturation
+  honoring `effective_saturation_threshold`, the `detect_smoke_commands`
+  python branch, and unicode log entries surviving rotation into archives.
+- Supply-side audits (miner/verify/agent): `scan_swallowed` skips its own
+  docstring (it minted two value-4 garbage candidates per mine run);
+  `detect-verify` walks the whole tree for pytest layouts (a repo with its
+  5000-line suite in scripts/ used to report "nothing detected" — live-verified
+  on this repository); the smoke recommendation only suggests `npm run lint`
+  when the lint script exists; `detect-agent` probes the canonical homes
+  (`~/.claude/CLAUDE.md`, `~/.codex/AGENTS.md`) so real installs stop
+  degrading to generic; docs-drift findings dedupe per missing reference
+  instead of collapsing to the first per README.
+- Supply hints: after `mining.exhausted` flips true, `check` stops steering
+  the loop into注定-zero mine runs and points at Deep Expansion instead.
+- `overview.md` (the agent-facing overview) now documents `mine` and
+  `round-prep`; troubleshooting gains playbooks for push failures, the
+  `diagnose` first move, merge-commit undo, ensure-branch dirty trees and
+  batch-flush "nothing staged".
+- SKILL.md: exhaustion stated once, as the helper's conjunction
+  (`mining.exhausted`) with the ≥3-subagents bar marked agent-side; stop
+  condition list reordered to the helper's report order; dashboard
+  "never writes" narrowed to its true guarantee (own lifecycle file only);
+  per-candidate isolation marked as agent-side discipline.
+
+### Docs
+
+- `config.md` deadline section: both entry points documented with
+  config-set examples (the "resolved once at init" sentence contradicted
+  the code); type_saturation_threshold null semantics documented.
+- `expansion-record --findings/--applied` yield flags now appear in every
+  doc example — waves recorded without them read as null yield.
+- Bilingual copy: begin-round goals-met refusal and backlog-pick ledger
+  guard anchors normalized.
+
 ## 1.13.0 (2026-10-08)
 
 Overnight self-iteration (rounds 26-41, 8 expansion waves, ~30 implemented

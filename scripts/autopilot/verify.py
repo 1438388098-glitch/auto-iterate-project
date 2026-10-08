@@ -1,5 +1,6 @@
 """Verification command discovery from repository entry points."""
 
+import json
 import re
 import shutil
 import subprocess
@@ -46,8 +47,17 @@ def detect_smoke_commands(repo):
         signals.append(("python", "python -m compileall -q ."))
     elif _has_pytest_test_files(root):
         signals.append(("python", "python -m compileall -q ."))
-    if (root / "package.json").exists():
-        signals.append(("node", "npm run lint"))
+    package_json = root / "package.json"
+    if package_json.exists():
+        # 只荐真实存在的脚本（wave14 candidate-429）：无 lint 键的包被荐
+        # npm run lint 后，采纳方每轮冒烟都红。
+        try:
+            scripts = (json.loads(package_json.read_text(encoding="utf-8"))
+                       .get("scripts") or {})
+        except (ValueError, OSError):
+            scripts = {}
+        if "lint" in scripts:
+            signals.append(("node", "npm run lint"))
     if (root / "Cargo.toml").exists():
         signals.append(("rust", "cargo check"))
     if (root / "go.mod").exists():
@@ -56,12 +66,17 @@ def detect_smoke_commands(repo):
 
 
 def _has_pytest_test_files(root):
-    """True when pytest-style test modules exist without any packaging config."""
-    tests_dir = root / "tests"
-    for pattern in ("test_*.py", "*_test.py"):
-        if any(root.glob(pattern)):
-            return True
-        if tests_dir.is_dir() and any(tests_dir.glob(pattern)):
+    """True when pytest-style test modules exist without any packaging config.
+    Walks the whole tree (any depth, any directory name): the root+tests/-only
+    probe missed the common "package dir with test file beside it" and
+    "tests/unit/" layouts — detect-verify reported nothing on a repo whose
+    5000-line suite lives in scripts/ (wave14 candidate-428). detect-verify is
+    a manual command, so the full walk costs nothing in the round loop."""
+    for path in root.rglob("*.py"):
+        # stem 判定（wave18 candidate-444）：name 恒以 .py 结尾，
+        # endswith("_test") 在 rglob 形态下永假——pytest 的 *_test.py 约定
+        # 曾因此不可检出（基线版本显式 glob 得到，属能力回退）。
+        if path.name.startswith("test_") or path.stem.endswith("_test"):
             return True
     return False
 

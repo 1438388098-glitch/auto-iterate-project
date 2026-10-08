@@ -1,6 +1,6 @@
 ---
 name: auto-iterate-project
-version: 1.13.0
+version: 1.14.0
 description: Automatically iterate any git project inside the current agent session by analyzing the repository, choosing the next high-value improvement, implementing small changes, verifying, committing, and looping until a goal is met or configurable round/time/token limits are reached. Use when the user asks for autonomous project iteration, continuous self-improvement, auto-improve, keep improving this project, full-auto development, or wants the agent to keep making and committing improvements without per-step approval. Also use for Chinese requests like 全自动迭代这个项目, 自动改进并提交这个仓库, 连续自动开发, or 自动推进项目改进. Do NOT use for one-off bugfixes, single-file edits, doc-only changes, or when the user wants step-by-step approval of each change.
 ---
 
@@ -145,7 +145,7 @@ python <this-skill>/scripts/autopilot_state.py begin-round --repo <repo> --title
 
 ### 5. Implement & Self-Review
 
-Work multi-candidate rounds **one candidate at a time**. Smallest change that satisfies the candidate; follow project patterns; no drive-by reformat, no new deps, no user-owned files. If a candidate exceeds `max_round_scope`, cancel and split.
+Work multi-candidate rounds **one candidate at a time** (agent-side discipline: the helper picks and closes the whole batch as one unit, so the per-candidate isolation is on you). Smallest change that satisfies the candidate; follow project patterns; no drive-by reformat, no new deps, no user-owned files. If a candidate exceeds `max_round_scope`, cancel and split.
 
 Before verify, self-review the diff (`git diff --cached` after staging): scope creep, dead/debug code, broken edges, secret-like content. For blast radius, when a public API signature or symbol rename is touched, `grep` all callers first. Fix real problems within `retries_per_round`. Optionally use the `requesting-code-review` skill here.
 
@@ -211,7 +211,7 @@ Wave 0 is mandatory on the first expand after a goal; lens-scan Deep Expansion i
 
 Expansion is continuous. It runs when `expand_after_goals: true` and goals are met (`phase: expand`), when pending < `min_pending_candidates` (`action_hint: expand`), or when the best ready candidate has no concrete user value.
 
-In every wave: rescan + `analysis-save` if the cache is stale; pick lenses from `lenses_unused`; propose 3-5 candidates from a detached perspective; value-gate before `backlog-add` (`type`/`value`/`effort`/`risk`, evidence in `--evidence`); honor review/verify/commit batching. Record the wave with `expansion-record --lens ...`. Lens catalog: `references/expansion-lenses.md` (names must match `EXPANSION_LENSES` exactly — e.g. `docs` and `ux-copy` are separate lenses).
+In every wave: rescan + `analysis-save` if the cache is stale; pick lenses from `lenses_unused`; propose 3-5 candidates from a detached perspective; value-gate before `backlog-add` (`type`/`value`/`effort`/`risk`, evidence in `--evidence`); honor review/verify/commit batching. Record the wave with `expansion-record --lens ... --findings <proposed> --applied <passed-gate>` (the yield stats make lens waves comparable with mining runs — always pass them, a wave recorded without them reads as yield `null` in the supply statistics). Lens catalog: `references/expansion-lenses.md` (names must match `EXPANSION_LENSES` exactly — e.g. `docs` and `ux-copy` are separate lenses).
 
 Expansion is still bounded by normal stop conditions. Keep at least one budget configured in this mode.
 
@@ -224,9 +224,9 @@ When `action_hint: "expand"` (mine already fresh), the backlog is empty after mi
 ### Wave shape
 
 0. Budget check: subagent spend is invisible to `max_tokens` (it estimates from diffs), so if the run has `max_expansion_waves` set, read `expansion_budget` and stop expanding at the cap (`expansion-record` refuses past it); with no cap, a run that expands repeatedly can outspend every configured budget while `check` reports it healthy.
-1. Pick 3-6 unused lenses from `check`'s `lenses_unused` (see `references/expansion-lenses.md`). Each subagent returns 2-5 candidates **with evidence**. Record with `expansion-record --lens ...`. Repeating the previous wave's exact set warns.
+1. Pick 3-6 unused lenses from `check`'s `lenses_unused` (see `references/expansion-lenses.md`). Each subagent returns 2-5 candidates **with evidence**. Record with `expansion-record --lens ... --findings N --applied M` (proposed vs value-gated counts). Repeating the previous wave's exact set warns.
 2. Judge and ingest: one concrete user-facing sentence of value **and** evidence (file:line or probe output). Unevidenced proposals get one follow-up, then reject. `backlog-add` with explicit scores and `--evidence`. Do not reject solely for high effort. `expansion-record` is wave-granular — it cannot record that a specific lens produced zero candidates; note lens-level zero yields in the round summary so later waves do not re-pick barren lenses without a reason. A candidate that looks infeasible under the run's constraints is isolated into its OWN round (explicit `--candidate-id`) so an honest `block-round` cannot spill over into other candidates' work.
-3. Still thin → escalate search depth (not the user): Wave 2 lower the value floor temporarily; Wave 3+ read hardest paths / real user journeys / public symbols; Wave 4+ widen scope (siblings, CI, packaging, examples). Keep spawning until `min_pending_candidates` ready items or a budget stop. **Never finish with "expansion exhausted" while budgets remain** — `finish` without `--force` is refused while stop conditions are unmet and ready work exists. Declaring exhaustion requires 2 consecutive recorded waves (≥3 subagents, ≥3 unused lenses each) with zero value-gated candidates — and even then the run stops only on a budget.
+3. Still thin → escalate search depth (not the user): Wave 2 lower the value floor temporarily; Wave 3+ read hardest paths / real user journeys / public symbols; Wave 4+ widen scope (siblings, CI, packaging, examples). Keep spawning until `min_pending_candidates` ready items or a budget stop. **Never finish with "expansion exhausted" while budgets remain** — `finish` without `--force` is refused while stop conditions are unmet and ready work exists. Declaring exhaustion requires the helper's conjunction (`mining.exhausted`): two consecutive `mine --apply` runs with zero new findings AND the last two recorded waves adding zero value-gated candidates — plus the agent-side honesty bar of ≥3 subagents and ≥3 unused lenses per dead wave, which no field records and only you can enforce. Even then the run stops only on a budget.
 4. **No-subagent fallback**: run the same lenses serially in-process (one lens per pass, `analysis-save` between passes). Do not claim "cannot expand".
 5. After goals are met, treat every thin backlog the same way.
 
@@ -240,10 +240,10 @@ Stop when any is true:
 
 - All goals are met **and** `expand_after_goals` is false (unverified goals withhold this stop).
 - `max_rounds` reached (completed + blocked + cancelled + reverted).
+- `max_blocked_in_a_row` consecutive blocked rounds (default 2). Listed third because the helper reports it before the time/token budgets when several fire at once.
 - `max_minutes` reached (wall-clock since last round activity; pause does not pause the clock). `null` = unlimited.
 - `deadline` reached (absolute timer). Past deadline stops on first `check`. `null` = disabled.
 - `max_tokens` soft budget reached (auto-estimated from diffs — subagent spend is NOT counted; `max_expansion_waves` is the bound that covers it).
-- `max_blocked_in_a_row` consecutive blocked rounds (default 2).
 - A round's staged diff exceeds `max_round_scope` and cannot be split.
 - The user interrupts or changes the request.
 
@@ -274,14 +274,14 @@ Unattended runs have nobody to ask: when one of the scenes above fires without a
 - `directive-add` / `directive-list` / `directive-remove` — standing rules.
 - `round-prep` — the loop's round start in one call (check fields + candidates + cached analysis + directives).
 - `detect-verify` — recommend `check_commands` (`--apply` writes them) and report `smoke_recommended` (record one with `config-set --smoke-commands`).
-- `mine [--apply] [--kind K] [--limit N]` — deterministic repo mining into backlog candidates (first move when you do not know what to do). Every non-dry-run invocation appends to `state.mining_runs`; exhaustion = two consecutive runs with zero new findings.
+- `mine [--apply] [--kind K] [--limit N]` — deterministic repo mining into backlog candidates (first move when you do not know what to do). Every non-dry-run invocation appends to `state.mining_runs`; exhaustion (`mining.exhausted` in check) = two consecutive runs with zero new findings AND, when expansion waves exist, the last two waves also added zero value-gated candidates — never-mined is not exhausted.
 - Every state-changing command accepts `--dry-run`.
 
 ## Observation Dashboard
 
 Optional read-only web panel (off by default): an evolution tree (domain → module → file) beside a per-round card stream, with replay. Enable it only when the user wants to watch the run — `config-set --dashboard` (disable with `--no-dashboard`; `--dashboard-port N` picks the port, `0` = random). Once enabled, every `begin-round` spawns the server automatically; you do nothing in the loop.
 
-Hard guarantees: bound to 127.0.0.1, reads only `.autopilot/` state and git history (never writes), and the loop never depends on it — a dashboard failure is only a warning in `.autopilot/log.jsonl` and never blocks a round. Do not wait on the panel, do not open it yourself, do not treat it as output. `dashboard --stop` shuts it down (it also exits itself after 30 idle minutes). Field reference: `references/config.md` → `dashboard`.
+Hard guarantees: bound to 127.0.0.1, reads only `.autopilot/` state and git history, and never writes anything except its own lifecycle file `.autopilot/dashboard.json`; the loop never depends on it — a dashboard failure is only a warning in `.autopilot/log.jsonl` and never blocks a round. Do not wait on the panel, do not open it yourself, do not treat it as output. `dashboard --stop` shuts it down (it also exits itself after 30 idle minutes). Field reference: `references/config.md` → `dashboard`.
 
 ## Safety Rules
 
@@ -303,7 +303,7 @@ Full table: `references/troubleshooting.md`. Common ones:
 | Symptom | Fix |
 |---|---|
 | Git identity missing | `git config user.name` / `user.email`, retry |
-| Dirty tree at `init`/first `begin-round` | Commit/stash, or `allow_uncommitted_changes: true` / `init --force` |
+| Dirty tree at `init`/first `begin-round` | Commit/stash, or set `allow_uncommitted_changes: true` via `config-set` (`init --force` resets the run and does not set this flag) |
 | All goals met, loop continues | `expand_after_goals: true` → `config-set --no-expand-after-goals` to stop at goal |
 | `action_hint: mine` | Run `mine --apply` now — do not idle |
 | `action_hint: expand` | Mine is fresh; Deep Expansion now |

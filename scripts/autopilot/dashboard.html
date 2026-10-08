@@ -344,12 +344,14 @@
     var g = (snapshot && snapshot.growth) || {};
     if (g.granularity === "run") return null;
     var rounds = g.rounds || [];
-    var maxTotal = 0, maxValid = 0;
+    var maxTotal = 0, maxValid = 0, minRound = 0;
     rounds.forEach(function (r) {
       if (r.round > maxTotal) maxTotal = r.round;
+      if (r.round && (minRound === 0 || r.round < minRound)) minRound = r.round;
       if (r.status === "completed" && r.round > maxValid) maxValid = r.round;
     });
-    return maxTotal ? { min: 1, max: maxTotal, valid: maxValid } : null;
+    // 窗口化（wave17 残留）：history 100 条裁剪后轴从窗口最小轮起，不谎称 r1
+    return maxTotal ? { min: minRound || 1, max: maxTotal, valid: maxValid } : null;
   }
 
   function passesReplay(ev) {
@@ -542,7 +544,9 @@
     var bounds = roundBounds();
     $("replay").hidden = !bounds;
     if (bounds) {
-      $("axis-label").textContent = "r1 — r" + bounds.max;
+      var windowed = snapshot && snapshot.growth && snapshot.growth.windowed;
+      $("axis-label").textContent = "r" + bounds.min + " — r" + bounds.max
+        + (windowed ? "（窗口）" : "");
       var cur = $("axis-cursor");
       if (replayRound === null) {
         $("axis-fill").style.width = Math.min(100, bounds.valid / bounds.max * 100) + "%";
@@ -744,6 +748,21 @@
   function renderEvents() {
     var evs = (snapshot && snapshot.growth && snapshot.growth.events) || [];
     var EVENTS_RENDER_LIMIT = 20;
+    // 回放先过滤后切片（wave16 candidate-432）：先切后滤会让早期轮回放时
+    // 最后 20 条全部不匹配、整条时间线空白。索引保持全局（data-ev 点击回
+    // 查全量数组）。
+    if (replayRound !== null) {
+      var filteredPairs = [];
+      for (var k = 0; k < evs.length; k++) {
+        if (passesReplay(evs[k])) filteredPairs.push([k, evs[k]]);
+      }
+      // 原全局下标随行携带（candidate-438）：data-ev 点击回查全量数组，
+      // 过滤数组的相对下标会指错事件。
+      var origIdx = filteredPairs.map(function (pair) { return pair[0]; });
+      evs = filteredPairs.map(function (pair) { return pair[1]; });
+    } else {
+      origIdx = null;
+    }
     var offset = Math.max(0, evs.length - EVENTS_RENDER_LIMIT);
     var render = offset ? evs.slice(offset) : evs;
     var hot = false;
@@ -784,7 +803,8 @@
       if (ev.score !== null && ev.score !== undefined) meta.push("自评 " + ev.score + "/5");
       if (ev.domains && ev.domains.length) meta.push(ev.domains.join("、"));
       var full = ((ev.title || "") + "\n" + (ev.summary || "")).replace(/\n+/g, " ").trim();
-      rows.push('<div class="' + cls + '" data-ev="' + (offset + i) + '"'
+      var evIdx = origIdx ? origIdx[offset + i] : (offset + i);
+      rows.push('<div class="' + cls + '" data-ev="' + evIdx + '"'
         + (full ? ' title="' + escapeHtml(full) + '"' : "")
         + (fresh ? ' style="' + growAnim() + '"' : "") + '>'
         + '<div class="meta mono">' + escapeHtml(meta.join(" · ")) + '</div>'
@@ -812,7 +832,7 @@
     $("dir-cnt").textContent = "· " + cands.length;
     $("directions").innerHTML = cands.map(function (c) {
       return '<div class="dirrow">'
-        + '<span class="ve mono">v' + fmt(c.value) + " e" + fmt(c.effort) + "</span>"
+        + '<span class="ve mono">v' + escapeHtml(fmt(c.value)) + " e" + escapeHtml(fmt(c.effort)) + "</span>"
         + "<span>" + escapeHtml(c.title || "") + "</span>"
         + '<span class="ty mono">' + escapeHtml(c.type || "") + "</span></div>";
     }).join("");

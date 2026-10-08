@@ -7,6 +7,7 @@ import json
 from pathlib import Path
 
 from . import io
+from . import state as state_module  # 别名：build_snapshot 的局部 state 是 state dict
 
 
 # History statuses that legitimately close a round without a commit: their
@@ -120,12 +121,19 @@ def walk_round_anchors(repo, history, run_start_sha, gitio=None):
     the caller. Numstat comes from ONE `git log` pass over run_start..HEAD
     (round 12 perf); an anchor outside that pass, or a failed batch call,
     falls back to the per-anchor `git diff` (same degrade semantics).
+    Head-trimmed windows (candidate-406): when the first surviving entry's
+    round > 1, the first chunk necessarily contains every trimmed round's
+    commits — its stats row is flagged `trimmed_prefix` so the timeline never
+    presents the prefix churn as that round's own work.
     Returns ({path: agg}, [round_stats]) or (None, None)."""
     run_git = _resolve_run_git(gitio)
     changes = {}
     stats = []
     prev = run_start_sha
     batch = None  # 懒加载的单遍 numstat（map, order）；None = 未加载或失败
+    first_entry_round = history[0].get("round") if history else None
+    trimmed_prefix = isinstance(first_entry_round, int) and first_entry_round > 1
+    first_chunk = True
     for entry in history:
         sha = entry.get("commit_sha") or entry.get("batch_commit_sha")
         if sha and sha == prev:
@@ -152,7 +160,9 @@ def walk_round_anchors(repo, history, run_start_sha, gitio=None):
                 "files_changed": len(rows),
                 "insertions": sum(r["insertions"] for r in rows),
                 "deletions": sum(r["deletions"] for r in rows),
+                "trimmed_prefix": bool(trimmed_prefix and first_chunk),
             })
+            first_chunk = False
             for item in rows:
                 agg = changes.setdefault(item["path"], {
                     "first_round": entry.get("round"), "touches": 0,
@@ -644,7 +654,6 @@ def build_snapshot(repo, gitio=None):
     # 项目总框架并入：即使轮次叠加层完全降级（无提交锚点），init 扫描的
     # 骨架也让树保持可用——降级标记只影响活动叠加，不灭整棵树。
     domains = merge_project_framework(state.get("project_map"), domains)
-    completed = [h for h in history if h.get("status") == "completed"]
     cfg = config if isinstance(config, dict) else {}
     budget = _budget_view(state, cfg)
     backlog_summary = _backlog_summary(_autopilot_dir(repo) / io.BACKLOG_FILENAME)
@@ -659,7 +668,9 @@ def build_snapshot(repo, gitio=None):
         "status": {
             "phase": "finished" if state.get("finished_at") else "running",
             "round": state.get("round"), "round_seq": state.get("round_seq"),
-            "completed_rounds": len(completed),   # 从 history 统计，不照抄 state 键
+            # 单调计数器（wave11 candidate-405）：history 窗口 100 条会让
+            # len() 统计在长 run 封顶，与 check 的停止门口径不一致。
+            "completed_rounds": state.get("completed_rounds") or 0,
             "blocked_rounds": state.get("blocked_rounds") or 0,
             "cancelled_rounds": state.get("cancelled_rounds") or 0,
             "budget": budget,
@@ -667,7 +678,7 @@ def build_snapshot(repo, gitio=None):
             "goals": {"total": len(state.get("goals") or []),
                       "met": len(state.get("completed_goals") or [])},
             "backlog": backlog_summary,
-            "expansion_waves": len(state.get("expansion_waves") or []),
+            "expansion_waves": state_module.expansion_wave_count(state),
             # 决策可见性（与 check --brief 同源语义，轻量重算）：面板从
             # 「发生了什么」也能读到「下一步为何」。
             "stop_reason": stop_reason,
@@ -675,6 +686,12 @@ def build_snapshot(repo, gitio=None):
         },
         "growth": {
             "granularity": granularity,
+            # 窗口标记（candidate-406）：history 被裁剪时首块 stats 含全部
+            # 修剪轮的 churn（行级 trimmed_prefix），树/时间线的「从第 N 轮
+            # 开始」叙事必须带着这个限定词读。
+            "windowed": bool(rounds) and any(
+                isinstance(r, dict) and r.get("trimmed_prefix") for r in rounds
+            ),
             "domains": domains,
             "events": correlate_events(history, round_domains),
             "rounds": rounds,
@@ -738,8 +755,15 @@ def _budget_view(state, cfg):
         "round_progress": {
             "round_seq": round_seq,
             "max_rounds": max_rounds,
+            # 与 check 同分母（candidate-405 / 同 candidate-385 的面板侧）：
+            # 四计数器和，round_seq 含 aborted 轮号会提前假归零。
             "remaining": (
-                max(0, max_rounds - round_seq)
+                max(0, max_rounds - (
+                    (state.get("completed_rounds") or 0)
+                    + (state.get("blocked_rounds") or 0)
+                    + (state.get("cancelled_rounds") or 0)
+                    + (state.get("reverted_rounds") or 0)
+                ))
                 if isinstance(max_rounds, int) else None
             ),
         },

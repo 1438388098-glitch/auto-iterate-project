@@ -226,12 +226,25 @@ def has_commits(repo):
     return run_git(repo, "rev-parse", "--verify", "-q", "HEAD").returncode == 0
 
 
+def head_sha(repo):
+    """Current HEAD SHA, or None when the repo has no commits yet. One probe
+    serving callers that need both has_commits and the SHA — check is the
+    loop's hottest command and used to spend two identical rev-parses on it
+    (wave10 candidate-390)."""
+    result = run_git(repo, "rev-parse", "--verify", "-q", "HEAD")
+    return result.stdout.strip() if result.returncode == 0 else None
+
+
 def _is_autopilot_path(path):
     if not path:
         return False
-    if path == AUTOPILOT_DIR:
+    # 大小写不敏感（wave12 candidate-411）：大小写不敏感盘（macOS APFS 默认）
+    # 上 `.Autopilot/...` 与 `.autopilot/...` 是同一个文件，case 敏感比对会让
+    # 运行态保护被 case 玩法绕过——与 guard.py 的双比对标准同一条线。
+    folded = str(path).casefold()
+    if folded == AUTOPILOT_DIR:
         return True
-    return path.startswith(AUTOPILOT_DIR + "/") or path.startswith(AUTOPILOT_DIR + "\\")
+    return folded.startswith(AUTOPILOT_DIR + "/") or folded.startswith(AUTOPILOT_DIR + "\\")
 
 
 _GIT_QUOTED_ESCAPE_RE = re.compile(r"\\([0-7]{3})|\\(.)")
@@ -483,7 +496,9 @@ def _acquire_lock(repo):
             # 重试，让末尾的「after retrying」措辞名副其实（轮 36 candidate-360）。
             _sleep(0.3)
     print(
-        "[ERROR] Could not acquire the autopilot lock at {} after retrying.".format(path),
+        "[ERROR] Could not acquire the autopilot lock at {} after retrying. If no other "
+            "autopilot process is active, remove the stale lock (see 'Another autopilot "
+            "run appears active' in references/troubleshooting.md).".format(path),
         file=sys.stderr,
     )
     raise SystemExit(2)
@@ -529,12 +544,19 @@ def append_log(repo, event, status, **fields):
     try:
         path.parent.mkdir(parents=True, exist_ok=True)
         if path.exists() and path.stat().st_size > LOG_ROTATE_BYTES:
-            for index in range(LOG_ROTATE_KEEP - 1, 0, -1):
-                older = Path(str(path) + ".{}".format(index))
-                newer = Path(str(path) + ".{}".format(index + 1))
-                if older.exists():
-                    os.replace(str(older), str(newer))
-            os.replace(str(path), str(path) + ".1")
+            try:
+                for index in range(LOG_ROTATE_KEEP - 1, 0, -1):
+                    older = Path(str(path) + ".{}".format(index))
+                    newer = Path(str(path) + ".{}".format(index + 1))
+                    if older.exists():
+                        os.replace(str(older), str(newer))
+                os.replace(str(path), str(path) + ".1")
+            except OSError:
+                # Windows 句柄竞态（wave11 candidate-399）：读者开着 log.jsonl
+                # 时 replace 抛 PermissionError。轮转推迟到下一次调用重试，
+                # 本条审计必须照写——持久读者不再能把 5MB 之后的审计链整段
+                # 静默蒸发（含 integrity 取证事件）。
+                pass
         with path.open("a", encoding="utf-8") as handle:
             handle.write(json.dumps(entry, ensure_ascii=False) + "\n")
     except OSError as exc:

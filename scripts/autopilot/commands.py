@@ -338,6 +338,12 @@ def cmd_read(args):
     # 与活跃 run 的写入互斥——锁外读会用旧快照覆盖新状态。
     with io.run_lock(repo):
         payload = state.load_state(repo)
+    # 派生计数（wave20 candidate-451）：aborted 不进持久计数器，机读消费者
+    # 需要 counters+aborted 与 round_seq 无缝对账，而不是扫 history。
+    payload["aborted_rounds"] = sum(
+        1 for entry in payload.get("history") or []
+        if isinstance(entry, dict) and entry.get("status") == "aborted"
+    )
     print(json.dumps(payload, indent=2, ensure_ascii=False))
     return 0
 
@@ -430,13 +436,31 @@ def cmd_begin_round(args):
             return 0
         candidate_ids = list(args.candidate_id) if args.candidate_id else []
         backlog = state.load_backlog(repo)
+        # picked-orphan 自愈（wave11 candidate-398）：backlog(picked) →
+        # state(current_round) 两写窗口内崩溃会留下「picked 但无开轮」残留，
+        # 反双拾守卫拒重拾、backlog-update 一次一 id——死账。此处已过开轮
+        # 拒绝（无开轮才走到），picked 必为孤儿，复位 pending 让账本自愈；
+        # 有开轮时 picked 属于该轮，不经过此路径。
+        if st.get("current_round") is None:
+            orphans = [c for c in backlog.get("candidates") or [] if c.get("status") == "picked"]
+            if orphans:
+                for orphan in orphans:
+                    orphan["status"] = "pending"
+                    orphan["updated_at"] = io.now_iso()
+                state.save_backlog(repo, backlog)
+                io.append_log(
+                    repo, "begin-round", "reconciled",
+                    reason="picked orphans from an interrupted round reset to pending",
+                    ids=[c.get("id") for c in orphans],
+                )
         floor = cfg.get("min_candidate_value")
         ready_above = []
         ready_below = []
+        deps_by_id = state.candidates_by_id(backlog)  # 每 pending 一次 O(1) 依赖查（candidate-392）
         for candidate in backlog.get("candidates") or []:
             if candidate.get("status") != "pending":
                 continue
-            missing, is_ready = state.candidate_deps_status(backlog, candidate)
+            missing, is_ready = state.candidate_deps_status(backlog, candidate, by_id=deps_by_id)
             if not is_ready:
                 continue
             below = floor is not None and state._resolved_value(candidate) < floor
@@ -468,6 +492,7 @@ def cmd_begin_round(args):
                 file=sys.stderr,
             )
         if candidate_ids:
+            picked_by_id = state.candidates_by_id(backlog)
             for cid in candidate_ids:
                 candidate = state.find_candidate(backlog, cid)
                 if candidate is None:
@@ -479,7 +504,28 @@ def cmd_begin_round(args):
                         args, False,
                         "[ERROR] Candidate not found in backlog: {}. Pending: {}".format(cid, hint),
                     )
-                missing, ready = state.candidate_deps_status(backlog, candidate)
+                status = candidate.get("status")
+                if status in ("picked", "completed", "blocked"):
+                    # 账本防护与 backlog-pick 同款（wave9 candidate-380）：已
+                    # 完成/受阻候选零缺依赖、能通过 deps 检查，重复拾取会双
+                    # 记账并漂移 state.type_stats。
+                    io.append_log(repo, "begin-round", "error",
+                                  reason="candidate already resolved", candidate_id=cid,
+                                  candidate_status=status)
+                    zh_status = {"picked": "已拾取", "completed": "已完成", "blocked": "受阻"}.get(status, status)
+                    return emit_result(
+                        args, False,
+                        _check_text(
+                            cfg,
+                            "[ERROR] Candidate {} is already '{}'（状态已是 {}）——begin-round 重复拾取会静默改写"
+                            "完成/受阻账本并使 state.type_stats 漂移。如需重新开工，请先 backlog-update --status pending。".format(
+                                cid, status, zh_status),
+                            "[ERROR] Candidate {} is already '{}' — begin-round would silently rewrite "
+                            "the completed/blocked ledger and drift state.type_stats. To reopen work, "
+                            "run backlog-update --status pending first.".format(cid, status),
+                        ),
+                    )
+                missing, ready = state.candidate_deps_status(backlog, candidate, by_id=picked_by_id)
                 if not ready:
                     io.append_log(repo, "begin-round", "error", reason="candidate deps unresolved", deps=missing)
                     return emit_result(
@@ -510,7 +556,7 @@ def cmd_begin_round(args):
         # run's own prior rounds deliberately left uncommitted (batch mode
         # defers commits; blocked/cancelled rounds leave work behind) — commit
         # uses what remains to refuse absorbing pre-existing user changes.
-        prior_deferred = set()
+        prior_deferred = set(st.get("deferred_paths") or [])
         for entry in st.get("history") or []:
             if isinstance(entry, dict):
                 prior_deferred.update(entry.get("deferred_dirty_files") or [])
@@ -722,6 +768,20 @@ def _close_round(repo, st, current, status, counter_key, tokens, history_entry,
             repo, "deferred-files", "warn",
             round=current.get("round"), reason=str(exc)[:200],
         )
+    # Run 级 deferred 账本（wave11 candidate-402）：history 窗口（100 条）
+    # 会遗忘老的 deferred 记录，修剪后并集把 run 自产遗留误标成 pre-existing
+    # 用户改动、flush 硬拒提交。账本只收当前确实未提交的 deferred 路径
+    # （提交/消失即出账），界自然收敛到在途集合；git 抖动轮不动账本。
+    ledger = st.get("deferred_paths")
+    if not isinstance(ledger, list):
+        ledger = []
+    if uncommitted is not None:
+        live = set(uncommitted)
+        ledger = [p for p in ledger if p in live]
+        for deferred_path in history_entry["deferred_dirty_files"]:
+            if deferred_path not in ledger:
+                ledger.append(deferred_path)
+        st["deferred_paths"] = ledger
     history_entry.setdefault("status", status)
     # Full candidate batch beside the legacy scalar (1.12 field test: a
     # multi-candidate round's history entry kept only the FIRST id, so the
@@ -731,13 +791,18 @@ def _close_round(repo, st, current, status, counter_key, tokens, history_entry,
     )
     state.append_history(st, history_entry)
     st["current_round"] = None
+    # 单次 backlog 读（wave10 candidate-391）：候选状态更新与 type_stats 共用
+    # 同一份内存 dict——此前 update_candidates_status 内部 load+save，紧接着
+    # _refresh_type_stats 再 load 刚写回的同一文件，两 parse 一多余 .bak，
+    # 还留有写后读的 type_stats 失效窗口。
+    backlog = state.load_backlog(repo)
     state.update_candidates_status(
         repo, state.round_candidate_ids(current), candidate_status, candidate_round,
-        extra_fields=candidate_extra,
+        extra_fields=candidate_extra, backlog=backlog,
     )
     if seed_outcome is not None:
         _resolve_round_seeds_in_state(repo, st, current, seed_outcome, seed_notes)
-    _refresh_type_stats(repo, st)
+    st["type_stats"] = state.compute_type_stats(backlog)
     state.save_state(repo, st)
 
 
@@ -751,7 +816,8 @@ def cmd_complete_round(args):
         current = st["current_round"]
         if current is None:
             io.append_log(repo, "complete-round", "error", reason="no open round")
-            return emit_result(args, False, "[ERROR] No open round to complete.")
+            return emit_result(args, False,
+                              "[ERROR] No open round to complete. Run begin-round first (round-prep shows the next round number).")
 
         cfg = config.load_config(repo)
         drift = _feature_branch_guard(repo, st, cfg, "complete the round")
@@ -765,7 +831,8 @@ def cmd_complete_round(args):
                 io.append_log(repo, "complete-round", "error", reason="invalid commit sha")
                 return emit_result(
                     args, False,
-                    "[ERROR] --commit-sha does not resolve to a commit: {}".format(args.commit_sha),
+                    "[ERROR] --commit-sha does not resolve to a commit: {}. Use the exact SHA the "
+                    "commit helper printed (git log -1 --format=%H to recover).".format(args.commit_sha),
                 )
 
         tokens, billed = _resolve_tokens(args, repo, st)
@@ -884,8 +951,10 @@ def cmd_complete_round(args):
 
         if push_warning:
             print("[WARN] Round completed but push failed: {}".format(push_warning), file=sys.stderr)
-            return emit_result(args, True, "[OK] Round completed (push failed, see warning).")
-        return emit_result(args, True, "[OK] Round completed.")
+            return emit_result(args, True, "[OK] Round completed (push failed, see warning).",
+                               data={"round": current["round"], "commit_sha": args.commit_sha})
+        return emit_result(args, True, "[OK] Round completed.",
+                           data={"round": current["round"], "commit_sha": args.commit_sha})
 
 
 def cmd_block_round(args):
@@ -898,7 +967,8 @@ def cmd_block_round(args):
         current = st["current_round"]
         if current is None:
             io.append_log(repo, "block-round", "error", reason="no open round")
-            return emit_result(args, False, "[ERROR] No open round to block.")
+            return emit_result(args, False,
+                            "[ERROR] No open round to block. Run begin-round first.")
 
         tokens, billed = _resolve_tokens(args, repo, st)
         if getattr(args, "dry_run", False):
@@ -940,6 +1010,7 @@ def cmd_block_round(args):
         return emit_result(
             args, True,
             "[OK] Round {} blocked. Blocked candidates: {}".format(current["round"], echo),
+            data={"round": current["round"], "candidate_ids": blocked_ids},
         )
 
 
@@ -953,7 +1024,8 @@ def cmd_cancel_round(args):
         current = st["current_round"]
         if current is None:
             io.append_log(repo, "cancel-round", "error", reason="no open round")
-            return emit_result(args, False, "[ERROR] No open round to cancel.")
+            return emit_result(args, False,
+                            "[ERROR] No open round to cancel. Run begin-round first.")
 
         # Zero-work probe retries (wrong flags, malformed refs, forgotten
         # --reason...) used to be billed as full cancelled rounds: a cancelled
@@ -1132,17 +1204,30 @@ def cmd_goal_met(args):
             # Verification anchor: --round must point at a round that actually
             # completed. Without it the claim stays unverified and cannot stop
             # the run (state.unverified_goals).
+            # 跨窗锚（wave11 candidate-404）：history 窗口只有 100 条，长 run
+            # 里真交付轮会被裁掉——届时窗口成员测试会拒掉真实的完成轮（消息
+            # 还谎称它没完成），把 goals 停止条件永久砖死。改用单调上界：
+            # 接受任何 ≤ 最高已完成轮的锚（修剪后锚精度本来就已被窗口抹掉，
+            # 两个错里取不砖机的那个）；超出上界仍拒绝。
             completed_rounds = {
                 entry.get("round")
                 for entry in st.get("history") or []
                 if isinstance(entry, dict) and entry.get("status") == "completed"
             }
-            if goal_round not in completed_rounds:
+            highest_completed = max(
+                (r for r in completed_rounds if isinstance(r, int)), default=None
+            )
+            anchor_known = goal_round in completed_rounds
+            anchor_plausible = (
+                highest_completed is not None and goal_round <= highest_completed
+            )
+            if not (anchor_known or anchor_plausible):
                 io.append_log(repo, "goal-met", "error", reason="round not completed")
                 return emit_result(
                     args, False,
-                    "[ERROR] --round {} does not match a completed round in history; a goal can only "
-                    "be verified against a round that actually completed.".format(goal_round),
+                    "[ERROR] --round {} does not match a completed round in history "
+                    "(highest completed: {}); a goal can only be verified against a round "
+                    "that actually completed.".format(goal_round, highest_completed),
                 )
 
         if getattr(args, "dry_run", False):
@@ -1153,7 +1238,7 @@ def cmd_goal_met(args):
         recent_topics = []
         round_candidate_ids = []
         if not args.no_auto_context:
-            saturated = state.saturated_types(st, cfg.get("type_saturation_threshold", 2))
+            saturated = state.saturated_types(st, state.effective_saturation_threshold(cfg))
             recent_topics = _recent_commit_topics(repo)
             round_candidate_ids = _last_completed_candidate_ids(st)
 
@@ -1189,26 +1274,28 @@ def cmd_goal_met(args):
                    for existing in st["completed_goals"]):
             st["completed_goals"].append(goal)
         st["last_activity_at"] = io.now_iso()
-        goal_event = None
-        if not args.no_auto_context or seeds or unlocked:
-            goal_event = state.append_goal_event(st, {
-                "goal": goal,
-                "met_at": io.now_iso(),
-                "round": goal_round if goal_round is not None else (st.get("round") or 0),
-                "evidence": getattr(args, "evidence", None) or "",
-                # No completed-round anchor -> the claim stays unverified and
-                # compute_stop_reason withholds "all goals met" until a
-                # goal-met --round <completed round> lands.
-                "unverified": goal_round is None,
-                "commit_shas": _last_completed_round_shas(st) if not args.no_auto_context else [],
-                "candidate_ids": round_candidate_ids,
-                "unlocked_capabilities": unlocked,
-                "recent_commit_topics": recent_topics,
-                "saturated_types": saturated,
-                "seed_ids": [seed["id"] for seed in seeds],
-            })
-            for seed in seeds:
-                seed["source_event_id"] = goal_event["id"]
+        # 事件本体恒落（wave18 candidate-441）：--no-auto-context 的语义是跳
+        # 过自动上下文（commit_shas/topics/saturated 置空），不是跳过验证事
+        # 件——此前与 --round 组合时静默不落账，锚定验证被吞、目标沿用旧
+        # unverified 事件永久阻止 all-goals-met 且无任何提示。
+        goal_event = state.append_goal_event(st, {
+            "goal": goal,
+            "met_at": io.now_iso(),
+            "round": goal_round if goal_round is not None else (st.get("round") or 0),
+            "evidence": getattr(args, "evidence", None) or "",
+            # No completed-round anchor -> the claim stays unverified and
+            # compute_stop_reason withholds "all goals met" until a
+            # goal-met --round <completed round> lands.
+            "unverified": goal_round is None,
+            "commit_shas": _last_completed_round_shas(st) if not args.no_auto_context else [],
+            "candidate_ids": [] if args.no_auto_context else round_candidate_ids,
+            "unlocked_capabilities": unlocked,
+            "recent_commit_topics": [] if args.no_auto_context else recent_topics,
+            "saturated_types": [] if args.no_auto_context else saturated,
+            "seed_ids": [seed["id"] for seed in seeds],
+        })
+        for seed in seeds:
+            seed["source_event_id"] = goal_event["id"]
         state.save_state(repo, st)
         io.append_log(repo, "goal-met", "success", goal=goal, seeds=[seed["id"] for seed in seeds])
         if state.all_goals_met(cfg, st) and cfg.get("expand_after_goals"):
@@ -1468,9 +1555,24 @@ def cmd_finish(args):
                 archive_dir.mkdir(parents=True, exist_ok=True)
                 if retrospective_path:
                     shutil.copy2(retrospective_path, archive_dir / io.RETROSPECTIVE_FILENAME)
+                # 只归档本 run 的报告（wave17 candidate-434）：跨 run 残留的
+                # 旧报告曾会被当作本 run 的记录永久化进 docs/autopilot。
+                run_start_ts = io.parse_time(st.get("started_at") or "")
                 for report in sorted((repo / io.AUTOPILOT_DIR).glob("phase-report-round-*.md")):
+                    if run_start_ts is not None:
+                        try:
+                            if report.stat().st_mtime < run_start_ts.timestamp():
+                                continue
+                        except OSError:
+                            pass
                     shutil.copy2(report, archive_dir / report.name)
-                print("[OK] Reports archived to docs/autopilot/.")
+                if getattr(args, "json", False):
+                    # JSON 模式信息行走 stderr（config.md 契约）：这是文档
+                    # 钦点的 finish --archive-reports --json 收官调用，
+                    # stdout 里混进 [OK] 行会炸掉循环 agent 的 json.loads。
+                    print("[OK] Reports archived to docs/autopilot/.", file=sys.stderr)
+                else:
+                    print("[OK] Reports archived to docs/autopilot/.")
             except OSError as exc:
                 print("[WARN] Report archiving failed: {}".format(exc), file=sys.stderr)
         message = "[OK] Autopilot run finished."
@@ -1591,7 +1693,7 @@ def cmd_backlog_add(args):
                     "[ERROR] --confidence for predicted/expansion work must be between 0.5 and 1.0 "
                     "(it discounts the score; observed work is always 1.0).",
                 )
-        candidate_id = "candidate-{:03d}".format(backlog["next_id"])
+        candidate_id = state.mint_candidate_id(backlog)
         value = args.value
         if value is None and seed is not None:
             value = _seed_num(seed, "value")
@@ -1666,9 +1768,43 @@ def cmd_backlog_add(args):
                 file=sys.stderr,
             )
             return 0
-        backlog["candidates"].append(candidate)
-        backlog["next_id"] += 1
+        prior_promotion = None
+        if seed is not None:
+            prior_promotion = next(
+                (c for c in backlog.get("candidates") or [] if c.get("from_seed") == seed["id"]),
+                None,
+            )
+        reused = prior_promotion is not None
+        if reused:
+            # 跨文件写序窗口自愈（wave11 candidate-401）：候选已落 backlog 而
+            # 种子标记未及写 state 的崩溃残留——重跑晋升复用既有行，不铸重复
+            # 候选；下方照常补完种子标记（幂等）。
+            candidate_id = prior_promotion["id"]
+            changed = [key for key in ("title", "value", "effort", "type")
+                       if key in candidate and prior_promotion.get(key) != candidate[key]]
+            if changed:
+                # 幂等复用保留持久化行（wave18 candidate-443）：调用方的新字段
+                # 被丢弃必须出声，否则操作者以为修正已生效。
+                print(
+                    "[WARN] Crash-recovery reuse: kept the persisted candidate's fields; "
+                    "this call's {} were ignored (id {}).".format(
+                        ", ".join(changed), candidate_id),
+                    file=sys.stderr,
+                )
+        else:
+            backlog["candidates"].append(candidate)
         state.save_backlog(repo, backlog)
+        if origin in ("predicted", "expansion") and not reused:
+            # 复用路径不回填（wave18 candidate-445）：added 数本波新产候选，
+            # 崩溃重试的幂等复用不算新产量，否则枯竭判定被幻影产量推迟。
+            # 波次产量回填（candidate-386）：added 数本波经价值门产出的候选，
+            # mining_exhausted 的波次项据此与 SKILL 契约（连续两波零新增才许
+            # 枯竭）对齐——expansion-record 在波首记录，waves[-1] 即本波。
+            st = state.load_state(repo)
+            waves = st.get("expansion_waves") or []
+            if waves and isinstance(waves[-1], dict):
+                waves[-1]["added"] = int(waves[-1].get("added") or 0) + 1
+                state.save_state(repo, st)
         if seed is not None:
             st = state.load_state(repo)
             state.resolve_seed(st, seed["id"], "promoted", candidate_id=candidate_id)
@@ -1978,8 +2114,9 @@ def cmd_push(args):
             io.append_log(repo, "push", "error", reason="push disabled in config")
             return emit_result(
                 args, False,
-                "[ERROR] push is disabled in .autopilot/config.json (push: false). "
-                "Set 'push': true to allow pushing.",
+                "[ERROR] push is disabled in .autopilot/config.json (push: false). Enable it at "
+                "runtime with `config-set --push` (hand-editing the file trips the "
+                "config-drift check on every later check).",
             )
         if getattr(args, "dry_run", False):
             print("[DRY-RUN] Would push the current branch to its remote.", file=sys.stderr)
@@ -1990,6 +2127,14 @@ def cmd_push(args):
             return emit_result(args, False, "[ERROR] git push failed: {}".format(err))
         io.append_log(repo, "push", "success")
         return emit_result(args, True, "[OK] Pushed to remote.")
+
+
+def _commit_refuse(args, repo, reason, message, **log_fields):
+    """Audit-and-refuse primitive for cmd_commit's guard chain: write the
+    error event, then return the emitted failure. Extra keyword arguments are
+    forwarded to the audit log (paths, round, findings...)."""
+    io.append_log(repo, "commit", "error", reason=reason, **log_fields)
+    return emit_result(args, False, message)
 
 
 def cmd_commit(args):
@@ -2003,22 +2148,22 @@ def cmd_commit(args):
 
         drift = _feature_branch_guard(repo, st, cfg, "commit")
         if drift is not None:
-            io.append_log(repo, "commit", "error", reason="branch drift")
-            return emit_result(args, False, drift)
+            return _commit_refuse(args, repo, "branch drift", drift)
 
         identity_ok, _, _ = io.git_identity_ok(repo)
         if not identity_ok:
-            io.append_log(repo, "commit", "error", reason="identity not configured")
-            return emit_result(
-                args, False,
+            return _commit_refuse(
+                args, repo, "identity not configured",
                 "[ERROR] Git identity is not configured. Run 'git config user.name ...' "
                 "and 'git config user.email ...' first.",
             )
 
         staged = io.run_git(repo, "diff", "--cached", "--quiet")
         if staged.returncode == 0:
-            io.append_log(repo, "commit", "error", reason="nothing staged")
-            return emit_result(args, False, "[ERROR] Nothing is staged. Run 'git add <files>' for the current round first.")
+            return _commit_refuse(
+                args, repo, "nothing staged",
+                "[ERROR] Nothing is staged. Run 'git add <files>' for the current round first.",
+            )
 
         bypassed_secrets = bool(cfg.get("scan_secrets", True) and getattr(args, "allow_secrets", False))
 
@@ -2036,14 +2181,14 @@ def cmd_commit(args):
         if not cfg.get("track_state"):
             forced_state = [p for p in staged_paths if io._is_autopilot_path(p)]
             if forced_state:
-                io.append_log(repo, "commit", "error", reason="autopilot state staged", paths=forced_state)
-                return emit_result(
-                    args, False,
+                return _commit_refuse(
+                    args, repo, "autopilot state staged",
                     "[ERROR] Staged files under .autopilot/ are run state, not product code "
                     "(track_state is false): {}. Unstage them ('git reset -q HEAD -- .autopilot/') "
                     "or set track_state: true if the state should be versioned.".format(
                         ", ".join(forced_state)
                     ),
+                    paths=forced_state,
                 )
 
         if cfg.get("allow_paths") or cfg.get("deny_paths"):
@@ -2052,26 +2197,31 @@ def cmd_commit(args):
                 if not path_allowed(path, cfg.get("allow_paths"), cfg.get("deny_paths"))
             ]
             if blocked:
-                io.append_log(repo, "commit", "error", reason="path whitelist violated", paths=blocked)
-                return emit_result(
-                    args, False,
+                return _commit_refuse(
+                    args, repo, "path whitelist violated",
                     "[ERROR] Staged files violate allow_paths/deny_paths: {}".format(", ".join(blocked)),
+                    paths=blocked,
                 )
 
+        # 一次共享的 staged numstat：secrets 的二进制探测与 max_round_scope 的
+        # 行数统计曾各 spawn 一次同一查询（wave10 candidate-389）。quotepath=
+        # false 是两者要求的并集（secrets 要字面文件名，计数不受影响）。
+        shared_numstat = io.run_git(repo, "-c", "core.quotepath=false", "diff", "--cached", "--numstat")
+
         if cfg.get("scan_secrets", True) and not getattr(args, "allow_secrets", False):
-            findings = scan_staged_diff(repo, cfg.get("secret_patterns"))
+            findings = scan_staged_diff(repo, cfg.get("secret_patterns"), staged_numstat=shared_numstat)
             if findings:
                 # Findings are masked (secrets.mask_secret_text) so the audit log
                 # never stores secret material.
-                io.append_log(repo, "commit", "error", reason="secrets detected", findings=findings)
                 detail = "; ".join(
                     "{}: {} (matched {})".format(f.get("file") or "?", f.get("text"), f.get("pattern"))
                     for f in findings[:5]
                 )
-                return emit_result(
-                    args, False,
+                return _commit_refuse(
+                    args, repo, "secrets detected",
                     "[ERROR] Secret-like content detected in the staged diff: {}. "
                     "Remove it, or commit with --allow-secrets / set scan_secrets: false.".format(detail),
+                    findings=findings,
                 )
 
         stat = io.run_git(repo, "diff", "--cached", "--stat")
@@ -2080,11 +2230,10 @@ def cmd_commit(args):
 
         max_scope = cfg.get("max_round_scope")
         if max_scope is not None:
-            changed_lines = _staged_numstat_lines(repo)
+            changed_lines = _staged_numstat_lines(repo, numstat=shared_numstat)
             if changed_lines > max_scope:
-                io.append_log(repo, "commit", "error", reason="max_round_scope exceeded")
-                return emit_result(
-                    args, False,
+                return _commit_refuse(
+                    args, repo, "max_round_scope exceeded",
                     "[ERROR] Staged diff exceeds max_round_scope ({} lines > {}). "
                     "Split the change into smaller rounds.".format(changed_lines, max_scope),
                 )
@@ -2095,8 +2244,10 @@ def cmd_commit(args):
         start_dirty = None
         if args.round is not None:
             if args.round < 1:
-                io.append_log(repo, "commit", "error", reason="round out of range")
-                return emit_result(args, False, "[ERROR] --round must be a positive integer (got {}).".format(args.round))
+                return _commit_refuse(
+                    args, repo, "round out of range",
+                    "[ERROR] --round must be a positive integer (got {}).".format(args.round),
+                )
             # --round is a batch flush for changes belonging to an
             # ALREADY-completed round, not an arbitrary-commit escape hatch:
             # the number must exist in the run's completed history.
@@ -2108,17 +2259,17 @@ def cmd_commit(args):
                 (h for h in completed_history if h.get("round") == args.round), None
             )
             if round_entry is None:
-                io.append_log(repo, "commit", "error", reason="round not in completed history", round=args.round)
                 known = ", ".join(
                     str(h.get("round")) for h in completed_history if isinstance(h.get("round"), int)
                 )
-                return emit_result(
-                    args, False,
+                return _commit_refuse(
+                    args, repo, "round not in completed history",
                     "[ERROR] --round {}: no completed round with that number (completed rounds: {}). "
                     "--round is only for flushing staged changes that belong to already-completed "
                     "rounds; open a round with begin-round instead.".format(
                         args.round, known or "none"
                     ),
+                    round=args.round,
                 )
             round_no = args.round
             start_dirty = round_entry.get("start_dirty_files")
@@ -2126,9 +2277,8 @@ def cmd_commit(args):
             round_no = open_round.get("round")
             start_dirty = open_round.get("start_dirty_files")
         else:
-            io.append_log(repo, "commit", "error", reason="no open round")
-            return emit_result(
-                args, False,
+            return _commit_refuse(
+                args, repo, "no open round",
                 "[ERROR] No round is open. Use begin-round first, or pass --round <N> to flush "
                 "staged changes for an already-completed round (batch flush only; <N> must exist "
                 "in the run's completed history).",
@@ -2158,14 +2308,14 @@ def cmd_commit(args):
             start_dirty_set = set(start_dirty)
             preexisting = sorted(p for p in staged_paths if p in start_dirty_set)
         if preexisting:
-            io.append_log(repo, "commit", "error", reason="pre-existing user changes staged", paths=preexisting)
-            return emit_result(
-                args, False,
+            return _commit_refuse(
+                args, repo, "pre-existing user changes staged",
                 "[ERROR] Staged files were already uncommitted when round {} started (pre-existing "
                 "user changes, allow_uncommitted_changes is false): {}. Unstage them ('git reset "
                 "HEAD -- <file>'), or set allow_uncommitted_changes: true.".format(
                     round_no, ", ".join(preexisting)
                 ),
+                paths=preexisting,
             )
         if not isinstance(start_dirty, list):
             warn_unverifiable = True
@@ -2180,7 +2330,7 @@ def cmd_commit(args):
             uncommitted_now = set(io.uncommitted_paths(repo))
         except SystemExit:
             uncommitted_now = set()
-        prior_deferred = set()
+        prior_deferred = set(st.get("deferred_paths") or [])
         for entry in st.get("history") or []:
             if isinstance(entry, dict):
                 prior_deferred.update(entry.get("deferred_dirty_files") or [])
@@ -2221,8 +2371,10 @@ def cmd_commit(args):
         result = io.run_git(repo, "commit", "-m", message)
         if result.returncode != 0:
             print(result.stderr.strip(), file=sys.stderr)
-            io.append_log(repo, "commit", "error", reason="git commit failed")
-            return emit_result(args, False, "[ERROR] git commit failed. Check pre-commit hooks or staged files.")
+            return _commit_refuse(
+                args, repo, "git commit failed",
+                "[ERROR] git commit failed. Check pre-commit hooks or staged files.",
+            )
         # Post-commit window（轮 15 候选 299）：commit 已落盘后 rev-parse/
         # state 回填若失败，这次冲刷不能在 state/log 里「从未发生」——
         # sha 尽力从 git commit 输出兜底，审计事件必然落一条。
@@ -2272,7 +2424,17 @@ def cmd_secret_scan(args):
         return refused
     cfg = config.load_config(repo)
     findings = scan_staged_diff(repo, cfg.get("secret_patterns"))
-    payload = {"findings": findings, "clean": not findings}
+    # {ok, message} 契约（config.md 点名 secret-scan 在内，wave12 candidate-408）；
+    # findings/clean 保留为兼容字段。
+    payload = {
+        "ok": not findings,
+        "message": (
+            "[OK] No secret-like content found in the staged diff." if not findings
+            else "[ERROR] {} secret-like finding(s) in the staged diff.".format(len(findings))
+        ),
+        "findings": findings,
+        "clean": not findings,
+    }
     if getattr(args, "json", False):
         print(json.dumps(payload, indent=2, ensure_ascii=False))
         return 0 if not findings else 2
@@ -2286,19 +2448,25 @@ def cmd_secret_scan(args):
     return 0
 
 
-def _staged_numstat_lines(repo):
-    result = io.run_git(repo, "diff", "--cached", "--numstat")
-    if result.returncode != 0:
+def _staged_numstat_lines(repo, numstat=None):
+    """Total changed units (text lines + binary files) in the staged diff.
+    Fail-closed: a failed numstat must not look like a zero-line diff, or
+    max_round_scope would silently stop applying. `numstat` accepts the shared
+    staged-diff pass from cmd_commit (wave10 candidate-389) instead of
+    spawning the identical query again."""
+    if numstat is None:
+        numstat = io.run_git(repo, "diff", "--cached", "--numstat")
+    if numstat.returncode != 0:
         # Fail-closed: a failed numstat must not look like a zero-line diff,
         # or max_round_scope would silently stop applying.
         print(
             "[ERROR] Could not read staged numstat ({}); refusing to treat the diff as empty.".format(
-                (result.stderr or result.stdout or "git diff --numstat failed").strip()
+                (numstat.stderr or numstat.stdout or "git diff --numstat failed").strip()
             ),
             file=sys.stderr,
         )
         raise SystemExit(2)
-    text, binary = io._parse_numstat(result.stdout)
+    text, binary = io._parse_numstat(numstat.stdout)
     return text + binary
 
 
@@ -2413,7 +2581,11 @@ def cmd_analysis_save(args):
         io.append_log(repo, "analysis-save", "success", name=args.name)
         return emit_result(
             args, True, "[OK] Analysis cached.",
-            data={"git_head": git_head, "valid_until": "next HEAD or config change"},
+            data={
+                "git_head": git_head,
+                # 机器可读失效条件（candidate-408）：散文式 valid_until 无法判定
+                "invalidated_by": ["HEAD", "config"],
+            },
         )
 
 
@@ -2422,8 +2594,8 @@ def cmd_analysis_load(args):
     refused = _require_initialized(args, repo, message="[ERROR] Autopilot not initialized. Run init first.")
     if refused is not None:
         return refused
-    validity, reason = state.analysis_validity(repo)
-    data = state.load_analysis(repo)
+    validity, reason, doc = state.analysis_validity(repo)
+    data = doc
     io.append_log(repo, "analysis-load", "success" if validity == "fresh" else "warn", validity=validity)
     payload = {
         "valid": validity == "fresh",
@@ -2470,12 +2642,27 @@ def cmd_config_set(args):
                 "[ERROR] --max-blocked-in-a-row must be a non-negative integer (got {}).".format(args.max_blocked_in_a_row),
             )
         requested["max_blocked_in_a_row"] = args.max_blocked_in_a_row
+    # 数值边界问注册表（config.field_int_rule，candidate-314）：config-set 与
+    # validate_config 共享同一份下界，两套机制不再各自漂移。config-set 只暴露
+    # 正整数旗标；预算四键不在 int_range 行，回落 1 保持原行为。
     for name, value in requested.items():
-        if value < 1 and name != "max_blocked_in_a_row":
+        bounds = config.field_int_rule(name)
+        min_value = bounds[0] if bounds else 1
+        if name in ("max_rounds", "max_minutes"):
+            # init 同款：max_rounds 0 立即停机、max_minutes 仅拒负数（float
+            # 合法）——config-set 曾一概拒 0，同一字段两扇门两种域（candidate-409）。
+            min_value = 0
+        if value < min_value and name != "max_blocked_in_a_row":
+            if name == "max_rounds":
+                expected = "a non-negative integer"
+            elif name == "max_minutes":
+                expected = "a non-negative number"
+            else:
+                expected = "a positive integer"
             io.append_log(repo, "config-set", "error", reason="non-positive value", field=name, value=value)
             return emit_result(
                 args, False,
-                "[ERROR] --{} must be a positive integer (got {}).".format(name.replace("_", "-"), value),
+                "[ERROR] --{} must be {} (got {}).".format(name.replace("_", "-"), expected, value),
             )
     for value_name, clear_name in (
         ("max_rounds", "clear_max_rounds"),
@@ -2704,13 +2891,14 @@ def cmd_expansion_record(args):
                 repo, "expansion-wave", "warn",
                 reason="same lens set as previous wave", lenses=wave["lenses"],
             )
+        wave_no = state.expansion_wave_count(st)  # 单调序号：窗口裁剪后不再重复报 20（candidate-403）
         io.append_log(
             repo, "expansion-wave", "success",
-            lenses=wave["lenses"], wave_no=len(st.get("expansion_waves") or []),
+            lenses=wave["lenses"], wave_no=wave_no,
             findings=wave["findings"], applied=wave["applied"],
         )
         message = "[OK] Expansion wave {} recorded (lenses: {}).".format(
-            len(st.get("expansion_waves") or []), ", ".join(wave["lenses"])
+            wave_no, ", ".join(wave["lenses"])
         )
         if repeated:
             message += " Warning: same lens set as the previous wave."
@@ -2798,7 +2986,10 @@ def cmd_undo_round(args):
         verify = io.run_git(repo, "rev-parse", "--verify", "--quiet", args.sha + "^{commit}")
         if verify.returncode != 0:
             io.append_log(repo, "undo-round", "error", reason="invalid sha")
-            return emit_result(args, False, "[ERROR] --sha does not resolve to a commit: {}".format(args.sha))
+            return emit_result(
+                args, False,
+                "[ERROR] --sha does not resolve to a commit: {}. List candidates with "
+                "`git log --oneline -10`.".format(args.sha))
         full_sha = verify.stdout.strip()
         parents = io.run_git(repo, "rev-list", "--parents", "-n", "1", full_sha)
         is_merge = len(parents.stdout.split()) > 2
@@ -2871,7 +3062,9 @@ def cmd_detect_verify(args):
     payload["message"] = (
         "[OK] Detected {} verification command(s).".format(len(commands))
         if commands else
-        "[ERROR] No verification commands detected; nothing to apply."
+        "[ERROR] No verification commands detected; nothing to apply. Set check_commands "
+                "manually with `config-set --check-commands <cmd>` (repeatable), or pass "
+                "--check-commands on init."
     )
     if commands and args.apply:
         if getattr(args, "dry_run", False):
@@ -2880,11 +3073,20 @@ def cmd_detect_verify(args):
                 file=sys.stderr,
             )
             return 0
-        cfg = config.load_config(repo)
-        cfg["check_commands"] = commands
-        config.save_config(repo, cfg)
-        io.append_log(repo, "detect-verify", "success", commands=commands)
-        return emit_result(args, True, "[OK] check_commands set to {}".format(commands), data=payload)
+        # 与其余状态写者同一把锁（wave11 candidate-400）：无锁的 config+state
+        # 双写与开轮的 load→save 交错时，陈旧副本后落会蒸发 current_round/
+        # 轮计数/水位线。
+        with io.run_lock(repo):
+            cfg = config.load_config(repo)
+            cfg["check_commands"] = commands
+            config.save_config(repo, cfg)
+            # 这次改动同样是故意的：刷新指纹与 config-set 同一契约（wave9
+            # candidate-382）——否则之后每次 check 都报永久 config-drift 假阳性。
+            st = state.load_state(repo)
+            st["config_fingerprint"] = io.file_sha256(config.config_path_for(repo))
+            state.save_state(repo, st)
+            io.append_log(repo, "detect-verify", "success", commands=commands)
+            return emit_result(args, True, "[OK] check_commands set to {}".format(commands), data=payload)
     if not commands and args.apply:
         io.append_log(repo, "detect-verify", "error", reason="nothing detected")
         if getattr(args, "json", False):
@@ -2991,7 +3193,7 @@ def cmd_mine(args):
             now = io.now_iso()
             for finding in new_findings:
                 fields = miner.finding_to_candidate_fields(finding)
-                candidate_id = "candidate-{:03d}".format(backlog["next_id"])
+                candidate_id = state.mint_candidate_id(backlog)
                 candidate = {
                     "id": candidate_id,
                     "title": fields["title"],
@@ -3015,7 +3217,6 @@ def cmd_mine(args):
                     "line": finding.get("line"),
                 }
                 backlog["candidates"].append(candidate)
-                backlog["next_id"] += 1
                 applied.append(candidate_id)
                 io.append_log(
                     repo, "backlog-add", "success",
@@ -3039,8 +3240,12 @@ def cmd_mine(args):
             kinds=result["kinds"],
         )
 
+        message = "[OK] Mine: {} findings ({} new, {} applied).".format(
+            result["count"], len(new_findings), len(applied)
+        )
         payload = {
             "ok": True,
+            "message": message,  # {ok,message} 契约：JSON 模式同款（candidate-408）
             "kinds": result["kinds"],
             "by_kind": result["by_kind"],
             "found": result["count"],
@@ -3053,9 +3258,6 @@ def cmd_mine(args):
         if getattr(args, "json", False):
             print(json.dumps(payload, indent=2, ensure_ascii=False))
             return 0
-        message = "[OK] Mine: {} findings ({} new, {} applied).".format(
-            result["count"], len(new_findings), len(applied)
-        )
         return emit_result(args, True, message, data=payload)
 
 
@@ -3129,9 +3331,12 @@ def cmd_round_prep(args):
     payload["withheld"] = max(0, len(pending) - len(payload["candidates"]))
 
     # 有效性与缓存内容：状态已在 payload["analysis"] 里（含 commits_behind），
-    # 只有 fresh 才需要读缓存文件本体。
+    # 只有 fresh 才需要读缓存文件本体——ctx 带出的已解析文档优先，无 ctx
+    # 路径才落盘重读（wave10 candidate-390）。
     if payload["analysis"].get("status") == "fresh":
-        cached = state.load_analysis(repo)
+        cached = ctx.get("analysis_doc") if ctx else None
+        if cached is None:
+            cached = state.load_analysis(repo)
         payload["analysis"]["cached"] = (cached or {}).get("analysis") if isinstance(cached, dict) else None
     else:
         payload["analysis"]["cached"] = None

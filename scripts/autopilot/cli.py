@@ -204,8 +204,9 @@ def build_parser():
     goal_parser.add_argument("--seed-value", type=int, default=None, help="Seed value 1-5 (default 4)")
     goal_parser.add_argument("--seed-effort", type=int, default=None, help="Seed effort 1-5 (default 2)")
     goal_parser.add_argument("--round", type=int, default=None,
-                             help="Round number that completed this goal (must match a completed history entry); "
-                                  "omitting it marks the goal unverified and withholds the 'all goals met' stop")
+                             help="Round number that completed this goal (must not exceed the highest completed round; "
+                                  "pruned rounds still count); omitting it marks the goal unverified "
+                                  "and withholds the 'all goals met' stop")
     goal_parser.add_argument("--evidence", default=None,
                              help="Audit-only note on the evidence that the goal is met (recorded on the goal event)")
     goal_parser.add_argument("--no-auto-context", action="store_true",
@@ -358,12 +359,12 @@ def build_parser():
                          help="Human checkpoint cadence in rounds (positive integer)")
     budgets = config_set_parser.add_argument_group("budget fields")
     budgets.add_argument("--max-rounds", dest="max_rounds", type=int, metavar="N",
-                         help="Round budget (positive integer)")
+                         help="Round budget (non-negative integer; 0 = stop immediately)")
     budgets.add_argument("--clear-max-rounds", dest="clear_max_rounds",
                          action="store_true", default=False,
                          help="Remove the round budget")
-    budgets.add_argument("--max-minutes", dest="max_minutes", type=int, metavar="N",
-                         help="Idle-clock minute budget (positive integer)")
+    budgets.add_argument("--max-minutes", dest="max_minutes", type=float, metavar="N",
+                         help="Idle-clock minute budget (positive number; fractions like 0.5 allowed, matching init)")
     budgets.add_argument("--clear-max-minutes", dest="clear_max_minutes",
                          action="store_true", default=False,
                          help="Remove the minute budget")
@@ -449,7 +450,7 @@ def build_parser():
     backlog_add_parser.add_argument("--origin", default=None,
                                     help="observed|predicted|expansion (predicted work is score-discounted and quota-limited; default observed, from-seed defaults predicted)")
     backlog_add_parser.add_argument("--confidence", type=float, default=None,
-                                    help="Belief 0.5-1.0 for predicted/expansion work (default 0.75); observed is always 1.0")
+                                    help="Belief 0.5-1.0 for predicted/expansion work (default 0.9 with --evidence, 0.75 without); observed is always 1.0")
     backlog_add_parser.add_argument("--based-on", default=None,
                                     help="Goal text this candidate was predicted from (goal-chain bonus <=1.08; from-seed defaults to the seed's source goal)")
     backlog_add_parser.add_argument("--evidence", default=None,

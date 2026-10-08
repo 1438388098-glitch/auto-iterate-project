@@ -39,6 +39,6 @@ and the constant in the same order and the same spelling.
 ## Rotation rules
 
 1. Pick this wave's lenses from `check`'s `lenses_unused`, never from memory.
-2. Record the wave with `expansion-record --repo <repo> --lens <lens> ...` (repeat `--lens` per lens).
+2. Record the wave with `expansion-record --repo <repo> --lens <lens> ... --findings <proposed> --applied <passed-gate>` (repeat `--lens` per lens; the yield stats make lens waves comparable with mining runs).
 3. Repeating the previous wave's exact lens set triggers a `[WARN]` and an `expansion-wave` warn event.
 4. Each subagent must return 2-5 concrete improvement candidates **with evidence** (file:line or probe output).
