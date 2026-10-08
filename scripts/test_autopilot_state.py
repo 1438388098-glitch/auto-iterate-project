@@ -1751,8 +1751,10 @@ class LedgerGuardTests(RepoTest):
         payload = json.loads(clean.stdout)
         self.assertTrue(payload["ok"])
         self.assertIn("message", payload)
-        # 假密钥用拼接构造：整段 AKIA+16 位字面量会触发真实密钥扫描器（实测被拦）
-        self.add_file("leak.py", content='KEY = "AKIA" + "BCDEFGHIJKLMNOP"\n')
+        # 假密钥运行时构造：整段 AKIA+16 位字面量会触发真实密钥扫描器拦提交
+        # （实测），而拼接写法在写出的 leak.py 里必须仍是可匹配形态。
+        fake_key = "AKIA" + "".join(chr(code) for code in range(66, 82))  # B..Q 共 16 位
+        self.add_file("leak.py", content='KEY = "{}"\n'.format(fake_key))
         dirty = self.run_state("secret-scan", "--json")
         self.assertNotEqual(dirty.returncode, 0)
         payload2 = json.loads(dirty.stdout)
