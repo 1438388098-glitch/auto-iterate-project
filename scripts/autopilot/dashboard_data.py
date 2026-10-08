@@ -121,12 +121,19 @@ def walk_round_anchors(repo, history, run_start_sha, gitio=None):
     the caller. Numstat comes from ONE `git log` pass over run_start..HEAD
     (round 12 perf); an anchor outside that pass, or a failed batch call,
     falls back to the per-anchor `git diff` (same degrade semantics).
+    Head-trimmed windows (candidate-406): when the first surviving entry's
+    round > 1, the first chunk necessarily contains every trimmed round's
+    commits — its stats row is flagged `trimmed_prefix` so the timeline never
+    presents the prefix churn as that round's own work.
     Returns ({path: agg}, [round_stats]) or (None, None)."""
     run_git = _resolve_run_git(gitio)
     changes = {}
     stats = []
     prev = run_start_sha
     batch = None  # 懒加载的单遍 numstat（map, order）；None = 未加载或失败
+    first_entry_round = history[0].get("round") if history else None
+    trimmed_prefix = isinstance(first_entry_round, int) and first_entry_round > 1
+    first_chunk = True
     for entry in history:
         sha = entry.get("commit_sha") or entry.get("batch_commit_sha")
         if sha and sha == prev:
@@ -153,7 +160,9 @@ def walk_round_anchors(repo, history, run_start_sha, gitio=None):
                 "files_changed": len(rows),
                 "insertions": sum(r["insertions"] for r in rows),
                 "deletions": sum(r["deletions"] for r in rows),
+                "trimmed_prefix": bool(trimmed_prefix and first_chunk),
             })
+            first_chunk = False
             for item in rows:
                 agg = changes.setdefault(item["path"], {
                     "first_round": entry.get("round"), "touches": 0,
@@ -677,6 +686,12 @@ def build_snapshot(repo, gitio=None):
         },
         "growth": {
             "granularity": granularity,
+            # 窗口标记（candidate-406）：history 被裁剪时首块 stats 含全部
+            # 修剪轮的 churn（行级 trimmed_prefix），树/时间线的「从第 N 轮
+            # 开始」叙事必须带着这个限定词读。
+            "windowed": bool(rounds) and any(
+                isinstance(r, dict) and r.get("trimmed_prefix") for r in rounds
+            ),
             "domains": domains,
             "events": correlate_events(history, round_domains),
             "rounds": rounds,

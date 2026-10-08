@@ -1744,7 +1744,19 @@ def cmd_backlog_add(args):
                 file=sys.stderr,
             )
             return 0
-        backlog["candidates"].append(candidate)
+        prior_promotion = None
+        if seed is not None:
+            prior_promotion = next(
+                (c for c in backlog.get("candidates") or [] if c.get("from_seed") == seed["id"]),
+                None,
+            )
+        if prior_promotion is not None:
+            # 跨文件写序窗口自愈（wave11 candidate-401）：候选已落 backlog 而
+            # 种子标记未及写 state 的崩溃残留——重跑晋升复用既有行，不铸重复
+            # 候选；下方照常补完种子标记（幂等）。
+            candidate_id = prior_promotion["id"]
+        else:
+            backlog["candidates"].append(candidate)
         state.save_backlog(repo, backlog)
         if origin in ("predicted", "expansion"):
             # 波次产量回填（candidate-386）：added 数本波经价值门产出的候选，

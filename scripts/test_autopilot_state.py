@@ -1772,6 +1772,65 @@ class LedgerGuardTests(RepoTest):
         self.assertEqual(status["expansion_waves"], 25)    # 不再封顶窗口 20
         self.assertEqual(status["round_progress"]["remaining"], 50)  # 与停止门同分母
 
+    def test_growth_walk_flags_trimmed_prefix(self):
+        # wave11 candidate-406：窗口被裁剪时（首条 round>1），首块 stats 必须
+        # 带 trimmed_prefix——前缀轮的 churn 不许伪装成首个窗口轮的产出。
+        run_start = self.git("rev-parse", "HEAD").stdout.strip()
+        (self.repo / "b.txt").write_text("one\n", encoding="utf-8")
+        self.git("add", "b.txt")
+        self.git("commit", "-q", "-m", "b")
+        sha2 = self.git("rev-parse", "HEAD").stdout.strip()
+        (self.repo / "c.txt").write_text("two\n", encoding="utf-8")
+        self.git("add", "c.txt")
+        self.git("commit", "-q", "-m", "c")
+        sha3 = self.git("rev-parse", "HEAD").stdout.strip()
+        from autopilot import dashboard_data as dd
+        trimmed_history = [
+            {"round": 2, "status": "completed", "commit_sha": sha2},
+            {"round": 3, "status": "completed", "commit_sha": sha3},
+        ]
+        _, stats = dd.walk_round_anchors(self.repo, trimmed_history, run_start)
+        self.assertTrue(stats[0]["trimmed_prefix"])
+        self.assertFalse(stats[1]["trimmed_prefix"])
+        whole_history = [
+            {"round": 1, "status": "completed", "commit_sha": run_start},
+            {"round": 2, "status": "completed", "commit_sha": sha2},
+        ]
+        _, stats2 = dd.walk_round_anchors(self.repo, whole_history, run_start)
+        self.assertFalse(any(r.get("trimmed_prefix") for r in stats2))
+
+    def test_seed_promotion_idempotent_after_crash(self):
+        self.run_state("init", "--goal", "G")
+        self.run_state("begin-round", "--title", "r", "--reason", "x")
+        self.add_file()
+        self.run_state("commit", "--summary", "w")
+        sha = self.git("rev-parse", "HEAD").stdout.strip()
+        self.run_state("complete-round", "--summary", "done", "--commit-sha", sha)
+        self.run_state("goal-met", "--goal", "G", "--round", "1",
+                       "--next-step", "follow up X")
+        promoted = self.run_state(
+            "backlog-add", "--from-seed", "seed-001",
+            "--value", "3", "--effort", "1", "--type", "feature")
+        self.assertEqual(promoted.returncode, 0, promoted.stderr)
+        # 崩溃残留模拟：backlog 已落而 state 的种子标记写丢（回滚为 open）
+        state_path = self.repo / ".autopilot" / "state.json"
+        st = json.loads(state_path.read_text(encoding="utf-8"))
+        for seed in st.get("goal_seeds") or []:
+            if seed.get("id") == "seed-001":
+                seed["status"] = "open"
+        state_path.write_text(json.dumps(st), encoding="utf-8")
+        rerun = self.run_state(
+            "backlog-add", "--from-seed", "seed-001",
+            "--value", "3", "--effort", "1", "--type", "feature")
+        self.assertEqual(rerun.returncode, 0, rerun.stderr)
+        self.assertIn("candidate-001", rerun.stdout)  # 复用既有行，不铸新 id
+        backlog = self._read_backlog()
+        rows = [c for c in backlog["candidates"] if c.get("from_seed") == "seed-001"]
+        self.assertEqual(len(rows), 1)
+        st = json.loads(state_path.read_text(encoding="utf-8"))
+        seed_status = next(s["status"] for s in st["goal_seeds"] if s["id"] == "seed-001")
+        self.assertEqual(seed_status, "promoted")  # 种子标记补完
+
     def test_round_progress_remaining_matches_stop_gate(self):
         self.run_state("init", "--max-rounds", "5")
         self.run_state("begin-round", "--title", "r", "--reason", "x")
