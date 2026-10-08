@@ -77,6 +77,36 @@ def _resolve_run_git(gitio):
     return run_git
 
 
+def _log_numstat_by_sha(repo, run_start_sha, run_git):
+    """单遍 `git log --numstat` 覆盖 run_start..HEAD 全部提交（轮 12 perf：
+    逐锚点 diff 在 100 轮 run 上最坏 ~100 次 spawn ≈4-5s，一次批量化后
+    ~50ms）。返回 ({sha: numstat_raw}, [sha 旧→新序])；批量调用失败返回
+    None（调用方退回逐锚 diff，不改变降级语义）。"""
+    if run_start_sha:
+        raw = run_git(repo, "log", "--reverse", "--numstat", "--format=%H",
+                      "{}..HEAD".format(run_start_sha))
+    else:
+        raw = run_git(repo, "log", "--reverse", "--numstat", "--format=%H",
+                      "--root", "HEAD")
+    if raw is None:
+        return None
+    by_sha = {}
+    order = []
+    current = None
+    for line in raw.splitlines():
+        stripped = line.strip()
+        if not stripped:
+            continue
+        if "\t" not in line and len(stripped) >= 7 and \
+                all(c in "0123456789abcdefABCDEF" for c in stripped):
+            current = stripped
+            by_sha[current] = []
+            order.append(current)
+        elif current is not None:
+            by_sha[current].append(line)
+    return {sha: "\n".join(lines) for sha, lines in by_sha.items()}, order
+
+
 def walk_round_anchors(repo, history, run_start_sha, gitio=None):
     """Single anchor walk producing BOTH views at once (file_changes +
     round_stats). `commit_sha` and `batch_commit_sha` are interchangeable
@@ -87,21 +117,36 @@ def walk_round_anchors(repo, history, run_start_sha, gitio=None):
     (None, None) rather than a partial picture — same for a failed git diff.
     A same-batch shared sha (prev == sha) contributes no new rows: file
     attribution stays on the batch boundary, per-round stats get zeros from
-    the caller. Returns ({path: agg}, [round_stats]) or (None, None)."""
+    the caller. Numstat comes from ONE `git log` pass over run_start..HEAD
+    (round 12 perf); an anchor outside that pass, or a failed batch call,
+    falls back to the per-anchor `git diff` (same degrade semantics).
+    Returns ({path: agg}, [round_stats]) or (None, None)."""
     run_git = _resolve_run_git(gitio)
     changes = {}
     stats = []
     prev = run_start_sha
+    batch = None  # 懒加载的单遍 numstat（map, order）；None = 未加载或失败
     for entry in history:
         sha = entry.get("commit_sha") or entry.get("batch_commit_sha")
         if sha and sha == prev:
             continue
         if sha:
             base = prev or io.EMPTY_TREE
-            raw = run_git(repo, "diff", "--numstat", "{}..{}".format(base, sha))
-            if raw is None:
-                return None, None
-            rows = parse_numstat(raw)
+            rows = None
+            if batch is None:
+                batch = _log_numstat_by_sha(repo, run_start_sha, run_git)
+            if batch is not None and sha in batch[0]:
+                by_sha, order = batch
+                start_idx = order.index(prev) + 1 if prev in order else 0
+                end_idx = order.index(sha)
+                if end_idx >= start_idx:
+                    chunk = "\n".join(by_sha[s] for s in order[start_idx:end_idx + 1])
+                    rows = parse_numstat(chunk)
+            if rows is None:
+                raw = run_git(repo, "diff", "--numstat", "{}..{}".format(base, sha))
+                if raw is None:
+                    return None, None
+                rows = parse_numstat(raw)
             stats.append({
                 "round": entry.get("round"), "status": entry.get("status"),
                 "files_changed": len(rows),
@@ -603,7 +648,7 @@ def build_snapshot(repo, gitio=None):
     cfg = config if isinstance(config, dict) else {}
     budget = _budget_view(state, cfg)
     backlog_summary = _backlog_summary(_autopilot_dir(repo) / io.BACKLOG_FILENAME)
-    stop_reason, action_hint = _loop_outlook(state, cfg, backlog_summary)
+    stop_reason, action_hint = _loop_outlook(state, cfg, backlog_summary, degraded)
     return {
         "meta": {
             "generated_at": io.now_iso(),
@@ -701,16 +746,21 @@ def _budget_view(state, cfg):
     }
 
 
-def _loop_outlook(state, cfg, backlog_summary):
+def _loop_outlook(state, cfg, backlog_summary, degraded=None):
     """stop_reason + action_hint for the panel (decision-level, not the full
     check warning catalog). stop_reason reuses state.compute_stop_reason so
-    the loop and the panel never disagree on why a run is stopped."""
+    the loop and the panel never disagree on why a run is stopped. A
+    compute_stop_reason failure falls back to the recorded stop_reason AND
+    names itself in meta.degraded (轮 15 候选 304) — the decision section used
+    to degrade silently."""
     from . import state as ap_state
     stop_reason = None
     try:
         stop_reason = ap_state.compute_stop_reason(state, cfg)
-    except Exception:
+    except Exception as exc:
         stop_reason = state.get("stop_reason")
+        if degraded is not None:
+            degraded.append("loop-outlook: {}".format(str(exc)[:120]))
     if stop_reason is not None:
         return stop_reason, "stop"
     pending = backlog_summary.get("pending") or 0

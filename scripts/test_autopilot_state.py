@@ -151,6 +151,34 @@ class ScriptSmokeTests(unittest.TestCase):
     def test_script_compiles(self):
         py_compile.compile(str(SCRIPT), doraise=True)
 
+    def test_smoke_flag_order_independent(self):
+        """--smoke 可以放在 --jobs 之前（轮 1 实测：旧 dispatch 只看
+        --jobs 之后的参数，--smoke --jobs 4 静默跑成全量 218 项 78s）。
+        进程内注入桩验证路径选择，不拉真实 multiprocessing（pytest 捕获
+        管道 + spawn 会死锁，已实测）。"""
+        import test_autopilot_state as runner
+        calls = {}
+
+        def fake_smoke(jobs, subset=None):
+            calls["smoke"] = (jobs, subset)
+            return 0, []
+
+        def fake_parallel(names, jobs_count):
+            calls["parallel"] = (list(names or []), jobs_count)
+            return 1
+
+        orig_smoke, orig_parallel = runner._run_parallel_smoke, runner._run_parallel
+        runner._run_parallel_smoke, runner._run_parallel = fake_smoke, fake_parallel
+        try:
+            self.assertEqual(runner.main(["--smoke", "--jobs", "4"]), 0)
+            self.assertEqual(calls["smoke"], (4, None))
+            self.assertEqual(runner.main(["--jobs", "4", "--smoke"]), 0)
+            self.assertEqual(calls["smoke"], (4, None))
+            self.assertEqual(runner.main(["--jobs", "4", "SomeTests"]), 1)
+            self.assertEqual(calls["parallel"], (["SomeTests"], 4))
+        finally:
+            runner._run_parallel_smoke, runner._run_parallel = orig_smoke, orig_parallel
+
 
 class InitTests(RepoTest):
     def test_init_creates_state_and_config(self):
@@ -386,6 +414,27 @@ class RoundFlowTests(RepoTest):
         self.assertFalse(data["continue"])
         self.assertIn("max_blocked_in_a_row", data["stop_reason"])
 
+    def test_block_round_echoes_candidates_and_audits_reason(self):
+        """block 事实单文件可还原（轮 2 实测：事件无 title、候选无
+        block_reason，输出不回显被 block 清单——跨三处拼合才能还原）。"""
+        self.run_state("init")
+        self.run_state("backlog-add", "--title", "T", "--reason", "r", "--value", "4", "--effort", "2")
+        self.run_state("begin-round", "--title", "r1", "--reason", "x", "--candidate-id", "candidate-001")
+        result = self.run_state("block-round", "--title", "infeasible", "--reason", "network forbidden")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("candidate-001", result.stdout)
+        events = [
+            json.loads(line)
+            for line in (self.repo / ".autopilot" / "log.jsonl").read_text(encoding="utf-8").splitlines()
+            if line.strip()
+        ]
+        block_event = [e for e in events if e.get("event") == "block-round" and e.get("status") == "success"][-1]
+        self.assertEqual(block_event.get("title"), "infeasible")
+        self.assertEqual(block_event.get("candidate_ids"), ["candidate-001"])
+        candidate = self.read_json("backlog.json")["candidates"][0]
+        self.assertEqual(candidate["status"], "blocked")
+        self.assertEqual(candidate.get("block_reason"), "network forbidden")
+
     def test_cancel_round_restores_candidate(self):
         self.run_state("init")
         self.run_state("backlog-add", "--title", "T", "--reason", "r")
@@ -604,6 +653,25 @@ class BranchGcTests(RepoTest):
         )
         self.assertIn(run_branch, data["deleted"])
 
+    def test_branch_gc_warns_on_unreadable_state(self):
+        """state.json 损坏时 gc 仍 fail-open 回收遗留分支，但必须留审计
+        事件（轮 4：吞异常治理——不再静默 pass）。"""
+        self._seed_autopilot_branch("autopilot/merged-run", merge=True)
+        (self.repo / ".autopilot").mkdir()
+        (self.repo / ".autopilot" / "state.json").write_text("{corrupt", encoding="utf-8")
+        result = self.run_state("branch-gc", "--json")
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        data = json.loads(result.stdout)
+        self.assertIn("autopilot/merged-run", data["deleted"])
+        events = [
+            json.loads(line)
+            for line in (self.repo / ".autopilot" / "log.jsonl").read_text(encoding="utf-8").splitlines()
+            if line.strip()
+        ]
+        warns = [e for e in events if e.get("event") == "branch-gc" and e.get("status") == "warn"]
+        self.assertTrue(warns)
+        self.assertIn("state unreadable", warns[-1].get("reason", ""))
+
     def test_check_brief_no_drift_warning_after_finish(self):
         """A finished run no longer issues round commands; the drift warning's
         recovery advice is noise there and can point at an already-reclaimed
@@ -671,7 +739,7 @@ class BeginRoundStopTests(RepoTest):
         self._complete_one_round()
         result = self.run_state("begin-round", "--title", "r2", "--reason", "y")
         self.assertNotEqual(result.returncode, 0)
-        self.assertIn("stopped", result.stderr.lower())
+        self.assertIn("max_rounds reached", result.stderr.lower())
 
     def test_refuses_after_goals_met(self):
         self.run_state("init", "--goal", "Ship")
@@ -679,7 +747,7 @@ class BeginRoundStopTests(RepoTest):
         self.run_state("goal-met", "--goal", "Ship", "--round", "1")
         result = self.run_state("begin-round", "--title", "r2", "--reason", "y")
         self.assertNotEqual(result.returncode, 0)
-        self.assertIn("stopped", result.stderr.lower())
+        self.assertIn("all goals met", result.stderr.lower())
 
     def test_refuses_after_max_blocked_in_a_row(self):
         self.run_state("init")
@@ -688,7 +756,7 @@ class BeginRoundStopTests(RepoTest):
             self.run_state("block-round", "--reason", "nope")
         result = self.run_state("begin-round", "--title", "b3", "--reason", "x")
         self.assertNotEqual(result.returncode, 0)
-        self.assertIn("stopped", result.stderr.lower())
+        self.assertIn("max_blocked_in_a_row reached", result.stderr.lower())
 
     def test_refuses_when_already_finished(self):
         self.run_state("init")
@@ -719,7 +787,7 @@ class FinishGateTests(RepoTest):
         self.assertIn("Refusing to finish", result.stderr)
         self.assertIn("Refusing to finish", result.stderr)
         self.assertIn("ready_floor=1", result.stderr)
-        self.assertIn("pass --force", result.stderr)
+        self.assertIn("--force", result.stderr)
         state = self.read_json("state.json")
         self.assertIsNone(state["finished_at"])
         data = json.loads(self.run_state("check", "--brief").stdout)
@@ -1094,6 +1162,35 @@ class ExpansionWaveTests(RepoTest):
             args.extend(["--lens", lens])
         return self.run_state(*args)
 
+    def test_lens_catalog_matches_constant(self):
+        """轮 21（candidate-324）：expansion-lenses.md 表与 EXPANSION_LENSES
+        同序同名（文档明文契约）——漂移会让 expansion-record 在 wave 中途
+        拒绝 agent 正在使用的 lens 名，打断自主运行。"""
+        catalog = []
+        doc = (Path(__file__).resolve().parent.parent / "references" / "expansion-lenses.md")
+        for line in doc.read_text(encoding="utf-8").splitlines():
+            m = re.match(r"^\| ([a-z0-9-]+) \|", line.strip())
+            if m:
+                catalog.append(m.group(1))
+        from autopilot import state as ap_state
+        self.assertTrue(catalog)
+        self.assertEqual(catalog, list(ap_state.EXPANSION_LENSES))
+
+    def test_expansion_record_optional_yield_stats(self):
+        """每波产出统计（candidate-272）：lens 波与 mine 通道可比的
+        findings/applied 账；不带旗标时保持 None（旧记录干净）。
+        注意旗标不能走 _record（它给每个参数都加 --lens 前缀）。"""
+        self.run_state("init")
+        self.run_state("expansion-record", "--lens", "docs", "--lens", "tests",
+                       "--findings", "5", "--applied", "3")
+        wave = self.read_json("state.json")["expansion_waves"][-1]
+        self.assertEqual(wave["findings"], 5)
+        self.assertEqual(wave["applied"], 3)
+        self.run_state("expansion-record", "--lens", "config")
+        wave = self.read_json("state.json")["expansion_waves"][-1]
+        self.assertIsNone(wave["findings"])
+        self.assertIsNone(wave["applied"])
+
     def _log_events(self):
         log_path = self.repo / ".autopilot" / "log.jsonl"
         return [json.loads(line) for line in log_path.read_text(encoding="utf-8").splitlines()
@@ -1371,13 +1468,142 @@ class BudgetAccountingTests(RepoTest):
         self.assertEqual(tokens, [620, 620, 0])
         self.assertEqual(state["estimated_tokens_used"], 1240)
 
+    def test_rank_for_selection_direct(self):
+        """轮 25（candidate-338，mine 自挖）：rank_for_selection 直测——
+        expected 返回完整 ranked 与 selected 计数；classic 计数 0 但 ranked
+        仍完整（classic 评分在 rank_candidates 内部）。"""
+        from autopilot import check_view
+        self.run_state("init")
+        self.run_state("backlog-add", "--title", "A", "--reason", "r", "--value", "4", "--effort", "2")
+        self.run_state("backlog-add", "--title", "B", "--reason", "r", "--value", "3", "--effort", "3")
+        backlog = self.read_json("backlog.json")
+        st = self.read_json("state.json")
+        cfg = self.read_json("config.json")
+        ranked, selected_count = check_view.rank_for_selection(backlog, st, cfg)
+        self.assertEqual(len(ranked), 2)
+        self.assertEqual(selected_count, len([e for e in ranked if e.get("selected")]))
+        # classic：selected 概念不存在 → 计数 0，ranked 仍完整
+        # （init --force 保留 backlog.json——旧候选仍在，属预期）
+        self.run_state("init", "--force", "--ranking-mode", "classic")
+        self.run_state("backlog-add", "--title", "A", "--reason", "r", "--value", "4", "--effort", "2")
+        backlog = self.read_json("backlog.json")
+        st = self.read_json("state.json")
+        cfg = self.read_json("config.json")
+        ranked, selected_count = check_view.rank_for_selection(backlog, st, cfg)
+        self.assertTrue(ranked)
+        self.assertEqual(selected_count, 0)
+
+    def test_token_staged_delete_double_count_documented(self):
+        """轮 25（candidate-340）：staged-add 后 worktree-delete 同文件——
+        --cached（+10）与 --diff（-10）两路各计一次，净零变更计 20 行。
+        金样钉住现状：这是估算器的已知边缘（净零变更多计），若未来修复
+        应同步更新本测试与 config.md 的 max_tokens 说明。"""
+        self.run_state("init")
+        self.run_state("begin-round", "--title", "r", "--reason", "x")
+        self._touch_staged("w.py")  # 10 行 staged
+        (self.repo / "w.py").unlink()  # worktree 删除，index 仍持有
+        self.run_state("complete-round", "--summary", "net-zero")
+        state = self.read_json("state.json")
+        self.assertEqual(state["history"][-1]["estimated_tokens"], 500 + 20 * 12)  # 740
+        self.assertEqual(state["billed_text"], 20)
+
+    def test_token_billing_counts_binary_files(self):
+        """轮 26（candidate-332）：delta_binary * TOKENS_PER_BINARY_FILE(100)
+        项此前零断言——回归丢失时预算对二进制改动静默少记。"""
+        self.run_state("init")
+        self.run_state("begin-round", "--title", "r", "--reason", "x")
+        (self.repo / "asset.bin").write_bytes(b"\x00" * 64)
+        self.git("add", "asset.bin")
+        self.run_state("complete-round", "--summary", "binary")
+        state = self.read_json("state.json")
+        self.assertEqual(state["history"][-1]["estimated_tokens"], 600)  # 500 base + 100 binary
+        self.assertEqual(state["billed_binary"], 1)
+
+    def test_token_watermark_never_lowers_on_shrink(self):
+        """轮 26（candidate-333）：内容回到曾观测状态 → 复观测零计费
+        （max(billed, total) 水位线防的正是这种重复计费；若 max 被回归删掉，
+        本测试的 r3 会再计一次 12 行）。SKILL.md/troubleshooting 承诺的金样。"""
+        self.run_state("init")
+        self.run_state("begin-round", "--title", "r1", "--reason", "x")
+        self._touch_staged("w.py")
+        self.run_state("complete-round", "--summary", "r1")
+        after_r1 = self.read_json("state.json")["billed_text"]
+        self.run_state("begin-round", "--title", "r2", "--reason", "x")
+        (self.repo / "w.py").write_text("a\nb\n", encoding="utf-8")
+        self.run_state("complete-round", "--summary", "shrink")
+        self.run_state("begin-round", "--title", "r3", "--reason", "x")
+        (self.repo / "w.py").write_text("x = 1\n" * 10, encoding="utf-8")
+        self.run_state("complete-round", "--summary", "back to observed")
+        state = self.read_json("state.json")
+        tokens = [entry["estimated_tokens"] for entry in state["history"]]
+        self.assertEqual(tokens[2], 0)
+        self.assertGreaterEqual(state["billed_text"], after_r1)
+
+    def test_backlog_watch_pure_contract(self):
+        """轮 30（candidate-341）：backlog_watch 纯契约——needs_expansion
+        驱动 action_hint，两条触发路径（ready==0 / pending<min）与默认值
+        必须逐点锁定。"""
+        from autopilot import check_view
+        min3 = {"min_pending_candidates": 3}
+        # 空池：pending 0 / ready 0 → 扩展
+        watch = check_view._backlog_watch({"candidates": []}, min3)
+        self.assertEqual((watch["pending"], watch["ready"], watch["min_pending_candidates"]), (0, 0, 3))
+        self.assertTrue(watch["needs_expansion"])
+        # ready>0 但 pending < min → 仍扩展（薄池）
+        backlog = {"candidates": [
+            {"id": "a", "status": "pending", "depends_on": []},
+        ]}
+        watch = check_view._backlog_watch(backlog, min3)
+        self.assertEqual((watch["pending"], watch["ready"]), (1, 1))
+        self.assertTrue(watch["needs_expansion"])
+        # pending >= min 且 ready>0 → 不扩展
+        backlog = {"candidates": [
+            {"id": "a", "status": "pending", "depends_on": []},
+            {"id": "b", "status": "pending", "depends_on": []},
+            {"id": "c", "status": "pending", "depends_on": []},
+        ]}
+        watch = check_view._backlog_watch(backlog, min3)
+        self.assertFalse(watch["needs_expansion"])
+        # 全部被依赖卡住：ready==0 即扩展（即便 pending 充足）
+        backlog = {"candidates": [
+            {"id": "a", "status": "pending", "depends_on": ["ghost"]},
+            {"id": "b", "status": "pending", "depends_on": ["ghost"]},
+            {"id": "c", "status": "pending", "depends_on": ["ghost"]},
+        ]}
+        watch = check_view._backlog_watch(backlog, min3)
+        self.assertEqual(watch["pending"], 3)
+        self.assertEqual(watch["ready"], 0)
+        self.assertTrue(watch["needs_expansion"])
+        # min_pending 未配置 → 默认 3
+        watch = check_view._backlog_watch({"candidates": []}, {})
+        self.assertEqual(watch["min_pending_candidates"], 3)
+
+    def test_parse_numstat_rename_forms(self):
+        """轮 26（candidate-334）：diff.renames=on 的改名行归一到新路径——
+        候选-302 后生长树走单遍 log numstat，解析错会把文件挂错模块。"""
+        from autopilot import dashboard_data as dd
+        raw = (
+            "5\t2\tsrc/old_name.py\n"
+            "3\t1\tsrc/{old_a.py => new_a.py}\n"
+            "2\t0\told_b.py => new_b.py\n"
+            "-\t-\tbin.dat\n"
+        )
+        rows = dd.parse_numstat(raw)
+        self.assertEqual(
+            [r["path"] for r in rows],
+            ["src/old_name.py", "src/new_a.py", "new_b.py", "bin.dat"],
+        )
+        self.assertTrue(rows[1]["renamed"])
+        self.assertFalse(rows[0]["renamed"])
+        self.assertTrue(rows[3]["binary"])
+
     def test_check_reports_blocked_streak(self):
         self.run_state("init")
         self.run_state("begin-round", "--title", "a", "--reason", "x")
         self.run_state("block-round", "--reason", "b1")
         data = json.loads(self.run_state("check", "--brief").stdout)
         self.assertEqual(data["blocked_streak"], 1)
-        self.assertTrue(any("one more blocked round stops the run" in w for w in data["warnings"]))
+        self.assertTrue(any("blocked streak" in w for w in data["warnings"]))
         # Second blocked round fires max_blocked_in_a_row (default 2).
         self.run_state("begin-round", "--title", "b", "--reason", "x")
         self.run_state("block-round", "--reason", "b2")
@@ -1439,6 +1665,216 @@ class BudgetAccountingTests(RepoTest):
         state = self.read_json("state.json")
         self.assertEqual(state["completed_rounds"], 1)
         self.assertEqual(state["history"][-1]["status"], "completed")
+
+    def test_lock_token_ownership_and_young_grace(self):
+        """轮 16（candidate-306）：释放只删自己的锁；年轻空锁获全宽限
+        （不再 0.1s 后即被偷——互斥击穿实测复现）；age≥2s 的死锁自动收割。"""
+        from autopilot import io as _io
+        import time as _time
+        lock = self.repo / ".autopilot" / "lock"
+        lock.parent.mkdir(parents=True, exist_ok=True)
+        lock.write_text(json.dumps({"pid": 999999, "token": "theirs", "hostname": "x"}), encoding="utf-8")
+        _io._release_lock(lock, "mine")
+        self.assertTrue(lock.exists())
+        _io._release_lock(lock, "theirs")
+        self.assertFalse(lock.exists())
+        lock.write_text("", encoding="utf-8")
+        t0 = _time.time()
+        path, token = _io._acquire_lock(self.repo)
+        elapsed = _time.time() - t0
+        # 年轻空锁必须吃满宽限（旧 bug：0.1s 后即被偷，互斥击穿）——
+        # age≥2s 后按 stale 自动收割，最终成功获取。
+        self.assertGreaterEqual(elapsed, 2.0)
+        self.assertEqual(_io._read_lock_file(path).get("token"), token)
+        _io._release_lock(path, token)
+        self.assertFalse(lock.exists())
+
+    def test_secret_pattern_redos_guard(self):
+        """轮 16（candidate-308）：嵌套量词模式编译期限时探测拒绝——
+        否则每次 commit 的逐行匹配会无限期挂起。"""
+        self.run_state("init", "--secret-pattern", "(a+)+b")
+        self.add_file("a.py", "x = 1\n")
+        result = self.run_state("secret-scan")
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("too dangerous", result.stderr)
+        self.assertNotIn("Traceback", result.stderr)
+
+    def test_report_output_autopilot_path_refused(self):
+        """轮 16（candidate-309）：--output 指向 .autopilot/ 运行态必须拒绝
+        （relative_to 只防外写，防不了内洞覆写 state.json）。"""
+        self.run_state("init")
+        self.run_state("begin-round", "--title", "r", "--reason", "x")
+        result = self.run_state("report", "--output", ".autopilot/state.json")
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn(".autopilot", result.stdout + result.stderr)
+        state_text = (self.repo / ".autopilot" / "state.json").read_text(encoding="utf-8")
+        self.assertNotIn("#", state_text[:5])  # 未被 markdown 覆写
+
+    def test_backlog_bak_created(self):
+        """轮 16（candidate-310）：backlog 与 state 同款单代 .bak——账本
+        损坏从「删除重来」变成「restore the backup」。首次落盘无前像可备，
+        .bak 从第二次保存起出现。"""
+        self.run_state("init")
+        self.run_state("backlog-add", "--title", "T", "--reason", "r", "--value", "4", "--effort", "2")
+        bak = self.repo / ".autopilot" / "backlog.json.bak"
+        self.assertFalse(bak.exists())
+        self.run_state("backlog-update", "--id", "candidate-001", "--value", "5")
+        self.assertTrue(bak.exists())
+        self.assertEqual(json.loads(bak.read_text(encoding="utf-8"))["candidates"][0]["value"], 4)
+        # 原子备份不留 tmp 残片（candidate-314）
+        leftovers = [p.name for p in (self.repo / ".autopilot").iterdir() if p.name.endswith(".tmp-bak")]
+        self.assertEqual(leftovers, [])
+
+    def test_package_imports_are_relative(self):
+        """轮 16（candidate-316）：包内一律相对导入——绝对导入依赖 sys.path
+        恰好把包装叫 autopilot，vendored 场景会静默产生第二个模块实例
+        （两份 _snapshot_cache，stop_server 杀不到对方起的服务）。"""
+        package_dir = SCRIPT.parent / "autopilot"
+        offenders = []
+        for py in sorted(package_dir.glob("*.py")):
+            for lineno, line in enumerate(py.read_text(encoding="utf-8").splitlines(), 1):
+                if re.match(r"\s*(?:from|import)\s+autopilot\b", line):
+                    offenders.append("{}:{}".format(py.name, lineno))
+        self.assertEqual(offenders, [])
+
+    def test_validate_config_deadline_and_goals_guards(self):
+        """轮 32（candidate-342/343）：手改坏 deadline 得到干净错误而非
+        NameError；goals 非字符串项被项级校验拦下（不再成为死目标）。"""
+        self.run_state("init")
+        config_path = self.repo / ".autopilot" / "config.json"
+        config_path.write_text(
+            json.dumps({"deadline": "tomorrow"}), encoding="utf-8")
+        result = self.run_state("check")
+        self.assertNotEqual(result.returncode, 0)
+        self.assertNotIn("Traceback", result.stderr)
+        self.assertIn("absolute ISO-8601", result.stderr)
+        config_path.write_text(
+            json.dumps({"goals": [42, None]}), encoding="utf-8")
+        result = self.run_state("check")
+        self.assertNotEqual(result.returncode, 0)
+        self.assertNotIn("Traceback", result.stderr)
+        self.assertIn("array of strings", result.stderr)
+
+    def test_config_set_max_blocked_in_a_row_round_trip(self):
+        """轮 33（candidate-344）：同族停机预算补齐 config-set 运行时旗标
+        （set/clear 往返 + hint 清单提及）。"""
+        self.run_state("init")
+        result = self.run_state("config-set", "--max-blocked-in-a-row", "5")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(self.read_json("config.json")["max_blocked_in_a_row"], 5)
+        result = self.run_state("config-set", "--clear-max-blocked-in-a-row")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIsNone(self.read_json("config.json")["max_blocked_in_a_row"])
+        result = self.run_state("config-set", "--max-blocked-in-a-row", "-1")
+        self.assertNotEqual(result.returncode, 0)
+        # 0 = run 立即停机（0/0 即满足条件），config-set 与 init 一致收 0
+        result = self.run_state("config-set", "--max-blocked-in-a-row", "0")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(self.read_json("config.json")["max_blocked_in_a_row"], 0)
+
+    def test_check_decision_audit_event_logged(self):
+        """轮 33（candidate-345）：check/round-prep 的循环决策审计事件——
+        回放「每轮为什么选 work/expand/mine/stop」的唯一数据源。"""
+        self.run_state("init", "--max-rounds", "1")
+        self.run_state("begin-round", "--title", "r", "--reason", "x")
+        self.add_file("a.py", "a = 1\n")
+        self.run_state("commit", "--summary", "w")
+        sha = self.git("rev-parse", "HEAD").stdout.strip()
+        self.run_state("complete-round", "--summary", "done", "--commit-sha", sha)
+        self.run_state("check", "--brief")
+        self.run_state("round-prep")
+        events = [
+            json.loads(line)
+            for line in (self.repo / ".autopilot" / "log.jsonl").read_text(encoding="utf-8").splitlines()
+            if line.strip()
+        ]
+        checks = [e for e in events if e.get("event") == "check" and e.get("status") == "success"]
+        self.assertGreaterEqual(len(checks), 2)
+        for event in checks:
+            for key in ("via", "action_hint", "stop_reason", "pending", "ready", "selected_count", "phase"):
+                self.assertIn(key, event)
+        # via 区分真实 check 与 round-prep（candidate-365 契约）
+        self.assertLessEqual({"check", "round-prep"} - {e.get("via") for e in checks}, set())
+        # max_rounds 用满的 run：stop_reason 非 None 更硬
+        self.assertTrue(any(e.get("stop_reason") for e in checks))
+
+    def test_lock_create_write_failure_cleans_up(self):
+        """轮 33（candidate-346）：O_EXCL 成功但 token 写失败 → 残骸清理后
+        上抛——若吞异常返回成功，锁文件无 token，互斥归属证明失效。"""
+        from autopilot import io as _io
+        from unittest import mock
+        lock = self.repo / ".autopilot" / "lock"
+        lock.parent.mkdir(parents=True, exist_ok=True)
+        with mock.patch.object(_io.os, "fdopen", side_effect=OSError("disk full")):
+            with self.assertRaises(OSError):
+                _io._create_lock_exclusive(lock, "tok-123")
+        self.assertFalse(lock.exists())  # 残骸已清理：不会留无 token 空锁
+
+    def test_redos_probe_accepts_fast_matching_pattern(self):
+        """轮 39（candidate-373）：「命中但快」的合法宽模式必须被接受——
+        修复前探针 assert not match 会把 a+ 类模式 SystemExit(2) 硬拒。"""
+        self.run_state("init", "--secret-pattern", "a+")
+        self.add_file("a.py", "aaa\n")
+        result = self.run_state("secret-scan")
+        self.assertNotIn("too dangerous", result.stderr)
+        self.assertNotIn("Traceback", result.stderr)
+
+    def test_lock_corrupt_stat_race_retries(self):
+        """轮 39（candidate-359 回归 pin）：corrupt 分支的 stat 竞态守卫——
+        锁在 read 与 stat 之间被收割时重试获胜而非裸 FileNotFoundError。"""
+        from autopilot import io as _io
+        from unittest import mock
+        lock = self.repo / ".autopilot" / "lock"
+        lock.parent.mkdir(parents=True, exist_ok=True)
+        original_read = _io._read_lock_file
+
+        def _read_then_delete(p):
+            original_read(p)
+            try:
+                p.unlink()
+            except OSError:
+                pass
+            return None
+
+        with mock.patch.object(_io, "_read_lock_file", side_effect=_read_then_delete), \
+                mock.patch.object(_io, "_sleep"):
+            path, token = _io._acquire_lock(self.repo)
+        self.assertTrue(path.exists())
+        self.assertEqual(_io._read_lock_file(path).get("token"), token)
+        _io._release_lock(path, token)
+
+    def test_en_report_lang_english_refusals(self):
+        """轮 33（candidate-347）：report_lang=en 的关键拒绝走英文分支——
+        zh/en 实参写反时现有 zh 测试全部照绿，en 用户静默拿中文。"""
+        self.run_state("init", "--report-lang", "en", "--review-threshold", "3")
+        self.run_state("begin-round", "--title", "r", "--reason", "x")
+        self.add_file("a.py", "a = 1\n")
+        result = self.run_state("complete-round", "--summary", "s", "--review-score", "1")
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("Self-review score", result.stdout + result.stderr)
+        self.run_state("block-round", "--title", "b", "--reason", "skip")
+        result = self.run_state("finish", "--reason", "probe")
+        self.assertNotEqual(result.returncode, 0)
+        combined = result.stdout + result.stderr
+        self.assertIn("Refusing to finish", combined)
+        self.assertNotIn("拒绝收尾", combined)
+
+    def test_en_report_lang_four_new_bilingual_pairs(self):
+        """轮 40（candidate-364）：新增双语串的 en 分支守卫（确定性子集）——
+        review_threshold 硬拒绝与 finish dry-run REFUSE 均走英文。"""
+        self.run_state("init", "--report-lang", "en", "--review-threshold", "3")
+        self.run_state("begin-round", "--title", "r", "--reason", "x")
+        self.add_file("a.py", "a = 1\n")
+        # review-score 必传拒绝（en 分支）
+        result = self.run_state("complete-round", "--summary", "s", "--review-score", "1")
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("Self-review score 1 is below review_threshold 3", result.stdout + result.stderr)
+        # finish dry-run REFUSE（en 分支）
+        result = self.run_state("finish", "--dry-run", "--reason", "probe")
+        self.assertEqual(result.returncode, 2)
+        combined = result.stdout + result.stderr
+        self.assertIn("Would REFUSE to finish", combined)
+        self.assertNotIn("拒绝收尾", combined)
 
     def test_paused_run_stops_on_first_check(self):
         self.run_state("init", "--max-minutes", "1")
@@ -1837,6 +2273,7 @@ class PredictedHardeningTests(RepoTest):
             ("agents/openai.yaml", "version: {}".format(version)),
             ("references/overview.md", "Version {}".format(version)),
             ("README.md", "Version {}".format(version)),
+            ("README.zh-CN.md", "版本 {}".format(version)),
             ("CHANGELOG.md", "## {} (".format(version)),
         ):
             self.assertIn(needle, (repo_root / rel).read_text(encoding="utf-8"), rel)
@@ -1967,7 +2404,7 @@ class PredictedHardeningTests(RepoTest):
         for command, args in (
             ("goal-met", ("--goal", "G", "--next-step", "N")),
             ("seed-reject", ("--id", "seed-001", "--reason", "x")),
-            ("finish", ()), ("undo-round", ("--sha", sha)),
+            ("undo-round", ("--sha", sha)),
             ("analysis-save", ("--content", "{}")),
             ("directive-remove", ("--index", "1")),
             ("backlog-update", ("--id", "candidate-001", "--value", "5")),
@@ -1977,6 +2414,11 @@ class PredictedHardeningTests(RepoTest):
             self.assertEqual(result.returncode, 0, (command, result.stderr))
             self.assertIn("[DRY-RUN]", result.stderr, command)
             self.assertEqual(snapshot(), before, command)
+        # finish --dry-run 会诚实回答 gate 结局（轮 15 candidate-296）：
+        # 有工作没停机条件时报 REFUSE（exit 2），无论 0 还是 2，零变更不变。
+        finish_dry = self.run_state("finish", "--dry-run")
+        self.assertIn(finish_dry.returncode, (0, 2), finish_dry.stderr)
+        self.assertEqual(snapshot(), before, "finish")
         self.assertFalse((self.repo / ".git" / "REVERT_HEAD").exists())
 
     def test_uninitialized_guard_matrix(self):
@@ -1986,11 +2428,17 @@ class PredictedHardeningTests(RepoTest):
             self.assertNotIn("Traceback", result.stderr, command)
             self.assertIn("not initialized", result.stderr, command)
         for command, args in (("read", ()), ("goal-met", ("--goal", "G")),
-                              ("seed-reject", ("--id", "seed-001", "--reason", "r")), ("report", ())):
+                              ("seed-reject", ("--id", "seed-001", "--reason", "r"))):
             result = self.run_state(command, *args)
             self.assertNotEqual(result.returncode, 0, command)
             self.assertNotIn("Traceback", result.stderr, command)
             self.assertIn("state.json not found", result.stderr, command)
+        # report 走同族守卫（轮 14 candidate-294）：未初始化时报
+        # "Autopilot not initialized" 且 JSON 模式仍是单对象
+        result = self.run_state("report")
+        self.assertNotEqual(result.returncode, 0)
+        self.assertNotIn("Traceback", result.stderr)
+        self.assertIn("not initialized", result.stderr)
 
     def test_complete_round_push_fail_and_backlog_guard(self):
         self.run_state("init", "--push")
@@ -2041,6 +2489,18 @@ class PredictedHardeningTests(RepoTest):
         self.assertEqual(data["phase"], "iterate")
 
 class BacklogManageTests(RepoTest):
+    def test_backlog_add_warns_without_evidence(self):
+        """扩展阶段候选必须带证据（Batch 3 实测：5 条 lens 候选全部
+        evidence=None，因为 helper 不提醒）。seed promote 豁免。"""
+        self.run_state("init")
+        result = self.run_state("backlog-add", "--title", "A", "--reason", "r", "--value", "4", "--effort", "2")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("No --evidence", result.stderr)
+        result = self.run_state("backlog-add", "--title", "B", "--reason", "r", "--value", "4",
+                                "--effort", "2", "--evidence", "tests/test_x.py:10")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertNotIn("No --evidence", result.stderr)
+
     def test_backlog_update_and_remove(self):
         self.run_state("init")
         self.run_state("backlog-add", "--title", "T", "--reason", "r", "--value", "3", "--effort", "3")
@@ -2086,6 +2546,32 @@ class PureHelperUnitTests(unittest.TestCase):
             _sys.path.insert(0, str(SCRIPT.parent))
         import autopilot_state as ap
         cls.ap = ap
+
+    def test_detect_shell_and_skill_root(self):
+        """mine test-gap（轮 5）：detect_shell 与 skill_root 此前无直接测试。"""
+        from autopilot import agent
+        old = {k: os.environ.get(k) for k in ("MSYSTEM", "SHELL")}
+        try:
+            if os.name == "nt":
+                os.environ["MSYSTEM"] = "MINGW64"
+                self.assertEqual(agent.detect_shell("powershell"), "bash")
+                os.environ.pop("MSYSTEM", None)
+                os.environ["SHELL"] = "C:\\Git\\bin\\bash.exe"
+                self.assertEqual(agent.detect_shell("powershell"), "bash")
+                os.environ.pop("SHELL", None)
+                self.assertEqual(agent.detect_shell("powershell"), "powershell")
+            else:
+                # 非 Windows 不读 MSYSTEM/SHELL：直通 profile 默认
+                self.assertEqual(agent.detect_shell("powershell"), "powershell")
+        finally:
+            for k, v in old.items():
+                if v is None:
+                    os.environ.pop(k, None)
+                else:
+                    os.environ[k] = v
+        root = agent.skill_root()
+        self.assertTrue((root / "SKILL.md").exists())
+        self.assertTrue((root / "scripts" / "autopilot_state.py").exists())
 
     def test_parse_time_and_numstat(self):
         ap = self.ap
@@ -2234,19 +2720,138 @@ class OptimizationTests(RepoTest):
 class FeatureTests(RepoTest):
     """End-to-end feature contracts (consolidated from 17 methods)."""
 
+    def test_subcommand_version_probe(self):
+        """轮 22（candidate-325）：--version 在子命令后也可用（装机后确认
+        「装的是哪个版本」的基础探针；此前报 unrecognized arguments）。"""
+        result = subprocess.run(
+            [sys.executable, str(SCRIPT), "init", "--version"],
+            stdout=subprocess.PIPE, stderr=subprocess.PIPE, universal_newlines=True,
+            encoding="utf-8", errors="replace", timeout=60,
+        )
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("auto-iterate-project", result.stdout)
+
+    def test_backlog_pick_guard_and_stats_sync(self):
+        """轮 14（candidate-295）：backlog-pick 不得改写 completed/blocked
+        账本；pick 后 type_stats 与 backlog 保持同步。"""
+        self.run_state("init")
+        self.run_state("backlog-add", "--title", "T", "--reason", "r", "--value", "4", "--effort", "2")
+        self.run_state("begin-round", "--title", "r", "--reason", "x", "--candidate-id", "candidate-001")
+        self.add_file("a.py", "a = 1\n")
+        self.run_state("commit", "--summary", "w")
+        sha = self.git("rev-parse", "HEAD").stdout.strip()
+        self.run_state("complete-round", "--summary", "done", "--commit-sha", sha)
+        result = self.run_state("backlog-pick", "--id", "candidate-001")
+        self.assertNotEqual(result.returncode, 0)
+        # 非 JSON 模式的拒绝消息走 stderr（emit_result 契约）
+        self.assertIn("already 'completed'", result.stdout + result.stderr)
+        self.assertEqual(self.read_json("backlog.json")["candidates"][0]["status"], "completed")
+        self.run_state("backlog-add", "--title", "U", "--reason", "r", "--value", "4", "--effort", "2")
+        self.assertEqual(self.run_state("backlog-pick", "--id", "candidate-002").returncode, 0)
+        self.assertEqual(self.read_json("backlog.json")["candidates"][1]["status"], "picked")
+        stats = self.read_json("state.json").get("type_stats") or {}
+        self.assertEqual((stats.get("feature") or {}).get("completed"), 1)
+
+    def test_dashboard_ensure_warns_instead_of_silent_none(self):
+        """轮 15（candidate-304）：ensure_dashboard 失败必须留 warn 事件，
+        不再静默返回 None（「面板为什么没起来」要有答案）。"""
+        from autopilot import dashboard
+        from unittest import mock
+        self.run_state("init")
+        self.run_state("config-set", "--dashboard")
+        with mock.patch.object(dashboard, "read_info", side_effect=RuntimeError("boom")):
+            result = dashboard.ensure_dashboard(self.repo, {"dashboard": {"enabled": True}})
+        self.assertIsNone(result)
+        events = [
+            json.loads(line)
+            for line in (self.repo / ".autopilot" / "log.jsonl").read_text(encoding="utf-8").splitlines()
+            if line.strip()
+        ]
+        warns = [e for e in events if e.get("event") == "dashboard" and e.get("status") == "warn"]
+        self.assertTrue(warns)
+        self.assertIn("ensure failed", warns[-1].get("reason", ""))
+
+    def test_finish_dry_run_reports_gate_refusal(self):
+        """轮 15（candidate-296）：finish --dry-run 的预检必须回答真实
+        调用的结局——gate 会拒的 dry-run 报 REFUSE（exit 2），不谎报成功。"""
+        self.run_state("init")
+        self.run_state("backlog-add", "--title", "T", "--reason", "r", "--value", "4", "--effort", "2")
+        self.run_state("mine", "--apply", "--dry-run")
+        result = self.run_state("finish", "--dry-run", "--reason", "not yet")
+        self.assertEqual(result.returncode, 2)
+        self.assertIn("Would REFUSE to finish", result.stderr)
+
+    def test_init_dry_run_validates_secret_pattern(self):
+        """轮 15（candidate-296）：init --dry-run 也要过 validate_config——
+        坏 --secret-pattern 正则的预检必须失败而不是谎报成功。"""
+        result = self.run_state("init", "--dry-run", "--force",
+                                "--secret-pattern", "[")
+        self.assertNotEqual(result.returncode, 0)
+
+    def test_token_estimate_fails_closed_on_bad_base(self):
+        """轮 13（candidate-297）：numstat 读不出来时计费 fail-closed——
+        静默按 0 行会让 max_tokens 软预算失效且无警告。"""
+        self.run_state("init")
+        self.run_state("begin-round", "--title", "r", "--reason", "x")
+        self.add_file("a.py", "a = 1\n")
+        state_path = self.repo / ".autopilot" / "state.json"
+        state = json.loads(state_path.read_text(encoding="utf-8"))
+        state["run_start_sha"] = "0" * 40  # 不存在的提交：diff 必失败
+        state_path.write_text(json.dumps(state), encoding="utf-8")
+        result = self.run_state("complete-round", "--summary", "done")
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("refusing to treat the diff as empty", result.stderr)
+
+    def test_report_json_uninitialized_contract(self):
+        """轮 13（candidate-294）：report --json 未初始化时返回 ok:false 的
+        JSON 对象而非纯文本 stderr（与 retrospective 同族守卫）。"""
+        result = self.run_state("report", "--json")
+        self.assertNotEqual(result.returncode, 0)
+        payload = json.loads(result.stdout)
+        self.assertFalse(payload["ok"])
+        self.assertIn("not initialized", payload["message"])
+
+    def test_io_current_branch_and_has_commits(self):
+        """轮 11 test-gap（candidate-292/293）：io 层两个基础探测——
+        已提交/committed 分支名、detached 报 HEAD、unborn 仓库 has_commits False。
+        （RepoTest 基类自带 initial commit，unborn 场景用手工新仓库。）"""
+        from autopilot import io as _io
+        self.assertTrue(_io.has_commits(self.repo))
+        self.assertEqual(_io.current_branch(self.repo), self.initial_branch)
+        head_sha = self.git("rev-parse", "HEAD").stdout.strip()
+        self.git("checkout", "-q", "--detach", head_sha)
+        self.assertEqual(_io.current_branch(self.repo), "HEAD")
+        self.git("checkout", "-q", self.initial_branch)
+        fresh = Path(self.tmp) / "unborn"
+        fresh.mkdir()
+        subprocess.run(["git", "init", "-q"], cwd=str(fresh),
+                       stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+        self.assertFalse(_io.has_commits(str(fresh)))
+        self.assertTrue(len(_io.current_branch(str(fresh))) > 0)
+
     def test_report_and_undo_round(self):
         self.run_state("init")
-        self.run_state("begin-round", "--title", "t", "--reason", "r")
+        self.run_state("backlog-add", "--title", "handover-A", "--reason", "r", "--value", "4", "--effort", "2")
+        self.run_state("backlog-add", "--title", "handover-B", "--reason", "r", "--value", "3", "--effort", "1")
+        # 有就绪候选时 begin-round 必须显式选人（护栏本身正确）——
+        # handover-A 被消费，handover-B 留给交接表。
+        self.run_state("begin-round", "--title", "t", "--reason", "r", "--candidate-id", "candidate-001")
         self.add_file()
         self.run_state("commit", "--summary", "add")
         self.run_state("complete-round", "--summary", "done")
         self.assertEqual(self.run_state("report").returncode, 0)
         self.assertEqual(self.run_state("report", "--output", "out.md").returncode, 0)
+        report = (self.repo / "out.md").read_text(encoding="utf-8")
+        # Pending handover section (candidate-273): the next run must see
+        # where to pick up without re-mining.
+        self.assertIn("待办交接", report)
+        self.assertIn("handover-A", report)
+        self.assertIn("handover-B", report)
         self.assertTrue((self.repo / "out.md").exists())
         result = self.run_state("undo-round", "--sha", "HEAD", "--summary", "bad")
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertNotEqual(self.run_state("undo-round", "--sha", "notasha").returncode, 0)
-        self.run_state("begin-round", "--title", "t", "--reason", "r")
+        self.run_state("begin-round", "--title", "t", "--reason", "r", "--candidate-id", "candidate-002")
         self.assertNotEqual(self.run_state("undo-round", "--sha", "HEAD", "--summary", "x").returncode, 0)
 
     def test_allow_deny_paths(self):
@@ -2799,6 +3404,45 @@ class ContractTests(RepoTest):
 class MiningAndFinishGateTests(RepoTest):
     """Mine supply + early-stop finish gate (consolidated from 23 methods)."""
 
+    def test_mine_writes_audit_event(self):
+        """mine 运行本身必须落 log.jsonl（Batch 4 实测：只有逐候选的
+        backlog-add 事件，回放看不到何时跑过 mine、产出了多少）。"""
+        (self.repo / "a.py").write_text("# TODO: x\n", encoding="utf-8")
+        self.git("add", "a.py")
+        self.git("commit", "-q", "-m", "seed")
+        self.run_state("init")
+        self.run_state("mine", "--apply")
+        events = [
+            json.loads(line)
+            for line in (self.repo / ".autopilot" / "log.jsonl").read_text(encoding="utf-8").splitlines()
+            if line.strip()
+        ]
+        mine_events = [e for e in events if e.get("event") == "mine"]
+        self.assertTrue(mine_events)
+        self.assertEqual(mine_events[-1].get("apply"), True)
+        self.assertGreaterEqual(mine_events[-1].get("findings", 0), 1)
+
+    def test_mining_exhausted_pure_contract(self):
+        """轮 6 test-gap：never-mined 不算枯竭；连续两次零新增才算；
+        只读探针（有 findings 未 apply）被排除在证据链外——不重置零新增链。"""
+        from autopilot import commands as _commands
+        exhausted = _commands.mining_exhausted
+        self.assertFalse(exhausted({}))
+        self.assertFalse(exhausted({"mining_runs": []}))
+        self.assertFalse(exhausted({"mining_runs": [{"apply": True, "new": 0}]}))
+        self.assertFalse(exhausted({"mining_runs": [
+            {"apply": True, "new": 3}, {"apply": True, "new": 0}]}))
+        self.assertTrue(exhausted({"mining_runs": [
+            {"apply": True, "new": 0}, {"apply": True, "new": 0}]}))
+        # 中间的只读探针被排除：首尾两次零新增依然构成连续证据链
+        self.assertTrue(exhausted({"mining_runs": [
+            {"apply": True, "new": 0},
+            {"apply": False, "findings": 5, "new": 5},
+            {"apply": True, "new": 0}]}))
+        self.assertTrue(exhausted({"mining_runs": [
+            {"apply": False, "findings": 0, "new": 0},
+            {"apply": True, "new": 0}]}))
+
     def test_mine_hotspot_ignores_run_commits(self):
         """Pre-run churn is the hotspot signal; the run's own commits are work
         in progress, not pre-existing hotspots (1.12 field test: the scanner
@@ -3094,6 +3738,146 @@ class DashboardContractTests(RepoTest):
     def _autopilot_listing(self):
         ap = self.repo / ".autopilot"
         return sorted(p.name for p in ap.iterdir())
+
+    def test_read_info_degrades_to_none(self):
+        """轮 6 test-gap：read_info 的退化路径（缺失/正常/非 dict/损坏），
+        任何一种都不得 raise——info_alive/stop_server 依赖这个契约。"""
+        from autopilot import dashboard
+        self.assertIsNone(dashboard.read_info(self.repo))
+        info_path = self.repo / ".autopilot" / "dashboard.json"
+        info_path.parent.mkdir(parents=True, exist_ok=True)
+        info_path.write_text('{"pid": 123, "port": 8123}', encoding="utf-8")
+        self.assertEqual(dashboard.read_info(self.repo), {"pid": 123, "port": 8123})
+        info_path.write_text("[]", encoding="utf-8")
+        self.assertIsNone(dashboard.read_info(self.repo))
+        info_path.write_text("{corrupt", encoding="utf-8")
+        self.assertIsNone(dashboard.read_info(self.repo))
+
+    def test_clear_stale_info_and_stop_server(self):
+        """轮 7 test-gap：clear_stale_info 只删死记录；stop_server 杀进程
+        且总是删 info 文件，无记录时返回 False。"""
+        from autopilot import dashboard
+        info_path = self.repo / ".autopilot" / "dashboard.json"
+        info_path.parent.mkdir(parents=True, exist_ok=True)
+        # 无记录：stop_server 返回 False
+        self.assertFalse(dashboard.stop_server(self.repo))
+        # 死服务记录：pid 大到不可活、port 1 必拒绝 → clear 删除文件
+        info_path.write_text('{"pid": 4000000000, "port": 1}', encoding="utf-8")
+        dashboard.clear_stale_info(self.repo)
+        self.assertFalse(info_path.exists())
+        # 活记录（本进程 + port 0 非法走 pid 兜底）：clear 保留
+        info_path.write_text('{"pid": %d, "port": 0}' % os.getpid(), encoding="utf-8")
+        dashboard.clear_stale_info(self.repo)
+        self.assertTrue(info_path.exists())
+        # stop_server：真实子进程被杀、info 总被删除
+        sleeper = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(60)"])
+        try:
+            info_path.write_text('{"pid": %d, "port": 0}' % sleeper.pid, encoding="utf-8")
+            self.assertTrue(dashboard.stop_server(self.repo))
+            self.assertFalse(info_path.exists())
+            sleeper.wait(timeout=10)
+            self.assertIsNotNone(sleeper.returncode)
+        finally:
+            if sleeper.poll() is None:
+                sleeper.kill()
+                sleeper.wait(timeout=5)
+
+    def test_invalidate_snapshot_cache_contract(self):
+        """轮 8 test-gap：显式失效接缝必须把缓存键打回 None。"""
+        from autopilot import dashboard
+        dashboard._snapshot_cache["key"] = "stale-key"
+        dashboard.invalidate_snapshot_cache()
+        self.assertIsNone(dashboard._snapshot_cache["key"])
+
+    def test_compute_round_file_changes_attributes_rounds(self):
+        """轮 8 test-gap：anchor walk 的文件归因——first_round 取最小、
+        touches 计出现、rounds 去重。"""
+        from autopilot import dashboard_data
+        self.run_state("init")
+        self.run_state("begin-round", "--title", "r1", "--reason", "x")
+        (self.repo / "a.py").write_text("x = 1\n", encoding="utf-8")
+        self.git("add", "a.py")
+        self.run_state("commit", "--summary", "add a")
+        sha1 = self.git("rev-parse", "HEAD").stdout.strip()
+        self.run_state("complete-round", "--summary", "r1", "--commit-sha", sha1)
+        self.run_state("begin-round", "--title", "r2", "--reason", "x")
+        (self.repo / "a.py").write_text("x = 2\n", encoding="utf-8")
+        (self.repo / "b.py").write_text("y = 1\n", encoding="utf-8")
+        self.git("add", "a.py", "b.py")
+        self.run_state("commit", "--summary", "touch a, add b")
+        sha2 = self.git("rev-parse", "HEAD").stdout.strip()
+        self.run_state("complete-round", "--summary", "r2", "--commit-sha", sha2)
+        state = self.read_json("state.json")
+        history = state["history"]
+        run_start_sha = state["run_start_sha"]
+        changes = dashboard_data.compute_round_file_changes(self.repo, history, run_start_sha)
+        self.assertIsNotNone(changes)
+        self.assertEqual(changes["a.py"]["first_round"], 1)
+        self.assertEqual(changes["a.py"]["touches"], 2)
+        self.assertEqual(len(changes["a.py"]["rounds"]), 2)
+        self.assertEqual(changes["b.py"]["first_round"], 2)
+        self.assertEqual(changes["b.py"]["touches"], 1)
+        self.assertGreaterEqual(changes["a.py"]["insertions"], 2)
+
+    def test_compute_round_stats_rows(self):
+        """轮 10 test-gap（candidate-289）：与 file changes 同一 anchor walk
+        的逐轮 churn 行——轮 1/2 各一行，insertions/files_changed 下界。"""
+        from autopilot import dashboard_data
+        self.run_state("init")
+        self.run_state("begin-round", "--title", "r1", "--reason", "x")
+        (self.repo / "a.py").write_text("x = 1\n", encoding="utf-8")
+        self.git("add", "a.py")
+        self.run_state("commit", "--summary", "add a")
+        sha1 = self.git("rev-parse", "HEAD").stdout.strip()
+        self.run_state("complete-round", "--summary", "r1", "--commit-sha", sha1)
+        self.run_state("begin-round", "--title", "r2", "--reason", "x")
+        (self.repo / "a.py").write_text("x = 2\n", encoding="utf-8")
+        (self.repo / "b.py").write_text("y = 1\n", encoding="utf-8")
+        self.git("add", "a.py", "b.py")
+        self.run_state("commit", "--summary", "touch a, add b")
+        sha2 = self.git("rev-parse", "HEAD").stdout.strip()
+        self.run_state("complete-round", "--summary", "r2", "--commit-sha", sha2)
+        state = self.read_json("state.json")
+        stats = dashboard_data.compute_round_stats(self.repo, state["history"], state["run_start_sha"])
+        by_round = {row["round"]: row for row in stats}
+        self.assertEqual(sorted(by_round), [1, 2])
+        self.assertGreaterEqual(by_round[1]["insertions"], 1)
+        self.assertEqual(by_round[1]["files_changed"], 1)
+        self.assertGreaterEqual(by_round[2]["insertions"], 2)
+        self.assertEqual(by_round[2]["files_changed"], 2)
+
+    def test_aggregate_modules_domains(self):
+        """轮 10 test-gap（candidate-290）：domain 聚合——内置启发式命中、
+        touches 降序与 weight 归一、domain_map 优先、空输入返回 []。"""
+        from autopilot import dashboard_data as dd
+        self.assertEqual(dd.aggregate_modules({}, None), [])
+        changes = {
+            "scripts/tool.py": {"first_round": 1, "touches": 4, "insertions": 10, "deletions": 2, "rounds": [1, 2, 3, 4]},
+            "tests/test_tool.py": {"first_round": 2, "touches": 2, "insertions": 6, "deletions": 0, "rounds": [2, 3]},
+            "README.md": {"first_round": 1, "touches": 1, "insertions": 5, "deletions": 1, "rounds": [1]},
+        }
+        domains = dd.aggregate_modules(changes, None)
+        self.assertEqual([d["name"] for d in domains], ["工具与脚本", "测试", "文档与知识"])
+        self.assertEqual(domains[0]["weight"], 1.0)
+        self.assertEqual(domains[0]["modules"][0]["path"], "scripts/tool.py")
+        mapped = dd.aggregate_modules(changes, {"scripts/": {"name": "引擎"}})
+        self.assertEqual([d["name"] for d in mapped][0], "引擎")
+
+    def test_correlate_events_cards(self):
+        """轮 10 test-gap（candidate-291）：history → 演化卡——输入序保留、
+        domains 排序、缺 review_score 记 None、commit_sha 透传。"""
+        from autopilot import dashboard_data as dd
+        history = [
+            {"round": 2, "status": "completed", "title": "b", "summary": "s2",
+             "review_score": 4, "commit_sha": "sha2"},
+            {"round": 1, "status": "completed", "title": "a", "summary": "s1",
+             "review_score": None, "commit_sha": "sha1"},
+        ]
+        events = dd.correlate_events(history, {1: ["测试", "工具与脚本"]})
+        self.assertEqual([e["round"] for e in events], [2, 1])
+        self.assertEqual(events[1]["domains"], ["工具与脚本", "测试"])
+        self.assertIsNone(events[1]["score"])
+        self.assertEqual(events[0]["commit_sha"], "sha2")
 
     def test_build_snapshot_is_read_only(self):
         self._seed_run()
@@ -3754,29 +4538,44 @@ def _run_parallel_smoke(jobs, subset=None):
     return (1 if bad else 0), results
 
 
-if __name__ == "__main__":
-    argv = sys.argv[1:]
-    if "--jobs" in argv:
-        i = argv.index("--jobs")
-        jobs = int(argv[i + 1])
-        rest = argv[i + 2:]
+def main(argv):
+    """Dispatch for `python test_autopilot_state.py ...`。提取成函数是为了
+    可测试性：flag 顺序契约（--smoke 放 --jobs 前）用注入桩在进程内验证，
+    不再拉真实 multiprocessing（Batch/轮 2：子进程 + pytest 捕获管道 +
+    spawn 三者叠加会死锁，bash 直跑却 0.8s）。"""
+    jobs = None
+    rest = []
+    i = 0
+    while i < len(argv):
+        if argv[i] == "--jobs":
+            jobs = int(argv[i + 1])
+            i += 2
+        else:
+            rest.append(argv[i])
+            i += 1
+    if jobs is not None:
         if "--smoke" in rest:
             rest.remove("--smoke")
             code, _ = _run_parallel_smoke(jobs, subset=rest or None)
-            sys.exit(code)
-        sys.exit(_run_parallel(rest or None, jobs))
-    elif "--time-report" in argv:
-        argv.remove("--time-report")
-        update = "--update-slow" in argv
+            return code
+        return _run_parallel(rest or None, jobs)
+    if "--time-report" in rest:
+        rest.remove("--time-report")
+        update = "--update-slow" in rest
         if update:
-            argv.remove("--update-slow")
+            rest.remove("--update-slow")
         _run_time_report(update=update)
-    elif "--smoke" in argv:
-        argv.remove("--smoke")
-        if argv:
+        return 0
+    if "--smoke" in rest:
+        rest.remove("--smoke")
+        if rest:
             # --smoke 显式跟类名：只跑指定类（人工快检，不走 smoke 子集）
-            unittest.main(argv=[sys.argv[0]] + argv)
-        else:
-            sys.exit(_run_smoke())
-    else:
-        unittest.main(argv=[sys.argv[0]] + argv)
+            unittest.main(argv=[sys.argv[0]] + rest)
+            return 0
+        return _run_smoke()
+    unittest.main(argv=[sys.argv[0]] + rest)
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv[1:]))

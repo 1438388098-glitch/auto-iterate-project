@@ -2,6 +2,7 @@
 
 import json
 import math
+import os
 import re
 import sys
 import unicodedata
@@ -260,6 +261,26 @@ def load_state(repo):
     return state
 
 
+def _atomic_backup(path):
+    """单代 .bak，原子落盘（轮 16 candidate-314）：备份自身用截断式
+    write_bytes 的话，崩溃/磁盘满会产生撕碎的 .bak——安全网恰在需要时
+    失效。与 io.save_json 同款 tmp+replace；备份失败不阻塞主写入。"""
+    backup = path.with_suffix(path.suffix + ".bak")
+    try:
+        data = path.read_bytes()
+    except OSError:
+        return
+    tmp = path.with_name(path.name + ".tmp-bak")
+    try:
+        tmp.write_bytes(data)
+        os.replace(str(tmp), str(backup))
+    except OSError:
+        try:
+            tmp.unlink()
+        except OSError:
+            pass
+
+
 def save_state(repo, state):
     path = config.state_path_for(repo)
     # Keep the last known-good copy before overwriting: save_json's atomic
@@ -267,11 +288,7 @@ def save_state(repo, state):
     # was corrupted outside this process. A one-generation .bak turns
     # "state is unrecoverable, delete and re-init" into "restore the backup".
     if path.exists():
-        try:
-            backup = path.with_suffix(path.suffix + ".bak")
-            backup.write_bytes(path.read_bytes())
-        except OSError:
-            pass  # backup is best-effort; the write below must still proceed
+        _atomic_backup(path)
     io.save_json(path, state)
 
 
@@ -315,7 +332,13 @@ def _validate_backlog(repo, backlog):
 
 
 def save_backlog(repo, backlog):
-    io.save_json(config.backlog_path_for(repo), backlog)
+    # 与 save_state 同款单代 .bak（轮 16 candidate-310）：backlog 是 run 的
+    # 核心资产——候选、状态、review 校准、依赖边全在这里，进程外损坏时
+    # 「restore the backup」比「删除重来」强一个数量级。
+    path = config.backlog_path_for(repo)
+    if path.exists():
+        _atomic_backup(path)
+    io.save_json(path, backlog)
 
 
 def find_candidate(backlog, candidate_id):
@@ -626,8 +649,13 @@ def ensure_branch(repo, state, cfg, to_stderr=False):
             if branch and io.current_branch(repo) == branch:
                 say("[OK] Already on the run branch: {}".format(branch))
                 return branch
-        except SystemExit:
-            pass
+        except SystemExit as exc:
+            # current_branch 探测失败（如 detached HEAD 的边界报错）时按
+            # 「不在运行分支」处理、走下方拒绝路径——但不静默，留审计。
+            io.append_log(
+                repo, "ensure-branch", "warn",
+                reason="current_branch probe failed: {}".format(str(exc)[:120]),
+            )
         print(
             "[ERROR] Working tree has tracked changes and allow_uncommitted_changes is false; "
             "refusing to switch branches so user changes are not carried over.",
@@ -1648,6 +1676,8 @@ _STATUS_LABELS = {
         "run_report": "Auto Iterate 运行报告", "meta": "运行信息", "goals": "目标",
         "counts": "轮次统计", "history": "轮次历史", "backlog": "改进清单",
         "gitlog": "最近提交", "next": "下一步建议", "active": "活动分支",
+        "handover": "待办交接（下一轮从这里接续）", "handover_total": "遗留 pending 候选",
+        "handover_hint": "按 score 降序（ready 优先）；新 run 用显式 --candidate-id 接续，无需重新挖矿",
         "tokens": "估算 Token", "repo": "仓库", "none": "无",
         "deadline": "定时截止", "seeds": "方向假设（种子）",
         "seed_status": {"open": "待处理", "promoted": "已立项", "verified": "已验证",
@@ -1661,6 +1691,8 @@ _STATUS_LABELS = {
         "run_report": "Auto Iterate Run Report", "meta": "Run info", "goals": "Goals",
         "counts": "Round counts", "history": "Round history", "backlog": "Backlog",
         "gitlog": "Recent commits", "next": "Next likely improvement", "active": "Active branch",
+        "handover": "Pending handover (next run starts here)", "handover_total": "pending candidates left",
+        "handover_hint": "score-descending (ready first); a new run resumes with explicit --candidate-id — no re-mining needed",
         "tokens": "Estimated tokens", "repo": "Repo", "none": "none",
         "deadline": "Deadline timer", "seeds": "Direction seeds (predictions)",
         "seed_status": {"open": "open", "promoted": "promoted", "verified": "verified",
@@ -1811,6 +1843,26 @@ def build_report(repo, state, cfg, lang="en"):
             top.get("id"), table_cell(top.get("title")), top.get("value"), top.get("effort"),
             top.get("type") or "feature", top.get("score"),
         ))
+        out.append("")
+
+    # Handover section (candidate-273): a run leaves pending candidates behind
+    # by design (max_rounds etc.), but nothing told the next run where to pick
+    # up — one explicit table instead of hoping the full backlog dump gets read.
+    handover_pending = [r for r in ranked if r.get("status") == "pending"]
+    if handover_pending:
+        out.append("## {}".format(L["handover"]))
+        out.append("")
+        out.append("- {}: {}".format(L["handover_total"], len(handover_pending)))
+        out.append("")
+        out.append("| id | title | type | value/effort | ready |")
+        out.append("|---|---|---|---|---|")
+        for r in handover_pending[:8]:
+            out.append("| `{}` | {} | {} | {}/{} | {} |".format(
+                r.get("id"), table_cell(r.get("title")), r.get("type") or "feature",
+                r.get("value"), r.get("effort"), "yes" if r.get("ready") else "no",
+            ))
+        out.append("")
+        out.append("- {}".format(L["handover_hint"]))
         out.append("")
 
     return "\n".join(out)

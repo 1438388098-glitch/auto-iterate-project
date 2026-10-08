@@ -251,7 +251,8 @@ def build_parser():
     retrospective_parser.add_argument("--output", default=None, help="Write the retrospective to a file instead of stdout")
     retrospective_parser.add_argument("--force", action="store_true",
                                       help="Allow --output paths outside the target repository")
-    retrospective_parser.add_argument("--lang", choices=["zh", "en"], default=None)
+    retrospective_parser.add_argument("--lang", choices=["zh", "en"], default=None,
+                                      help="Retrospective language (default: config report_lang)")
     add_json(retrospective_parser)
     retrospective_parser.set_defaults(func=commands.cmd_retrospective)
 
@@ -376,6 +377,11 @@ def build_parser():
     budgets.add_argument("--clear-max-expansion-waves", dest="clear_max_expansion_waves",
                          action="store_true", default=False,
                          help="Remove the expansion wave cap")
+    budgets.add_argument("--max-blocked-in-a-row", dest="max_blocked_in_a_row", type=int, metavar="N",
+                         help="Consecutive-blocked stop budget (0 = the run stops immediately: a 0/0 streak satisfies the condition before any round opens)")
+    budgets.add_argument("--clear-max-blocked-in-a-row", dest="clear_max_blocked_in_a_row",
+                         action="store_true", default=False,
+                         help="Remove the consecutive-blocked budget")
     deadline = config_set_parser.add_mutually_exclusive_group()
     deadline.add_argument("--deadline", dest="deadline", metavar="EXPR",
                           help="Absolute stop time (ISO timestamp, +8h duration, or HH:MM)")
@@ -417,6 +423,11 @@ def build_parser():
     expansion_record_parser.add_argument("--repo", default=".")
     expansion_record_parser.add_argument("--lens", action="append", required=True,
                                          help="Lens used by this wave (repeatable; must be one of the EXPANSION_LENSES)")
+    expansion_record_parser.add_argument("--findings", type=int, default=None,
+                                         help="Candidates this wave's lenses proposed (optional yield stat, "
+                                              "same vocabulary as mine — makes lens waves comparable with mining runs)")
+    expansion_record_parser.add_argument("--applied", type=int, default=None,
+                                         help="Proposals that passed the value gate into the backlog (optional)")
     add_json(expansion_record_parser)
     add_dry_run(expansion_record_parser)
     expansion_record_parser.set_defaults(func=commands.cmd_expansion_record)
@@ -542,6 +553,13 @@ def build_parser():
 
 def main():
     _force_utf8_stdio()
+    # 装机探针（轮 22 candidate-325）：--version 在任何位置（含子命令后，
+    # 如 `autopilot_state.py init --version`）都报告版本——argparse 的顶层
+    # --version action 不被子命令继承，实测会报 unrecognized arguments。
+    if "--version" in sys.argv[1:]:
+        from . import __version__
+        print("auto-iterate-project {}".format(__version__))
+        sys.exit(0)
     parser = build_parser()
     args = parser.parse_args()
     if args.command is None:

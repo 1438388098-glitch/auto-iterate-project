@@ -1,6 +1,6 @@
 ---
 name: auto-iterate-project
-version: 1.12.5
+version: 1.13.0
 description: Automatically iterate any git project inside the current agent session by analyzing the repository, choosing the next high-value improvement, implementing small changes, verifying, committing, and looping until a goal is met or configurable round/time/token limits are reached. Use when the user asks for autonomous project iteration, continuous self-improvement, auto-improve, keep improving this project, full-auto development, or wants the agent to keep making and committing improvements without per-step approval. Also use for Chinese requests like 全自动迭代这个项目, 自动改进并提交这个仓库, 连续自动开发, or 自动推进项目改进. Do NOT use for one-off bugfixes, single-file edits, doc-only changes, or when the user wants step-by-step approval of each change.
 ---
 
@@ -225,7 +225,7 @@ When `action_hint: "expand"` (mine already fresh), the backlog is empty after mi
 
 0. Budget check: subagent spend is invisible to `max_tokens` (it estimates from diffs), so if the run has `max_expansion_waves` set, read `expansion_budget` and stop expanding at the cap (`expansion-record` refuses past it); with no cap, a run that expands repeatedly can outspend every configured budget while `check` reports it healthy.
 1. Pick 3-6 unused lenses from `check`'s `lenses_unused` (see `references/expansion-lenses.md`). Each subagent returns 2-5 candidates **with evidence**. Record with `expansion-record --lens ...`. Repeating the previous wave's exact set warns.
-2. Judge and ingest: one concrete user-facing sentence of value **and** evidence (file:line or probe output). Unevidenced proposals get one follow-up, then reject. `backlog-add` with explicit scores and `--evidence`. Do not reject solely for high effort. `expansion-record` is wave-granular — it cannot record that a specific lens produced zero candidates; note lens-level zero yields in the round summary so later waves do not re-pick barren lenses without a reason.
+2. Judge and ingest: one concrete user-facing sentence of value **and** evidence (file:line or probe output). Unevidenced proposals get one follow-up, then reject. `backlog-add` with explicit scores and `--evidence`. Do not reject solely for high effort. `expansion-record` is wave-granular — it cannot record that a specific lens produced zero candidates; note lens-level zero yields in the round summary so later waves do not re-pick barren lenses without a reason. A candidate that looks infeasible under the run's constraints is isolated into its OWN round (explicit `--candidate-id`) so an honest `block-round` cannot spill over into other candidates' work.
 3. Still thin → escalate search depth (not the user): Wave 2 lower the value floor temporarily; Wave 3+ read hardest paths / real user journeys / public symbols; Wave 4+ widen scope (siblings, CI, packaging, examples). Keep spawning until `min_pending_candidates` ready items or a budget stop. **Never finish with "expansion exhausted" while budgets remain** — `finish` without `--force` is refused while stop conditions are unmet and ready work exists. Declaring exhaustion requires 2 consecutive recorded waves (≥3 subagents, ≥3 unused lenses each) with zero value-gated candidates — and even then the run stops only on a budget.
 4. **No-subagent fallback**: run the same lenses serially in-process (one lens per pass, `analysis-save` between passes). Do not claim "cannot expand".
 5. After goals are met, treat every thin backlog the same way.
@@ -260,12 +260,12 @@ Unattended runs have nobody to ask: when one of the scenes above fires without a
 1. If commits are batched and the last round did not commit, flush with `commit --round <n> --summary "flush accumulated changes"`.
 2. `finish --reason "<stop reason>"` (add `--stay` to remain on the feature branch). The gate refuses while no stop condition is reached and any of these remains: thin backlog needing expand/mine, any ready candidate (above **or below** `min_candidate_value`), a non-empty recommended batch, or mining not yet exhausted (never-mined ≠ exhausted). `--force` only when the user explicitly asked to stop. Auto-cancels any open round, writes `.autopilot/retrospective.md`, and in `feature` mode returns to the origin branch. If the run's branch is already fully merged (empty run or you merged it first) it is deleted; otherwise commits remain on the autopilot branch, unmerged — the finish output and the retrospective say so. After merging later, run `branch-gc` to reclaim leftovers.
    **Unattended runs** (nobody will be asked): stranding all deliverables on an unmerged `autopilot/*` branch is not an acceptable end state. After a normal finish, merge the run branch into the origin branch yourself — a regular merge commit, never force — then run `branch-gc`, and state in the summary that the merge was made autonomously.
-3. Write `.autopilot/last-summary.md` in the user's language (completed/blocked rounds, commits, branch, remaining goals, backlog, next likely improvement). Data: `report --repo <repo> [--lang zh|en] [--output <file>]`.
+3. Write `.autopilot/last-summary.md` in the user's language (completed/blocked rounds, commits, branch, remaining goals, backlog, next likely improvement). Data: `report --repo <repo> [--lang zh|en] [--output <file>]`. Unattended runs that merge their own branch should also pass `--archive-reports` on `finish` — it copies the phase reports and the retrospective into `docs/autopilot/` so the run's record survives in the repo (`.autopilot/` itself stays out of version control).
 4. Report a short summary to the user.
 
 ## Reports & Dry-Run
 
-- `report` / `retrospective` — deterministic markdown (goals, rounds, backlog, commits, next improvement / type stats).
+- `report` / `retrospective` — deterministic markdown (goals, rounds, backlog, commits, next improvement / type stats). `finish --archive-reports` copies the phase reports and retrospective into `docs/autopilot/`.
 - `analysis-load` / `analysis-save` — repo analysis cache.
 - `secret-scan` — staged-diff secret scan (also automatic on `commit`).
 - `push` — manual push of the run branch via an explicit non-force refspec (refuses while `push: false`).
@@ -309,4 +309,4 @@ Full table: `references/troubleshooting.md`. Common ones:
 | `action_hint: expand` | Mine is fresh; Deep Expansion now |
 | A real-work round records `estimated_tokens: 0` | Water marks are monotonic — an earlier round billed the lines while uncommitted, then the content was rewritten smaller; see `max_tokens` in `references/config.md` |
 | `commit` warns "Run-deferred files are still uncommitted" | The flush staged only part of what the run's rounds left behind — stage and commit the named files (same `--round`), or leave them knowingly |
-| `config-set` requires a field | Pass at least one field flag | e.g. `--expand-after-goals`, `--candidates-per-round N`, `--max-rounds N`/`--clear-max-rounds`, `--deadline EXPR`; see `references/config.md` |
+| `config-set` requires a field | Pass at least one field flag — e.g. `--expand-after-goals`, `--candidates-per-round N`, `--max-rounds N`/`--clear-max-rounds`, `--deadline EXPR`; see `references/config.md` |

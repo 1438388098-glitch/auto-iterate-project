@@ -10,6 +10,7 @@ import socket
 import subprocess
 import sys
 import tempfile
+import uuid
 from contextlib import contextmanager
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
@@ -376,11 +377,13 @@ def _read_lock_file(path):
         return None
 
 
-def _create_lock_exclusive(path):
+def _create_lock_exclusive(path, token):
     """Atomically create the lock file (O_CREAT|O_EXCL). Returns False when the
-    file already exists — never overwrites another process's lock."""
+    file already exists — never overwrites another process's lock. The random
+    token is the ownership proof _release_lock checks before unlinking."""
     payload = json.dumps(
-        {"pid": os.getpid(), "started_at": now_iso(), "hostname": socket.gethostname()}
+        {"pid": os.getpid(), "started_at": now_iso(), "hostname": socket.gethostname(),
+         "token": token}
     )
     try:
         fd = os.open(str(path), os.O_CREAT | os.O_EXCL | os.O_WRONLY)
@@ -390,6 +393,12 @@ def _create_lock_exclusive(path):
         with os.fdopen(fd, "w", encoding="utf-8") as handle:
             handle.write(payload)
     except OSError:
+        # fdopen 失败时 fd 仍开着——Windows 上不关闭就无法 unlink，残留的
+        # 空 token 锁会让互斥归属证明失效（轮 33 candidate-346 测试钉住）。
+        try:
+            os.close(fd)
+        except OSError:
+            pass
         try:
             os.unlink(str(path))
         except OSError:
@@ -407,11 +416,20 @@ def _sleep(seconds):
 def _acquire_lock(repo):
     path = lock_path_for(repo)
     path.parent.mkdir(parents=True, exist_ok=True)
-    # Three attempts: create / grace-backoff (fresh corrupt-looking lock may
-    # be mid-creation by a live process) / steal-and-recreate.
-    for attempt in range(3):
-        if _create_lock_exclusive(path):
-            return path
+    token = uuid.uuid4().hex
+    # Eight attempts with 0.3s grace: a young empty lock (O_EXCL done, payload
+    # not yet written) may be mid-creation by a LIVE process, so the grace
+    # applies on EVERY attempt — honoring it only on attempt 0 let attempt 1
+    # steal the lock 0.1s later and break mutual exclusion entirely (field
+    # test round 16, candidate-306: three-process steal chain reproduced).
+    # Once the lock ages past 2.0s it is treated as stale and taken, so a
+    # dead creator still self-heals instead of wedging the repo.
+    # Eight grace attempts (0.3s each) + one final create after the last
+    # unlink: once the lock ages past 2.0s the corrupt branch unlinks it and
+    # the next attempt must get its chance, or a dead creator wedges the repo.
+    for attempt in range(9):
+        if _create_lock_exclusive(path, token):
+            return path, token
         holder = _read_lock_file(path)
         if isinstance(holder, dict):
             hostname = holder.get("hostname")
@@ -442,18 +460,28 @@ def _acquire_lock(repo):
                 file=sys.stderr,
             )
         else:
-            # A lock that was just created (O_EXCL done, payload not yet
-            # written) reads as corrupt. A file this young is almost surely
-            # mid-creation by a live process — back off once before stealing.
-            age = datetime.now(timezone.utc).timestamp() - path.stat().st_mtime
-            if age < 2.0 and attempt == 0:
-                _sleep(0.1)
+            # 锁可能在 read（→None）与 stat 之间被并发收割/释放——缺失即视为
+            # 可重试（轮 36 candidate-359：竞态下此处会裸 FileNotFoundError）。
+            try:
+                age = datetime.now(timezone.utc).timestamp() - path.stat().st_mtime
+            except OSError:
+                _sleep(0.3)
                 continue
-            print("[WARN] Removing corrupt autopilot lock file at {}.".format(path), file=sys.stderr)
+            if age < 2.0:
+                _sleep(0.3)
+                continue
+            print(
+                "[WARN] Removing corrupt autopilot lock file at {} (age {:.1f}s).".format(
+                    path, age
+                ),
+                file=sys.stderr,
+            )
         try:
             path.unlink()
         except OSError:
-            pass
+            # Windows 上文件被 AV/索引器短暂占住时 unlink 会失败——退避后
+            # 重试，让末尾的「after retrying」措辞名副其实（轮 36 candidate-360）。
+            _sleep(0.3)
     print(
         "[ERROR] Could not acquire the autopilot lock at {} after retrying.".format(path),
         file=sys.stderr,
@@ -461,8 +489,25 @@ def _acquire_lock(repo):
     raise SystemExit(2)
 
 
-def _release_lock(path):
+def _release_lock(path, token=None):
+    """Only unlink when the lock still belongs to THIS process (token match).
+    An unconditional unlink deleted the lock of whoever stole/re-acquired it
+    after a stale takeover, turning one steal into a three-process concurrency
+    chain (field test round 16, candidate-306). Residual TOCTOU window: the
+    token compare and the unlink are still two steps — a stealer landing
+    exactly between them keeps its lock lost. The unconditional unlink this
+    replaced was strictly wider; fully closing the gap needs an OS-level
+    atomic compare-and-delete, out of scope — the 2s stale takeover already
+    admits breakthrough by design."""
     try:
+        holder = _read_lock_file(path)
+        if holder is not None and token is not None and holder.get("token") != token:
+            print(
+                "[WARN] Autopilot lock at {} is no longer ours (re-acquired after a stale "
+                "takeover); leaving it alone.".format(path),
+                file=sys.stderr,
+            )
+            return
         path.unlink()
     except OSError:
         pass
@@ -470,11 +515,11 @@ def _release_lock(path):
 
 @contextmanager
 def run_lock(repo):
-    path = _acquire_lock(repo)
+    path, token = _acquire_lock(repo)
     try:
         yield
     finally:
-        _release_lock(path)
+        _release_lock(path, token)
 
 
 def append_log(repo, event, status, **fields):
@@ -529,8 +574,18 @@ def estimate_tokens_for_round(repo, run_start_sha, billed_text, billed_binary):
     base = run_start_sha or EMPTY_TREE
     if has_commits(repo):
         result = run_git(repo, "diff", "--numstat", base, "HEAD")
-        if result.returncode == 0:
-            committed_t, committed_b = _parse_numstat(result.stdout)
+        if result.returncode != 0:
+            # 同 _staged_numstat_lines 的不变量（轮 13 候选 297）：失败的
+            # numstat 不能被当成 0 行——否则 run_start_sha 被 gc/浅克隆裁剪
+            # 后 max_tokens 软预算静默失效、超支无任何警告。
+            print(
+                "[ERROR] Could not read committed numstat ({}); refusing to treat the diff as "
+                "empty — max_tokens accounting would silently stop applying.".format(
+                    (result.stderr or "").strip()[:200]),
+                file=sys.stderr,
+            )
+            raise SystemExit(2)
+        committed_t, committed_b = _parse_numstat(result.stdout)
     worktree_t, worktree_b = worktree_units(repo)
     total_text = committed_t + worktree_t
     total_binary = committed_b + worktree_b
@@ -547,15 +602,24 @@ def estimate_tokens_for_round(repo, run_start_sha, billed_text, billed_binary):
 
 def worktree_units(repo):
     """(text_lines, binary_files) changed in the working tree and the index
-    combined, measured against HEAD. Tuple form of worktree_change_lines."""
+    combined, measured against HEAD. Tuple form of worktree_change_lines.
+    A failed git diff fails closed (same invariant as estimate_tokens_for_round:
+    a silent zero would drain max_tokens of its teeth)."""
     text = 0
     binary = 0
     for diff_args in (("diff", "--numstat"), ("diff", "--cached", "--numstat")):
         result = run_git(repo, *diff_args)
-        if result.returncode == 0:
-            t, b = _parse_numstat(result.stdout)
-            text += t
-            binary += b
+        if result.returncode != 0:
+            print(
+                "[ERROR] Could not read worktree numstat ({}); refusing to treat the diff as "
+                "empty — max_tokens accounting would silently stop applying.".format(
+                    (result.stderr or "").strip()[:200]),
+                file=sys.stderr,
+            )
+            raise SystemExit(2)
+        t, b = _parse_numstat(result.stdout)
+        text += t
+        binary += b
     return text, binary
 
 

@@ -2,7 +2,7 @@ English · [简体中文](./README.zh-CN.md)
 
 # Auto Iterate Project
 
-Version 1.12.5 — see [CHANGELOG.md](CHANGELOG.md) for release history.
+Version 1.13.0 — see [CHANGELOG.md](CHANGELOG.md) for release history.
 
 Automatically iterate any git project inside an agent session: analyze the repository, pick the next high-value improvement, implement small changes, verify, commit, and loop until a goal is met or a configured budget (rounds / minutes / tokens / absolute deadline) runs out.
 
@@ -36,8 +36,9 @@ The skill's entry point is [SKILL.md](SKILL.md) — the agent reads it, runs `de
 - **Self-owned state**: `.autopilot/` (config, state, backlog, directives, logs) — resumable, migratable, corruption fails clean, and every state write keeps a one-generation `.bak`.
 - **Honest accounting**: unverified goals withhold the "all goals met" stop; zero-work cancels consume no budget; `finish` is refused while real work remains unless a stop condition (or you) says otherwise.
 - **Safety rails**: never rewrites git history, never pushes unless configured, refuses to absorb pre-existing user changes into autopilot commits, `allow_paths`/`deny_paths` whitelists, secret patterns (AWS / private keys / GitHub / Slack / Google / `sk-*` / JWT).
+- **Field-test hardened (1.12.x)**: boundary-proof schedule fields, batch-flush reconciliation that names missed round products, branch-gc that reclaims finished runs, Git Bash adaptation, per-wave expansion yield stats, and a pending-handover section in the run report — every fix traced to an observed unattended-run failure.
 - **Branch lifecycle**: feature-mode runs reclaim dead `autopilot/*` branches — `init` prunes merged leftovers, `finish` deletes the run branch when already merged, `branch-gc` cleans up after a later merge. Unmerged work is never deleted.
-- **Deterministic helper**: all of the above runs through `scripts/autopilot_state.py` (Python 3.6+, stdlib only), covered by a lean ~190-test suite on 3.8–3.13 across Linux and Windows (`--smoke` for a ~1s, machine-dependent round-loop check).
+- **Deterministic helper**: all of the above runs through `scripts/autopilot_state.py` (Python 3.6+, stdlib only), covered by a lean test suite on 3.8–3.13 across Linux and Windows (`--smoke` for a ~1s, machine-dependent round-loop check).
 - **Observation dashboard (optional)**: a 127.0.0.1-only read-only web panel that opens when a run starts — an evolution tree (domain → module → file) beside a per-round card stream, with replay. The tree is seeded at init by a full project scan (state.project_map: the whole skeleton, per-module file counts) and rounds overlay activity on it; the token stat is a change-equivalent proxy, not LLM usage. Pure stdlib; the loop never depends on it (`dashboard --stop` shuts it down).
 
 ## Install

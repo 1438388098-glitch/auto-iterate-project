@@ -9,6 +9,7 @@ import os
 import signal
 import subprocess
 import sys
+import tempfile
 import threading
 import time
 from http.server import BaseHTTPRequestHandler, HTTPServer
@@ -37,13 +38,22 @@ def write_info(repo, info):
     """Persist the server's lifecycle info (pid/port/started_at/opened) as
     plain JSON. Deliberately not io.save_json: a torn or corrupt file must
     degrade to read_info() → None, never SystemExit like io.load_json.
-    Atomic tmp+replace (io.save_json precedent): a killed writer leaves the
-    previous file intact instead of a torn one."""
+    Atomic tmp+replace with a UNIQUE mkstemp name (io.save_json precedent):
+    a fixed ".json.tmp" let two concurrent spawns clobber each other's temp
+    file and os.replace publish a torn record (轮 16 candidate-312)."""
     path = _info_path(repo)
     path.parent.mkdir(parents=True, exist_ok=True)
-    tmp = path.with_suffix(".json.tmp")
-    tmp.write_text(json.dumps(info), encoding="utf-8")
-    os.replace(str(tmp), str(path))
+    fd, tmp_name = tempfile.mkstemp(dir=str(path.parent), prefix=path.name, suffix=".tmp")
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as handle:
+            handle.write(json.dumps(info))
+        os.replace(tmp_name, str(path))
+    except OSError:
+        try:
+            os.unlink(tmp_name)
+        except OSError:
+            pass
+        raise
 
 
 def read_info(repo):
@@ -149,8 +159,16 @@ def ensure_dashboard(repo, config):
         clear_stale_info(repo)
         if info_alive(repo):
             return read_info(repo)
-        return spawn_server(repo, config)
-    except Exception:
+        spawned = spawn_server(repo, config)
+        if spawned is None:
+            # spawn 失败原先是静默 None——调用方的错误日志只在异常路径触发，
+            # 面板「为什么没起来」无处可查（轮 15 候选 304）。
+            io.append_log(repo, "dashboard", "warn",
+                          reason="spawn_server returned None (timeout or config rejected)")
+        return spawned
+    except Exception as exc:
+        io.append_log(repo, "dashboard", "warn",
+                      reason="ensure failed: {}".format(str(exc)[:200]))
         return None
 
 
@@ -189,20 +207,36 @@ def _cache_key(repo):
     return (tuple(mtimes), head_sha)
 
 
+_snapshot_lock = threading.Lock()
+
+
 def get_snapshot(repo):
     """build_snapshot with a one-slot cache: repeated browser polling between
     state writes returns the identical dict (stable generated_at) instead of
     re-running the growth pipeline per request; a changed mtime or the TTL
-    (SNAPSHOT_TTL_SECONDS) triggers one rebuild."""
-    key = _cache_key(repo)
+    (SNAPSHOT_TTL_SECONDS) triggers one rebuild. The TTL short-circuit runs
+    BEFORE the cache key: a fresh cached hit must not pay the rev-parse
+    spawn that _cache_key costs on every poll (field-test round 12). The
+    whole check-and-build is serialized under one lock — ThreadingHTTPServer
+    serves each request on its own thread, and two concurrent misses used to
+    run the full pipeline twice and publish torn key/snapshot pairs (轮 16
+    candidate-313)."""
     now = time.time()
-    if _snapshot_cache["key"] == key and _snapshot_cache["snapshot"] is not None \
-            and now - _snapshot_cache["at"] < SNAPSHOT_TTL_SECONDS:
-        return _snapshot_cache["snapshot"]
-    from . import dashboard_data as dd
-    snapshot = dd.build_snapshot(repo)
-    _snapshot_cache.update(key=key, snapshot=snapshot, at=now)
-    return snapshot
+    with _snapshot_lock:
+        if _snapshot_cache["key"] is not None and _snapshot_cache["snapshot"] is not None \
+                and now - _snapshot_cache["at"] < SNAPSHOT_TTL_SECONDS:
+            return _snapshot_cache["snapshot"]
+        key = _cache_key(repo)
+        if _snapshot_cache["key"] == key and _snapshot_cache["snapshot"] is not None:
+            # Same key past the TTL: every input the pipeline reads is in the
+            # key, so a rebuild would produce identical output — refresh the
+            # window instead of re-running the pipeline.
+            _snapshot_cache.update(at=now)
+            return _snapshot_cache["snapshot"]
+        from . import dashboard_data as dd
+        snapshot = dd.build_snapshot(repo)
+        _snapshot_cache.update(key=key, snapshot=snapshot, at=now)
+        return snapshot
 
 
 def _make_handler(repo):

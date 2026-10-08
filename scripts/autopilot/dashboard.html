@@ -463,6 +463,11 @@
     var phaseTxt = phase === "running" ? "运行中"
       : (phase === "finished" ? "已完成" : "—");
     if (st.stop_reason) phaseTxt += " · " + st.stop_reason;
+    // loop-outlook 降级角标（轮 40 candidate-367）：决策段的 stop_reason/action_hint
+    // 回退到旧值时对看板用户如实标注，而非静默展示
+    if ((meta.degraded || []).some(function (d) { return d.indexOf("loop-outlook") === 0; })) {
+      phaseTxt += " · 决策降级(loop-outlook)";
+    }
     $("stat-phase").textContent = phaseTxt;
     $("stat-version").textContent = meta.skill_version
       ? "v" + meta.skill_version : "";

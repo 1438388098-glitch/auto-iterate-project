@@ -30,6 +30,45 @@ SECRET_PATTERNS = [
 
 _COMPILED_DEFAULTS = [re.compile(pattern) for pattern in SECRET_PATTERNS]
 
+# 编译期对抗样本（轮 16 candidate-308）：用户自供模式在进入 commit 热路径前
+# 先对固定样本限时试跑——stdlib re 无超时且灾难性回溯的匹配持 GIL 不放
+# （进程内线程探测会饿死整个解释器），所以探测走子进程：超时即杀、判危险拒绝。
+# 实测 `(a+)+b` 对 26 字符行 1.15s 指数增长，64 字符样本对危险模式必然超时。
+_PROBE_SNIPPET = (
+    "import re,sys\n"
+    "p = re.compile(sys.argv[1])\n"
+    "p.search('a' * 64)\n"
+    "print('ok')\n"
+)
+_PATTERN_PROBE_TIMEOUT = 2.0
+
+
+_probe_verdicts = {}
+
+
+def _pattern_compiles_in_time(pattern, timeout=_PATTERN_PROBE_TIMEOUT):
+    """True unless a probe subprocess matching a fixed 64-char adversarial
+    sample against the pattern finishes within `timeout` seconds. Results are
+    memoized per pattern (one subprocess per distinct pattern per process).
+    Environment failures fail OPEN (a missing python must not break secret
+    scanning — the probe is a guard, not the scan itself)."""
+    cached = _probe_verdicts.get(pattern)
+    if cached is not None:
+        return cached
+    import subprocess
+    try:
+        proc = subprocess.run(
+            [sys.executable, "-c", _PROBE_SNIPPET, pattern],
+            stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=timeout,
+        )
+    except subprocess.TimeoutExpired:
+        return False
+    except OSError:
+        return True  # fail-open 是文档化选择（探测是守卫不是扫描本体）
+    verdict = proc.returncode == 0 and b"ok" in (proc.stdout or b"")
+    _probe_verdicts[pattern] = verdict
+    return verdict
+
 
 def compile_patterns(extra_patterns=None):
     """Compile user-supplied patterns with a clean error instead of a traceback."""
@@ -38,7 +77,7 @@ def compile_patterns(extra_patterns=None):
         if not pattern:
             continue
         try:
-            compiled.append(re.compile(pattern))
+            candidate = re.compile(pattern)
         except re.error as exc:
             print(
                 "[ERROR] Invalid regex in secret_patterns ({}): {}. Fix the pattern in "
@@ -46,6 +85,16 @@ def compile_patterns(extra_patterns=None):
                 file=sys.stderr,
             )
             raise SystemExit(2)
+        if not _pattern_compiles_in_time(pattern):
+            print(
+                "[ERROR] secret_patterns entry ({}) is too dangerous to run: it did not finish matching a "
+                "64-char adversarial probe within {:.1f}s (possible catastrophic backtracking). Remove or fix the "
+                "pattern in .autopilot/config.json or on the init command line.".format(
+                    pattern, _PATTERN_PROBE_TIMEOUT),
+                file=sys.stderr,
+            )
+            raise SystemExit(2)
+        compiled.append(candidate)
     return compiled
 
 

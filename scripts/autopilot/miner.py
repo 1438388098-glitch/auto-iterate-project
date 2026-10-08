@@ -452,6 +452,10 @@ def scan_hotspot(repo, limit=10, before_sha=None):
             effort=3,
             risk=2,
         ))
+        if len(findings) >= limit:
+            # config.md 承诺 --limit N caps per-kind results——六个兄弟扫描器
+            # 都落实了截断，唯独这里静默忽略（轮 21 candidate-320）。
+            break
     return findings
 
 

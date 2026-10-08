@@ -16,6 +16,15 @@ from .guard import path_allowed
 from .secrets import scan_staged_diff
 from . import miner
 from .verify import detect_smoke_commands, detect_verify_commands
+from .check_view import (
+    _check_text,
+    _backlog_watch,
+    brief_rank_entry,
+    build_check_payload,
+    mining_exhausted,
+    rank_for_selection,
+    _ready_valuable_count,
+)
 
 
 def emit_result(args, ok, message, data=None):
@@ -239,6 +248,9 @@ def cmd_init(args):
         )
 
     if getattr(args, "dry_run", False):
+        # Dry-run honesty（轮 15 候选 296）：真实 init 会过的 validate_config
+        # （如坏 --secret-pattern 正则）dry-run 也要同样过，预检才算预检。
+        config.validate_config(cfg, source="values from init flags")
         print(
             "[DRY-RUN] Would initialize autopilot state in {} with run_id {}, {} rounds, goals={}.".format(
                 repo, uuid.uuid4().hex[:io.RUN_ID_LENGTH], cfg.get("max_rounds"), cfg.get("goals")
@@ -281,8 +293,12 @@ def cmd_init(args):
             from . import dashboard_data
             st["project_map"] = dashboard_data.scan_project_framework(
                 repo, (cfg.get("dashboard") or {}).get("domain_map"))
-        except Exception:
+        except Exception as exc:
+            # 扫描失败不阻塞 init，但不再静默（轮 13 吞异常治理漏网）：
+            # 空树只能看到轮次叠加层，得留一句为什么。
             st["project_map"] = None
+            io.append_log(repo, "project-map", "warn",
+                          reason="init scan failed: {}".format(str(exc)[:200]))
         state.save_state(repo, st)
         io.ensure_git_exclude(git_dir, cfg.get("track_state", False), to_stderr=getattr(args, "json", False))
         state.ensure_branch(repo, st, cfg, to_stderr=getattr(args, "json", False))
@@ -295,8 +311,11 @@ def cmd_init(args):
             try:
                 pruned = state.prune_merged_autopilot_branches(
                     repo, keep=[st.get("branch")] if st.get("branch") else None)
-            except Exception:
+            except Exception as exc:
+                # 该删的分支没删时不能再静默（轮 13 吞异常治理漏网）。
                 pruned = {"deleted": [], "kept": []}
+                io.append_log(repo, "init", "warn",
+                              reason="leftover branch prune failed: {}".format(str(exc)[:200]))
         io.append_log(
             repo, "init", "success", run_id=run_id,
             branch_mode=cfg.get("branch_mode"),
@@ -315,12 +334,16 @@ def cmd_read(args):
     # Validate git first: a non-git path must fail as "Not a git repository",
     # not as the misleading "state.json not found" that load_state would print.
     io.git_dir_for(repo)
-    print(json.dumps(state.load_state(repo), indent=2, ensure_ascii=False))
+    # 锁内读取（轮 16 candidate-307）：load_state 可能触发迁移/回填写，
+    # 与活跃 run 的写入互斥——锁外读会用旧快照覆盖新状态。
+    with io.run_lock(repo):
+        payload = state.load_state(repo)
+    print(json.dumps(payload, indent=2, ensure_ascii=False))
     return 0
 
 
 def cmd_dashboard(args):
-    from autopilot import dashboard as ap_dash
+    from . import dashboard as ap_dash
     repo = Path(args.repo).resolve()
     if args.stop:
         sys.exit(0 if ap_dash.stop_server(repo) else 2)
@@ -330,8 +353,13 @@ def cmd_dashboard(args):
     try:
         ap_dash.serve(repo, port=args.port, auto_open=auto_open)
     except OSError as err:
-        print("[ERROR] dashboard: 端口 {} 无法绑定（可能被占用）——用 --port 0 换随机端口重试。（{}）".format(
-            args.port, err), file=sys.stderr)
+        print(_check_text(
+            cfg,
+            "[ERROR] dashboard: 端口 {} 无法绑定（可能被占用）——用 --port 0 换随机端口重试。（{}）".format(
+                args.port, err),
+            "[ERROR] dashboard: port {} could not bind (probably in use) — retry with --port 0 "
+            "for a random port. ({})".format(args.port, err),
+        ), file=sys.stderr)
         return 2
 
 
@@ -358,8 +386,10 @@ def cmd_begin_round(args):
             if dd_scan.project_map_stale(st.get("project_map"), repo):
                 st["project_map"] = dd_scan.scan_project_framework(
                     repo, (cfg.get("dashboard") or {}).get("domain_map"))
-        except Exception:
-            pass
+        except Exception as exc:
+            # 可选可观测路径：循环永不依赖 project map（软失败契约不变），
+            # 但纯静默会藏住真实损坏——降级为审计事件。
+            io.append_log(repo, "project-map", "warn", reason=str(exc)[:200])
         stop_reason = state.compute_stop_reason(st, cfg)
         if stop_reason is not None:
             io.append_log(repo, "begin-round", "error", reason=stop_reason)
@@ -369,11 +399,24 @@ def cmd_begin_round(args):
                 n = _ready_valuable_count(state.load_backlog(repo), cfg.get("min_candidate_value"))
                 return emit_result(
                     args, False,
-                    "[ERROR] Autopilot is stopped: all goals met (expand_after_goals=false)。"
-                    "backlog 尚有 {} 条 value>=min_candidate_value 的 ready 候选；"
-                    "要继续探索请运行 config-set --expand-after-goals 或修改 .autopilot/config.json。".format(n),
+                    _check_text(
+                        cfg,
+                        "[ERROR] Autopilot 已停止：目标已全部达成（all goals met，expand_after_goals=false）。"
+                        "backlog 尚有 {} 条 value>=min_candidate_value 的 ready 候选；"
+                        "要继续探索请运行 config-set --expand-after-goals 或修改 .autopilot/config.json。".format(n),
+                        "[ERROR] Autopilot is stopped: all goals met (expand_after_goals=false). "
+                        "{} ready candidates at value>=min_candidate_value remain; to keep exploring, "
+                        "run config-set --expand-after-goals or edit .autopilot/config.json.".format(n),
+                    ),
                 )
-            return emit_result(args, False, "[ERROR] Autopilot is stopped: {}. Finish or adjust the config before opening a new round.".format(stop_reason))
+            return emit_result(
+                args, False,
+                _check_text(
+                    cfg,
+                    "[ERROR] Autopilot 已停止（stopped）：{}。请 finish 或调整 config 后再开新轮。".format(stop_reason),
+                    "[ERROR] Autopilot is stopped: {}. Finish or adjust the config before opening a new round.".format(stop_reason),
+                ),
+            )
 
         # Round numbers come from a monotonic sequence, not from the round
         # counters: zero-work aborted rounds do not advance max_rounds's
@@ -458,7 +501,10 @@ def cmd_begin_round(args):
                     file=sys.stderr,
                 )
 
-        dirty = io.working_tree_dirty(repo)
+        # 一次 porcelain 解析同时供 dirty 布尔与 start_dirty_files 使用
+        # （轮 12 perf 候选：两者背靠背各 spawn 一次 status，输出必然相同）。
+        uncommitted = io.uncommitted_paths(repo)
+        dirty = bool(uncommitted)
         # Snapshot of what was already uncommitted when the round started (same
         # .autopilot/ filter as working_tree_dirty), EXCLUDING the leftovers the
         # run's own prior rounds deliberately left uncommitted (batch mode
@@ -469,8 +515,7 @@ def cmd_begin_round(args):
             if isinstance(entry, dict):
                 prior_deferred.update(entry.get("deferred_dirty_files") or [])
         start_dirty_files = (
-            [p for p in io.uncommitted_paths(repo) if p not in prior_deferred]
-            if dirty else []
+            [p for p in uncommitted if p not in prior_deferred] if dirty else []
         )
         allow_dirty = cfg.get("allow_uncommitted_changes", False)
         first_round = (
@@ -539,13 +584,17 @@ def cmd_begin_round(args):
         st["current_round"] = current
         st["last_activity_at"] = current["started_at"]
         state.save_state(repo, st)
-        io.append_log(repo, "begin-round", "success", round=round_number, candidate_id=candidate_ids)
+        io.append_log(
+            repo, "begin-round", "success",
+            round=round_number, candidate_id=candidate_ids,
+            title=args.title, start_sha=start_sha,
+        )
     # Observation dashboard (1.8.0): fire-and-forget spawn AFTER the run lock
     # is released — first enable busy-waits up to 5s inside ensure (spawn
     # handshake) and must never extend the lock hold. Hard rule: the loop must
     # not depend on the panel — a failure only warns, never blocks the round.
     try:
-        from autopilot import dashboard as ap_dash
+        from . import dashboard as ap_dash
         ap_dash.ensure_dashboard(repo, cfg)
     except Exception as err:
         io.append_log(repo, "dashboard", "error", reason="ensure failed", detail=str(err))
@@ -636,13 +685,15 @@ def _resolve_round_seeds_in_state(repo, st, current, outcome, notes=None):
 
 def _close_round(repo, st, current, status, counter_key, tokens, history_entry,
                  candidate_status, candidate_round=None, candidate_extra=None,
-                 seed_outcome=None, seed_notes=None, billed=None):
+                 seed_outcome=None, seed_notes=None, billed=None, uncommitted=None):
     """Shared round-closing bookkeeping: bump the round counter, append tokens,
     record bounded history, release the round, update candidates in one backlog
     pass, resolve this round's seeds into the SAME state save, refresh type
     stats, and persist state. `billed` is the run's advanced (text, binary)
     water-mark tuple from _resolve_tokens; run_start_sha is already on state
-    and is persisted along with it."""
+    and is persisted along with it. `uncommitted` lets a caller that already
+    holds a fresh porcelain listing share it (complete-round's touched_files
+    and the deferred capture below read the same snapshot)."""
     if counter_key:
         st[counter_key] = st.get(counter_key, 0) + 1
     if tokens:
@@ -657,11 +708,20 @@ def _close_round(repo, st, current, status, counter_key, tokens, history_entry,
     # Zero-work aborts leave exactly the inherited set, so they carve nothing.
     try:
         inherited = set(current.get("start_dirty_files") or [])
+        if uncommitted is None:
+            uncommitted = io.uncommitted_paths(repo)
         history_entry["deferred_dirty_files"] = [
-            p for p in io.uncommitted_paths(repo) if p not in inherited
+            p for p in uncommitted if p not in inherited
         ]
-    except SystemExit:
+    except SystemExit as exc:
+        # git 抖动一次不该永久丢失该轮遗留清单（轮 13 吞异常治理漏网）：
+        # 清空是原降级语义，但现在留审计——否则后续 flush 对账告警永不再
+        # 触发且查不到原因。
         history_entry["deferred_dirty_files"] = []
+        io.append_log(
+            repo, "deferred-files", "warn",
+            round=current.get("round"), reason=str(exc)[:200],
+        )
     history_entry.setdefault("status", status)
     # Full candidate batch beside the legacy scalar (1.12 field test: a
     # multi-candidate round's history entry kept only the FIRST id, so the
@@ -731,18 +791,28 @@ def cmd_complete_round(args):
                 io.append_log(repo, "complete-round", "error", reason="review score required")
                 return emit_result(
                     args, False,
-                    "[ERROR] review_threshold is {} but no --review-score was provided. "
-                    "Self-review the round on a 1-5 scale and pass --review-score.".format(review_threshold),
+                    _check_text(
+                        cfg,
+                        "[ERROR] 已配置 review_threshold={} 但未提供 --review-score。请对本轮做 1-5 自评并传 --review-score。".format(review_threshold),
+                        "[ERROR] review_threshold is {} but no --review-score was provided. "
+                        "Self-review the round on a 1-5 scale and pass --review-score.".format(review_threshold),
+                    ),
                 )
             if args.review_score < review_threshold:
                 if not getattr(args, "below_threshold", False):
                     io.append_log(repo, "complete-round", "error", reason="review score below threshold")
                     return emit_result(
                         args, False,
-                        "[ERROR] Self-review score {} is below review_threshold {}. "
-                        "Rework the round and re-verify, run block-round, or pass "
-                        "--below-threshold to record the low score without blocking the run.".format(
-                            args.review_score, review_threshold
+                        _check_text(
+                            cfg,
+                            "[ERROR] 自评 {} 低于 review_threshold {}（below review_threshold）。"
+                            "返工并重新验证、改用 block-round，或传 --below-threshold 以低分完成收口（不计受阻）。".format(
+                                args.review_score, review_threshold),
+                            "[ERROR] Self-review score {} is below review_threshold {}. "
+                            "Rework the round and re-verify, run block-round, or pass "
+                            "--below-threshold to record the low score without blocking the run.".format(
+                                args.review_score, review_threshold
+                            ),
                         ),
                     )
                 # Explicit quality admit-down: the round stays completed (it
@@ -750,6 +820,9 @@ def cmd_complete_round(args):
                 # the low score still feeds the calibration ledger.
                 below_threshold = True
 
+        # 一次 porcelain 解析供 touched_files 与 deferred_dirty_files 共用
+        # （轮 12 perf 候选：两处背靠背各 spawn 一次 status）。
+        uncommitted_now = io.uncommitted_paths(repo)
         _close_round(
             repo, st, current,
             status="completed",
@@ -770,7 +843,7 @@ def cmd_complete_round(args):
                 # touched-file list (worktree minus pre-round dirty files)
                 # still gives the dashboard per-round domain attribution.
                 "touched_files": [
-                    p for p in io.uncommitted_paths(repo)
+                    p for p in uncommitted_now
                     if p not in set(current.get("start_dirty_files") or [])
                 ],
                 "review_score": getattr(args, "review_score", None),
@@ -782,6 +855,7 @@ def cmd_complete_round(args):
             candidate_extra=(
                 {"review_score": args.review_score} if getattr(args, "review_score", None) is not None else None
             ),
+            uncommitted=uncommitted_now,
             seed_outcome="completed",
             billed=billed,
         )
@@ -833,6 +907,7 @@ def cmd_block_round(args):
                 file=sys.stderr,
             )
             return 0
+        blocked_ids = state.round_candidate_ids(current)
         _close_round(
             repo, st, current,
             status="blocked",
@@ -847,12 +922,25 @@ def cmd_block_round(args):
             },
             candidate_status="blocked",
             candidate_round=current["round"],
+            candidate_extra={"block_reason": args.reason or ""},
             seed_outcome="blocked",
             seed_notes=args.reason,
             billed=billed,
         )
-        io.append_log(repo, "block-round", "success", round=current["round"], reason=args.reason)
-        return emit_result(args, True, "[OK] Round blocked.")
+        # Field test Batch 6: the event carried no title and the candidates
+        # carried no block_reason — the block fact was smeared across
+        # state/log/backlog and only reconstructible by cross-file joins.
+        io.append_log(
+            repo, "block-round", "success",
+            round=current["round"], reason=args.reason,
+            title=args.title or current.get("title"),
+            candidate_ids=blocked_ids,
+        )
+        echo = ", ".join(blocked_ids) if blocked_ids else "no candidates attached"
+        return emit_result(
+            args, True,
+            "[OK] Round {} blocked. Blocked candidates: {}".format(current["round"], echo),
+        )
 
 
 def cmd_cancel_round(args):
@@ -1185,15 +1273,6 @@ def cmd_finish(args):
         st = state.load_state(repo)
         cfg = config.load_config(repo)
 
-        if getattr(args, "dry_run", False):
-            print(
-                "[DRY-RUN] Would finish the run (reason={}, stay={}, open_round={}).".format(
-                    args.reason, bool(getattr(args, "stay", False)), st.get("current_round") is not None
-                ),
-                file=sys.stderr,
-            )
-            return 0
-
         # P0 anti-early-stop gate: an honest finish needs a reached stop
         # condition or an explicit --force. Budgets remaining plus actionable
         # (or expansion-needing) backlog is exactly the premature stop this
@@ -1203,14 +1282,7 @@ def cmd_finish(args):
         watch = _backlog_watch(backlog, cfg)
         ready_floor = _ready_valuable_count(backlog, cfg.get("min_candidate_value"))
         ready_any = any_ready_candidates(backlog)
-        selected_count = 0
-        selected_empty_reason = None
-        if (cfg.get("ranking_mode", "expected") or "expected") != "classic":
-            ranked = state.rank_candidates(
-                backlog, cfg, progress=state.progress_from_state(st, cfg),
-                completed_goals=list(st.get("completed_goals") or []),
-            )
-            selected_count = len([e for e in ranked if e.get("selected")])
+        _, selected_count = rank_for_selection(backlog, st, cfg)
         # P0 anti-early-stop gate: an honest finish needs a reached stop
         # condition or an explicit --force. Refuse while ANY of the following
         # remains true — including below-floor ready work (the old gate only
@@ -1231,6 +1303,29 @@ def cmd_finish(args):
                 or not mining_ok
             )
         )
+        if getattr(args, "dry_run", False):
+            # Dry-run honesty（轮 15 候选 296）：预检必须回答真实调用会发生
+            # 什么——gate 会拒的 dry-run 也报拒，而不是谎报「会成功」。
+            if gate_blocks and not getattr(args, "force", False):
+                print(_check_text(
+                    cfg,
+                    "[DRY-RUN] Would REFUSE to finish（预检：真实调用将被拒绝）：未达任何停止条件"
+                    "且仍有工作（ready_any={}，ready_floor={}，selected={}，mining_exhausted={}）。".format(
+                        ready_any, ready_floor, selected_count, mining_ok
+                    ),
+                    "[DRY-RUN] Would REFUSE to finish: no stop condition reached; work remains "
+                    "(ready_any={}, ready_floor={}, selected={}, mining_exhausted={}).".format(
+                        ready_any, ready_floor, selected_count, mining_ok
+                    ),
+                ), file=sys.stderr)
+                return 2
+            print(
+                "[DRY-RUN] Would finish the run (reason={}, stay={}, open_round={}).".format(
+                    args.reason, bool(getattr(args, "stay", False)), st.get("current_round") is not None
+                ),
+                file=sys.stderr,
+            )
+            return 0
         if gate_blocks:
             if not getattr(args, "force", False):
                 io.append_log(
@@ -1243,10 +1338,18 @@ def cmd_finish(args):
                 )
                 return emit_result(
                     args, False,
-                    "[ERROR] Refusing to finish: no stop condition reached; work remains "
-                    "(ready_any={}, ready_floor={}, selected={}, mining_exhausted={}). "
-                    "Run `mine --apply` / Deep Expansion, or pass --force to override.".format(
-                        ready_any, ready_floor, selected_count, mining_ok
+                    _check_text(
+                        cfg,
+                        "[ERROR] Refusing to finish（拒绝收尾）：未达任何停止条件且仍有工作"
+                        "（ready_any={}，ready_floor={}，selected={}，mining_exhausted={}）。"
+                        "先跑 `mine --apply` / Deep Expansion 补供给，或用 --force 覆盖。".format(
+                            ready_any, ready_floor, selected_count, mining_ok
+                        ),
+                        "[ERROR] Refusing to finish: no stop condition reached; work remains "
+                        "(ready_any={}, ready_floor={}, selected={}, mining_exhausted={}). "
+                        "Run `mine --apply` / Deep Expansion, or pass --force to override.".format(
+                            ready_any, ready_floor, selected_count, mining_ok
+                        ),
                     ),
                 )
             io.append_log(repo, "finish-forced", "success", reason=args.reason, ready=ready_floor, ready_any=ready_any)
@@ -1448,6 +1551,17 @@ def cmd_backlog_add(args):
         title = args.title or (seed or {}).get("title")
         if not title:
             return emit_result(args, False, "[ERROR] --title is required (unless --from-seed supplies it).")
+        if getattr(args, "evidence", None) is None and seed is None:
+            # Deep Expansion protocol requires one concrete evidence note per
+            # candidate (field test Batch 3: five lens candidates all landed
+            # evidence-less because nothing reminded the operator). A seed
+            # promotion is exempt — the seed carries the hypothesis.
+            print(
+                "[WARN] No --evidence given: the protocol requires one concrete evidence note "
+                "per candidate (file:line or probe output). Accepted anyway; the candidate will "
+                "show as evidence-less in report/replay.",
+                file=sys.stderr,
+            )
         origin = getattr(args, "origin", None)
         if origin is not None and origin not in ("observed", "predicted", "expansion"):
             return emit_result(args, False, "[ERROR] --origin must be one of observed|predicted|expansion.")
@@ -1685,22 +1799,26 @@ def cmd_backlog_remove(args):
 
 def cmd_backlog_list(args):
     repo = Path(args.repo).resolve()
-    if not config.state_path_for(repo).exists():
-        return emit_result(args, False, "[ERROR] Autopilot not initialized. Run init first.")
+    refused = _require_initialized(args, repo, message="[ERROR] Autopilot not initialized. Run init first.")
+    if refused is not None:
+        return refused
     print(json.dumps(state.load_backlog(repo), indent=2, ensure_ascii=False))
     return 0
 
 
 def cmd_backlog_rank(args):
     repo = Path(args.repo).resolve()
-    if not config.state_path_for(repo).exists():
-        return emit_result(args, False, "[ERROR] Autopilot not initialized. Run init first.")
+    refused = _require_initialized(args, repo, message="[ERROR] Autopilot not initialized. Run init first.")
+    if refused is not None:
+        return refused
     top = getattr(args, "top", None)
     if top is not None and top < 1:
         return emit_result(args, False, "[ERROR] --top must be a positive integer.")
     backlog = state.load_backlog(repo)
     cfg = config.load_config(repo)
-    st = state.load_state(repo)
+    # 锁内读取（轮 16 candidate-307）：同 cmd_read——迁移写互斥。
+    with io.run_lock(repo):
+        st = state.load_state(repo)
     ranked = state.rank_candidates(
         backlog, cfg, progress=state.progress_from_state(st, cfg),
         completed_goals=list(st.get("completed_goals") or []),
@@ -1726,20 +1844,6 @@ def cmd_backlog_rank(args):
     return 0
 
 
-def brief_rank_entry(entry):
-    """Compact one ranked backlog entry for the loop's per-round read. Ranking
-    keeps score_breakdown and provenance because they explain a score to a
-    human debugging the ranking; the loop only needs what it acts on, and the
-    full form costs ~1.1KB per candidate per round (measured: 18KB for a
-    16-candidate backlog)."""
-    keep = (
-        "id", "title", "type", "value", "effort", "status", "score",
-        "ready", "blocked_by", "unlocks", "selected", "below_floor",
-        "cut_reason", "origin", "confidence",
-    )
-    return {key: entry[key] for key in keep if key in entry}
-
-
 def cmd_backlog_pick(args):
     repo = Path(args.repo).resolve()
     refused = _require_initialized(args, repo, message="[ERROR] Autopilot not initialized. Run init first.")
@@ -1747,6 +1851,7 @@ def cmd_backlog_pick(args):
         return refused
     with io.run_lock(repo):
         backlog = state.load_backlog(repo)
+        cfg = config.load_config(repo)
         candidate = state.find_candidate(backlog, args.id)
         if candidate is None:
             io.append_log(repo, "backlog-pick", "error", reason="candidate not found")
@@ -1754,9 +1859,33 @@ def cmd_backlog_pick(args):
         if getattr(args, "dry_run", False):
             print("[DRY-RUN] Would mark candidate {} as picked.".format(args.id), file=sys.stderr)
             return 0
+        if candidate.get("status") in ("completed", "blocked"):
+            # 账本防护（轮 13 api-design 候选）：把已完成/受阻候选静默翻回
+            # picked 会改写完成账本并让 state.type_stats 漂移。
+            io.append_log(repo, "backlog-pick", "error",
+                          reason="candidate already resolved", candidate_id=args.id,
+                          candidate_status=candidate.get("status"))
+            return emit_result(
+                args, False,
+                _check_text(
+                    cfg,
+                    "[ERROR] Candidate {} is already '{}'（状态已是 {}）——重复 pick 会静默改写完成/受阻账本"
+                    "并使 state.type_stats 漂移。如需重新开工，请用 backlog-update --status pending。".format(
+                        args.id, candidate.get("status"),
+                        "已完成" if candidate.get("status") == "completed" else "受阻"),
+                    "[ERROR] Candidate {} is already '{}' — picking it again would silently rewrite "
+                    "the completed/blocked ledger and drift state.type_stats. To reopen work, use "
+                    "backlog-update --status pending.".format(args.id, candidate.get("status")),
+                ),
+            )
         candidate["status"] = "picked"
         candidate["updated_at"] = io.now_iso()
         state.save_backlog(repo, backlog)
+        # 与 backlog-update/remove 同一契约：backlog 变更后 type_stats 快照
+        # 必须重算，否则与 rank_candidates 的新鲜计算互相矛盾。
+        st = state.load_state(repo)
+        _refresh_type_stats(repo, st)
+        state.save_state(repo, st)
         io.append_log(repo, "backlog-pick", "success", candidate_id=args.id)
         return emit_result(args, True, "[OK] Picked candidate: {}".format(args.id))
 
@@ -1802,8 +1931,13 @@ def cmd_branch_gc(args):
             # reported "kept" forever).
             if st.get("branch") and not st.get("finished_at"):
                 keep.append(st["branch"])
-        except SystemExit:
-            pass
+        except (SystemExit, ValueError) as exc:
+            # state.json 不可读时 fail-open（gc 的对象是遗留分支，不是本 run
+            # 的活动分支），但不再静默——留一条审计事件。
+            io.append_log(
+                repo, "branch-gc", "warn",
+                reason="state unreadable; run-branch keep skipped: {}".format(str(exc)[:120]),
+            )
     if dry_run:
         planned = state.prune_merged_autopilot_branches(
             repo, base=base, keep=keep, dry_run=True)
@@ -2089,17 +2223,36 @@ def cmd_commit(args):
             print(result.stderr.strip(), file=sys.stderr)
             io.append_log(repo, "commit", "error", reason="git commit failed")
             return emit_result(args, False, "[ERROR] git commit failed. Check pre-commit hooks or staged files.")
-        sha = io.run_git(repo, "rev-parse", "HEAD").stdout.strip()
-        if round_no is not None:
-            # seed-002 延伸（1.9）：批量 flush 时把批次 sha 记入本批各轮
-            # （无独立 sha 的 completed 轮），观察台时间轴据此获得准逐轮锚点。
-            for entry in st.get("history") or []:
-                if (entry.get("status") == "completed"
-                        and not entry.get("commit_sha")
-                        and entry.get("round") is not None
-                        and entry["round"] <= round_no):
-                    entry.setdefault("batch_commit_sha", sha)
-            state.save_state(repo, st)
+        # Post-commit window（轮 15 候选 299）：commit 已落盘后 rev-parse/
+        # state 回填若失败，这次冲刷不能在 state/log 里「从未发生」——
+        # sha 尽力从 git commit 输出兜底，审计事件必然落一条。
+        sha = ""
+        try:
+            sha = io.run_git(repo, "rev-parse", "HEAD").stdout.strip()
+            if round_no is not None:
+                # seed-002 延伸（1.9）：批量 flush 时把批次 sha 记入本批各轮
+                # （无独立 sha 的 completed 轮），观察台时间轴据此获得准逐轮锚点。
+                for entry in st.get("history") or []:
+                    if (entry.get("status") == "completed"
+                            and not entry.get("commit_sha")
+                            and entry.get("round") is not None
+                            and entry["round"] <= round_no):
+                        entry.setdefault("batch_commit_sha", sha)
+                state.save_state(repo, st)
+        except SystemExit as exc:
+            for token in (result.stdout or "").replace("]", " ").split():
+                if len(token) >= 7 and all(c in "0123456789abcdef" for c in token.lower()):
+                    sha = sha or token
+                    break
+            io.append_log(repo, "commit", "warn",
+                          reason="post-commit bookkeeping failed: {}".format(str(exc)[:150]),
+                          sha=sha or None)
+            print(
+                "[WARN] The commit {} IS on disk, but post-commit bookkeeping failed ({}): "
+                "batch_commit_sha backfill skipped — reconcile per-round anchors via git log.".format(
+                    (sha or "?")[:10], str(exc)[:120]),
+                file=sys.stderr,
+            )
         if bypassed_secrets:
             # Audit trail for the --allow-secrets bypass (U: SEC-03).
             io.append_log(repo, "commit", "success", commit_sha=sha, message=message, round=round_no, secrets_bypassed=True)
@@ -2114,8 +2267,9 @@ def cmd_commit(args):
 
 def cmd_secret_scan(args):
     repo = Path(args.repo).resolve()
-    if not config.state_path_for(repo).exists():
-        return emit_result(args, False, "[ERROR] Autopilot not initialized. Run init first.")
+    refused = _require_initialized(args, repo, message="[ERROR] Autopilot not initialized. Run init first.")
+    if refused is not None:
+        return refused
     cfg = config.load_config(repo)
     findings = scan_staged_diff(repo, cfg.get("secret_patterns"))
     payload = {"findings": findings, "clean": not findings}
@@ -2159,8 +2313,9 @@ def _write_report_output(args, repo, markdown, kind):
     if not candidate.is_absolute():
         candidate = repo / candidate
     output = candidate.resolve()
+    rel_output = None
     try:
-        output.relative_to(repo)
+        rel_output = output.relative_to(repo)
     except ValueError:
         if not getattr(args, "force", False):
             return emit_result(
@@ -2168,6 +2323,16 @@ def _write_report_output(args, repo, markdown, kind):
                 "[ERROR] --output {} is outside the target repository. Pass --force "
                 "to write there anyway.".format(output),
             )
+    # 运行态保护（轮 16 candidate-309）：仓库内的 .autopilot/ 是 run 的命根
+    # ——被误导的 agent 一条 `report --output .autopilot/state.json` 就能把它
+    # 覆写成 markdown。relative_to 只防外写，防不了这个内洞。
+    if rel_output is not None and not getattr(args, "force", False) \
+            and io._is_autopilot_path(rel_output.as_posix()):
+        return emit_result(
+            args, False,
+            "[ERROR] --output {} points into .autopilot/ (run state). Pick a path outside "
+            "it, or pass --force to overwrite anyway.".format(output),
+        )
     output.parent.mkdir(parents=True, exist_ok=True)
     output.write_text(markdown, encoding="utf-8")
     return emit_result(args, True, "[OK] {} written to {}".format(kind, output), data={"path": str(output)})
@@ -2175,7 +2340,14 @@ def _write_report_output(args, repo, markdown, kind):
 
 def cmd_report(args):
     repo = Path(args.repo).resolve()
-    st = state.load_state(repo)
+    if not config.state_path_for(repo).exists():
+        # 与 retrospective 同族守卫（轮 13 api-design 候选）：JSON 模式的
+        # 契约是单个可解析对象——未初始化时 load_state 的纯文本报错会把
+        # 循环 agent 的解析器炸掉。
+        return emit_result(args, False, "[ERROR] Autopilot not initialized. Run init first.")
+    # 锁内读取（轮 16 candidate-307）：迁移写与活跃 run 互斥。
+    with io.run_lock(repo):
+        st = state.load_state(repo)
     cfg = config.load_config(repo)
     lang = args.lang or cfg.get("report_lang", "zh")
     markdown = state.build_report(repo, st, cfg, lang)
@@ -2191,9 +2363,12 @@ def cmd_report(args):
 
 def cmd_retrospective(args):
     repo = Path(args.repo).resolve()
-    if not config.state_path_for(repo).exists():
-        return emit_result(args, False, "[ERROR] Autopilot not initialized. Run init first.")
-    st = state.load_state(repo)
+    refused = _require_initialized(args, repo, message="[ERROR] Autopilot not initialized. Run init first.")
+    if refused is not None:
+        return refused
+    # 锁内读取（轮 16 candidate-307）：迁移写与活跃 run 互斥。
+    with io.run_lock(repo):
+        st = state.load_state(repo)
     cfg = config.load_config(repo)
     lang = args.lang or cfg.get("report_lang", "zh")
     markdown = state.build_retrospective(repo, st, cfg, lang)
@@ -2244,8 +2419,9 @@ def cmd_analysis_save(args):
 
 def cmd_analysis_load(args):
     repo = Path(args.repo).resolve()
-    if not config.state_path_for(repo).exists():
-        return emit_result(args, False, "[ERROR] Autopilot not initialized. Run init first.")
+    refused = _require_initialized(args, repo, message="[ERROR] Autopilot not initialized. Run init first.")
+    if refused is not None:
+        return refused
     validity, reason = state.analysis_validity(repo)
     data = state.load_analysis(repo)
     io.append_log(repo, "analysis-load", "success" if validity == "fresh" else "warn", validity=validity)
@@ -2282,9 +2458,20 @@ def cmd_config_set(args):
         ("max_minutes", args.max_minutes),
         ("max_tokens", args.max_tokens),
     )
+    # max_blocked_in_a_row 允许 0（=run 立即停机，0/0 即满足停止条件），
+    # 不走 positive_int 门——与 init 的非负校验对齐（轮 34 candidate-351）。
     requested = {name: value for name, value in positive_int_fields if value is not None}
+    if args.max_blocked_in_a_row is not None:
+        if args.max_blocked_in_a_row < 0:
+            io.append_log(repo, "config-set", "error", reason="negative value",
+                          field="max_blocked_in_a_row", value=args.max_blocked_in_a_row)
+            return emit_result(
+                args, False,
+                "[ERROR] --max-blocked-in-a-row must be a non-negative integer (got {}).".format(args.max_blocked_in_a_row),
+            )
+        requested["max_blocked_in_a_row"] = args.max_blocked_in_a_row
     for name, value in requested.items():
-        if value < 1:
+        if value < 1 and name != "max_blocked_in_a_row":
             io.append_log(repo, "config-set", "error", reason="non-positive value", field=name, value=value)
             return emit_result(
                 args, False,
@@ -2295,6 +2482,7 @@ def cmd_config_set(args):
         ("max_minutes", "clear_max_minutes"),
         ("max_tokens", "clear_max_tokens"),
         ("deadline", "clear_deadline"),
+        ("max_blocked_in_a_row", "clear_max_blocked_in_a_row"),
     ):
         if getattr(args, clear_name):
             if value_name in requested:
@@ -2383,6 +2571,7 @@ def cmd_config_set(args):
             "--push/--no-push, --scan-secrets/--no-scan-secrets, --report-lang, "
             "--check-commands/--clear-check-commands, --smoke-commands/--clear-smoke-commands, "
             "--max-expansion-waves/--clear-max-expansion-waves, "
+            "--max-blocked-in-a-row/--clear-max-blocked-in-a-row, "
             "--dashboard/--no-dashboard, --dashboard-port).",
         )
 
@@ -2497,6 +2686,11 @@ def cmd_expansion_record(args):
         previous = st.get("expansion_waves") or []
         previous_set = set(previous[-1].get("lenses") or []) if previous else None
         wave = state.append_expansion_wave(st, lenses)
+        # Per-wave yield (candidate-272): mine runs record findings/applied,
+        # lens waves recorded nothing — the two supply channels were not
+        # comparable. Optional flags; absent stays None (old records clean).
+        wave["findings"] = getattr(args, "findings", None)
+        wave["applied"] = getattr(args, "applied", None)
         st["last_activity_at"] = io.now_iso()
         state.save_state(repo, st)
         repeated = previous_set is not None and set(wave["lenses"]) == previous_set
@@ -2510,7 +2704,11 @@ def cmd_expansion_record(args):
                 repo, "expansion-wave", "warn",
                 reason="same lens set as previous wave", lenses=wave["lenses"],
             )
-        io.append_log(repo, "expansion-wave", "success", lenses=wave["lenses"], wave_no=len(st.get("expansion_waves") or []))
+        io.append_log(
+            repo, "expansion-wave", "success",
+            lenses=wave["lenses"], wave_no=len(st.get("expansion_waves") or []),
+            findings=wave["findings"], applied=wave["applied"],
+        )
         message = "[OK] Expansion wave {} recorded (lenses: {}).".format(
             len(st.get("expansion_waves") or []), ", ".join(wave["lenses"])
         )
@@ -2537,8 +2735,9 @@ def cmd_directive_add(args):
 
 def cmd_directive_list(args):
     repo = Path(args.repo).resolve()
-    if not config.state_path_for(repo).exists():
-        return emit_result(args, False, "[ERROR] Autopilot not initialized. Run init first.")
+    refused = _require_initialized(args, repo, message="[ERROR] Autopilot not initialized. Run init first.")
+    if refused is not None:
+        return refused
     directives = state.load_directives(repo)
     # Each entry carries its 1-based index so directive-remove --index has an
     # unambiguous source (the error message points here).
@@ -2549,7 +2748,6 @@ def cmd_directive_list(args):
         ]
     }
     print(json.dumps(payload, indent=2, ensure_ascii=False))
-    return 0
     return 0
 
 
@@ -2731,36 +2929,6 @@ def _append_mining_run(st, findings_count, new_count, applied_count, kinds, appl
         del runs[: len(runs) - 20]
 
 
-def _mining_run_new(run):
-    """New-finding count of a mining run, with the pre-1.5.1 field fallback."""
-    value = run.get("new")
-    if value is None:
-        value = run.get("findings")
-    return int(value or 0)
-
-
-def mining_exhausted(st):
-    """True only after two consecutive mine runs added nothing new AND
-    (when expansion waves exist) the last two waves added nothing either.
-    Never-mined is NOT exhausted — the supply side has not been tried.
-    Read-only probes (no --apply) don't mutate the backlog, so when findings
-    exist their new-count degenerates to the raw count and misreads as churn;
-    such runs are excluded. A zero-finding probe IS real zero-new evidence and
-    still counts."""
-    runs = [
-        r for r in (st.get("mining_runs") or [])
-        if isinstance(r, dict) and (r.get("apply", True) or not int(r.get("findings") or 0))
-    ]
-    if len(runs) < 2:
-        return False
-    if any(_mining_run_new(r) > 0 for r in runs[-2:]):
-        return False
-    waves = [w for w in (st.get("expansion_waves") or []) if isinstance(w, dict)]
-    if waves and any((w.get("added") or 0) > 0 for w in waves[-2:]):
-        return False
-    return True
-
-
 def any_ready_candidates(backlog):
     """Dependency-ready pending candidates regardless of value floor."""
     count = 0
@@ -2861,7 +3029,15 @@ def cmd_mine(args):
             st = state.load_state(repo)
             _append_mining_run(st, result["count"], len(new_findings), 0, result["kinds"], apply_mode=False)
             state.save_state(repo, st)
-            state.save_state(repo, st)
+        # Audit event for the mining RUN itself (field test Batch 4: the
+        # per-candidate backlog-add events were logged, but "when did mine
+        # run and what did it yield" was invisible in replay).
+        io.append_log(
+            repo, "mine", "success",
+            findings=result["count"], new=len(new_findings),
+            applied=len(applied), apply=bool(getattr(args, "apply", False)),
+            kinds=result["kinds"],
+        )
 
         payload = {
             "ok": True,
@@ -2883,496 +3059,29 @@ def cmd_mine(args):
         return emit_result(args, True, message, data=payload)
 
 
-def _backlog_watch(backlog, cfg):
-    """Summarize pending backlog health for check. Empty/thin/unready backlog is an
-    expansion trigger, never an automatic stop."""
-    candidates = backlog.get("candidates") or []
-    pending = [c for c in candidates if c.get("status") == "pending"]
-    ready = []
-    for candidate in pending:
-        missing, is_ready = state.candidate_deps_status(backlog, candidate)
-        if is_ready:
-            ready.append(candidate)
-    min_pending = cfg.get("min_pending_candidates")
-    if min_pending is None:
-        min_pending = 3
-    # Expand when there is nothing actionable (ready==0), even if pending is
-    # "full" of dependency-blocked items — otherwise check says work while
-    # begin-round rejects every candidate.
-    needs_expansion = len(ready) == 0 or len(pending) < min_pending
-    return {
-        "pending": len(pending),
-        "ready": len(ready),
-        "min_pending_candidates": min_pending,
-        "needs_expansion": needs_expansion,
-    }
-
-
-def _ready_valuable_count(backlog, floor):
-    """Pending candidates that are dependency-ready and at or above the value
-    floor (``floor: null`` disables the filter). Shared by the finish gate,
-    check's unverified-goal warning, and begin-round's goals-met refusal —
-    "work remains" must mean the same thing in all three."""
-    count = 0
-    for candidate in backlog.get("candidates") or []:
-        if candidate.get("status") != "pending":
-            continue
-        _, is_ready = state.candidate_deps_status(backlog, candidate)
-        if is_ready and (floor is None or state._resolved_value(candidate) >= floor):
-            count += 1
-    return count
-
-
-def _check_text(cfg, zh_text, en_text):
-    """check guidance follows the report language (report_lang) so zh runs read
-    zh advice; anything non-zh falls back to en."""
-    return zh_text if (cfg.get("report_lang") or "zh") == "zh" else en_text
-
-
-def build_check_payload(repo, full=False):
-    """Build the check payload without printing it. `check` and `round-prep`
-    share this: round-prep is check's loop-driving fields plus the ranked
-    candidates, directives and schedule, so the loop needs one call per round
-    instead of four. `full` adds the state and config dump (the debugging
-    view; 5x the payload — the loop's contract is the brief form)."""
-    # Validate git first: a non-git path must fail as "Not a git repository",
-    # not as the misleading "state.json not found" that load_state would print.
-    io.git_dir_for(repo)
-    st = state.load_state(repo)
-    cfg = config.load_config(repo)
-    stop_reason = state.compute_stop_reason(st, cfg)
-    warnings = []
-
-    if st.get("current_round") is not None:
-        warnings.append("current_round is open; complete, block, or cancel it before starting a new round.")
-
-    repo_has_commits = io.has_commits(repo)
-    # Probed once and shared by the detached-HEAD check and the feature-mode
-    # branch-drift warning below: check is the loop's hottest command.
-    head_branch = io.current_branch(repo) if repo_has_commits else None
-    if not repo_has_commits:
-        warnings.append("Repository has no commits yet; git log is unavailable and the first round creates the initial commit.")
-    elif head_branch == "HEAD":
-        warnings.append("Detached HEAD; consider checking out a branch before starting.")
-
-    # Branch drift in feature mode: the round commands will refuse (commit/
-    # begin-round/complete-round), so say so here — check is the pre-flight.
-    # A FINISHED run no longer issues round commands; the recovery advice is
-    # noise there and can point at a branch finish already reclaimed
-    # (1.12 field test: finished runs warned about their deleted branch).
-    if cfg.get("branch_mode") == "feature" and st.get("branch") and not st.get("finished_at"):
-        expected = st["branch"]
-        if head_branch == "HEAD":
-            warnings.append(_check_text(
-                cfg,
-                "HEAD 处于 detached 状态，而本轮运行分支是 `{b}`；commit/begin-round/complete-round "
-                "将被拒绝（提交会悬空）。运行 ensure-branch 或 `git checkout {b}` 恢复。".format(b=expected),
-                "Detached HEAD while the run's branch is `{b}`; commit/begin-round/complete-round "
-                "will be refused (the commit would be orphaned). Run ensure-branch or "
-                "`git checkout {b}` to recover.".format(b=expected),
-            ))
-        elif head_branch != expected:
-            warnings.append(_check_text(
-                cfg,
-                "分支漂移：当前在 `{c}`，而本轮运行分支是 `{b}`；commit/begin-round/complete-round 将被拒绝，"
-                "防止把运行提交落到（并随 push 发布）错误分支。运行 ensure-branch 或 `git checkout {b}` 恢复。".format(
-                    c=head_branch, b=expected
-                ),
-                "Branch drift: HEAD is on `{c}` but the run's branch is `{b}`; "
-                "commit/begin-round/complete-round will be refused so the run's commits do not "
-                "land on (and get pushed from) the wrong branch. Run ensure-branch or "
-                "`git checkout {b}` to recover.".format(c=head_branch, b=expected),
-            ))
-
-    if st.get("config_fingerprint") and io.file_sha256(config.config_path_for(repo)) != st["config_fingerprint"]:
-        io.append_log(repo, "config-drift", "warn")
-        warnings.append(
-            "autopilot config.json changed since init; verify the change was intentional "
-            "(check_commands are executed and budgets are trusted by the loop)."
-        )
-
-    # Only the FIRST begin-round refuses a dirty tree; once a round is open
-    # this warning contradicts reality (later rounds only WARN), so it is
-    # emitted for the no-open-round case only.
-    if st.get("current_round") is None and io.working_tree_dirty(repo):
-        if not cfg.get("allow_uncommitted_changes"):
-            if (cfg.get("commit_every_rounds") or 1) > 1:
-                # Batch mode defers commits on purpose — same wording
-                # contract as begin-round's warning (fixed 1.12.3 there,
-                # synced here in 1.12.4): do NOT advise "commit or stash".
-                # "dirty" stays a stable token for consumers grepping it.
-                warnings.append(
-                    "Working tree is dirty with deferred work from earlier rounds — expected in batch "
-                    "mode (commit_every_rounds={}); the next flush round commits the batch.".format(
-                        cfg.get("commit_every_rounds")
-                    )
-                )
-            else:
-                warnings.append(
-                    "Working tree is dirty and allow_uncommitted_changes is false; only the first "
-                    "begin-round refuses a dirty tree, later rounds only warn. Commit or stash before "
-                    "starting the run, or set allow_uncommitted_changes: true."
-                )
-        else:
-            warnings.append(
-                "Working tree is dirty and allow_uncommitted_changes is true; pre-existing user "
-                "changes may be committed as part of a round."
-            )
-
-    goals = cfg.get("goals") or []
-    if not goals:
-        warnings.append("goals is empty; the run is open-ended and will stop only on the configured budgets.")
-    if (
-        cfg.get("max_rounds") is None
-        and cfg.get("max_minutes") is None
-        and cfg.get("deadline") is None
-        and cfg.get("max_tokens") is None
-        and cfg.get("max_blocked_in_a_row") is None
-        and not goals
-    ):
-        warnings.append("No stop condition is configured (goals and all max_* and deadline are unset); the loop has no automatic stopping point.")
-    if goals and cfg.get("expand_after_goals") and (
-        cfg.get("max_rounds") is None
-        and cfg.get("max_minutes") is None
-        and cfg.get("deadline") is None
-        and cfg.get("max_tokens") is None
-        and cfg.get("max_blocked_in_a_row") is None
-    ):
-        warnings.append("expand_after_goals is true but no other stop condition is configured; the expansion phase has no automatic stopping point.")
-    if cfg.get("review_threshold") is not None:
-        warnings.append("review_threshold is set; complete-round will require --review-score >= {}.".format(cfg["review_threshold"]))
-
-    if not cfg.get("scan_secrets", True):
-        warnings.append(_check_text(
-            cfg,
-            "secret 扫描已关闭（scan_secrets: false）：提交时不会拦截疑似密钥，请确认这是有意配置。",
-            "Secret scanning is disabled (scan_secrets: false); secret-like content will not be "
-            "blocked on commit. Confirm this is intentional.",
-        ))
-
-    if cfg.get("push"):
-        remotes = io.run_git(repo, "remote")
-        if remotes.returncode == 0 and not remotes.stdout.strip():
-            warnings.append("push is true but no git remote is configured; complete-round will warn on every push attempt.")
-
-    blocked_streak = state.count_consecutive_blocked(st)
-    max_blocked = cfg.get("max_blocked_in_a_row")
-    if max_blocked is not None and 1 <= blocked_streak < max_blocked:
-        warnings.append(
-            "blocked streak {}/{}: one more blocked round stops the run; a quality-failed "
-            "round can complete instead via complete-round --below-threshold".format(
-                blocked_streak, max_blocked
-            )
-        )
-
-    if (
-        cfg.get("review_threshold") is None
-        and st.get("completed_rounds", 0) >= 3
-        and all((entry.get("review_n") or 0) == 0 for entry in (st.get("type_stats") or {}).values())
-    ):
-        warnings.append(
-            "价值校准未激活，候选 value 自评未经验证；每轮 complete-round 传 --review-score"
-        )
-
-    backlog = state.load_backlog(repo)
-    backlog_watch = _backlog_watch(backlog, cfg)
-    candidates_per_round = cfg.get("candidates_per_round") or 1
-    if backlog_watch["pending"] >= 2 * candidates_per_round:
-        warnings.append(
-            "Backlog pending ({}) is at least twice the batch width ({}); consider raising "
-            "candidates_per_round to amortize the per-round fixed cost (verify, commit) over "
-            "more work.".format(backlog_watch["pending"], candidates_per_round)
-        )
-    goals_unverified = state.unverified_goals(st, cfg)
-    ready_floor = _ready_valuable_count(backlog, cfg.get("min_candidate_value"))
-    if goals_unverified and ready_floor > 0:
-        warnings.append(
-            "goal {} 未关联到已完成轮次（--round）；尚有 {} 条 value>=floor 的 ready 候选，不得 finish".format(
-                ", ".join(goals_unverified), ready_floor
-            )
-        )
-    # Lens-rotation observability: Deep Expansion runs in BOTH phases (thin
-    # backlog and post-goal expansion), so the rotation keys live at the top
-    # level rather than inside the expand-only payload. lenses_used is the
-    # order-preserving union across recorded waves; lenses_unused is what the
-    # next wave should draw from.
-    waves = [w for w in (st.get("expansion_waves") or []) if isinstance(w, dict)]
-    lenses_used = []
-    for wave in waves:
-        for lens in wave.get("lenses") or []:
-            if lens not in lenses_used:
-                lenses_used.append(lens)
-    analysis_status, analysis_reason = state.analysis_validity(repo)
-    commits_behind = state.analysis_commits_behind(repo)
-    if backlog_watch["needs_expansion"] and analysis_status == "stale" and (commits_behind or 0) >= 3:
-        warnings.append(
-            "analysis cache is {} commits stale; run analysis-load + analysis-save with a "
-            "fresh scan before the next expansion wave".format(commits_behind)
-        )
-    ranking_expected = cfg.get("ranking_mode", "expected") == "expected"
-    ranked = None
-    selected_entries = []
-    selected_empty_reason = None
-    if ranking_expected:
-        # One rank pass shared with the batch contract: check must never say
-        # "work" while rank_candidates would mark an empty selection — the two
-        # answers come from the same computation, not two drifted ones.
-        ranked = state.rank_candidates(
-            backlog, cfg, progress=state.progress_from_state(st, cfg),
-            completed_goals=list(st.get("completed_goals") or []),
-        )
-        selected_entries = [e for e in ranked if e.get("selected")]
-        if not selected_entries:
-            ready_pool = [e for e in ranked
-                          if e.get("status") == "pending" and e.get("ready") and not e.get("below_floor")]
-            ready_below = [e for e in ranked
-                           if e.get("status") == "pending" and e.get("ready") and e.get("below_floor")]
-            if ready_pool:
-                selected_empty_reason = ready_pool[0].get("cut_reason") or "quota"
-            elif ready_below:
-                selected_empty_reason = "floor"
-    open_seed_list = state.open_seeds(st)
-    seed_hint = ""
-    if open_seed_list:
-        seed_hint = (
-            " Wave 0 first: verify and value-gate the open direction seeds ({}) via "
-            "'backlog-add --from-seed <id>'; lens-scan Deep Expansion is the second wave.".format(
-                ", ".join(seed.get("id") or "" for seed in open_seed_list[:5])
-            )
-        )
-    action_hint = "expand" if (stop_reason is None and backlog_watch["needs_expansion"]) else (
-        "stop" if stop_reason is not None else "work"
+def _audit_loop_decision(repo, payload, source):
+    """循环决策审计（轮 12 observability 候选）：check/round-prep 每轮算出的
+    action_hint/stop_reason 此前只进 stdout 即蒸发——回放能看到每轮做了什么，
+    却看不到为什么选 work/expand/mine/stop。每次调用一行，log 轮转兜住量。
+    source 区分真实 check 与 round-prep 的决策（轮 36 candidate-365）。"""
+    backlog = payload.get("backlog") or {}
+    io.append_log(
+        repo, "check", "success",
+        via=source,
+        action_hint=payload.get("action_hint"),
+        stop_reason=payload.get("stop_reason"),
+        pending=backlog.get("pending"),
+        ready=backlog.get("ready"),
+        selected_count=payload.get("selected_count"),
+        phase=payload.get("phase"),
     )
-    if (
-        action_hint == "work"
-        and ranking_expected
-        and not selected_entries
-        and backlog_watch["ready"] > 0
-    ):
-        # Contract: action_hint=work must imply a non-empty recommended batch.
-        # Quota/type/cutoff cuts emptied the batch while ready candidates sit
-        # in the pool — expanding (new candidates or quota relief) is the
-        # honest move, not grinding a pool rank refused to select.
-        action_hint = "expand"
-
-    # Deterministic mining comes BEFORE judgment expansion: when the supply
-    # side is thin/empty and `mine` is stale, the next step is `mine --apply`.
-    # A non-empty ready pool that was quota/type-cut is an expansion problem
-    # (diversity / origin limits), not a mining problem — leave those as expand.
-    mining_runs = [r for r in (st.get("mining_runs") or []) if isinstance(r, dict)]
-    last_mine = mining_runs[-1] if mining_runs else None
-    mine_stale = (
-        last_mine is None
-        or (last_mine.get("findings") or 0) > (last_mine.get("applied") or 0)
-    )
-    if stop_reason is None and mine_stale and action_hint in ("expand", "work"):
-        min_pending = backlog_watch.get("min_pending_candidates")
-        if min_pending is None:
-            min_pending = 3
-        supply_thin = (
-            backlog_watch["pending"] == 0
-            or backlog_watch["ready"] == 0
-            or backlog_watch["pending"] < min_pending
-        )
-        quota_cut = bool(selected_empty_reason) and backlog_watch["ready"] > 0
-        if supply_thin and not quota_cut:
-            action_hint = "mine"
-
-    if stop_reason is None and action_hint == "mine":
-        # ONE actionable path replaces the formerly contradictory pair ("run
-        # Deep Expansion now" vs "run deterministic mining first"): mine is the
-        # first supply side, Deep Expansion only tops up what mining cannot.
-        warnings.append(_check_text(
-            cfg,
-            "Backlog 供给不足（pending={p}，ready={r}，min_pending_candidates={m}）："
-            "先 `mine --apply`（再 backlog-rank）；mine 之后 backlog 仍薄才做 Deep Expansion 探索。"
-            "Do not idle and do not finish — mining is the supply side.".format(
-                p=backlog_watch["pending"], r=backlog_watch["ready"],
-                m=backlog_watch["min_pending_candidates"],
-            ),
-            "Backlog supply is thin (pending={p}, ready={r}, min_pending_candidates={m}): "
-            "run `mine --apply` first (then backlog-rank); run Deep Expansion only if the "
-            "backlog is still thin after mining. "
-            "Do not idle and do not finish — mining is the supply side.".format(
-                p=backlog_watch["pending"], r=backlog_watch["ready"],
-                m=backlog_watch["min_pending_candidates"],
-            ),
-        ) + seed_hint)
-    elif stop_reason is None and backlog_watch["needs_expansion"]:
-        if backlog_watch["pending"] == 0:
-            warnings.append(
-                "Backlog has no pending candidates and deterministic mining is already fresh. "
-                "Do NOT idle or wait for the deadline: run Deep Expansion now (spawn explore "
-                "subagents, add 3-5 candidates with backlog-add). Empty backlog is an expansion "
-                "trigger, not a reason to stop."
-                + seed_hint
-            )
-        elif backlog_watch["ready"] == 0:
-            warnings.append(
-                "Backlog has {} pending candidates but 0 are dependency-ready. "
-                "Unblock depends-on chains or Deep Expansion for independent work; "
-                "do not idle.".format(backlog_watch["pending"])
-            )
-        else:
-            warnings.append(
-                "Backlog pending candidates ({}) is below min_pending_candidates ({}). "
-                "Top up via Deep Expansion (subagent scout) before the next begin-round; "
-                "do not grind the last thin candidates or idle. You may still begin-round "
-                "with existing ready candidates while expanding in parallel.".format(
-                    backlog_watch["pending"], backlog_watch["min_pending_candidates"]
-                )
-            )
-
-    payload = {
-        "continue": stop_reason is None,
-        "stop_reason": stop_reason,
-        "warnings": warnings,
-        "backlog": backlog_watch,
-        "action_hint": action_hint,
-        # 轮次进度（预算可见性）：max_rounds 为 null 时 remain 亦为 null
-        "round_progress": {
-            "round_seq": st.get("round_seq", 0),
-            "max_rounds": cfg.get("max_rounds"),
-            "remaining": (
-                max(0, cfg["max_rounds"] - st.get("round_seq", 0))
-                if isinstance(cfg.get("max_rounds"), int) else None
-            ),
-        },
-        "selected_count": len(selected_entries) if ranking_expected else None,
-        "selected_empty_reason": selected_empty_reason,
-        "wave_no": len(waves),
-        "lenses_used": lenses_used,
-        "lenses_unused": [lens for lens in state.EXPANSION_LENSES if lens not in lenses_used],
-        "mining": {
-            "runs": len(mining_runs),
-            "last_findings": (last_mine or {}).get("findings"),
-            "last_applied": (last_mine or {}).get("applied"),
-            "exhausted": mining_exhausted(st),
-        },
-        "analysis": {
-            "status": analysis_status,
-            "reason": analysis_reason,
-            "commits_behind": commits_behind,
-            # Same key set as round-prep's analysis object (which overwrites
-            # this when the cache is fresh) — same-named fields must not
-            # exist in one payload and vanish from the other.
-            "cached": None,
-        },
-    }
-    goals_met = state.all_goals_met(cfg, st)
-    payload["goals_met"] = goals_met
-    payload["goals_unverified"] = goals_unverified
-    payload["phase"] = "expand" if (goals_met and cfg.get("expand_after_goals")) else "iterate"
-    if payload["phase"] == "expand":
-        # Expansion context for Wave 0 (seed wave). Key set is stable even when
-        # every list is empty — `seeds` is [] rather than a missing key so the
-        # consumer's key-existence check never flips between runs.
-        type_stats = st.get("type_stats") or {}
-        recent_types = {}
-        for candidate_type in sorted(type_stats):
-            entry = type_stats.get(candidate_type)
-            if not isinstance(entry, dict):
-                continue
-            try:
-                recent_types[candidate_type] = int(entry.get("completed") or 0)
-            except (TypeError, ValueError, OverflowError):
-                recent_types[candidate_type] = 0
-        saturated = state.saturated_types(st, cfg.get("type_saturation_threshold", 2))
-        underused = [t for t in state.VALID_CANDIDATE_TYPES if t not in saturated]
-        suggested_themes = []
-        for event in reversed(st.get("goal_events") or []):
-            if not isinstance(event, dict):
-                continue
-            if event.get("goal"):
-                suggested_themes.append("follow up on goal: {}".format(event["goal"]))
-            suggested_themes.extend((event.get("recent_commit_topics") or [])[:2])
-            break
-        payload["expansion"] = {
-            "seeds": [
-                {
-                    "id": seed.get("id"),
-                    "title": seed.get("title"),
-                    "type": seed.get("type") or "feature",
-                    "from_capability": seed.get("from_capability") or "",
-                    "source_goal": seed.get("source_goal") or "",
-                    "status": seed.get("status"),
-                }
-                for seed in state.open_seeds(st)
-            ],
-            "completed_goals": list(st.get("completed_goals") or []),
-            "recent_types": recent_types,
-            "saturated_types": saturated,
-            "underused_types": underused,
-            "suggested_themes": suggested_themes,
-            "min_pending_candidates": cfg.get("min_pending_candidates") if cfg.get("min_pending_candidates") is not None else 3,
-        }
-    completed_total = (
-        st.get("completed_rounds", 0)
-        + st.get("blocked_rounds", 0)
-        + st.get("cancelled_rounds", 0)
-        + st.get("reverted_rounds", 0)
-    )
-    # Boundary math: the anchor is the next round that will CLOSE (completed
-    # rounds plus the open one, if any). Round k is itself a boundary when
-    # k % every == 0 — with commit_every_rounds 5 the next boundary after 4
-    # closed rounds is 5, and once round 5 has closed the same formula points
-    # at 10 instead of re-reporting the finished round.
-    anchor = completed_total + 1
-    verify_every = cfg.get("verify_every_rounds") or 1
-    commit_every = cfg.get("commit_every_rounds") or 1
-    payload["next_verify_round"] = ((anchor - 1) // verify_every + 1) * verify_every
-    payload["next_commit_round"] = ((anchor - 1) // commit_every + 1) * commit_every
-    checkpoint_every = cfg.get("checkpoint_every")
-    payload["next_checkpoint_round"] = (
-        ((anchor - 1) // checkpoint_every + 1) * checkpoint_every if checkpoint_every else None
-    )
-    payload["blocked_streak"] = blocked_streak
-
-    # Budget observability: max_minutes measures wall-clock since the last
-    # round activity (pausing burns it), deadline is an absolute moment.
-    max_minutes = cfg.get("max_minutes")
-    remaining_minutes = None
-    if max_minutes is not None:
-        last_activity = io.parse_time(st.get("last_activity_at") or st.get("started_at"))
-        if last_activity is not None:
-            elapsed = (datetime.now(timezone.utc) - last_activity).total_seconds() / 60
-            remaining_minutes = round(max(0.0, max_minutes - elapsed), 1)
-    deadline_remaining = None
-    deadline_at = io.parse_time(cfg.get("deadline"))
-    if deadline_at is not None:
-        deadline_remaining = round((deadline_at - datetime.now(timezone.utc)).total_seconds() / 60, 1)
-    payload["budget"] = {
-        "max_minutes": max_minutes,
-        "last_activity_at": st.get("last_activity_at"),
-        "remaining_minutes": remaining_minutes,
-        "deadline_remaining_minutes": deadline_remaining,
-    }
-    # Subagent spend from an expansion wave is invisible to max_tokens (that
-    # estimate counts diffs), so the wave cap is the bound that actually holds.
-    max_waves = cfg.get("max_expansion_waves")
-    waves_used = state.expansion_wave_count(st)
-    payload["expansion_budget"] = {
-        "waves_used": waves_used,
-        "max_waves": max_waves,
-        "waves_left": None if max_waves is None else max(0, max_waves - waves_used),
-    }
-    if max_waves is not None and waves_used >= max_waves and stop_reason is None:
-        # `warnings` is the same list object already bound into payload.
-        warnings.append(
-            "Expansion wave cap reached ({}/{}): stop expanding and work the remaining backlog to a "
-            "stop condition, or raise the cap with `config-set --max-expansion-waves N`. Note that "
-            "max_tokens does not see subagent spend (it estimates from diffs), so this cap is the "
-            "only hard bound on expansion cost.".format(waves_used, max_waves)
-        )
-    if full:
-        payload["state"] = st
-        payload["config"] = cfg
-    return payload
 
 
 def cmd_check(args):
     repo = Path(args.repo).resolve()
     payload = build_check_payload(repo, full=not getattr(args, "brief", False))
+    payload.pop("_ctx", None)
+    _audit_loop_decision(repo, payload, "check")
     print(json.dumps(payload, indent=2, ensure_ascii=False))
     return 0
 
@@ -3389,20 +3098,26 @@ def cmd_round_prep(args):
     reading it. round-prep is one call and one JSON.
     """
     repo = Path(args.repo).resolve()
-    if not config.state_path_for(repo).exists():
-        return emit_result(args, False, "[ERROR] Autopilot not initialized. Run init first.")
+    refused = _require_initialized(args, repo, message="[ERROR] Autopilot not initialized. Run init first.")
+    if refused is not None:
+        return refused
     top = getattr(args, "top", None)
     if top is not None and top < 1:
         return emit_result(args, False, "[ERROR] --top must be a positive integer.")
     payload = build_check_payload(repo)
-    cfg = config.load_config(repo)
-    st = state.load_state(repo)
-    backlog = state.load_backlog(repo)
-
-    ranked = state.rank_candidates(
-        backlog, cfg, progress=state.progress_from_state(st, cfg),
-        completed_goals=list(st.get("completed_goals") or []),
-    )
+    # ctx 复用（轮 12 perf 候选）：ranked/cfg/state/backlog 在 build_check_payload
+    # 里已经算过——此前这里全部重载并重跑 rank_candidates，再跑一遍 analysis 有效性。
+    ctx = payload.pop("_ctx", None) or {}
+    if ctx:
+        cfg = ctx["cfg"]
+        st = ctx["st"]
+        backlog = ctx["backlog"]
+        ranked = ctx["ranked"]
+    else:
+        cfg = config.load_config(repo)
+        st = state.load_state(repo)
+        backlog = state.load_backlog(repo)
+        ranked, _ = rank_for_selection(backlog, st, cfg)
     if top is None:
         # The recommended batch plus one backup: enough to open a round and
         # absorb one candidate going stale between prep and begin-round,
@@ -3413,9 +3128,13 @@ def cmd_round_prep(args):
     payload["recommended"] = [entry["id"] for entry in pending[:top] if entry.get("selected")]
     payload["withheld"] = max(0, len(pending) - len(payload["candidates"]))
 
-    validity, reason = state.analysis_validity(repo)
-    cached = state.load_analysis(repo) if validity == "fresh" else None
-    payload["analysis"]["cached"] = (cached or {}).get("analysis") if isinstance(cached, dict) else None
+    # 有效性与缓存内容：状态已在 payload["analysis"] 里（含 commits_behind），
+    # 只有 fresh 才需要读缓存文件本体。
+    if payload["analysis"].get("status") == "fresh":
+        cached = state.load_analysis(repo)
+        payload["analysis"]["cached"] = (cached or {}).get("analysis") if isinstance(cached, dict) else None
+    else:
+        payload["analysis"]["cached"] = None
     payload["directives"] = state.load_directives(repo).get("directives") or []
 
     open_round = st.get("current_round")
@@ -3433,7 +3152,8 @@ def cmd_round_prep(args):
         if open_round
         else None
     )
-
+    payload.pop("_ctx", None)
+    _audit_loop_decision(repo, payload, "round-prep")
     print(json.dumps(payload, indent=2, ensure_ascii=False))
     return 0
 

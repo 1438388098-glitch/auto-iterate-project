@@ -83,8 +83,10 @@ def _config_error(path, message, source=None):
             file=sys.stderr,
         )
     else:
+        # path 参数自诘认知：非 init-flag 来源的错误把真实文件名带上
+        # （轮 21 dead-code 候选 321——收了不用的参数要么用要么删）。
         print(
-            "[ERROR] Invalid .autopilot/config.json: {}. Fix the value or delete the file and run init again.".format(message),
+            "[ERROR] Invalid .autopilot/config.json: {}. Fix the value or delete the file and run init again. (file: {})".format(message, path),
             file=sys.stderr,
         )
     raise SystemExit(2)
@@ -120,7 +122,11 @@ def validate_config(merged, source=None):
     that trace back to init flags rather than an on-disk file."""
     path = config_path_for(Path(merged.get("repo") or "."))
 
-    if not isinstance(merged["goals"], list):
+    if not isinstance(merged["goals"], list) or not all(
+        isinstance(goal, str) for goal in merged["goals"]
+    ):
+        # 项级校验（轮 32 candidate-343）：文案承诺 array of strings——
+        # [42] 这类项会变成 normalize 原样返回、all_goals_met 恒 False 的死目标。
         _config_error(path, "'goals' must be an array of strings", source)
     for key in ("max_rounds", "max_minutes", "max_tokens", "max_round_scope"):
         value = merged.get(key)
@@ -138,10 +144,12 @@ def validate_config(merged, source=None):
             _config_error(path, "'deadline' must be an ISO-8601 timestamp string or null", source)
         elif io.parse_time(deadline) is None:
             _config_error(
-                config_path_for(repo),
+                path,
                 "'deadline' must be an absolute ISO-8601 timestamp (for example "
                 "'2026-08-10T08:00:00'). Use init --deadline to resolve relative "
-                "expressions like '+8h' or '08:00'.",
+                "expressions like '+8h' or '08:00'. Or fix in place with "
+                "config-set --deadline.",
+                source,
             )
     if merged.get("max_blocked_in_a_row") is not None and (
         not isinstance(merged["max_blocked_in_a_row"], int) or isinstance(merged["max_blocked_in_a_row"], bool)
