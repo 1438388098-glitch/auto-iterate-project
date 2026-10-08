@@ -812,7 +812,7 @@
     $("dir-cnt").textContent = "· " + cands.length;
     $("directions").innerHTML = cands.map(function (c) {
       return '<div class="dirrow">'
-        + '<span class="ve mono">v' + fmt(c.value) + " e" + fmt(c.effort) + "</span>"
+        + '<span class="ve mono">v' + escapeHtml(fmt(c.value)) + " e" + escapeHtml(fmt(c.effort)) + "</span>"
         + "<span>" + escapeHtml(c.title || "") + "</span>"
         + '<span class="ty mono">' + escapeHtml(c.type || "") + "</span></div>";
     }).join("");

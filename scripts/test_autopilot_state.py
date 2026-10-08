@@ -4462,6 +4462,14 @@ class DashboardContractTests(RepoTest):
         ap = self.repo / ".autopilot"
         return sorted(p.name for p in ap.iterdir())
 
+    def test_dashboard_html_directions_sink_escaped(self):
+        """wave12 candidate-412：fmt() 是 String() 非转义——value/effort 曾是
+        页面仅剩的原始 innerHTML 汇点。钉死修复形态（宽泛的 fmt 静态守卫会
+        误伤 textContent 安全流，故只锁此汇点的转义包裹）。"""
+        html = (Path(autopilot.__file__).parent / "dashboard.html").read_text(encoding="utf-8")
+        self.assertIn("escapeHtml(fmt(c.value))", html)
+        self.assertIn("escapeHtml(fmt(c.effort))", html)
+
     def test_unlink_info_tolerates_locked_file(self):
         """candidate-397：Windows 句柄释放竞态——刚被杀掉的 server 留下的
         打开句柄会让 unlink 抛 PermissionError；_unlink_info 必须容忍而不是
