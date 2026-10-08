@@ -2990,6 +2990,75 @@ class IoAppendLogTests(unittest.TestCase):
         self.assertIn("[WARN] Failed to append", stderr.getvalue())
 
 
+class EstimateTokensUnitTests(RepoTest):
+    """candidate-388：run 级单调记账（io.estimate_tokens_for_round）直测。
+    锁六条契约：空 run 零计费（TOKEN_BASE 不落零差轮）、首轮 500+12/行、
+    水位线防重复计费、改小不退账、二进制按文件平价、坏 base sha fail-closed。"""
+
+    def _initial_commit(self):
+        (self.repo / "seed.txt").write_text("seed\n", encoding="utf-8")
+        self.git("add", "seed.txt")
+        self.git("commit", "-q", "-m", "seed")
+        return self.git("rev-parse", "HEAD").stdout.strip()
+
+    def test_empty_run_bills_zero(self):
+        head = self._initial_commit()  # RepoTest 已含 README 1 行，从 HEAD 起算
+        result = ap_io.estimate_tokens_for_round(self.repo, head, 0, 0)
+        self.assertEqual(result, (0, 0, 0))  # 零差不收 TOKEN_BASE
+
+    def test_first_round_charges_base_plus_lines(self):
+        run_start = self._initial_commit()
+        (self.repo / "b.txt").write_text("1\n2\n3\n", encoding="utf-8")
+        self.git("add", "b.txt")
+        tokens, total_t, total_b = ap_io.estimate_tokens_for_round(self.repo, run_start, 0, 0)
+        self.assertEqual((tokens, total_t, total_b), (500 + 3 * 12, 3, 0))
+
+    def test_monotonic_marks_prevent_double_billing(self):
+        run_start = self._initial_commit()
+        (self.repo / "b.txt").write_text("1\n2\n3\n", encoding="utf-8")
+        self.git("add", "b.txt")
+        first = ap_io.estimate_tokens_for_round(self.repo, run_start, 0, 0)
+        self.assertEqual(first[0], 500 + 3 * 12)
+        self.git("commit", "-q", "-m", "b")  # 提交后行数离开 worktree 差
+        again = ap_io.estimate_tokens_for_round(self.repo, run_start, first[1], first[2])
+        self.assertEqual(again[0], 0)  # 已计费行不再计费
+        self.assertEqual(again[1], 3)  # 总量口径不变
+        (self.repo / "b.txt").write_text("1\n2\n3\n4\n5\n", encoding="utf-8")
+        self.git("add", "b.txt")
+        third = ap_io.estimate_tokens_for_round(self.repo, run_start, first[1], first[2])
+        self.assertEqual(third[0], 500 + 2 * 12)  # 只对增量收
+
+    def test_observation_below_marks_clamps_to_zero(self):
+        # max(0, total-billed) 的夹零契约：_close_round 持久化的单调水位线
+        # 高于本次观测时（行被提交/重写），本轮 0 计费、绝不退账。
+        run_start = self._initial_commit()
+        (self.repo / "b.txt").write_text("1\n2\n3\n", encoding="utf-8")
+        self.git("add", "b.txt")
+        tokens, total_t, total_b = ap_io.estimate_tokens_for_round(self.repo, run_start, 100, 5)
+        self.assertEqual((tokens, total_t, total_b), (0, 3, 0))
+
+    def test_binary_files_flat_cost(self):
+        run_start = self._initial_commit()
+        (self.repo / "blob.bin").write_bytes(b"\x00\x01\x02binary")
+        self.git("add", "blob.bin")
+        tokens, total_t, total_b = ap_io.estimate_tokens_for_round(self.repo, run_start, 0, 0)
+        self.assertEqual((tokens, total_t, total_b), (500 + 100, 0, 1))
+
+    def test_worktree_and_index_combined(self):
+        run_start = self._initial_commit()
+        (self.repo / "b.txt").write_text("1\n2\n3\n", encoding="utf-8")
+        self.git("add", "b.txt")          # index +3
+        with open(self.repo / "b.txt", "a", encoding="utf-8") as handle:
+            handle.write("4\n5\n6\n7\n")  # worktree 再 +4
+        _, total_t, _ = ap_io.estimate_tokens_for_round(self.repo, run_start, 0, 0)
+        self.assertEqual(total_t, 7)
+
+    def test_bad_start_sha_fails_closed(self):
+        self._initial_commit()
+        with self.assertRaises(SystemExit):
+            ap_io.estimate_tokens_for_round(self.repo, "deadbeef" * 5 + "0000", 0, 0)
+
+
 class OptimizationTests(RepoTest):
     """Dirty-tree rules, budgets, deadline, JSON shapes, config errors."""
 
