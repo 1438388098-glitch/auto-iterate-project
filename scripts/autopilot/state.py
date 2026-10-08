@@ -1785,6 +1785,7 @@ _STATUS_LABELS = {
         "handover": "待办交接（下一轮从这里接续）", "handover_total": "遗留 pending 候选",
         "handover_hint": "按 score 降序（ready 优先）；新 run 用显式 --candidate-id 接续，无需重新挖矿",
         "tokens": "估算 Token", "repo": "仓库", "none": "无",
+        "aborted": "空转取消",
         "deadline": "定时截止", "seeds": "方向假设（种子）",
         "seed_status": {"open": "待处理", "promoted": "已立项", "verified": "已验证",
                         "refuted": "已证伪", "rejected": "已否决", "pending": "待处理",
@@ -1800,6 +1801,7 @@ _STATUS_LABELS = {
         "handover": "Pending handover (next run starts here)", "handover_total": "pending candidates left",
         "handover_hint": "score-descending (ready first); a new run resumes with explicit --candidate-id — no re-mining needed",
         "tokens": "Estimated tokens", "repo": "Repo", "none": "none",
+        "aborted": "aborted rounds",
         "deadline": "Deadline timer", "seeds": "Direction seeds (predictions)",
         "seed_status": {"open": "open", "promoted": "promoted", "verified": "verified",
                         "refuted": "refuted", "rejected": "rejected", "pending": "pending",
@@ -1852,6 +1854,18 @@ def build_report(repo, state, cfg, lang="en"):
     out.append("- {}: {}".format(L["blocked"], state.get("blocked_rounds", 0)))
     out.append("- {}: {}".format(L["cancelled"], state.get("cancelled_rounds", 0)))
     out.append("- {}: {}".format(L["revert"], state.get("reverted_rounds", 0)))
+    # aborted 轮不进任何计数器（counter_key=None）但占历史表一行——
+    # 从窗口内统计使计数与下表可对账（wave17 candidate-435）。
+    history_entries = state.get("history") or []
+    aborted_n = sum(
+        1 for entry in history_entries
+        if isinstance(entry, dict) and entry.get("status") == "aborted"
+    )
+    if aborted_n:
+        zh = (cfg.get("report_lang") or "zh") == "zh"
+        out.append("- {}: {} ({})*".format(
+            L.get("aborted", "aborted rounds"), aborted_n,
+            "零工作取消，不消耗预算" if zh else "zero-work cancels, no budget burned"))
     out.append("- {}: {}".format(L["tokens"], state.get("estimated_tokens_used", 0)))
     out.append("")
 
@@ -1976,19 +1990,32 @@ def build_report(repo, state, cfg, lang="en"):
 
 def write_phase_report(repo, state, cfg):
     """Write a phase report (every io.PHASE_REPORT_INTERVAL completed rounds) in the
-    configured language, keeping only the most recent io.PHASE_REPORT_KEEP files."""
+    configured language, keeping only the most recent io.PHASE_REPORT_KEEP files.
+
+    Trim scope is THIS run only (wave17 candidate-434): files older than the
+    run's started_at belong to a previous run — the old round-number trim
+    deleted this run's fresh low-numbered report while keeping a dead run's
+    files, and the "[PHASE] written" message lied."""
     lang = cfg.get("report_lang", "zh")
     completed = state.get("completed_rounds", 0)
     markdown = build_report(repo, state, cfg, lang)
     path = io.autopilot_file_for(repo, "{}{}.md".format(io.PHASE_REPORT_PREFIX, completed))
+    run_start = io.parse_time(state.get("started_at") or "")
     try:
         path.parent.mkdir(parents=True, exist_ok=True)
         path.write_text(markdown, encoding="utf-8")
         reports = []
         for old in path.parent.glob(io.PHASE_REPORT_PREFIX + "*.md"):
             suffix = old.name[len(io.PHASE_REPORT_PREFIX):-3]
-            if suffix.isdigit():
-                reports.append((int(suffix), old))
+            if not suffix.isdigit():
+                continue
+            if run_start is not None:
+                try:
+                    if old.stat().st_mtime < run_start.timestamp():
+                        continue  # 上役遗留：不动也不计入本 run 保留配额
+                except OSError:
+                    pass
+            reports.append((int(suffix), old))
         reports.sort()
         for _, old in reports[:-io.PHASE_REPORT_KEEP]:
             # Retention cleanup: failing to trim an old report must not fail

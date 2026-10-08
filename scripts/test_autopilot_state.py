@@ -2008,6 +2008,40 @@ class LedgerGuardTests(RepoTest):
         survivors = filter_new_findings(findings, [])
         self.assertEqual(len(survivors), 2)
 
+    def test_phase_report_trim_and_archive_are_run_scoped(self):
+        # wave17 candidate-434：上役遗留的 phase-report 不参与本 run 修剪
+        # （不再挤删新报告），也不被 --archive-reports 归档成本 run 记录。
+        import time as _time
+        self.run_state("init")
+        ap_dir = self.repo / ".autopilot"
+        old_report = ap_dir / "phase-report-round-40.md"
+        old_report.write_text("stale previous run", encoding="utf-8")
+        old_mtime = _time.time() - 3600
+        import os as _os
+        _os.utime(old_report, (old_mtime, old_mtime))
+        # 直接驱动报告写入（complete 每 10 轮才触发）：本 run 写 round-10，
+        # 上役遗留 round-40 共存但互不挤删
+        state = ap_state.load_state(self.repo)
+        state["completed_rounds"] = 10
+        config = config_module.load_config(self.repo)
+        ap_state.write_phase_report(self.repo, state, config)
+        self.assertTrue((ap_dir / "phase-report-round-10.md").exists())
+        self.assertTrue(old_report.exists())
+        result = self.run_state("finish", "--reason", "done", "--archive-reports", "--force")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        archived = self.repo / "docs" / "autopilot"
+        self.assertFalse((archived / "phase-report-round-40.md").exists())
+        self.assertTrue((archived / "phase-report-round-10.md").exists())
+
+    def test_report_counts_include_aborted_rounds(self):
+        # wave17 candidate-435：aborted 占历史一行但不进计数器——报告补一行
+        # 使计数与历史表可对账。
+        self.run_state("init")
+        self.run_state("begin-round", "--title", "r", "--reason", "x")
+        self.run_state("cancel-round", "--reason", "probe")  # aborted
+        report = self.run_state("report")
+        self.assertIn("空转取消: 1", report.stdout)
+
     def test_config_set_budget_domains_match_init(self):
         # wave12 candidate-409：同一字段两扇门同域——max_rounds 收 0（立即
         # 停机）、max_minutes 收小数，与 init/validator 一致。

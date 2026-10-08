@@ -1547,7 +1547,16 @@ def cmd_finish(args):
                 archive_dir.mkdir(parents=True, exist_ok=True)
                 if retrospective_path:
                     shutil.copy2(retrospective_path, archive_dir / io.RETROSPECTIVE_FILENAME)
+                # 只归档本 run 的报告（wave17 candidate-434）：跨 run 残留的
+                # 旧报告曾会被当作本 run 的记录永久化进 docs/autopilot。
+                run_start_ts = io.parse_time(st.get("started_at") or "")
                 for report in sorted((repo / io.AUTOPILOT_DIR).glob("phase-report-round-*.md")):
+                    if run_start_ts is not None:
+                        try:
+                            if report.stat().st_mtime < run_start_ts.timestamp():
+                                continue
+                        except OSError:
+                            pass
                     shutil.copy2(report, archive_dir / report.name)
                 if getattr(args, "json", False):
                     # JSON 模式信息行走 stderr（config.md 契约）：这是文档
