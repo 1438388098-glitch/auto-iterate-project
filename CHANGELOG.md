@@ -154,6 +154,10 @@ deterministic mine round). 26 implemented candidates, suite grown 261 → 302.
   commands; check/state key enumerations include the 1.14 additions
   (`deferred_paths`, `lenses_used_all`, `aborted_rounds`, `round_progress`);
   README highlights refreshed to the 1.14 view (bilingual).
+- Regression pins from the final test-gap audit: the deferred-paths ledger's
+  full lifecycle (defer → commit → exit → re-defer), classic-mode saturation
+  honoring `effective_saturation_threshold`, the `detect_smoke_commands`
+  python branch, and unicode log entries surviving rotation into archives.
 - Supply-side audits (miner/verify/agent): `scan_swallowed` skips its own
   docstring (it minted two value-4 garbage candidates per mine run);
   `detect-verify` walks the whole tree for pytest layouts (a repo with its
