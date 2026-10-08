@@ -605,7 +605,11 @@ def _dedup_key(finding):
     file = finding.get("file")
     if kind in ("markers", "swallowed"):
         return ("mine", kind, file, _evidence_body(finding)[:120])
-    if kind in ("hotspot", "syntax", "docs-drift"):
+    if kind == "docs-drift":
+        # 每条断链独立（wave14 candidate-430）：evidence 含缺失路径，同一
+        # README 引用 N 个死路径是 N 条独立供给，不该塌缩成第一条。
+        return ("mine", kind, file, finding.get("evidence") or "")
+    if kind in ("hotspot", "syntax"):
         return ("mine", kind, file)
     if kind in ("test-gap", "dead-export"):
         match = re.search(r"`([^`]+)`", finding.get("title") or "")

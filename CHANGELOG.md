@@ -119,6 +119,21 @@ deterministic mine round). 26 implemented candidates, suite grown 261 → 302.
   round_seq), so aborted rounds no longer point them at already-spent
   numbers; a checkpoint boundary now WARNS in check/round-prep — the human
   steering wheel was the only safety feature with no in-loop tripwire.
+- Supply-side audits (miner/verify/agent): `scan_swallowed` skips its own
+  docstring (it minted two value-4 garbage candidates per mine run);
+  `detect-verify` walks the whole tree for pytest layouts (a repo with its
+  5000-line suite in scripts/ used to report "nothing detected" — live-verified
+  on this repository); the smoke recommendation only suggests `npm run lint`
+  when the lint script exists; `detect-agent` probes the canonical homes
+  (`~/.claude/CLAUDE.md`, `~/.codex/AGENTS.md`) so real installs stop
+  degrading to generic; docs-drift findings dedupe per missing reference
+  instead of collapsing to the first per README.
+- Supply hints: after `mining.exhausted` flips true, `check` stops steering
+  the loop into注定-zero mine runs and points at Deep Expansion instead.
+- `overview.md` (the agent-facing overview) now documents `mine` and
+  `round-prep`; troubleshooting gains playbooks for push failures, the
+  `diagnose` first move, merge-commit undo, ensure-branch dirty trees and
+  batch-flush "nothing staged".
 - SKILL.md: exhaustion stated once, as the helper's conjunction
   (`mining.exhausted`) with the ≥3-subagents bar marked agent-side; stop
   condition list reordered to the helper's report order; dashboard

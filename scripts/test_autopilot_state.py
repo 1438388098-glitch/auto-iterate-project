@@ -1993,6 +1993,21 @@ class LedgerGuardTests(RepoTest):
         signals = detect_smoke_commands(str(self.repo))
         self.assertNotIn(("node", "npm run lint"), signals)
 
+    def test_docs_drift_dedup_keeps_per_reference(self):
+        # wave14 candidate-430：docs-drift 去重键曾只按文件塌缩——同一 README
+        # 的 N 条断链应各自存活（evidence 含缺失路径）。
+        from autopilot.miner import filter_new_findings
+        findings = [
+            {"kind": "docs-drift", "file": "README.md",
+             "evidence": "README.md: references scripts/a.py", "title": "t1",
+             "reason": "r", "value": 3, "effort": 1, "type": "bugfix"},
+            {"kind": "docs-drift", "file": "README.md",
+             "evidence": "README.md: references scripts/b.py", "title": "t2",
+             "reason": "r", "value": 3, "effort": 1, "type": "bugfix"},
+        ]
+        survivors = filter_new_findings(findings, [])
+        self.assertEqual(len(survivors), 2)
+
     def test_config_set_budget_domains_match_init(self):
         # wave12 candidate-409：同一字段两扇门同域——max_rounds 收 0（立即
         # 停机）、max_minutes 收小数，与 init/validator 一致。
