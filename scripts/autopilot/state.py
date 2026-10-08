@@ -1133,12 +1133,14 @@ def compute_predicted_account(backlog):
     completed = blocked = 0
     review_sum = 0.0
     review_n = 0
+    value_sum = 0.0
     for candidate in backlog.get("candidates", []):
         if candidate.get("origin") != "predicted":
             continue
         status = candidate.get("status")
         if status == "completed":
             completed += 1
+            value_sum += _resolved_value(candidate)
             review = candidate.get("review_score")
             if isinstance(review, (int, float)) and not isinstance(review, bool) and review == review:
                 review_sum += review
@@ -1156,8 +1158,8 @@ def compute_predicted_account(backlog):
         "review_n": review_n,
         "review_avg": round(review_sum / review_n, 2) if review_n else None,
         "calibration": (
-            round(max(0.6, min(1.5, (review_sum / review_n) / max(1, completed))), 2)
-            if review_n >= 3 and completed else 1.0
+            round(max(0.6, min(1.5, (review_sum / review_n) / (value_sum / completed))), 2)
+            if review_n >= 3 and completed and value_sum > 0 else 1.0
         ),
     }
 
@@ -1261,7 +1263,14 @@ def _score_expected(candidate, type_stats=None, saturation_threshold=2,
     confidence_factor = confidence
 
     based_on = candidate.get("based_on")
-    goal_chain_factor = 1.08 if (based_on and based_on in (completed_goals or [])) else 1.0
+    # 归一比较（wave13 candidate-417）：全文件其余目标比较都走
+    # normalize_goal_text——NFC/零宽/空白差异不该吞掉 ≤1.08 的平局裁决加成。
+    normalized_completed = [normalize_goal_text(goal) for goal in (completed_goals or [])]
+    goal_chain_factor = (
+        1.08
+        if based_on and normalize_goal_text(based_on) in normalized_completed
+        else 1.0
+    )
 
     unlock_bonus = 1.0 + 0.15 * unlocks
 
