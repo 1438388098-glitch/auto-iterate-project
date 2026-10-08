@@ -1600,6 +1600,57 @@ class LedgerGuardTests(RepoTest):
         self.assertNotEqual(refused.returncode, 0)
         self.assertIn("'candidates_per_round' must be a positive integer", refused.stderr)
 
+    def test_max_same_type_null_disables_quota(self):
+        self.run_state("init")
+        for _ in range(5):
+            self.run_state("backlog-add", "--title", "t", "--reason", "r",
+                           "--value", "5", "--effort", "1", "--type", "test")
+        config_path = self.repo / ".autopilot" / "config.json"
+
+        def _rank_selected():
+            out = self.run_state("backlog-rank", "--pending-only")
+            entries = json.loads(out.stdout[out.stdout.find("["):])
+            return [e for e in entries if e.get("selected")]
+
+        config = json.loads(config_path.read_text(encoding="utf-8"))
+        config["max_same_type_per_round"] = None  # 文档口径：禁用配额
+        config_path.write_text(json.dumps(config), encoding="utf-8")
+        self.assertEqual(len(_rank_selected()), 4)  # 批宽 4 全满，无 type 截断
+        config["max_same_type_per_round"] = 2
+        config_path.write_text(json.dumps(config), encoding="utf-8")
+        self.assertEqual(len(_rank_selected()), 2)  # 对照：默认配额生效
+
+    def test_detect_verify_apply_refreshes_fingerprint(self):
+        self.run_state("init")  # 先 init：脏树（pyproject）会被 init 拒绝
+        (self.repo / "pyproject.toml").write_text(
+            "[project]\nname = 't'\n", encoding="utf-8")
+        result = self.run_state("detect-verify", "--apply")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        config = json.loads(
+            (self.repo / ".autopilot" / "config.json").read_text(encoding="utf-8"))
+        self.assertTrue(config["check_commands"])
+        data = json.loads(self.run_state("check", "--brief").stdout)
+        self.assertFalse(
+            any("config.json changed since init" in w for w in data["warnings"]))
+
+    def test_state_shape_validation_for_supply_keys(self):
+        self.run_state("init")
+        state_path = self.repo / ".autopilot" / "state.json"
+        st = json.loads(state_path.read_text(encoding="utf-8"))
+        st["mining_runs"] = {}
+        state_path.write_text(json.dumps(st), encoding="utf-8")
+        refused = self.run_state("mine")
+        self.assertNotEqual(refused.returncode, 0)
+        self.assertIn("Invalid .autopilot/state.json", refused.stderr)
+        self.assertIn("'mining_runs' must be an array", refused.stderr)
+        st = json.loads(state_path.read_text(encoding="utf-8"))
+        st["mining_runs"] = []
+        st["expansion_waves"] = "oops"
+        state_path.write_text(json.dumps(st), encoding="utf-8")
+        refused2 = self.run_state("expansion-record", "--lens", "tests")
+        self.assertNotEqual(refused2.returncode, 0)
+        self.assertIn("'expansion_waves' must be an array", refused2.stderr)
+
 
 class BudgetAccountingTests(RepoTest):
     """P1 budget/round accounting: zero-work cancels do not consume a round,

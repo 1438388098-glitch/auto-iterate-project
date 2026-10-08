@@ -2918,6 +2918,11 @@ def cmd_detect_verify(args):
         cfg = config.load_config(repo)
         cfg["check_commands"] = commands
         config.save_config(repo, cfg)
+        # 这次改动同样是故意的：刷新指纹与 config-set 同一契约（wave9
+        # candidate-382）——否则之后每次 check 都报永久 config-drift 假阳性。
+        st = state.load_state(repo)
+        st["config_fingerprint"] = io.file_sha256(config.config_path_for(repo))
+        state.save_state(repo, st)
         io.append_log(repo, "detect-verify", "success", commands=commands)
         return emit_result(args, True, "[OK] check_commands set to {}".format(commands), data=payload)
     if not commands and args.apply:

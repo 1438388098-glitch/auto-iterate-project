@@ -190,6 +190,12 @@ def _validate_state_types(repo, state):
         _state_type_error(path, "'goal_events' must be an array")
     if not isinstance(state.get("goal_seeds", []), list):
         _state_type_error(path, "'goal_seeds' must be an array")
+    # 供给侧两键（wave9 candidate-383）：坏形状曾让 mine/expansion-record
+    # 以裸 AttributeError 崩溃（cli 只捕 ValueError/KeyError/TypeError/OSError）。
+    if not isinstance(state.get("mining_runs", []), list):
+        _state_type_error(path, "'mining_runs' must be an array")
+    if not isinstance(state.get("expansion_waves", []), list):
+        _state_type_error(path, "'expansion_waves' must be an array")
     current = state.get("current_round")
     if current is not None and not isinstance(current, dict):
         _state_type_error(path, "'current_round' must be an object or null")
@@ -1342,7 +1348,12 @@ def _mark_selection(entries, cfg, progress=None):
         batch is already full (so consumers can tell why nothing was picked)
     """
     n = cfg.get("candidates_per_round") or 3
-    max_per_type = cfg.get("max_same_type_per_round") or 2
+    max_per_type = cfg.get("max_same_type_per_round")
+    if max_per_type is None:
+        # 文档口径（config.md「Set to null to disable the quota」）：null 禁用
+        # 配额，不是折叠回默认 2（wave9 candidate-381）——与下面
+        # max_predicted/max_expansion 的 None=不封顶同一条语义线。
+        max_per_type = len(entries)
     max_predicted = cfg.get("max_predicted_per_round")
     if max_predicted is None:
         max_predicted = len(entries)
