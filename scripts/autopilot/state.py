@@ -1403,9 +1403,12 @@ def _mark_selection(entries, cfg, progress=None):
     for entry in entries:
         entry["selected"] = False
         entry.pop("cut_reason", None)
-    pool = [e for e in entries if e.get("status") == "pending" and e.get("ready") and not e.get("below_floor")]
-    below = [e for e in entries if e.get("status") == "pending" and e.get("ready") and e.get("below_floor")]
-    observed_ready = any((e.get("origin") or "observed") == "observed" for e in pool)
+    ready_pending = [e for e in entries if e.get("status") == "pending" and e.get("ready")]
+    pool = [e for e in ready_pending if not e.get("below_floor")]
+    below = [e for e in ready_pending if e.get("below_floor")]
+    # 尾期安全阀口径（wave13 candidate-416）：「observed 仍就绪」含 below-floor——
+    # 只看池子会让阀门恰在观测工作跌破价值下限时（收尾期常态）失效。
+    observed_ready = any((e.get("origin") or "observed") == "observed" for e in ready_pending)
     predicted_quota = 0 if (late_run and observed_ready) else max_predicted
     selected = []
     type_counts = {}
@@ -1472,6 +1475,20 @@ def _mark_selection(entries, cfg, progress=None):
         entry["selected"] = True
 
 
+def _rank_sort_key(item):
+    """Deterministic rank order: pending first, ready first, score desc,
+    below-floor demoted at equal score (wave13 candidate-418), observed
+    before predicted/expansion, then id as the total-order tiebreak."""
+    return (
+        item.get("status") != "pending",
+        not item.get("ready"),
+        -item.get("score", 0.0),
+        bool(item.get("below_floor")),
+        (item.get("origin") or "observed") != "observed",
+        item.get("id") or "",
+    )
+
+
 def progress_from_state(state, cfg):
     """Fraction of the round budget consumed (0-1), or None when max_rounds is unset."""
     max_rounds = (cfg or {}).get("max_rounds")
@@ -1530,15 +1547,7 @@ def rank_candidates(backlog, cfg, progress=None, completed_goals=None):
         entry["unlocks"] = unlocks.get(candidate.get("id"), 0)
         entry["below_floor"] = bool(floor is not None and _resolved_value(candidate) < floor)
         entries.append(entry)
-    entries.sort(
-        key=lambda item: (
-            item.get("status") != "pending",
-            not item.get("ready"),
-            -item.get("score", 0.0),
-            (item.get("origin") or "observed") != "observed",
-            item.get("id") or "",
-        )
-    )
+    entries.sort(key=_rank_sort_key)
     if cfg.get("ranking_mode", "expected") != "classic":
         _mark_selection(entries, cfg, progress=progress)
     return entries

@@ -1867,6 +1867,40 @@ class LedgerGuardTests(RepoTest):
         seed_status = next(s["status"] for s in st["goal_seeds"] if s["id"] == "seed-001")
         self.assertEqual(seed_status, "promoted")  # 种子标记补完
 
+    def test_late_run_cut_sees_below_floor_observed(self):
+        # wave13 candidate-416：尾期安全阀口径 = 有任何 observed 就绪（含
+        # below-floor）——predicted 让位，选 below-floor 的 O1 而非预测 P1。
+        entries = [
+            {"id": "p1", "status": "pending", "ready": True, "below_floor": False,
+             "score": 3.2, "origin": "predicted", "type": "feature"},
+            {"id": "o1", "status": "pending", "ready": True, "below_floor": True,
+             "score": 1.0, "origin": "observed", "type": "bugfix"},
+        ]
+        ap_state._mark_selection(entries, {"candidates_per_round": 2, "min_candidate_value": 3},
+                                 progress=0.8)
+        self.assertTrue(entries[1]["selected"])  # O1 入选
+        self.assertEqual(entries[0].get("cut_reason"), "late_run")
+        self.assertFalse(entries[0]["selected"])
+
+    def test_sort_key_demotes_below_floor_at_equal_score(self):
+        # wave13 candidate-418：同分时快赢排在主池之后（config.md 降位承诺）。
+        backlog = {"candidates": [
+            {"id": "candidate-001", "status": "pending", "ready": True,
+             "title": "quick", "value": 2, "effort": 1, "risk": 1, "type": "bugfix"},
+            {"id": "candidate-002", "status": "pending", "ready": True,
+             "title": "main", "value": 4, "effort": 1, "risk": 1, "type": "bugfix"},
+        ]}
+        base = {"status": "pending", "ready": True, "origin": "observed", "id": "x"}
+        equal_main = dict(base, score=1.5, below_floor=False, id="candidate-002")
+        equal_quick = dict(base, score=1.5, below_floor=True, id="candidate-001")
+        self.assertGreater(
+            ap_state._rank_sort_key(equal_quick), ap_state._rank_sort_key(equal_main))
+        # 分数仍主导：高分快赢压过低分主池（降位只在同分生效）
+        high_quick = dict(base, score=2.8, below_floor=True, id="candidate-001")
+        low_main = dict(base, score=0.1, below_floor=False, id="candidate-002")
+        self.assertLess(
+            ap_state._rank_sort_key(high_quick), ap_state._rank_sort_key(low_main))
+
     def test_config_set_budget_domains_match_init(self):
         # wave12 candidate-409：同一字段两扇门同域——max_rounds 收 0（立即
         # 停机）、max_minutes 收小数，与 init/validator 一致。
