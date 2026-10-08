@@ -1901,6 +1901,35 @@ class LedgerGuardTests(RepoTest):
         self.assertLess(
             ap_state._rank_sort_key(high_quick), ap_state._rank_sort_key(low_main))
 
+    def test_boundary_fields_use_round_number_space(self):
+        # wave13 candidate-419：轮 5 aborted（耗号不进计数器）后，边界字段必须
+        # 站在轮号空间——next_commit_round=10（下一个将关闭的轮 6 之后的边界），
+        # 修复前锚 completed_total+1=5，指向已发生的号。
+        self.run_state("init", "--commit-every-rounds", "5", "--verify-every-rounds", "3")
+        state_path = self.repo / ".autopilot" / "state.json"
+        st = json.loads(state_path.read_text(encoding="utf-8"))
+        st["history"] = [{"round": i, "status": "completed"} for i in (1, 2, 3, 4)]
+        st["history"].append({"round": 5, "status": "aborted"})
+        st["completed_rounds"] = 4
+        st["round_seq"] = 5
+        state_path.write_text(json.dumps(st), encoding="utf-8")
+        data = json.loads(self.run_state("check", "--brief").stdout)
+        self.assertEqual(data["next_commit_round"], 10)
+        self.assertEqual(data["next_verify_round"], 6)
+
+    def test_checkpoint_boundary_warns(self):
+        # wave13 candidate-420：下一轮撞上 checkpoint 界时必须出声（此前唯一
+        # 无绊线的安全特性）。
+        self.run_state("init", "--checkpoint-every", "3")
+        state_path = self.repo / ".autopilot" / "state.json"
+        st = json.loads(state_path.read_text(encoding="utf-8"))
+        st["round_seq"] = 2
+        st["completed_rounds"] = 2
+        st["history"] = [{"round": 1, "status": "completed"}, {"round": 2, "status": "completed"}]
+        state_path.write_text(json.dumps(st), encoding="utf-8")
+        data = json.loads(self.run_state("check", "--brief").stdout)
+        self.assertTrue(any("checkpoint" in w.lower() for w in data["warnings"]))
+
     def test_config_set_budget_domains_match_init(self):
         # wave12 candidate-409：同一字段两扇门同域——max_rounds 收 0（立即
         # 停机）、max_minutes 收小数，与 init/validator 一致。

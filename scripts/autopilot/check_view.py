@@ -529,12 +529,20 @@ def build_check_payload(repo, full=False):
             "suggested_themes": suggested_themes,
             "min_pending_candidates": cfg.get("min_pending_candidates") if cfg.get("min_pending_candidates") is not None else 3,
         }
-    # Boundary math: the anchor is the next round that will CLOSE (completed
-    # rounds plus the open one, if any). Round k is itself a boundary when
-    # k % every == 0 — with commit_every_rounds 5 the next boundary after 4
-    # closed rounds is 5, and once round 5 has closed the same formula points
-    # at 10 instead of re-reporting the finished round.
-    anchor = completed_total + 1
+    # Boundary math: the anchor is the NUMBER of the round that will close
+    # next — the open round's own number, else round_seq + 1. Round numbers
+    # come from the monotonic round_seq (aborted rounds consume numbers
+    # without advancing the counters), so anchoring on completed_total made
+    # the boundary fields point at already-spent numbers after any abort and
+    # desync them from commit's own round-number WARN (wave13 candidate-419).
+    # Round k is itself a boundary when k % every == 0.
+    open_round_entry = st.get("current_round") or {}
+    if open_round_entry:
+        anchor = open_round_entry.get("round")
+    else:
+        # max() 兼容两种状态形态：真实 run 的 round_seq ≥ 计数器（aborted 耗
+        # 号），测试/老 state 可能只推进 completed_rounds。
+        anchor = max(completed_total, st.get("round_seq", 0) or 0) + 1
     verify_every = cfg.get("verify_every_rounds") or 1
     commit_every = cfg.get("commit_every_rounds") or 1
     payload["next_verify_round"] = ((anchor - 1) // verify_every + 1) * verify_every
@@ -543,6 +551,20 @@ def build_check_payload(repo, full=False):
     payload["next_checkpoint_round"] = (
         ((anchor - 1) // checkpoint_every + 1) * checkpoint_every if checkpoint_every else None
     )
+    if checkpoint_every and anchor == payload["next_checkpoint_round"]:
+        # checkpoint 绊线（wave13 candidate-420）：人工方向盘是唯一没有在环
+        # 强制的安全特性——姊妹节奏（commit WARN / 扩展上限 / review 阈值）
+        # 都在边界时刻出声，checkpoint 曾只算数字不出声。
+        warnings.append(_check_text(
+            cfg,
+            "下一轮（轮 {n}）是 checkpoint 轮（checkpoint_every={m}）：先汇总进度"
+            "（backlog 头部、token、提交数）并向用户请示继续/换向/改预算/停止。".format(
+                n=anchor, m=checkpoint_every),
+            "The next round (round {n}) is a checkpoint round (checkpoint_every={m}): "
+            "summarize progress (backlog top, tokens, commits) and consult the user — "
+            "continue / change goals / change budgets / stop — before continuing.".format(
+                n=anchor, m=checkpoint_every),
+        ))
     payload["blocked_streak"] = blocked_streak
 
     # Budget observability: max_minutes measures wall-clock since the last
