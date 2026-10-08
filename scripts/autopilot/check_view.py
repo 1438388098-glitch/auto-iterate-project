@@ -480,7 +480,7 @@ def build_check_payload(repo, full=False):
                 recent_types[candidate_type] = int(entry.get("completed") or 0)
             except (TypeError, ValueError, OverflowError):
                 recent_types[candidate_type] = 0
-        saturated = state.saturated_types(st, cfg.get("type_saturation_threshold", 2))
+        saturated = state.saturated_types(st, state.effective_saturation_threshold(cfg))
         underused = [t for t in state.VALID_CANDIDATE_TYPES if t not in saturated]
         suggested_themes = []
         for event in reversed(st.get("goal_events") or []):

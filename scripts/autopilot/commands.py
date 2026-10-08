@@ -1153,7 +1153,7 @@ def cmd_goal_met(args):
         recent_topics = []
         round_candidate_ids = []
         if not args.no_auto_context:
-            saturated = state.saturated_types(st, cfg.get("type_saturation_threshold", 2))
+            saturated = state.saturated_types(st, state.effective_saturation_threshold(cfg))
             recent_topics = _recent_commit_topics(repo)
             round_candidate_ids = _last_completed_candidate_ids(st)
 

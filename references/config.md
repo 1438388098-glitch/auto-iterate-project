@@ -164,7 +164,7 @@ Array of regex strings, default `[]`. Extra patterns appended to the built-in se
 
 ### type_saturation_threshold
 
-Integer, default `2`. After this many candidates of the same `type` have been completed, `backlog-rank` downweights further same-type pending candidates by logarithmic decay with a hard floor (`max(0.35, 1.0 - 0.12 * log2(1 + max(0, completed - threshold)))` in the default `ranking_mode: expected`; `0.85` power decay in `classic`). Saturation dents the diversity signal but must never veto a genuinely valuable candidate of the dominant type. This stops the loop from grinding out the same low-hanging-fruit category forever. Set to a large number to disable.
+Integer, default `2`. After this many candidates of the same `type` have been completed, `backlog-rank` downweights further same-type pending candidates by logarithmic decay with a hard floor (`max(0.35, 1.0 - 0.12 * log2(1 + max(0, completed - threshold)))` in the default `ranking_mode: expected`; `0.85` power decay in `classic`). Saturation dents the diversity signal but must never veto a genuinely valuable candidate of the dominant type. This stops the loop from grinding out the same low-hanging-fruit category forever. Set to a large number to disable. An explicit `null` falls back to the default `2` — the validator tolerates it, and it must not degrade to a zero threshold (which would saturate every type).
 
 ### ranking_mode
 

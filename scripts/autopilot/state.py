@@ -412,6 +412,20 @@ def round_candidate_ids(current):
 SEED_STATUSES = ("open", "promoted", "verified", "refuted", "rejected")
 
 
+def effective_saturation_threshold(cfg):
+    """type_saturation_threshold 落地值。validate_config 容忍显式 null（int_range
+    行的 null 跳过语义），但 null 顺着 cfg.get(key, 2) 流进来时默认值不生效，
+    到 saturated_types/评分函数里退化成阈值 0 = 全类型饱和（candidate-378 热点
+    复审发现）。null/缺失/非 int 一律回落默认 2，与键缺失路径同一条线。"""
+    value = (cfg or {}).get("type_saturation_threshold")
+    if value is None:
+        return 2
+    try:
+        return max(0, int(value))
+    except (TypeError, ValueError):
+        return 2
+
+
 def saturated_types(state, threshold=2):
     """Types whose completed-candidate count reached the saturation threshold
     (from the state's type_stats snapshot). Deterministic order."""
@@ -1405,7 +1419,7 @@ def rank_candidates(backlog, cfg, progress=None, completed_goals=None):
     cfg = cfg or {}
     type_stats = compute_type_stats(backlog)
     predicted_account = compute_predicted_account(backlog)
-    threshold = cfg.get("type_saturation_threshold", 2)
+    threshold = effective_saturation_threshold(cfg)
     floor = cfg.get("min_candidate_value")
     risk_weight = _risk_weight_for(cfg, progress)
 

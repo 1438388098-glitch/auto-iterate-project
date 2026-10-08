@@ -10,6 +10,7 @@ import sys
 import tempfile
 import time
 import unittest
+from contextlib import redirect_stderr
 from datetime import datetime, timedelta
 from io import StringIO
 from unittest import mock
@@ -1483,6 +1484,44 @@ class ConfigFieldRegistryTests(unittest.TestCase):
         config_module.validate_config(config_module.default_config(Path(".")))
 
 
+class SaturationThresholdTests(RepoTest):
+    """candidate-378 回归：type_saturation_threshold 显式 null（validator 容忍）
+    曾退化成阈值 0 = 全类型饱和（评分全面打折、underused_types 恒空）。
+    null/缺失/非 int 必须回落默认 2。"""
+
+    def _init_goal_and_expand(self):
+        self.run_state("init", "--expand-after-goals", "--goal", "G")
+        self.run_state("begin-round", "--title", "r", "--reason", "x")
+        self.add_file()
+        self.run_state("commit", "--summary", "add feature")
+        sha = self.git("rev-parse", "HEAD").stdout.strip()
+        self.run_state("complete-round", "--summary", "done", "--commit-sha", sha)
+        self.run_state("goal-met", "--goal", "G", "--round", "1")
+
+    def test_effective_threshold_unit(self):
+        self.assertEqual(ap_state.effective_saturation_threshold(None), 2)
+        self.assertEqual(ap_state.effective_saturation_threshold({}), 2)
+        self.assertEqual(
+            ap_state.effective_saturation_threshold({"type_saturation_threshold": None}), 2)
+        self.assertEqual(
+            ap_state.effective_saturation_threshold({"type_saturation_threshold": 0}), 0)
+        self.assertEqual(
+            ap_state.effective_saturation_threshold({"type_saturation_threshold": 7}), 7)
+        self.assertEqual(
+            ap_state.effective_saturation_threshold({"type_saturation_threshold": "x"}), 2)
+
+    def test_null_threshold_falls_back_to_default_not_zero(self):
+        self._init_goal_and_expand()
+        config_path = self.repo / ".autopilot" / "config.json"
+        config = json.loads(config_path.read_text(encoding="utf-8"))
+        config["type_saturation_threshold"] = None
+        config_path.write_text(json.dumps(config), encoding="utf-8")
+        data = json.loads(self.run_state("check", "--brief").stdout)
+        # null → 默认 2：零完成类型不饱和，underused 池保持可用
+        self.assertEqual(data["expansion"]["saturated_types"], [])
+        self.assertTrue(data["expansion"]["underused_types"])
+
+
 class BudgetAccountingTests(RepoTest):
     """P1 budget/round accounting: zero-work cancels do not consume a round,
     tokens are billed monotonically per run, blocked streaks and budgets are
@@ -2733,6 +2772,62 @@ class PureHelperUnitTests(unittest.TestCase):
             {"status": "blocked", "type": "bugfix", "value": 2},
         ]})
         self.assertIn("bugfix", stats)
+
+class IoAppendLogTests(unittest.TestCase):
+    """candidate-377：io.append_log 是全部审计事件的落点（12+ 命令共用），
+    此前零直测。锁四条契约：JSONL 行结构与 ts、unicode 原样、超限三代轮转、
+    OSError 软失败（WARN 不抛）。"""
+
+    def setUp(self):
+        self.tmp = Path(tempfile.mkdtemp(prefix="autopilot-appendlog-"))
+        self.addCleanup(shutil.rmtree, self.tmp, ignore_errors=True)
+        self.repo = self.tmp / "repo"
+        self.repo.mkdir()
+
+    def _log_lines(self, path):
+        return [json.loads(line) for line in path.read_text(encoding="utf-8").splitlines()]
+
+    def test_append_log_writes_jsonl_entry(self):
+        ap_io.append_log(self.repo, "commit", "error", reason="nothing staged", paths=["a.py"])
+        entry = self._log_lines(self.repo / ".autopilot" / "log.jsonl")[0]
+        self.assertEqual(entry["event"], "commit")
+        self.assertEqual(entry["status"], "error")
+        self.assertEqual(entry["reason"], "nothing staged")
+        self.assertEqual(entry["paths"], ["a.py"])
+        self.assertIsNotNone(ap_io.parse_time(entry["ts"]))
+
+    def test_append_log_appends_and_preserves_unicode(self):
+        ap_io.append_log(self.repo, "begin-round", "success", title="注册表轮")
+        ap_io.append_log(self.repo, "complete-round", "success", summary="轮次收官")
+        entries = self._log_lines(self.repo / ".autopilot" / "log.jsonl")
+        self.assertEqual([e["event"] for e in entries], ["begin-round", "complete-round"])
+        self.assertEqual(entries[0]["title"], "注册表轮")
+
+    def test_append_log_rotates_three_generations(self):
+        # 每条自带 >200B 的 reason，保证每次 append 都越过阈值各轮转一代。
+        filler = "x" * 250
+        with mock.patch.object(ap_io, "LOG_ROTATE_BYTES", 200), \
+                mock.patch.object(ap_io, "LOG_ROTATE_KEEP", 3):
+            for index in range(1, 6):
+                ap_io.append_log(self.repo, "event-{}".format(index), "success", note=filler)
+        log_dir = self.repo / ".autopilot"
+        # KEEP=3：.3=[e2], .2=[e3], .1=[e4], log=[e5]；最老的 e1 被丢弃
+        self.assertEqual(self._log_lines(log_dir / "log.jsonl.3")[0]["event"], "event-2")
+        self.assertEqual(self._log_lines(log_dir / "log.jsonl.2")[0]["event"], "event-3")
+        self.assertEqual(self._log_lines(log_dir / "log.jsonl.1")[0]["event"], "event-4")
+        self.assertEqual(self._log_lines(log_dir / "log.jsonl")[0]["event"], "event-5")
+        self.assertFalse((log_dir / "log.jsonl.4").exists(), "no fourth generation")
+
+    def test_append_log_soft_fails_on_unwritable_target(self):
+        target = self.repo / ".autopilot" / "log.jsonl"
+        target.parent.mkdir()
+        target.mkdir()  # 目录占用目标路径：open("a") 必抛 OSError 子类
+        stderr = StringIO()
+        with mock.patch.object(ap_io, "LOG_ROTATE_BYTES", 10):
+            with redirect_stderr(stderr):
+                ap_io.append_log(self.repo, "commit", "error", reason="boom")
+        self.assertIn("[WARN] Failed to append", stderr.getvalue())
+
 
 class OptimizationTests(RepoTest):
     """Dirty-tree rules, budgets, deadline, JSON shapes, config errors."""
