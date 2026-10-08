@@ -748,11 +748,16 @@
     // 最后 20 条全部不匹配、整条时间线空白。索引保持全局（data-ev 点击回
     // 查全量数组）。
     if (replayRound !== null) {
-      var filtered = [];
+      var filteredPairs = [];
       for (var k = 0; k < evs.length; k++) {
-        if (passesReplay(evs[k])) filtered.push(evs[k]);
+        if (passesReplay(evs[k])) filteredPairs.push([k, evs[k]]);
       }
-      evs = filtered;
+      // 原全局下标随行携带（candidate-438）：data-ev 点击回查全量数组，
+      // 过滤数组的相对下标会指错事件。
+      var origIdx = filteredPairs.map(function (pair) { return pair[0]; });
+      evs = filteredPairs.map(function (pair) { return pair[1]; });
+    } else {
+      origIdx = null;
     }
     var offset = Math.max(0, evs.length - EVENTS_RENDER_LIMIT);
     var render = offset ? evs.slice(offset) : evs;
@@ -794,7 +799,8 @@
       if (ev.score !== null && ev.score !== undefined) meta.push("自评 " + ev.score + "/5");
       if (ev.domains && ev.domains.length) meta.push(ev.domains.join("、"));
       var full = ((ev.title || "") + "\n" + (ev.summary || "")).replace(/\n+/g, " ").trim();
-      rows.push('<div class="' + cls + '" data-ev="' + (offset + i) + '"'
+      var evIdx = origIdx ? origIdx[offset + i] : (offset + i);
+      rows.push('<div class="' + cls + '" data-ev="' + evIdx + '"'
         + (full ? ' title="' + escapeHtml(full) + '"' : "")
         + (fresh ? ' style="' + growAnim() + '"' : "") + '>'
         + '<div class="meta mono">' + escapeHtml(meta.join(" · ")) + '</div>'
