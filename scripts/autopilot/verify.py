@@ -56,12 +56,15 @@ def detect_smoke_commands(repo):
 
 
 def _has_pytest_test_files(root):
-    """True when pytest-style test modules exist without any packaging config."""
-    tests_dir = root / "tests"
-    for pattern in ("test_*.py", "*_test.py"):
-        if any(root.glob(pattern)):
-            return True
-        if tests_dir.is_dir() and any(tests_dir.glob(pattern)):
+    """True when pytest-style test modules exist without any packaging config.
+    Walks the whole tree (any depth, any directory name): the root+tests/-only
+    probe missed the common "package dir with test file beside it" and
+    "tests/unit/" layouts — detect-verify reported nothing on a repo whose
+    5000-line suite lives in scripts/ (wave14 candidate-428). detect-verify is
+    a manual command, so the full walk costs nothing in the round loop."""
+    for path in root.rglob("*.py"):
+        name = path.name
+        if name.startswith("test_") or name.endswith("_test"):
             return True
     return False
 

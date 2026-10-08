@@ -194,9 +194,17 @@ def scan_markers(repo, limit=30):
 
 
 def scan_swallowed(repo, limit=20):
-    """except Exception: pass / bare except: pass swallow failures silently."""
+    """except Exception: pass / bare except: pass swallow failures silently.
+
+    The scanner's own docstring contains both example forms — self-referential
+    like scan_markers' regex definitions, so the scanner skips its own file
+    (wave14 candidate-427): without the skip every `mine --apply` mints two
+    value-4 garbage candidates from this docstring."""
+    self_name = Path(__file__).name
     findings = []
     for path in _iter_source_files(repo, suffixes={".py"}):
+        if path.name == self_name:
+            continue
         # except-pass in test files is usually a mocked-shape fixture; audit
         # product code only (test paths are already excluded from test-gap's
         # corpus and dead-export's defs for the same reason).

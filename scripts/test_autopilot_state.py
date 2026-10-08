@@ -1952,6 +1952,26 @@ class LedgerGuardTests(RepoTest):
         data = json.loads(self.run_state("check", "--brief").stdout)
         self.assertEqual(data["action_hint"], "mine")
 
+    def test_scan_swallowed_skips_own_docstring(self):
+        # wave14 candidate-427：scan_swallowed 的 docstring 含两种示例形态，
+        # 无自指守卫时每次 mine 铸两条垃圾候选。
+        from autopilot import miner
+        findings = miner.scan_swallowed(Path(autopilot.__file__).parent)
+        self.assertFalse(
+            any((f.get("file") or "").endswith("miner.py") for f in findings))
+
+    def test_pytest_discovery_walks_nested_layouts(self):
+        # wave14 candidate-428：scripts/test_*.py 与 tests/unit/ 深层布局
+        # 曾返回「无测试」——实机即本仓库（detect-verify 曾返回空）。
+        from autopilot.verify import _has_pytest_test_files
+        (self.repo / "scripts").mkdir()
+        (self.repo / "scripts" / "test_tool.py").write_text(
+            "def test_a():\n    pass\n", encoding="utf-8")
+        self.assertTrue(_has_pytest_test_files(self.repo))
+        empty = Path(tempfile.mkdtemp(prefix="autopilot-verify-"))
+        self.addCleanup(shutil.rmtree, empty, ignore_errors=True)
+        self.assertFalse(_has_pytest_test_files(empty))
+
     def test_config_set_budget_domains_match_init(self):
         # wave12 candidate-409：同一字段两扇门同域——max_rounds 收 0（立即
         # 停机）、max_minutes 收小数，与 init/validator 一致。
