@@ -1383,6 +1383,79 @@ class ConfigSetTests(RepoTest):
         self.assertNotEqual(unparsable.returncode, 0)
         self.assertIn("Could not parse --deadline", unparsable.stderr)
 
+    def test_nothing_to_set_message_lists_every_field_flag(self):
+        # candidate-376 守卫：cmd_config_set 的 "nothing to set" 消息手工列举
+        # 旗标，加旗标忘改消息（或反之）即漂移——消息集合必须与解析器实际
+        # 字段旗标集合相等。
+        self.run_state("init")
+        refused = self.run_state("config-set")
+        self.assertNotEqual(refused.returncode, 0)
+        listed = set(re.findall(r"--[a-z0-9-]+", refused.stderr))
+        parser = build_parser()
+        sub = None
+        for action in parser._actions:
+            choices = getattr(action, "choices", None)
+            if isinstance(choices, dict) and "config-set" in choices:
+                sub = choices["config-set"]
+                break
+        self.assertIsNotNone(sub)
+        framework = {"--repo", "--json", "--dry-run", "-h", "--help"}
+        field_flags = {f for f in sub._option_string_actions if f not in framework}
+        self.assertEqual(listed, field_flags)
+
+    def test_every_config_set_flag_actually_persists(self):
+        # candidate-376 守卫（最危险漂移形态）：argparse 接受了旗标但
+        # cmd_config_set 的收集逻辑漏了它 = 静默 no-op。每个字段旗标必须
+        # 端到端落盘。
+        self.run_state("init")
+        cases = [
+            (["--candidates-per-round", "6"], "candidates_per_round", 6),
+            (["--commit-every-rounds", "3"], "commit_every_rounds", 3),
+            (["--verify-every-rounds", "2"], "verify_every_rounds", 2),
+            (["--checkpoint-every", "9"], "checkpoint_every", 9),
+            (["--max-rounds", "7"], "max_rounds", 7),
+            (["--max-minutes", "33"], "max_minutes", 33),
+            (["--max-tokens", "1234"], "max_tokens", 1234),
+            (["--max-expansion-waves", "3"], "max_expansion_waves", 3),
+            (["--max-blocked-in-a-row", "1"], "max_blocked_in_a_row", 1),
+            (["--report-lang", "en"], "report_lang", "en"),
+            (["--push"], "push", True),
+            (["--no-push"], "push", False),
+            (["--scan-secrets"], "scan_secrets", True),
+            (["--no-scan-secrets"], "scan_secrets", False),
+            (["--expand-after-goals"], "expand_after_goals", True),
+            (["--no-expand-after-goals"], "expand_after_goals", False),
+            (["--dashboard"], "dashboard.enabled", True),
+            (["--dashboard-port", "8080"], "dashboard.port", 8080),
+            (["--check-commands", "echo verify"], "check_commands", ["echo verify"]),
+            (["--smoke-commands", "echo smoke"], "smoke_commands", ["echo smoke"]),
+        ]
+        for argv, path, expected in cases:
+            result = self.run_state("config-set", *argv)
+            self.assertEqual(result.returncode, 0, "{}: {}".format(argv, result.stderr))
+            node = self.read_json("config.json")
+            for part in path.split("."):
+                node = node[part]
+            self.assertEqual(node, expected, "flag {} did not persist".format(argv[0]))
+        # 开关对的另一侧与 clear 孪生：store_false 与置 null 也必须真实生效。
+        for argv, path, expected in [
+            (["--no-dashboard"], "dashboard.enabled", False),
+            (["--deadline", "+2h"], "deadline", "SENTINEL_PARSE"),
+            (["--clear-deadline"], "deadline", None),
+            (["--clear-max-rounds"], "max_rounds", None),
+            (["--clear-check-commands"], "check_commands", []),
+            (["--clear-smoke-commands"], "smoke_commands", []),
+        ]:
+            result = self.run_state("config-set", *argv)
+            self.assertEqual(result.returncode, 0, "{}: {}".format(argv, result.stderr))
+            node = self.read_json("config.json")
+            for part in path.split("."):
+                node = node[part]
+            if expected == "SENTINEL_PARSE":
+                self.assertIsNotNone(ap_io.parse_time(node), argv)
+            else:
+                self.assertEqual(node, expected, "flag {} did not persist".format(argv[0]))
+
 
 class ConfigFieldRegistryTests(unittest.TestCase):
     """candidate-314 守卫：default_config 的每个键必须被字段注册表覆盖或显式
