@@ -206,8 +206,10 @@ def _cache_key(repo):
     # the pipeline never consumes; the narrative .md files it does), plus git
     # HEAD — a pure commit without a state rewrite must not serve a stale
     # growth walk (design §2.3).
+    # log.jsonl 也在键里（wave16 candidate-431）：轮中的 105 个 append_log
+    # 调用点不改 state.json，漏掉它会让「运行事件」面板整轮冻结。
     names = (io.STATE_FILENAME, io.BACKLOG_FILENAME, io.CONFIG_FILENAME,
-             "last-summary.md", "retrospective.md")
+             io.LOG_FILENAME, "last-summary.md", "retrospective.md")
     mtimes = []
     for name in names:
         p = dd._autopilot_dir(repo) / name
@@ -217,7 +219,10 @@ def _cache_key(repo):
             mtimes.append(None)
     head = io.run_git(repo, "rev-parse", "--verify", "-q", "HEAD")
     head_sha = head.stdout.strip().splitlines()[0].strip() if head.returncode == 0 and head.stdout else None
-    return (tuple(mtimes), head_sha)
+    # 30s 时钟桶（wave16 candidate-431）：remaining/deadline 是构建时刻的
+    # 墙钟值，不进键就随同键快路径停走。桶粒度 = 倒计时最小刷新粒度。
+    clock_bucket = int(time.time() // 30)
+    return (tuple(mtimes), head_sha, clock_bucket)
 
 
 _snapshot_lock = threading.Lock()

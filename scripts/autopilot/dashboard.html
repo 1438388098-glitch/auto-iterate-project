@@ -744,6 +744,16 @@
   function renderEvents() {
     var evs = (snapshot && snapshot.growth && snapshot.growth.events) || [];
     var EVENTS_RENDER_LIMIT = 20;
+    // 回放先过滤后切片（wave16 candidate-432）：先切后滤会让早期轮回放时
+    // 最后 20 条全部不匹配、整条时间线空白。索引保持全局（data-ev 点击回
+    // 查全量数组）。
+    if (replayRound !== null) {
+      var filtered = [];
+      for (var k = 0; k < evs.length; k++) {
+        if (passesReplay(evs[k])) filtered.push(evs[k]);
+      }
+      evs = filtered;
+    }
     var offset = Math.max(0, evs.length - EVENTS_RENDER_LIMIT);
     var render = offset ? evs.slice(offset) : evs;
     var hot = false;
