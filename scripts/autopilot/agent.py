@@ -103,6 +103,17 @@ def detect_agent(cwd=None, home=None):
             marker = home / name
             if marker.exists() or (home / ("." + name)).exists():
                 return agent, "home:{}".format(name)
+            # 规范家目录（wave14 candidate-426）：真实安装写的是
+            # ~/.claude/CLAUDE.md、~/.codex/AGENTS.md、~/.config/opencode/...
+            # ——dot 前缀拼名（~/.CLAUDE.md）没有工具会写，实测致真装机
+            # 降级 generic/fallback。
+            canonical = {
+                "claude-code": home / ".claude" / name,
+                "codex": home / ".codex" / name,
+                "opencode": home / ".config" / "opencode" / name,
+            }.get(agent)
+            if canonical and canonical.exists():
+                return agent, "home:{}".format(canonical.name)
 
     return "generic", "fallback"
 

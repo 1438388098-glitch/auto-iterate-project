@@ -1972,6 +1972,27 @@ class LedgerGuardTests(RepoTest):
         self.addCleanup(shutil.rmtree, empty, ignore_errors=True)
         self.assertFalse(_has_pytest_test_files(empty))
 
+    def test_detect_agent_canonical_homes(self):
+        # wave14 candidate-426：真装机的规范家目录（~/.claude/CLAUDE.md 等）
+        # 曾因探 ~/.CLAUDE.md 这种不存在的拼名而降级 generic。
+        from autopilot.agent import detect_agent
+        home = Path(tempfile.mkdtemp(prefix="autopilot-agent-"))
+        self.addCleanup(shutil.rmtree, home, ignore_errors=True)
+        (home / ".claude").mkdir()
+        (home / ".claude" / "CLAUDE.md").write_text("", encoding="utf-8")
+        agent, by = detect_agent(str(self.repo), home=str(home))
+        self.assertEqual(agent, "claude-code")
+        self.assertTrue(by.startswith("home:"))
+
+    def test_smoke_recommendation_requires_lint_script(self):
+        # wave14 candidate-429：无 lint 键的 package.json 不再荐 npm run lint
+        # （采纳后每轮冒烟都红）。
+        from autopilot.verify import detect_smoke_commands
+        (self.repo / "package.json").write_text(
+            json.dumps({"name": "x", "scripts": {"test": "tape"}}), encoding="utf-8")
+        signals = detect_smoke_commands(str(self.repo))
+        self.assertNotIn(("node", "npm run lint"), signals)
+
     def test_config_set_budget_domains_match_init(self):
         # wave12 candidate-409：同一字段两扇门同域——max_rounds 收 0（立即
         # 停机）、max_minutes 收小数，与 init/validator 一致。

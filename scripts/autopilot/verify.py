@@ -1,5 +1,6 @@
 """Verification command discovery from repository entry points."""
 
+import json
 import re
 import shutil
 import subprocess
@@ -46,8 +47,17 @@ def detect_smoke_commands(repo):
         signals.append(("python", "python -m compileall -q ."))
     elif _has_pytest_test_files(root):
         signals.append(("python", "python -m compileall -q ."))
-    if (root / "package.json").exists():
-        signals.append(("node", "npm run lint"))
+    package_json = root / "package.json"
+    if package_json.exists():
+        # 只荐真实存在的脚本（wave14 candidate-429）：无 lint 键的包被荐
+        # npm run lint 后，采纳方每轮冒烟都红。
+        try:
+            scripts = (json.loads(package_json.read_text(encoding="utf-8"))
+                       .get("scripts") or {})
+        except (ValueError, OSError):
+            scripts = {}
+        if "lint" in scripts:
+            signals.append(("node", "npm run lint"))
     if (root / "Cargo.toml").exists():
         signals.append(("rust", "cargo check"))
     if (root / "go.mod").exists():
