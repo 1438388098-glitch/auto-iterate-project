@@ -1743,6 +1743,35 @@ class LedgerGuardTests(RepoTest):
         self.assertNotEqual(refused.returncode, 0)
         self.assertIn("highest completed: 100", refused.stderr)
 
+    def test_lens_memory_and_wave_no_survive_window_trim(self):
+        self.run_state("init")
+        state_path = self.repo / ".autopilot" / "state.json"
+        st = json.loads(state_path.read_text(encoding="utf-8"))
+        st["expansion_waves"] = [{"at": "2026-10-09T00:00:00+00:00", "lenses": ["tests"], "added": 0}]
+        st["expansion_wave_seq"] = 25
+        st["lenses_used_all"] = ["i18n", "tests"]  # i18n 属被裁剪的早期波
+        state_path.write_text(json.dumps(st), encoding="utf-8")
+        data = json.loads(self.run_state("check", "--brief").stdout)
+        self.assertEqual(data["wave_no"], 25)  # 单调序号，不再冻结窗口尺寸
+        self.assertIn("i18n", data["lenses_used"])
+        self.assertNotIn("i18n", data["lenses_unused"])  # 不重报已用镜头
+
+    def test_dashboard_counters_stay_monotonic(self):
+        self.run_state("init", "--max-rounds", "200")
+        state_path = self.repo / ".autopilot" / "state.json"
+        st = json.loads(state_path.read_text(encoding="utf-8"))
+        st["history"] = [{"round": 150, "status": "completed"}]  # 窗口只剩 1 条
+        st["completed_rounds"] = 150
+        st["expansion_waves"] = [{"at": "2026-10-09T00:00:00+00:00", "lenses": ["tests"], "added": 0}]
+        st["expansion_wave_seq"] = 25
+        state_path.write_text(json.dumps(st), encoding="utf-8")
+        from autopilot import dashboard_data as dd
+        snapshot = dd.build_snapshot(self.repo)
+        status = snapshot["status"]
+        self.assertEqual(status["completed_rounds"], 150)  # 不再封顶窗口 1 条
+        self.assertEqual(status["expansion_waves"], 25)    # 不再封顶窗口 20
+        self.assertEqual(status["round_progress"]["remaining"], 50)  # 与停止门同分母
+
     def test_round_progress_remaining_matches_stop_gate(self):
         self.run_state("init", "--max-rounds", "5")
         self.run_state("begin-round", "--title", "r", "--reason", "x")

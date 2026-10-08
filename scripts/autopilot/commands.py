@@ -2816,13 +2816,14 @@ def cmd_expansion_record(args):
                 repo, "expansion-wave", "warn",
                 reason="same lens set as previous wave", lenses=wave["lenses"],
             )
+        wave_no = state.expansion_wave_count(st)  # 单调序号：窗口裁剪后不再重复报 20（candidate-403）
         io.append_log(
             repo, "expansion-wave", "success",
-            lenses=wave["lenses"], wave_no=len(st.get("expansion_waves") or []),
+            lenses=wave["lenses"], wave_no=wave_no,
             findings=wave["findings"], applied=wave["applied"],
         )
         message = "[OK] Expansion wave {} recorded (lenses: {}).".format(
-            len(st.get("expansion_waves") or []), ", ".join(wave["lenses"])
+            wave_no, ", ".join(wave["lenses"])
         )
         if repeated:
             message += " Warning: same lens set as the previous wave."

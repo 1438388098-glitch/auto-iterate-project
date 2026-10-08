@@ -300,7 +300,13 @@ def build_check_payload(repo, full=False):
     # order-preserving union across recorded waves; lenses_unused is what the
     # next wave should draw from.
     waves = [w for w in (st.get("expansion_waves") or []) if isinstance(w, dict)]
+    # lenses_used 的出处是跨窗总账（candidate-403）：20 波窗口会裁掉早期
+    # 波次记录，只并窗口会把已用镜头重报成 unused、误导轮换。总账缺失时
+    # （旧 state）回退窗口并集，行为不劣于修复前。
     lenses_used = []
+    for lens in st.get("lenses_used_all") or []:
+        if lens not in lenses_used:
+            lenses_used.append(lens)
     for wave in waves:
         for lens in wave.get("lenses") or []:
             if lens not in lenses_used:
@@ -457,7 +463,7 @@ def build_check_payload(repo, full=False):
         },
         "selected_count": len(selected_entries),
         "selected_empty_reason": selected_empty_reason,
-        "wave_no": len(waves),
+        "wave_no": state.expansion_wave_count(st),  # 单调序号，窗口裁剪不再冻结（candidate-403）
         "lenses_used": lenses_used,
         "lenses_unused": [lens for lens in state.EXPANSION_LENSES if lens not in lenses_used],
         "mining": {

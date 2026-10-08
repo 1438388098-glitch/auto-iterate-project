@@ -199,6 +199,9 @@ def _validate_state_types(repo, state):
     if not isinstance(state.get("deferred_paths", []), list):
         # Run 级 deferred 账本（wave11 candidate-402）：跨 history 窗口存续
         _state_type_error(path, "'deferred_paths' must be an array")
+    if not isinstance(state.get("lenses_used_all", []), list):
+        # 镜头跨窗总账（wave11 candidate-403）：≤16 项，order-preserving
+        _state_type_error(path, "'lenses_used_all' must be an array")
     current = state.get("current_round")
     if current is not None and not isinstance(current, dict):
         _state_type_error(path, "'current_round' must be an object or null")
@@ -575,7 +578,10 @@ def append_expansion_wave(st, lenses):
     snapshot used to verify lens rotation across waves; `added` starts 0 at
     record time and is backfilled by backlog-add per value-gated candidate of
     origin predicted/expansion (candidate-386), so mining_exhausted's wave
-    term sees real wave yield."""
+    term sees real wave yield. `lenses_used_all` (candidate-403) is the
+    order-preserving union across ALL waves ever recorded — the 20-entry
+    window forgets early waves, and the rotation guidance must not re-report
+    a used lens as unused."""
     waves = st.setdefault("expansion_waves", [])
     wave = {
         "at": io.now_iso(),
@@ -585,6 +591,13 @@ def append_expansion_wave(st, lenses):
     waves.append(wave)
     if len(waves) > io.EXPANSION_WAVES_LIMIT:
         del waves[: len(waves) - io.EXPANSION_WAVES_LIMIT]
+    used_all = st.get("lenses_used_all")
+    if not isinstance(used_all, list):
+        used_all = []
+    for lens in wave["lenses"]:
+        if lens not in used_all:
+            used_all.append(lens)
+    st["lenses_used_all"] = used_all
     # Monotonic total, independent of the rolling window above: the wave cap
     # (max_expansion_waves) must count every wave ever recorded, not just the
     # ones still inside the window (len(expansion_waves) saturates).
