@@ -430,6 +430,23 @@ def cmd_begin_round(args):
             return 0
         candidate_ids = list(args.candidate_id) if args.candidate_id else []
         backlog = state.load_backlog(repo)
+        # picked-orphan 自愈（wave11 candidate-398）：backlog(picked) →
+        # state(current_round) 两写窗口内崩溃会留下「picked 但无开轮」残留，
+        # 反双拾守卫拒重拾、backlog-update 一次一 id——死账。此处已过开轮
+        # 拒绝（无开轮才走到），picked 必为孤儿，复位 pending 让账本自愈；
+        # 有开轮时 picked 属于该轮，不经过此路径。
+        if st.get("current_round") is None:
+            orphans = [c for c in backlog.get("candidates") or [] if c.get("status") == "picked"]
+            if orphans:
+                for orphan in orphans:
+                    orphan["status"] = "pending"
+                    orphan["updated_at"] = io.now_iso()
+                state.save_backlog(repo, backlog)
+                io.append_log(
+                    repo, "begin-round", "reconciled",
+                    reason="picked orphans from an interrupted round reset to pending",
+                    ids=[c.get("id") for c in orphans],
+                )
         floor = cfg.get("min_candidate_value")
         ready_above = []
         ready_below = []
@@ -533,7 +550,7 @@ def cmd_begin_round(args):
         # run's own prior rounds deliberately left uncommitted (batch mode
         # defers commits; blocked/cancelled rounds leave work behind) — commit
         # uses what remains to refuse absorbing pre-existing user changes.
-        prior_deferred = set()
+        prior_deferred = set(st.get("deferred_paths") or [])
         for entry in st.get("history") or []:
             if isinstance(entry, dict):
                 prior_deferred.update(entry.get("deferred_dirty_files") or [])
@@ -745,6 +762,20 @@ def _close_round(repo, st, current, status, counter_key, tokens, history_entry,
             repo, "deferred-files", "warn",
             round=current.get("round"), reason=str(exc)[:200],
         )
+    # Run 级 deferred 账本（wave11 candidate-402）：history 窗口（100 条）
+    # 会遗忘老的 deferred 记录，修剪后并集把 run 自产遗留误标成 pre-existing
+    # 用户改动、flush 硬拒提交。账本只收当前确实未提交的 deferred 路径
+    # （提交/消失即出账），界自然收敛到在途集合；git 抖动轮不动账本。
+    ledger = st.get("deferred_paths")
+    if not isinstance(ledger, list):
+        ledger = []
+    if uncommitted is not None:
+        live = set(uncommitted)
+        ledger = [p for p in ledger if p in live]
+        for deferred_path in history_entry["deferred_dirty_files"]:
+            if deferred_path not in ledger:
+                ledger.append(deferred_path)
+        st["deferred_paths"] = ledger
     history_entry.setdefault("status", status)
     # Full candidate batch beside the legacy scalar (1.12 field test: a
     # multi-candidate round's history entry kept only the FIRST id, so the
@@ -2235,7 +2266,7 @@ def cmd_commit(args):
             uncommitted_now = set(io.uncommitted_paths(repo))
         except SystemExit:
             uncommitted_now = set()
-        prior_deferred = set()
+        prior_deferred = set(st.get("deferred_paths") or [])
         for entry in st.get("history") or []:
             if isinstance(entry, dict):
                 prior_deferred.update(entry.get("deferred_dirty_files") or [])

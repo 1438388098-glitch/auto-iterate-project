@@ -196,6 +196,9 @@ def _validate_state_types(repo, state):
         _state_type_error(path, "'mining_runs' must be an array")
     if not isinstance(state.get("expansion_waves", []), list):
         _state_type_error(path, "'expansion_waves' must be an array")
+    if not isinstance(state.get("deferred_paths", []), list):
+        # Run 级 deferred 账本（wave11 candidate-402）：跨 history 窗口存续
+        _state_type_error(path, "'deferred_paths' must be an array")
     current = state.get("current_round")
     if current is not None and not isinstance(current, dict):
         _state_type_error(path, "'current_round' must be an object or null")
