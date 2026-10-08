@@ -4236,6 +4236,20 @@ class DashboardContractTests(RepoTest):
         ap = self.repo / ".autopilot"
         return sorted(p.name for p in ap.iterdir())
 
+    def test_unlink_info_tolerates_locked_file(self):
+        """candidate-397：Windows 句柄释放竞态——刚被杀掉的 server 留下的
+        打开句柄会让 unlink 抛 PermissionError；_unlink_info 必须容忍而不是
+        炸掉 stop_server/init 剪枝路径。"""
+        if sys.platform != "win32":
+            self.skipTest("Windows handle-lock semantics")
+        from autopilot import dashboard as ap_dashboard
+        info = ap_dashboard._info_path(self.repo)
+        info.parent.mkdir(parents=True, exist_ok=True)
+        info.write_text("{}", encoding="utf-8")
+        with open(info, "r"):
+            ap_dashboard._unlink_info(self.repo)  # 持句柄时删除：容忍失败不抛
+        info.exists()  # 可能仍在（句柄未放）；本断言只关心不抛
+
     def test_read_info_degrades_to_none(self):
         """轮 6 test-gap：read_info 的退化路径（缺失/正常/非 dict/损坏），
         任何一种都不得 raise——info_alive/stop_server 依赖这个契约。"""

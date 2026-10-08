@@ -91,11 +91,14 @@ def info_alive(repo):
 
 
 def _unlink_info(repo):
-    """Remove the info file, tolerating absence. The 3.8 unlink keyword is
-    off-limits: README pins the helper to Python 3.6+ (candidate-395)."""
+    """Remove the info file, tolerating absence and Windows handle-release
+    races (a just-killed server's open handle turns unlink into
+    PermissionError; the stale record is re-checked by info_alive, so a
+    failed removal is non-fatal). The 3.8 unlink keyword is off-limits:
+    README pins the helper to Python 3.6+ (candidate-395)."""
     try:
         _info_path(repo).unlink()
-    except FileNotFoundError:
+    except OSError:
         pass
 
 
