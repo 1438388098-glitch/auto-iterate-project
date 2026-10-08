@@ -752,13 +752,18 @@ def _close_round(repo, st, current, status, counter_key, tokens, history_entry,
     )
     state.append_history(st, history_entry)
     st["current_round"] = None
+    # 单次 backlog 读（wave10 candidate-391）：候选状态更新与 type_stats 共用
+    # 同一份内存 dict——此前 update_candidates_status 内部 load+save，紧接着
+    # _refresh_type_stats 再 load 刚写回的同一文件，两 parse 一多余 .bak，
+    # 还留有写后读的 type_stats 失效窗口。
+    backlog = state.load_backlog(repo)
     state.update_candidates_status(
         repo, state.round_candidate_ids(current), candidate_status, candidate_round,
-        extra_fields=candidate_extra,
+        extra_fields=candidate_extra, backlog=backlog,
     )
     if seed_outcome is not None:
         _resolve_round_seeds_in_state(repo, st, current, seed_outcome, seed_notes)
-    _refresh_type_stats(repo, st)
+    st["type_stats"] = state.compute_type_stats(backlog)
     state.save_state(repo, st)
 
 
@@ -2095,8 +2100,13 @@ def cmd_commit(args):
                     paths=blocked,
                 )
 
+        # 一次共享的 staged numstat：secrets 的二进制探测与 max_round_scope 的
+        # 行数统计曾各 spawn 一次同一查询（wave10 candidate-389）。quotepath=
+        # false 是两者要求的并集（secrets 要字面文件名，计数不受影响）。
+        shared_numstat = io.run_git(repo, "-c", "core.quotepath=false", "diff", "--cached", "--numstat")
+
         if cfg.get("scan_secrets", True) and not getattr(args, "allow_secrets", False):
-            findings = scan_staged_diff(repo, cfg.get("secret_patterns"))
+            findings = scan_staged_diff(repo, cfg.get("secret_patterns"), staged_numstat=shared_numstat)
             if findings:
                 # Findings are masked (secrets.mask_secret_text) so the audit log
                 # never stores secret material.
@@ -2117,7 +2127,7 @@ def cmd_commit(args):
 
         max_scope = cfg.get("max_round_scope")
         if max_scope is not None:
-            changed_lines = _staged_numstat_lines(repo)
+            changed_lines = _staged_numstat_lines(repo, numstat=shared_numstat)
             if changed_lines > max_scope:
                 return _commit_refuse(
                     args, repo, "max_round_scope exceeded",
@@ -2325,19 +2335,25 @@ def cmd_secret_scan(args):
     return 0
 
 
-def _staged_numstat_lines(repo):
-    result = io.run_git(repo, "diff", "--cached", "--numstat")
-    if result.returncode != 0:
+def _staged_numstat_lines(repo, numstat=None):
+    """Total changed units (text lines + binary files) in the staged diff.
+    Fail-closed: a failed numstat must not look like a zero-line diff, or
+    max_round_scope would silently stop applying. `numstat` accepts the shared
+    staged-diff pass from cmd_commit (wave10 candidate-389) instead of
+    spawning the identical query again."""
+    if numstat is None:
+        numstat = io.run_git(repo, "diff", "--cached", "--numstat")
+    if numstat.returncode != 0:
         # Fail-closed: a failed numstat must not look like a zero-line diff,
         # or max_round_scope would silently stop applying.
         print(
             "[ERROR] Could not read staged numstat ({}); refusing to treat the diff as empty.".format(
-                (result.stderr or result.stdout or "git diff --numstat failed").strip()
+                (numstat.stderr or numstat.stdout or "git diff --numstat failed").strip()
             ),
             file=sys.stderr,
         )
         raise SystemExit(2)
-    text, binary = io._parse_numstat(result.stdout)
+    text, binary = io._parse_numstat(numstat.stdout)
     return text + binary
 
 

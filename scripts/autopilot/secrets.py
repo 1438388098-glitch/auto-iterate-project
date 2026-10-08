@@ -106,14 +106,17 @@ def mask_secret_text(text):
     return text[:6] + "..." + text[-4:]
 
 
-def scan_staged_diff(repo, extra_patterns=None):
+def scan_staged_diff(repo, extra_patterns=None, staged_numstat=None):
     """Scan the added lines of the staged diff for secret-like content. Returns a
     list of findings (pattern, file, masked text), deduplicated per pattern+line.
     Uses -U0 so context lines are not read, and core.quotepath=false so non-ASCII
     file names are reported literally. Fail-closed: if git diff fails, the scan
     reports a synthetic finding instead of pretending the tree is clean. Staged
     BINARY files also produce a finding: their content is unscannable, so a
-    binary can only be committed via --allow-secrets (same fail-closed promise)."""
+    binary can only be committed via --allow-secrets (same fail-closed promise).
+    `staged_numstat` accepts the caller's shared `git diff --cached --numstat`
+    pass (wave10 candidate-389) — it must carry core.quotepath=false for
+    literal file names; when given, the binary-detection spawn below is skipped."""
     diff = io.run_git(repo, "-c", "core.quotepath=false", "diff", "--cached", "-U0")
     if diff.returncode != 0:
         detail = (diff.stderr or diff.stdout or "git diff failed").strip()
@@ -165,7 +168,10 @@ def scan_staged_diff(repo, extra_patterns=None):
                         }
                     )
         prev_line = line
-    numstat = io.run_git(repo, "-c", "core.quotepath=false", "diff", "--cached", "--numstat")
+    if staged_numstat is not None:
+        numstat = staged_numstat
+    else:
+        numstat = io.run_git(repo, "-c", "core.quotepath=false", "diff", "--cached", "--numstat")
     if numstat.returncode == 0:
         for line in numstat.stdout.splitlines():
             parts = line.split("\t")
