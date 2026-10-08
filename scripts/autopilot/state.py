@@ -256,7 +256,23 @@ def load_state(repo):
         # purpose. EMPTY_TREE (an existing value) is left alone so an unborn
         # repo does not churn the state file on every load.
         head = io.run_git(repo, "rev-parse", "--verify", "-q", "HEAD")
-        state["run_start_sha"] = head.stdout.strip() if head.returncode == 0 else io.EMPTY_TREE
+        if head.returncode == 0:
+            state["run_start_sha"] = head.stdout.strip()
+        else:
+            # 只对 unborn 仓（确有 .git 但无提交）回退 EMPTY_TREE；其他失败
+            # （.git 暂不可读等瞬时故障）保持 None——错锚会让下一轮把整仓
+            # diff 一次性记账并可能假触发 max_tokens（注释自述的不变量，
+            # wave18 candidate-442）。保持 None 时本次不计费，下次加载重试。
+            probe = io.run_git(repo, "rev-parse", "--is-inside-work-tree")
+            if probe.returncode == 0 and probe.stdout.strip() == "true":
+                state["run_start_sha"] = io.EMPTY_TREE
+            else:
+                print(
+                    "[WARN] Could not read HEAD ({}); run_start_sha stays unset and "
+                    "billing is deferred to the next load.".format(
+                        (head.stderr or head.stdout or "").strip()[:120]),
+                    file=sys.stderr,
+                )
         changed = True
     _validate_state_types(repo, state)
     if old_schema < io.SCHEMA_VERSION:
@@ -1862,7 +1878,6 @@ def build_report(repo, state, cfg, lang="en"):
         if isinstance(entry, dict) and entry.get("status") == "aborted"
     )
     if aborted_n:
-        zh = (cfg.get("report_lang") or "zh") == "zh"
         out.append("- {}: {} ({})*".format(
             L.get("aborted", "aborted rounds"), aborted_n,
             "零工作取消，不消耗预算" if zh else "zero-work cancels, no budget burned"))

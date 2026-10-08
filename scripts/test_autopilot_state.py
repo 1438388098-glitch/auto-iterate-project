@@ -2112,6 +2112,22 @@ class LedgerGuardTests(RepoTest):
             backlog_path.read_text(encoding="utf-8"))["candidates"]]
         self.assertEqual(len(ids), len(set(ids)))
 
+    def test_report_lang_override_not_polluted_by_aborted_block(self):
+        # wave18 F1（candidate-440，轮35 引入的回归）：report --lang en 的
+        # 英文报告在含 aborted 轮时不得后半反转成中文状态标签。
+        self.run_state("init")
+        self.run_state("begin-round", "--title", "r", "--reason", "x")
+        self.run_state("cancel-round", "--reason", "probe")  # aborted
+        self.run_state("begin-round", "--title", "r2", "--reason", "y")
+        self.add_file()
+        self.run_state("commit", "--summary", "w")
+        sha = self.git("rev-parse", "HEAD").stdout.strip()
+        self.run_state("complete-round", "--summary", "done", "--commit-sha", sha)
+        report = self.run_state("report", "--lang", "en")
+        self.assertIn("completed: 1", report.stdout)
+        self.assertNotIn("已完成", report.stdout)
+        self.assertIn("aborted", report.stdout)
+
     def test_config_set_budget_domains_match_init(self):
         # wave12 candidate-409：同一字段两扇门同域——max_rounds 收 0（立即
         # 停机）、max_minutes 收小数，与 init/validator 一致。
