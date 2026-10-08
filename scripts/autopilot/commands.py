@@ -810,7 +810,8 @@ def cmd_complete_round(args):
         current = st["current_round"]
         if current is None:
             io.append_log(repo, "complete-round", "error", reason="no open round")
-            return emit_result(args, False, "[ERROR] No open round to complete.")
+            return emit_result(args, False,
+                              "[ERROR] No open round to complete. Run begin-round first (round-prep shows the next round number).")
 
         cfg = config.load_config(repo)
         drift = _feature_branch_guard(repo, st, cfg, "complete the round")
@@ -824,7 +825,8 @@ def cmd_complete_round(args):
                 io.append_log(repo, "complete-round", "error", reason="invalid commit sha")
                 return emit_result(
                     args, False,
-                    "[ERROR] --commit-sha does not resolve to a commit: {}".format(args.commit_sha),
+                    "[ERROR] --commit-sha does not resolve to a commit: {}. Use the exact SHA the "
+                    "commit helper printed (git log -1 --format=%H to recover).".format(args.commit_sha),
                 )
 
         tokens, billed = _resolve_tokens(args, repo, st)
@@ -943,8 +945,10 @@ def cmd_complete_round(args):
 
         if push_warning:
             print("[WARN] Round completed but push failed: {}".format(push_warning), file=sys.stderr)
-            return emit_result(args, True, "[OK] Round completed (push failed, see warning).")
-        return emit_result(args, True, "[OK] Round completed.")
+            return emit_result(args, True, "[OK] Round completed (push failed, see warning).",
+                               data={"round": current["round"], "commit_sha": args.commit_sha})
+        return emit_result(args, True, "[OK] Round completed.",
+                           data={"round": current["round"], "commit_sha": args.commit_sha})
 
 
 def cmd_block_round(args):
@@ -957,7 +961,8 @@ def cmd_block_round(args):
         current = st["current_round"]
         if current is None:
             io.append_log(repo, "block-round", "error", reason="no open round")
-            return emit_result(args, False, "[ERROR] No open round to block.")
+            return emit_result(args, False,
+                            "[ERROR] No open round to block. Run begin-round first.")
 
         tokens, billed = _resolve_tokens(args, repo, st)
         if getattr(args, "dry_run", False):
@@ -999,6 +1004,7 @@ def cmd_block_round(args):
         return emit_result(
             args, True,
             "[OK] Round {} blocked. Blocked candidates: {}".format(current["round"], echo),
+            data={"round": current["round"], "candidate_ids": blocked_ids},
         )
 
 
@@ -1012,7 +1018,8 @@ def cmd_cancel_round(args):
         current = st["current_round"]
         if current is None:
             io.append_log(repo, "cancel-round", "error", reason="no open round")
-            return emit_result(args, False, "[ERROR] No open round to cancel.")
+            return emit_result(args, False,
+                            "[ERROR] No open round to cancel. Run begin-round first.")
 
         # Zero-work probe retries (wrong flags, malformed refs, forgotten
         # --reason...) used to be billed as full cancelled rounds: a cancelled
@@ -2076,8 +2083,9 @@ def cmd_push(args):
             io.append_log(repo, "push", "error", reason="push disabled in config")
             return emit_result(
                 args, False,
-                "[ERROR] push is disabled in .autopilot/config.json (push: false). "
-                "Set 'push': true to allow pushing.",
+                "[ERROR] push is disabled in .autopilot/config.json (push: false). Enable it at "
+                "runtime with `config-set --push` (hand-editing the file trips the "
+                "config-drift check on every later check).",
             )
         if getattr(args, "dry_run", False):
             print("[DRY-RUN] Would push the current branch to its remote.", file=sys.stderr)
@@ -2385,7 +2393,17 @@ def cmd_secret_scan(args):
         return refused
     cfg = config.load_config(repo)
     findings = scan_staged_diff(repo, cfg.get("secret_patterns"))
-    payload = {"findings": findings, "clean": not findings}
+    # {ok, message} 契约（config.md 点名 secret-scan 在内，wave12 candidate-408）；
+    # findings/clean 保留为兼容字段。
+    payload = {
+        "ok": not findings,
+        "message": (
+            "[OK] No secret-like content found in the staged diff." if not findings
+            else "[ERROR] {} secret-like finding(s) in the staged diff.".format(len(findings))
+        ),
+        "findings": findings,
+        "clean": not findings,
+    }
     if getattr(args, "json", False):
         print(json.dumps(payload, indent=2, ensure_ascii=False))
         return 0 if not findings else 2
@@ -2532,7 +2550,11 @@ def cmd_analysis_save(args):
         io.append_log(repo, "analysis-save", "success", name=args.name)
         return emit_result(
             args, True, "[OK] Analysis cached.",
-            data={"git_head": git_head, "valid_until": "next HEAD or config change"},
+            data={
+                "git_head": git_head,
+                # 机器可读失效条件（candidate-408）：散文式 valid_until 无法判定
+                "invalidated_by": ["HEAD", "config"],
+            },
         )
 
 
@@ -2923,7 +2945,10 @@ def cmd_undo_round(args):
         verify = io.run_git(repo, "rev-parse", "--verify", "--quiet", args.sha + "^{commit}")
         if verify.returncode != 0:
             io.append_log(repo, "undo-round", "error", reason="invalid sha")
-            return emit_result(args, False, "[ERROR] --sha does not resolve to a commit: {}".format(args.sha))
+            return emit_result(
+                args, False,
+                "[ERROR] --sha does not resolve to a commit: {}. List candidates with "
+                "`git log --oneline -10`.".format(args.sha))
         full_sha = verify.stdout.strip()
         parents = io.run_git(repo, "rev-list", "--parents", "-n", "1", full_sha)
         is_merge = len(parents.stdout.split()) > 2
@@ -2996,7 +3021,9 @@ def cmd_detect_verify(args):
     payload["message"] = (
         "[OK] Detected {} verification command(s).".format(len(commands))
         if commands else
-        "[ERROR] No verification commands detected; nothing to apply."
+        "[ERROR] No verification commands detected; nothing to apply. Set check_commands "
+                "manually with `config-set --check-commands <cmd>` (repeatable), or pass "
+                "--check-commands on init."
     )
     if commands and args.apply:
         if getattr(args, "dry_run", False):
@@ -3172,8 +3199,12 @@ def cmd_mine(args):
             kinds=result["kinds"],
         )
 
+        message = "[OK] Mine: {} findings ({} new, {} applied).".format(
+            result["count"], len(new_findings), len(applied)
+        )
         payload = {
             "ok": True,
+            "message": message,  # {ok,message} 契约：JSON 模式同款（candidate-408）
             "kinds": result["kinds"],
             "by_kind": result["by_kind"],
             "found": result["count"],
@@ -3186,9 +3217,6 @@ def cmd_mine(args):
         if getattr(args, "json", False):
             print(json.dumps(payload, indent=2, ensure_ascii=False))
             return 0
-        message = "[OK] Mine: {} findings ({} new, {} applied).".format(
-            result["count"], len(new_findings), len(applied)
-        )
         return emit_result(args, True, message, data=payload)
 
 

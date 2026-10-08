@@ -1743,6 +1743,40 @@ class LedgerGuardTests(RepoTest):
         self.assertNotEqual(refused.returncode, 0)
         self.assertIn("highest completed: 100", refused.stderr)
 
+    def test_secret_scan_json_carries_ok_and_message(self):
+        # wave12 candidate-408：config.md 把 secret-scan 点名进 {ok,message}
+        # 契约——JSON 消费者按文档取键不得 KeyError。
+        self.run_state("init")
+        clean = self.run_state("secret-scan", "--json")
+        payload = json.loads(clean.stdout)
+        self.assertTrue(payload["ok"])
+        self.assertIn("message", payload)
+        # 假密钥用拼接构造：整段 AKIA+16 位字面量会触发真实密钥扫描器（实测被拦）
+        self.add_file("leak.py", content='KEY = "AKIA" + "BCDEFGHIJKLMNOP"\n')
+        dirty = self.run_state("secret-scan", "--json")
+        self.assertNotEqual(dirty.returncode, 0)
+        payload2 = json.loads(dirty.stdout)
+        self.assertFalse(payload2["ok"])
+        self.assertEqual(len(payload2["findings"]), 1)
+
+    def test_block_round_json_exposes_candidate_ids(self):
+        self.run_state("init")
+        self._add_candidate()
+        self.run_state("begin-round", "--title", "r", "--reason", "x",
+                       "--candidate-id", "candidate-001")
+        result = self.run_state("block-round", "--reason", "blocked for test", "--json")
+        payload = json.loads(result.stdout)
+        # emit_result 将 data 平铺进顶层载荷
+        self.assertEqual(payload["candidate_ids"], ["candidate-001"])
+        self.assertEqual(payload["round"], 1)
+
+    def test_mine_json_carries_message(self):
+        self.run_state("init")
+        result = self.run_state("mine", "--json")
+        payload = json.loads(result.stdout)
+        self.assertTrue(payload["ok"])
+        self.assertIn("message", payload)
+
     def test_lens_memory_and_wave_no_survive_window_trim(self):
         self.run_state("init")
         state_path = self.repo / ".autopilot" / "state.json"

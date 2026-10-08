@@ -492,7 +492,9 @@ def _acquire_lock(repo):
             # 重试，让末尾的「after retrying」措辞名副其实（轮 36 candidate-360）。
             _sleep(0.3)
     print(
-        "[ERROR] Could not acquire the autopilot lock at {} after retrying.".format(path),
+        "[ERROR] Could not acquire the autopilot lock at {} after retrying. If no other "
+            "autopilot process is active, remove the stale lock (see 'Another autopilot "
+            "run appears active' in references/troubleshooting.md).".format(path),
         file=sys.stderr,
     )
     raise SystemExit(2)
