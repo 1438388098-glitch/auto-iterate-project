@@ -315,10 +315,12 @@ def build_check_payload(repo, full=False):
         repo, current_head=head_sha)
     commits_behind = state.analysis_commits_behind(repo, analysis=analysis_doc)
     if backlog_watch["needs_expansion"] and analysis_status == "stale" and (commits_behind or 0) >= 3:
-        warnings.append(
+        warnings.append(_check_text(
+            cfg,
+            "分析缓存落后 HEAD {n} 个提交：下一波扩展前先 analysis-load + 全新扫描 + analysis-save".format(n=commits_behind),
             "analysis cache is {} commits stale; run analysis-load + analysis-save with a "
-            "fresh scan before the next expansion wave".format(commits_behind)
-        )
+            "fresh scan before the next expansion wave".format(commits_behind),
+        ))
     ranked, selected_count = rank_for_selection(backlog, st, cfg)
     selected_entries = [e for e in ranked if e.get("selected")]
     selected_empty_reason = None
@@ -580,6 +582,10 @@ def build_check_payload(repo, full=False):
         )
         warnings.append(_check_text(cfg, zh_msg, en_msg))
     payload["blocked_streak"] = blocked_streak
+    payload["aborted_rounds"] = sum(
+        1 for entry in (st.get("history") or [])
+        if isinstance(entry, dict) and entry.get("status") == "aborted"
+    )
 
     # Budget observability: max_minutes measures wall-clock since the last
     # round activity (pausing burns it), deadline is an absolute moment.

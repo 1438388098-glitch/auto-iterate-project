@@ -338,6 +338,12 @@ def cmd_read(args):
     # 与活跃 run 的写入互斥——锁外读会用旧快照覆盖新状态。
     with io.run_lock(repo):
         payload = state.load_state(repo)
+    # 派生计数（wave20 candidate-451）：aborted 不进持久计数器，机读消费者
+    # 需要 counters+aborted 与 round_seq 无缝对账，而不是扫 history。
+    payload["aborted_rounds"] = sum(
+        1 for entry in payload.get("history") or []
+        if isinstance(entry, dict) and entry.get("status") == "aborted"
+    )
     print(json.dumps(payload, indent=2, ensure_ascii=False))
     return 0
 

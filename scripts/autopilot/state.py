@@ -1878,7 +1878,7 @@ def build_report(repo, state, cfg, lang="en"):
         if isinstance(entry, dict) and entry.get("status") == "aborted"
     )
     if aborted_n:
-        out.append("- {}: {} ({})*".format(
+        out.append("- {}: {} ({})".format(
             L.get("aborted", "aborted rounds"), aborted_n,
             "零工作取消，不消耗预算" if zh else "zero-work cancels, no budget burned"))
     out.append("- {}: {}".format(L["tokens"], state.get("estimated_tokens_used", 0)))

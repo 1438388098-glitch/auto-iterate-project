@@ -1259,7 +1259,8 @@ class ExpansionWaveTests(RepoTest):
         data = json.loads(self.run_state("check", "--brief").stdout)
         self.assertEqual(data["analysis"]["status"], "stale")
         self.assertGreaterEqual(data["analysis"]["commits_behind"], 3)
-        self.assertTrue(any("analysis cache is" in w and "commits stale" in w
+        # 双语契约（candidate-449）：zh run 读中文提示（默认 report_lang=zh）
+        self.assertTrue(any("分析缓存落后" in w and "个提交" in w
                             for w in data["warnings"]))
         # Cache staleness is a hint, never a stop.
         self.assertTrue(data["continue"])
@@ -2201,6 +2202,24 @@ class LedgerGuardTests(RepoTest):
         self.assertIn("after-release", text)
         self.assertIn("deferred-1", target.with_name(
             target.name + ".1").read_text(encoding="utf-8"))  # 推迟期条目已归档
+
+    def test_read_and_check_expose_aborted_rounds(self):
+        # wave20 candidate-451：机读接口补 aborted 派生计数——counters+aborted
+        # 与 round_seq 无缝对账。
+        self.run_state("init")
+        self.run_state("begin-round", "--title", "r", "--reason", "x")
+        self.run_state("cancel-round", "--reason", "probe")  # aborted
+        read_payload = json.loads(self.run_state("read").stdout)
+        self.assertEqual(read_payload["aborted_rounds"], 1)
+        self.assertEqual(
+            read_payload["aborted_rounds"]
+            + read_payload["completed_rounds"]
+            + read_payload["blocked_rounds"]
+            + read_payload["cancelled_rounds"]
+            + read_payload["reverted_rounds"],
+            read_payload["round_seq"])
+        data = json.loads(self.run_state("check", "--brief").stdout)
+        self.assertEqual(data["aborted_rounds"], 1)
 
     def test_config_set_budget_domains_match_init(self):
         # wave12 candidate-409：同一字段两扇门同域——max_rounds 收 0（立即
@@ -4345,7 +4364,7 @@ class ContractTests(RepoTest):
                 "backlog", "action_hint", "selected_count", "selected_empty_reason",
                 "wave_no", "lenses_used", "lenses_unused", "analysis", "mining",
                 "blocked_streak", "budget", "expansion_budget",
-                "round_progress",
+                "round_progress", "aborted_rounds",
             },
         )
         self.assertEqual(
