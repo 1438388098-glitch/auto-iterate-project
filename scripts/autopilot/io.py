@@ -538,12 +538,19 @@ def append_log(repo, event, status, **fields):
     try:
         path.parent.mkdir(parents=True, exist_ok=True)
         if path.exists() and path.stat().st_size > LOG_ROTATE_BYTES:
-            for index in range(LOG_ROTATE_KEEP - 1, 0, -1):
-                older = Path(str(path) + ".{}".format(index))
-                newer = Path(str(path) + ".{}".format(index + 1))
-                if older.exists():
-                    os.replace(str(older), str(newer))
-            os.replace(str(path), str(path) + ".1")
+            try:
+                for index in range(LOG_ROTATE_KEEP - 1, 0, -1):
+                    older = Path(str(path) + ".{}".format(index))
+                    newer = Path(str(path) + ".{}".format(index + 1))
+                    if older.exists():
+                        os.replace(str(older), str(newer))
+                os.replace(str(path), str(path) + ".1")
+            except OSError:
+                # Windows 句柄竞态（wave11 candidate-399）：读者开着 log.jsonl
+                # 时 replace 抛 PermissionError。轮转推迟到下一次调用重试，
+                # 本条审计必须照写——持久读者不再能把 5MB 之后的审计链整段
+                # 静默蒸发（含 integrity 取证事件）。
+                pass
         with path.open("a", encoding="utf-8") as handle:
             handle.write(json.dumps(entry, ensure_ascii=False) + "\n")
     except OSError as exc:

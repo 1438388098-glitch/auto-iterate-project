@@ -1191,17 +1191,30 @@ def cmd_goal_met(args):
             # Verification anchor: --round must point at a round that actually
             # completed. Without it the claim stays unverified and cannot stop
             # the run (state.unverified_goals).
+            # 跨窗锚（wave11 candidate-404）：history 窗口只有 100 条，长 run
+            # 里真交付轮会被裁掉——届时窗口成员测试会拒掉真实的完成轮（消息
+            # 还谎称它没完成），把 goals 停止条件永久砖死。改用单调上界：
+            # 接受任何 ≤ 最高已完成轮的锚（修剪后锚精度本来就已被窗口抹掉，
+            # 两个错里取不砖机的那个）；超出上界仍拒绝。
             completed_rounds = {
                 entry.get("round")
                 for entry in st.get("history") or []
                 if isinstance(entry, dict) and entry.get("status") == "completed"
             }
-            if goal_round not in completed_rounds:
+            highest_completed = max(
+                (r for r in completed_rounds if isinstance(r, int)), default=None
+            )
+            anchor_known = goal_round in completed_rounds
+            anchor_plausible = (
+                highest_completed is not None and goal_round <= highest_completed
+            )
+            if not (anchor_known or anchor_plausible):
                 io.append_log(repo, "goal-met", "error", reason="round not completed")
                 return emit_result(
                     args, False,
-                    "[ERROR] --round {} does not match a completed round in history; a goal can only "
-                    "be verified against a round that actually completed.".format(goal_round),
+                    "[ERROR] --round {} does not match a completed round in history "
+                    "(highest completed: {}); a goal can only be verified against a round "
+                    "that actually completed.".format(goal_round, highest_completed),
                 )
 
         if getattr(args, "dry_run", False):
@@ -2979,16 +2992,20 @@ def cmd_detect_verify(args):
                 file=sys.stderr,
             )
             return 0
-        cfg = config.load_config(repo)
-        cfg["check_commands"] = commands
-        config.save_config(repo, cfg)
-        # 这次改动同样是故意的：刷新指纹与 config-set 同一契约（wave9
-        # candidate-382）——否则之后每次 check 都报永久 config-drift 假阳性。
-        st = state.load_state(repo)
-        st["config_fingerprint"] = io.file_sha256(config.config_path_for(repo))
-        state.save_state(repo, st)
-        io.append_log(repo, "detect-verify", "success", commands=commands)
-        return emit_result(args, True, "[OK] check_commands set to {}".format(commands), data=payload)
+        # 与其余状态写者同一把锁（wave11 candidate-400）：无锁的 config+state
+        # 双写与开轮的 load→save 交错时，陈旧副本后落会蒸发 current_round/
+        # 轮计数/水位线。
+        with io.run_lock(repo):
+            cfg = config.load_config(repo)
+            cfg["check_commands"] = commands
+            config.save_config(repo, cfg)
+            # 这次改动同样是故意的：刷新指纹与 config-set 同一契约（wave9
+            # candidate-382）——否则之后每次 check 都报永久 config-drift 假阳性。
+            st = state.load_state(repo)
+            st["config_fingerprint"] = io.file_sha256(config.config_path_for(repo))
+            state.save_state(repo, st)
+            io.append_log(repo, "detect-verify", "success", commands=commands)
+            return emit_result(args, True, "[OK] check_commands set to {}".format(commands), data=payload)
     if not commands and args.apply:
         io.append_log(repo, "detect-verify", "error", reason="nothing detected")
         if getattr(args, "json", False):

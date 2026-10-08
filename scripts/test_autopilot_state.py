@@ -1716,6 +1716,33 @@ class LedgerGuardTests(RepoTest):
         self.assertEqual(committed.returncode, 0, committed.stderr)  # 不再误标硬拒
         self.assertNotIn("pre-existing", committed.stderr)
 
+    def test_rotation_failure_degrades_to_append(self):
+        # wave11 candidate-399：持久读者持有句柄时 Windows 的 os.replace 失败
+        # ——本条审计必须照写（轮转推迟），取证链不断流。
+        if sys.platform != "win32":
+            self.skipTest("Windows handle-lock semantics")
+        target = self.repo / ".autopilot" / "log.jsonl"
+        target.parent.mkdir(parents=True)
+        target.write_text("x" * 300, encoding="utf-8")
+        with open(target, "r"):
+            with mock.patch.object(ap_io, "LOG_ROTATE_BYTES", 200):
+                with redirect_stderr(StringIO()):
+                    ap_io.append_log(self.repo, "commit", "error", reason="must survive")
+        self.assertIn("must survive", target.read_text(encoding="utf-8"))
+
+    def test_goal_met_accepts_round_below_highest_after_trim(self):
+        self.run_state("init", "--goal", "G", "--goal", "H")
+        state_path = self.repo / ".autopilot" / "state.json"
+        st = json.loads(state_path.read_text(encoding="utf-8"))
+        st["history"] = [{"round": 100, "status": "completed"}]  # 轮 30 已被裁剪
+        st["completed_rounds"] = 100
+        state_path.write_text(json.dumps(st), encoding="utf-8")
+        ok = self.run_state("goal-met", "--goal", "G", "--round", "30")
+        self.assertEqual(ok.returncode, 0, ok.stderr)  # ≤ 最高已完成轮：接受
+        refused = self.run_state("goal-met", "--goal", "H", "--round", "101")
+        self.assertNotEqual(refused.returncode, 0)
+        self.assertIn("highest completed: 100", refused.stderr)
+
     def test_round_progress_remaining_matches_stop_gate(self):
         self.run_state("init", "--max-rounds", "5")
         self.run_state("begin-round", "--title", "r", "--reason", "x")
