@@ -35,7 +35,7 @@ Hard stop after this many completed or blocked rounds. Default is `10`.
 
 ### max_minutes
 
-Hard stop based on wall-clock time elapsed since the most recent round activity (`init`, `begin-round`, `complete-round`, `block-round`, `cancel-round`, or `goal-met`). Pausing the run does not pause the clock: a pause longer than the remaining budget stops the resumed run on the first `check`. `null` means unlimited.
+Hard stop based on wall-clock time elapsed since the most recent round activity (`init`, `begin-round`, `complete-round`, `block-round`, `cancel-round`, `goal-met`, `backlog-add`, `expansion-record`, `mine --apply`, `undo-round`, or `seed-reject` — recording/supply work refreshes the clock too, so a run doing only mining and wave bookkeeping burns no idle budget). Pausing the run does not pause the clock: a pause longer than the remaining budget stops the resumed run on the first `check`. `null` means unlimited.
 
 ### deadline
 
@@ -141,7 +141,12 @@ config-drift warning). Settable fields: `--expand-after-goals`/`--no-expand-afte
 `--checkpoint-every N`, `--max-rounds N`/`--clear-max-rounds`,
 `--max-minutes N`/`--clear-max-minutes`, `--max-tokens N`/`--clear-max-tokens`,
 `--deadline EXPR`/`--clear-deadline` (same expression parser as init),
-`--push`/`--no-push`, `--scan-secrets`/`--no-scan-secrets`, `--report-lang zh|en`.
+`--push`/`--no-push`, `--scan-secrets`/`--no-scan-secrets`, `--report-lang zh|en`,
+`--max-blocked-in-a-row N`/`--clear-max-blocked-in-a-row`,
+`--max-expansion-waves N`/`--clear-max-expansion-waves`,
+`--dashboard`/`--no-dashboard`/`--dashboard-port N`,
+`--check-commands CMD`/`--clear-check-commands`,
+`--smoke-commands CMD`/`--clear-smoke-commands`.
 Guard-rail fields (`branch_mode`, `allow_uncommitted_changes`, `allow_paths`/
 `deny_paths`, `secret_patterns`, `track_state`) are deliberately
 not settable at runtime — changing those mid-run requires editing the file by
@@ -289,6 +294,8 @@ Dogfooding example (the mapping this repository uses for itself — `scripts/aut
   "review_threshold": 3,
   "max_blocked_in_a_row": 2,
   "check_commands": ["pytest", "npm run lint"],
+  "smoke_commands": ["py -3.13 scripts/test_autopilot_state.py --smoke"],
+  "max_expansion_waves": null,
   "track_state": false,
   "allow_paths": ["src/", "tests/"],
   "deny_paths": ["*.secret", "**/keys/**"],
@@ -370,7 +377,8 @@ Anti-noise scoring (刀 B): a promoted candidate carries `origin: "predicted"`, 
 - `schema`, `run_id`, `repo`, `branch`, `origin_branch`
 - `started_at`, `last_activity_at` (rolling window for `max_minutes`)
 - `deadline` (config): absolute ISO-8601 timer stop; see the `deadline` field above
-- `round`, `completed_rounds`, `blocked_rounds`, `cancelled_rounds`, `reverted_rounds` (cancelled and reverted rounds advance the round-number counter so numbers are never reused)
+- `round`, `round_seq`, `completed_rounds`, `blocked_rounds`, `cancelled_rounds`, `reverted_rounds` (cancelled and reverted rounds advance the round-number counter so numbers are never reused; aborted zero-work rounds consume a number but appear only in `history`/`aborted_rounds`)
+- `deferred_paths` (run-level deferred-file ledger), `lenses_used_all` (cross-window lens union), `mining_runs`, `expansion_waves`, `expansion_wave_seq`
 - `current_round`, `history`, `completed_goals`, `goal_events`, `goal_seeds` (direction seeds — see the section above; migrated into older state files automatically)
 - `estimated_tokens_used`
 - `type_stats` (per-type completed/blocked/blocked-rate/avg-effort/avg-value, refreshed on every round close)
@@ -383,7 +391,7 @@ Anti-noise scoring (刀 B): a promoted candidate carries `origin: "predicted"`, 
 ## State Helper Commands
 
 - `init` — create config + state (+ optional feature branch). Flags cover every config field: `--goal`, `--goals-from-prompt`, `--max-rounds`, `--max-minutes`, `--deadline`, `--max-tokens`, `--max-round-scope`, `--branch-mode`, `--allow-uncommitted-changes`, `--track-state`, `--check-commands`, `--smoke-commands`, `--push`, `--commit-message-prefix`, `--retries-per-round`, `--candidates-per-round`, `--commit-every-rounds`, `--verify-every-rounds`, `--checkpoint-every`, `--expand-after-goals`, `--review-threshold`, `--scan-secrets`/`--no-scan-secrets`, `--secret-pattern`, `--type-saturation-threshold`, `--ranking-mode`, `--min-candidate-value`, `--max-same-type-per-round`, `--min-pending-candidates`, `--max-predicted-per-round`, `--max-expansion-per-round`, `--max-expansion-waves`, `--max-blocked-in-a-row`, `--allow-path`, `--deny-path`, `--report-lang`, `--force`.
-- `read`, `check`, `diagnose` — inspect state, stop conditions, and repository/git health. `check --brief` returns loop-driving fields only: `continue`/`stop_reason`/`warnings`/`goals_met`/`phase`/`backlog` (`pending`/`ready`/`min_pending_candidates`/`needs_expansion`)/`action_hint` (`work`|`mine`|`expand`|`stop`)/`next_verify_round`/`next_commit_round`/`next_checkpoint_round`/`blocked_streak`/`wave_no`/`lenses_used`/`lenses_unused`/`analysis`/`mining`/`budget` (`remaining_minutes`/`deadline_remaining_minutes`) (saves tokens in the loop). In the expand phase an `expansion` object with open seeds and type context is appended (see Direction Seeds above).
+- `read`, `check`, `diagnose` — inspect state, stop conditions, and repository/git health. `check --brief` returns loop-driving fields only: `continue`/`stop_reason`/`warnings`/`goals_met`/`phase`/`backlog` (`pending`/`ready`/`min_pending_candidates`/`needs_expansion`)/`action_hint` (`work`|`mine`|`expand`|`stop`)/`next_verify_round`/`next_commit_round`/`next_checkpoint_round`/`blocked_streak`/`aborted_rounds`/`round_progress`/`selected_count`/`selected_empty_reason`/`goals_unverified`/`expansion_budget`/`wave_no`/`lenses_used`/`lenses_unused`/`analysis`/`mining`/`budget` (`remaining_minutes`/`deadline_remaining_minutes`) (saves tokens in the loop). In the expand phase an `expansion` object with open seeds and type context is appended (see Direction Seeds above).
 - `detect-agent` — detect the runtime agent (opencode / claude-code / codex / generic) and print adaptation context. Honors a `SKILL_DIR` environment variable for the reported skill directory.
 - `begin-round`, `complete-round`, `block-round`, `cancel-round` — round lifecycle. `begin-round` enforces the clean-tree rule, refuses to pick candidates with unresolved `depends_on`, and refuses to reuse round numbers; `--candidate-id` is repeatable so one round can pick multiple backlog candidates (`candidates_per_round`). `complete-round` accepts an optional `--commit-sha` (omit it on deferred commit rounds when `commit_every_rounds > 1`), an optional `--review-score`/`--review-notes` (pass a score every round — it feeds the value calibration; enforced only when `review_threshold` is set) and `--below-threshold` (records a below-threshold round as completed with its low score, without counting blocked — the only in-run exit once `max_blocked_in_a_row` fires), auto-writes a phase report (`.autopilot/phase-report-round-<N>.md`, in the configured `report_lang` — Chinese by default) every 10 completed rounds, and refreshes `state.type_stats`. A `cancel-round` with zero work (no tree delta, no commit, under 10 minutes) records an `aborted` round that consumes no round budget and no token base.
 - `commit` — staged-change check, git identity check, path whitelist check (`allow_paths`/`deny_paths`), secret scan (`scan_secrets`, bypassable with `--allow-secrets`), scope guard (including binary files), open-round requirement (always enforced unless `--round <n>` is passed explicitly; what batched mode skips is only the dirty-start check), and prefix message building.
