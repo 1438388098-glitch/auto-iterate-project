@@ -16,7 +16,9 @@ AGENT_OVERRIDE_ENV = "AUTOPILOT_AGENT"
 # from hijacking detection.
 AGENT_ENV_SIGNALS = [
     ("opencode", ("OPENCODE",)),
-    ("claude-code", ("CLAUDE_CODE",)),
+    # CLAUDECODE（无下划线）是 Claude Code 实际注入的环境变量名；
+    # CLAUDE_CODE_ENTRYPOINT 是其官方文档列出的入口标记。
+    ("claude-code", ("CLAUDE_CODE", "CLAUDECODE", "CLAUDE_CODE_ENTRYPOINT")),
     ("codex", ("CODEX",)),
 ]
 
@@ -48,7 +50,7 @@ AGENT_PROFILES = {
         "default_shell": "bash",
         "skill_dir": ".codex/skills",
         "project_marker": "AGENTS.md",
-        "agent_config": "AGENTS.md",
+        "agent_config": "~/.codex/config.toml",  # AGENTS.md 只承载指令，配置在 config.toml
     },
     "generic": {
         "label": "Generic agent",
@@ -136,7 +138,10 @@ def detect_python():
             )
         except (OSError, subprocess.SubprocessError):
             continue
-        if probe.returncode == 0:
+        version_text = (probe.stdout or b"") + (probe.stderr or b"")
+        if probe.returncode == 0 and b"Python 3" in version_text:
+            # 只接受 Python 3（wave18 终扫）：双 Python 主机上 python=2.7
+            # 同样退出 0，会让循环的第一条命令就指到跑不动本 helper 的解释器。
             return candidate
     return "python"
 
