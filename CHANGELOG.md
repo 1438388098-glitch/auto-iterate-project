@@ -91,6 +91,40 @@ deterministic mine round). 26 implemented candidates, suite grown 261 → 302.
   split, saturation null, quota null, trim windows and the config-set flag
   surface all have regression pins.
 
+- Refusal messages carry the fix: eight dead-end errors now name the next
+  command (push refusal points at `config-set --push` instead of inviting a
+  config.json hand-edit that trips the drift check; lock-acquisition,
+  no-open-round and sha-resolution errors give recovery paths).
+- JSON mode honors the documented `{ok, message}` contract: `secret-scan`
+  gains `ok`/`message` (named in config.md), `mine --json` carries the same
+  message as text mode, `analysis-save` reports machine-readable
+  `invalidated_by` instead of a prose `valid_until`, and block/complete-round
+  expose round/candidate/SHA fields instead of prose-only payloads.
+- Help strings aligned with behavior: `--confidence` default is 0.9 with
+  `--evidence`; `goal-met --round` states the monotonic bound (any round up
+  to the highest completed survives history trimming); `config-set
+  --max-rounds` accepts 0 and `--max-minutes` accepts fractions, matching
+  init and the validator (one field, one domain per door).
+- Ranking math fixes from the wave-13 audit: predicted calibration divides
+  review average by average VALUE (not the completion count — the old form
+  discounted the predicted pipeline harder the more it succeeded); the 40%
+  cutoff now fires on all-below-floor batches (cutoff_base was never set);
+  the late-run valve cuts predicted work while ANY observed candidate is
+  ready, including below-floor ones; the goal-chain bonus normalizes goal
+  text (NFC/zero-width/whitespace) like every other goal comparison; the
+  rank sort key demotes below-floor entries at equal score
+  (`_rank_sort_key` extracted).
+- Cadence/safety tripwires: `next_verify_round`/`next_commit_round`/
+  `next_checkpoint_round` anchor on round NUMBERS (max of counters and
+  round_seq), so aborted rounds no longer point them at already-spent
+  numbers; a checkpoint boundary now WARNS in check/round-prep — the human
+  steering wheel was the only safety feature with no in-loop tripwire.
+- SKILL.md: exhaustion stated once, as the helper's conjunction
+  (`mining.exhausted`) with the ≥3-subagents bar marked agent-side; stop
+  condition list reordered to the helper's report order; dashboard
+  "never writes" narrowed to its true guarantee (own lifecycle file only);
+  per-candidate isolation marked as agent-side discipline.
+
 ### Docs
 
 - `config.md` deadline section: both entry points documented with
