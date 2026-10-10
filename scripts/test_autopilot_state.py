@@ -2158,6 +2158,24 @@ class LedgerGuardTests(RepoTest):
         data = json.loads(self.run_state("check", "--brief").stdout)
         self.assertTrue(data["goals_met"])
 
+    def test_goal_met_no_auto_context_message_names_blanked_context(self):
+        # wave18 F3 遗留修复：--no-auto-context 把四个上下文字段置空是显式
+        # 语义，成功消息必须说破，否则空表被误读为「该轮无产物」。
+        self.run_state("init", "--goal", "G")
+        self.run_state("begin-round", "--title", "r", "--reason", "x")
+        self.add_file()
+        self.run_state("commit", "--summary", "w")
+        sha = self.git("rev-parse", "HEAD").stdout.strip()
+        self.run_state("complete-round", "--summary", "done", "--commit-sha", sha)
+        blanked = self.run_state(
+            "goal-met", "--goal", "G2", "--round", "1", "--no-auto-context")
+        self.assertEqual(blanked.returncode, 0, blanked.stderr)
+        self.assertIn("context blanked", blanked.stdout)
+        self.assertIn("--no-auto-context", blanked.stdout)
+        full = self.run_state("goal-met", "--goal", "G3", "--round", "1")
+        self.assertEqual(full.returncode, 0, full.stderr)
+        self.assertNotIn("context blanked", full.stdout)
+
     def test_seed_reuse_warns_on_discarded_fields(self):
         # wave18 candidate-443：幂等复用丢弃调用方新字段必须出声。
         self.run_state("init", "--goal", "G")
@@ -2415,6 +2433,180 @@ class LedgerGuardTests(RepoTest):
         state_path.write_text(json.dumps(st), encoding="utf-8")
         data = json.loads(self.run_state("check", "--brief").stdout)
         self.assertTrue(data["mining"]["exhausted"])  # 对照：零产出 + 零新增 mine
+
+
+class NextImprovementSectionTests(RepoTest):
+    """wave18 F2 遗留修复：report/retro 的「下一步建议」必须与调度器一致——
+    优先取本批 selected 榜首；全部落选时回退榜首并标注 cut_reason。
+    此前恒取 ready[0]，调度器刚以 late_run/quota 拒绝的候选仍被推荐。"""
+
+    def _seed(self, origin_a="predicted", origin_b="observed", ranking_mode=None):
+        argv = ["init", "--goal", "G"]
+        if ranking_mode:
+            argv += ["--ranking-mode", ranking_mode]
+        self.run_state(*argv)
+        added = self.run_state(
+            "backlog-add", "--title", "Pred top", "--value", "5",
+            "--effort", "1", "--type", "feature",
+            "--origin", origin_a, "--evidence", "docs/spec.md:1")
+        self.assertEqual(added.returncode, 0, added.stderr)
+        added = self.run_state(
+            "backlog-add", "--title", "Observed second", "--value", "3",
+            "--effort", "2", "--type", "bugfix", "--origin", origin_b)
+        self.assertEqual(added.returncode, 0, added.stderr)
+        self.run_state("config-set", "--max-rounds", "2")
+        state_path = self.repo / ".autopilot" / "state.json"
+        st = json.loads(state_path.read_text(encoding="utf-8"))
+        st["completed_rounds"] = 2  # progress = 1.0 → late_run 阀门生效
+        state_path.write_text(json.dumps(st), encoding="utf-8")
+
+    def _set_cfg(self, **kwargs):
+        # config-set 未暴露的配额键（max_predicted_per_round）走配置直写：
+        # 注册表 int_range(0, None) 允许 0，load_config 会走完整校验。
+        path = self.repo / ".autopilot" / "config.json"
+        cfg = json.loads(path.read_text(encoding="utf-8"))
+        cfg.update(kwargs)
+        path.write_text(json.dumps(cfg), encoding="utf-8")
+
+    @staticmethod
+    def _section(text, header):
+        out, grab = [], False
+        for line in text.splitlines():
+            if line.startswith("## "):
+                grab = line.strip() == header
+                continue
+            if grab:
+                out.append(line)
+        return "\n".join(out)
+
+    def test_report_next_prefers_scheduler_selection(self):
+        # late_run 切 predicted：榜首 candidate-001 被 cut=late_run，
+        # 观测候选 candidate-002 才是调度器本批 selected——报告须推荐后者。
+        self._seed()
+        report = self.run_state("report", "--lang", "en").stdout
+        section = self._section(report, "## Next likely improvement")
+        self.assertIn("candidate-002", section)
+        self.assertNotIn("candidate-001", section)
+        self.assertNotIn("cut=", section)
+
+    def test_report_next_annotates_cut_when_batch_refused(self):
+        # max_predicted=0：ready 池全是 predicted → 本批空选，回退榜首时
+        # 必须把落选原因写在明面上，而不是装作调度器推荐了它。
+        self._seed(origin_a="predicted", origin_b="predicted")
+        self._set_cfg(max_predicted_per_round=0)
+        report = self.run_state("report", "--lang", "en").stdout
+        section = self._section(report, "## Next likely improvement")
+        self.assertIn("cut=quota", section)
+        self.assertIn("candidate-001", section)
+
+    def test_retro_next_prefers_scheduler_selection(self):
+        self._seed()
+        retro = self.run_state("retrospective", "--lang", "zh").stdout
+        section = self._section(retro, "## 下一步建议")
+        self.assertIn("candidate-002", section)
+        self.assertNotIn("candidate-001", section)
+
+    def test_retro_next_annotates_cut_when_batch_refused(self):
+        # max_predicted=0 且 ready 池全是 predicted：本批空选，retro 回退
+        # 榜首时同样必须亮出落选原因。
+        self._seed(origin_a="predicted", origin_b="predicted")
+        self._set_cfg(max_predicted_per_round=0)
+        retro = self.run_state("retrospective", "--lang", "zh").stdout
+        self.assertIn("cut=quota", self._section(retro, "## 下一步建议"))
+
+    def test_classic_mode_keeps_top_without_annotation(self):
+        # classic 不跑 _mark_selection：无 selected/cut_reason 可言，
+        # 行为必须原样（榜首、无标注）——修复不得泄漏进 classic。
+        self._seed(origin_a="predicted", origin_b="observed", ranking_mode="classic")
+        report = self.run_state("report", "--lang", "en").stdout
+        section = self._section(report, "## Next likely improvement")
+        self.assertIn("candidate-001", section)
+        self.assertNotIn("cut=", section)
+
+
+class TypeStatsDriftTests(RepoTest):
+    """candidate-450 历史病灶的根因守卫：state.type_stats 快照与 backlog
+    完成账本曾静默差 5（358 vs 363），复盘曾无条件优先采信快照。三层防线：
+    retro 恒现算（真值层）、check 暴露 drift + 警告（检测面）、begin-round
+    重算落盘 + warn 审计（自愈点，check 保持只读契约）。"""
+
+    def _seed_drift(self):
+        """2 条 bugfix 候选手翻 completed，快照留在 0 completed 的漂移态。"""
+        self.run_state("init", "--goal", "G")
+        for title in ("a", "b"):
+            added = self.run_state(
+                "backlog-add", "--title", title, "--value", "3", "--effort", "1",
+                "--type", "bugfix", "--evidence", "docs/x.md:1")
+            self.assertEqual(added.returncode, 0, added.stderr)
+        backlog_path = self.repo / ".autopilot" / "backlog.json"
+        backlog = json.loads(backlog_path.read_text(encoding="utf-8"))
+        for candidate in backlog["candidates"]:
+            candidate["status"] = "completed"
+        backlog_path.write_text(json.dumps(backlog), encoding="utf-8")
+
+    def test_drift_function_sync_reports_empty(self):
+        self.run_state("init")
+        st = json.loads(
+            (self.repo / ".autopilot" / "state.json").read_text(encoding="utf-8"))
+        # backlog.json 惰性创建：init 后可能尚不存在，纯函数吃 dict
+        backlog_path = self.repo / ".autopilot" / "backlog.json"
+        backlog = (
+            json.loads(backlog_path.read_text(encoding="utf-8"))
+            if backlog_path.exists() else {"candidates": []})
+        self.assertEqual(ap_state.type_stats_drift(st, backlog), {})
+
+    def test_drift_function_reports_signed_delta(self):
+        self._seed_drift()
+        st = json.loads(
+            (self.repo / ".autopilot" / "state.json").read_text(encoding="utf-8"))
+        backlog = json.loads(
+            (self.repo / ".autopilot" / "backlog.json").read_text(encoding="utf-8"))
+        self.assertEqual(
+            ap_state.type_stats_drift(st, backlog),
+            {"bugfix": {"completed": 2, "blocked": 0}})
+        # 对照：快照缺失（旧 run）按全量漂移处理，让自愈路径补齐
+        st.pop("type_stats", None)
+        self.assertEqual(
+            ap_state.type_stats_drift(st, backlog),
+            {"bugfix": {"completed": 2, "blocked": 0}})
+
+    def test_check_exposes_drift_and_warning(self):
+        self._seed_drift()
+        data = json.loads(self.run_state("check", "--brief").stdout)
+        self.assertEqual(
+            data["type_stats_drift"], {"bugfix": {"completed": 2, "blocked": 0}})
+        self.assertTrue(any("type_stats" in w for w in data["warnings"]))
+        # 对照组：同步态键恒存在且为空（消费方键存在性检查不翻转）
+        st_path = self.repo / ".autopilot" / "state.json"
+        st = json.loads(st_path.read_text(encoding="utf-8"))
+        st["type_stats"] = ap_state.compute_type_stats(
+            json.loads((self.repo / ".autopilot" / "backlog.json").read_text(encoding="utf-8")))
+        st_path.write_text(json.dumps(st), encoding="utf-8")
+        data = json.loads(self.run_state("check", "--brief").stdout)
+        self.assertEqual(data["type_stats_drift"], {})
+
+    def test_begin_round_reconciles_drift_with_warn_audit(self):
+        self._seed_drift()
+        result = self.run_state("begin-round", "--title", "r", "--reason", "x")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        st = json.loads(
+            (self.repo / ".autopilot" / "state.json").read_text(encoding="utf-8"))
+        self.assertEqual(
+            st["type_stats"],
+            ap_state.compute_type_stats(json.loads(
+                (self.repo / ".autopilot" / "backlog.json").read_text(encoding="utf-8"))))
+        self.assertEqual(st["type_stats"]["bugfix"]["completed"], 2)
+        log = (self.repo / ".autopilot" / "log.jsonl").read_text(encoding="utf-8")
+        self.assertTrue(any(
+            '"type-stats-drift reconciled"' in line and '"warn"' in line
+            for line in log.splitlines()))
+
+    def test_retro_computes_fresh_not_snapshot(self):
+        # 病灶本体：快照 0 completed、backlog 2 completed——复盘表必须
+        # 显示 2（真值），不再优先采信漂移快照。
+        self._seed_drift()
+        retro = self.run_state("retrospective", "--lang", "zh").stdout
+        self.assertRegex(retro, r"\| bugfix \| 2 \| 0 \|")
 
 
 class BudgetAccountingTests(RepoTest):
@@ -4431,7 +4623,7 @@ class ContractTests(RepoTest):
             {
                 "continue", "stop_reason", "warnings", "goals_met", "goals_unverified",
                 "phase", "next_verify_round", "next_commit_round", "next_checkpoint_round",
-                "backlog", "action_hint", "selected_count", "selected_empty_reason",
+                "backlog", "type_stats_drift", "action_hint", "selected_count", "selected_empty_reason",
                 "wave_no", "lenses_used", "lenses_unused", "analysis", "mining",
                 "blocked_streak", "budget", "expansion_budget",
                 "round_progress", "aborted_rounds",
@@ -4947,6 +5139,19 @@ class DashboardContractTests(RepoTest):
         html = (Path(autopilot.__file__).parent / "dashboard.html").read_text(encoding="utf-8")
         self.assertIn("escapeHtml(fmt(c.value))", html)
         self.assertIn("escapeHtml(fmt(c.effort))", html)
+
+    def test_dashboard_html_server_death_banner_contract(self):
+        """遗留项（1.14 尾组 v1）：轮询失败曾全静默——server 死后画面冻结
+        而观者以为实时。横幅契约：元素默认 hidden、连续失败达阈值才亮、
+        成功一拍立即复位、亮着时写明停留的快照时点。"""
+        html = (Path(autopilot.__file__).parent / "dashboard.html").read_text(encoding="utf-8")
+        self.assertIn('id="conn-banner" hidden', html)
+        self.assertIn("failStreak = 0", html)              # 成功拍复位
+        self.assertRegex(html, r"failStreak >= CONN_FAILS")  # 阈值才亮
+        self.assertRegex(html, r"CONN_FAILS = 2")           # 阈值=2（单拍抖动不吓人）
+        self.assertIn("showConn(true)", html)               # 恢复即隐
+        show_conn = html.split("function showConn")[1].split("async function poll")[0]
+        self.assertIn("generated_at", show_conn)            # 横幅写明停留时点
 
     def test_unlink_info_tolerates_locked_file(self):
         """candidate-397：Windows 句柄释放竞态——刚被杀掉的 server 留下的

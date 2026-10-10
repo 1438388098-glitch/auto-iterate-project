@@ -436,6 +436,17 @@ def cmd_begin_round(args):
             return 0
         candidate_ids = list(args.candidate_id) if args.candidate_id else []
         backlog = state.load_backlog(repo)
+        # type_stats 快照自愈（candidate-450 根因守卫）：快照只随特定命令刷新，
+        # 任何漏刷新路径或手改 backlog 都让它静默失真并污染饱和判定与复盘——
+        # 每次开轮先对账，漂移非零即重算落盘 + warn 审计。独立先落盘：后续
+        # 拒绝路径（无 --candidate-id 等）不回滚这次对账。
+        stats_drift = state.type_stats_drift(st, backlog)
+        if stats_drift:
+            st["type_stats"] = state.compute_type_stats(backlog)
+            state.save_state(repo, st)
+            io.append_log(repo, "begin-round", "warn",
+                          reason="type-stats-drift reconciled", drift=stats_drift)
+
         # picked-orphan 自愈（wave11 candidate-398）：backlog(picked) →
         # state(current_round) 两写窗口内崩溃会留下「picked 但无开轮」残留，
         # 反双拾守卫拒重拾、backlog-update 一次一 id——死账。此处已过开轮
@@ -1310,6 +1321,13 @@ def cmd_goal_met(args):
             # An exit-0 with no anchor word used to read as verified evidence:
             # say plainly that the claim will withhold the all-goals-met stop.
             message += " unverified（未关联已完成轮次，将阻止 all-goals-met 停止）"
+        if args.no_auto_context:
+            # wave18 F3：置空是显式语义而非遗漏——exit-0 里不说，消费者无从
+            # 知道事件里的空表是跳过采集的结果，会误读为「该轮确实无产物」。
+            message += (
+                " context blanked（--no-auto-context：commit_shas/candidate_ids/"
+                "recent_commit_topics/saturated_types 未采集，事件本体照常落账）"
+            )
         data = None
         if getattr(args, "json", False):
             data = {"goal_event": goal_event, "seeds": seeds}

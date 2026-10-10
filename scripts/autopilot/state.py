@@ -1110,6 +1110,34 @@ def compute_type_stats(backlog):
     return stats
 
 
+def type_stats_drift(state_dict, backlog):
+    """state.type_stats 快照与 backlog 现算账本的完成/受阻漂移（candidate-450
+    历史病灶的守卫：任一完成路径漏刷新或手改 backlog 后，快照静默失真，
+    饱和判定与整份复盘跟着错）。返回仅含差异类型的
+    ``{type: {"completed": ±n, "blocked": ±n}}``（正值=快照少算），同步时
+    为 {}。只对账 completed/blocked 两个账本列——均值列由同一批计数派生，
+    对浮点做等值比较只会制造假阳性。快照缺失（旧 run）按全量漂移处理，
+    让调用方的自愈路径把它补齐。"""
+    fresh = compute_type_stats(backlog)
+    snap = state_dict.get("type_stats") or {}
+
+    def _int(mapping, key):
+        try:
+            return int(mapping.get(key) or 0)
+        except (TypeError, ValueError, OverflowError):
+            return 0
+
+    drift = {}
+    for candidate_type in sorted(set(fresh) | set(snap)):
+        delta_completed = _int(fresh.get(candidate_type) or {}, "completed") - _int(
+            snap.get(candidate_type) or {}, "completed")
+        delta_blocked = _int(fresh.get(candidate_type) or {}, "blocked") - _int(
+            snap.get(candidate_type) or {}, "blocked")
+        if delta_completed or delta_blocked:
+            drift[candidate_type] = {"completed": delta_completed, "blocked": delta_blocked}
+    return drift
+
+
 def candidates_by_id(backlog):
     """id -> candidate map, one pass over the backlog. First occurrence wins on
     duplicate ids (same semantics as find_candidate). Shared by every caller
@@ -1678,6 +1706,19 @@ def analysis_commits_behind(repo, analysis=None):
         return None
 
 
+def _next_improvement_entry(ranked):
+    """「下一步建议」的选人规则（wave18 F2）：优先调度器本批 `selected` 的
+    榜首；全部落选时回退榜首——此时条目必带 `cut_reason`，展示层必须标注，
+    否则报告在调度器刚拒绝（late_run/quota/type）同一候选时仍把它推荐为
+    下一步，自相矛盾。classic 模式不跑 _mark_selection：无 selected 标记，
+    行为退回原样（取榜首，无标注）。"""
+    ready = [r for r in ranked if r.get("status") == "pending" and r.get("ready")]
+    if not ready:
+        return None
+    selected = [r for r in ready if r.get("selected")]
+    return (selected or ready)[0]
+
+
 def build_retrospective(repo, state, cfg, lang="zh"):
     """Run-level retrospective: per-type success stats, blocked rounds, and the
     verification setup, in the configured language."""
@@ -1728,7 +1769,10 @@ def build_retrospective(repo, state, cfg, lang="zh"):
         out.append("")
         out.append("## Stats by type")
         out.append("")
-    stats = state.get("type_stats") or compute_type_stats(backlog)
+    # 复盘是账本真值层，恒按 backlog 现算、不采信 state.type_stats 快照：
+    # 快照只在特定命令路径刷新（candidate-450 病灶），漏刷新/手改后它静默
+    # 失真，而这里曾无条件优先采信——363（真）vs 358（表）差 5 即由此放大。
+    stats = compute_type_stats(backlog)
     if not stats:
         out.append("- {}: {}".format("无" if zh else "none", "—"))
     else:
@@ -1776,16 +1820,18 @@ def build_retrospective(repo, state, cfg, lang="zh"):
         backlog, cfg, progress=progress_from_state(state, cfg),
         completed_goals=list(state.get("completed_goals") or []),
     )
-    ready = [r for r in ranked if r.get("status") == "pending" and r.get("ready")]
+    top = _next_improvement_entry(ranked)
     out.append("## {}".format("下一步建议" if zh else "Next likely improvement"))
     out.append("")
-    if not ready:
+    if top is None:
         out.append("- {}".format("无" if zh else "none"))
     else:
-        top = ready[0]
-        out.append("- {} `{}` (value={}, effort={}, type={})".format(
+        line = "- {} `{}` (value={}, effort={}, type={})".format(
             top.get("id"), table_cell(top.get("title")), top.get("value"), top.get("effort"), top.get("type") or "feature"
-        ))
+        )
+        if top.get("cut_reason"):
+            line += " cut={}".format(top["cut_reason"])
+        out.append(line)
     out.append("")
     return "\n".join(out)
 
@@ -1985,15 +2031,17 @@ def build_report(repo, state, cfg, lang="en"):
         backlog_data, cfg, progress=progress_from_state(state, cfg),
         completed_goals=list(state.get("completed_goals") or []),
     )
-    ready = [r for r in ranked if r.get("status") == "pending" and r.get("ready")]
-    if ready:
-        top = ready[0]
+    top = _next_improvement_entry(ranked)
+    if top is not None:
         out.append("## {}".format(L["next"]))
         out.append("")
-        out.append("- {} `{}` (value={}, effort={}, type={}, score={})".format(
+        line = "- {} `{}` (value={}, effort={}, type={}, score={})".format(
             top.get("id"), table_cell(top.get("title")), top.get("value"), top.get("effort"),
             top.get("type") or "feature", top.get("score"),
-        ))
+        )
+        if top.get("cut_reason"):
+            line += " cut={}".format(top["cut_reason"])
+        out.append(line)
         out.append("")
 
     # Handover section (candidate-273): a run leaves pending candidates behind

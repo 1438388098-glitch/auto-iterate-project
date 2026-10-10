@@ -167,6 +167,18 @@
   #norun .msg { font-size:14px; color:var(--txt2); }
   #norun .hint { font-size:11px; }
 
+  /* ---- 连接中断横幅（server-death）：轮询连续失败才亮，恢复即隐。
+     旧画面保留但必须让观者知道它是冻结的，而不是实时数据。 ---- */
+  #conn-banner {
+    position:fixed; top:0; left:0; right:0; z-index:50;
+    display:flex; align-items:center; justify-content:center; gap:8px;
+    padding:8px 16px; font-size:12px; letter-spacing:.2px;
+    background:var(--warm); color:#fff;
+  }
+  #conn-banner .dot {
+    width:8px; height:8px; border-radius:50%; background:#fff; opacity:.9; flex:none;
+  }
+
   /* ---- 生长动画：新节点/卡片浮现（只动 opacity/transform） ---- */
   @keyframes grow-in { from { opacity:0; transform:translateY(8px); } to { opacity:1; transform:translateY(0); } }
 
@@ -203,6 +215,11 @@
 </style>
 </head>
 <body>
+
+  <div id="conn-banner" hidden role="alert">
+    <span class="dot"></span>
+    <span id="conn-msg"></span>
+  </div>
 
   <div id="norun" hidden>
     <div class="dot"></div>
@@ -390,6 +407,19 @@
   function schedule() { pollTimer = setTimeout(poll, POLL_MS); }
 
   var polling = false;
+  // server-death 横幅（遗留项）：单拍网络抖动不吓人，连续两拍失败才亮；
+  // 亮着时旧画面仍在但已冻结——横幅写明停留的快照时点，恢复即隐。
+  var failStreak = 0;
+  var CONN_FAILS = 2;
+
+  function showConn(ok) {
+    var banner = $("conn-banner");
+    if (ok) { banner.hidden = true; return; }
+    var ts = (snapshot && snapshot.meta && snapshot.meta.generated_at) || "—";
+    $("conn-msg").textContent =
+      "数据连接中断——画面停留在 " + ts + " 的快照；恢复后自动续传";
+    banner.hidden = false;
+  }
 
   async function poll() {
     if (polling) return;
@@ -399,6 +429,8 @@
       var res = await fetch("/api/snapshot");
       if (!res.ok) throw new Error("HTTP " + res.status);
       var next = await res.json();
+      failStreak = 0;
+      showConn(true);
       if (next && next.error === "no-run") {
         if (lastDrawn !== "no-run") { lastDrawn = "no-run"; renderNoRun(); }
       } else if (next && next.meta && next.meta.generated_at) {
@@ -414,7 +446,11 @@
           renderAll();
         }
       }
-    } catch (err) { /* 网络/解析失败：保留旧画面，不打断观察 */ }
+    } catch (err) {
+      /* 网络/解析失败：保留旧画面，不打断观察——但连续失败要出声 */
+      failStreak += 1;
+      if (failStreak >= CONN_FAILS) showConn(false);
+    }
     polling = false;
     schedule();
   }

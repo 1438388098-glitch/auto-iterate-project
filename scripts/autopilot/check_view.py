@@ -277,6 +277,21 @@ def build_check_payload(repo, full=False):
 
     backlog = state.load_backlog(repo)
     backlog_watch = _backlog_watch(backlog, cfg)
+    # type_stats 快照漂移检测（candidate-450 历史病灶）：check 是每轮必看的
+    # 状态面，漂移在此曝光；落盘自愈在 begin-round（check 保持只读契约）。
+    # 键恒存在（同步时 {}），消费方的键存在性检查不会在两个版本间翻转。
+    type_stats_drift = state.type_stats_drift(st, backlog)
+    if type_stats_drift:
+        detail = ", ".join(
+            "{}(completed {:+d}, blocked {:+d})".format(candidate_type, d["completed"], d["blocked"])
+            for candidate_type, d in sorted(type_stats_drift.items()))
+        warnings.append(_check_text(
+            cfg,
+            "type_stats 快照与 backlog 完成账本漂移：{}；下轮 begin-round 自动重算校准，"
+            "也可 backlog-update 立即刷新".format(detail),
+            "state.type_stats snapshot drifts from the backlog ledger: {}; the next "
+            "begin-round recomputes it, or refresh now via backlog-update".format(detail),
+        ))
     candidates_per_round = cfg.get("candidates_per_round") or 1
     if backlog_watch["pending"] >= 2 * candidates_per_round:
         warnings.append(
@@ -457,6 +472,7 @@ def build_check_payload(repo, full=False):
         "stop_reason": stop_reason,
         "warnings": warnings,
         "backlog": backlog_watch,
+        "type_stats_drift": type_stats_drift,
         "action_hint": action_hint,
         # 轮次进度（预算可见性）：max_rounds 为 null 时 remain 亦为 null
         "round_progress": {
