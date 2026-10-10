@@ -2,7 +2,7 @@
 
 # Auto Iterate Project
 
-版本 1.14.0 — 发布历史见 [CHANGELOG.md](CHANGELOG.md)。
+版本 1.15.0 — 发布历史见 [CHANGELOG.md](CHANGELOG.md)。
 
 在 agent 会话中自动迭代任意 git 项目：分析仓库、挑选下一个高价值改进、实施小步变更、验证、提交，然后循环往复，直到达成目标，或配置的预算（轮数 / 分钟数 / token 数 / 绝对截止时间）用尽。
 

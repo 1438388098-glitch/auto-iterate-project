@@ -2,6 +2,50 @@
 
 All notable changes to auto-iterate-project are documented here.
 
+## 1.15.0 (2026-10-10)
+
+Leftover-fix batch closing out the 1.14 overnight run's preserved findings
+(candidate-450 root cause, wave18 F2/F3, endgame v1/v2 polish). Suite 337 → 349.
+
+### Fixed
+
+- **`state.type_stats` snapshot drift (candidate-450 root cause)**: the
+  overnight run's retrospective showed 358 completed candidates while the
+  backlog held 363 — a stale snapshot from a missed-refresh era was trusted
+  blindly by the report layer. Three layers now guard the ledger: the
+  retrospective always computes fresh from the backlog (truth layer); `check`
+  exposes a `type_stats_drift` payload key (empty object when in sync) plus a
+  bilingual warning naming the per-type delta (detection surface, still
+  read-only); `begin-round` recomputes the snapshot and logs a `warn` audit
+  event `type-stats-drift reconciled` (heal point, persisted independently of
+  the command's later refusal paths).
+- **Report/retro "next likely improvement" contradicted the scheduler
+  (wave18 F2)**: the section always took the top-ranked ready candidate even
+  when `_mark_selection` had just cut it (`late_run`/`quota`/`type`), so the
+  report recommended work the scheduler refused. It now prefers the top
+  `selected` entry and, when the whole batch is refused, falls back to the
+  top candidate annotated with `cut=<reason>`. Classic mode (no selection
+  pass) keeps the old behavior verbatim.
+- **`goal-met --no-auto-context` blanked context silently (wave18 F3)**:
+  the success message now says `context blanked` and names the four emptied
+  fields, so an empty `commit_shas`/`candidate_ids` list can't be misread as
+  "the round had no products". config.md's flag description also caught up
+  with the 1.14 semantics it predated (the event always lands now).
+- **Dashboard server-death was silent**: poll failures kept the last frame
+  with no signal. A fixed banner (default `hidden`, `role=alert`) lights up
+  after two consecutive failed polls, names the frozen snapshot's
+  `generated_at`, and hides on the first successful beat.
+
+### Tests
+
+- `TypeStatsDriftTests` (6): drift function (sync/signed delta/missing
+  snapshot), check payload + warning + sync-shape key stability, begin-round
+  reconciliation with warn audit, retro-computes-fresh pin.
+- `NextImprovementSectionTests` (5): report/retro prefer the selected batch,
+  `cut=` annotation when the batch is refused, classic mode unchanged.
+- Dashboard banner contract test; `goal-met` message regression; the check
+  `--brief` contract key set gains `type_stats_drift`.
+
 ## 1.14.0 (2026-10-09)
 
 Overnight self-iteration (16 rounds, waves 1-5: cross-command invariant and
