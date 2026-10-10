@@ -2138,6 +2138,39 @@ class LedgerGuardTests(RepoTest):
         self.assertNotIn("已完成", report.stdout)
         self.assertIn("aborted", report.stdout)
 
+    def test_report_lang_override_not_polluted_by_windowed_note(self):
+        # #440 同款回归复活（round-45）：history≥HISTORY_LIMIT 时窗口注记
+        # 位点曾用 cfg 重绑 zh，--lang en 报告自注记行起整体反转成中文。
+        # zh 一律只认 lang 参数派生值；zh 缺省运行行为保持不变。
+        self.run_state("init")
+        self.run_state("begin-round", "--title", "r", "--reason", "x")
+        self.add_file()
+        self.run_state("commit", "--summary", "w")
+        sha = self.git("rev-parse", "HEAD").stdout.strip()
+        self.run_state("complete-round", "--summary", "done", "--commit-sha", sha)
+        state_path = self.repo / ".autopilot" / "state.json"
+        st = json.loads(state_path.read_text(encoding="utf-8"))
+        entry = (st.get("history") or [{}])[0]
+        self.assertTrue(entry)  # 前置：真实轮已在历史中
+        st["history"] = [dict(entry, round=i + 1, title="t{}".format(i + 1))
+                         for i in range(ap_io.HISTORY_LIMIT)]
+        state_path.write_text(json.dumps(st, ensure_ascii=False), encoding="utf-8")
+        en = self.run_state("report", "--lang", "en")
+        self.assertIn("(windowed: showing the last", en.stdout)
+        self.assertNotIn("窗口注记", en.stdout)
+        self.assertNotIn("已完成", en.stdout)  # 注记后的历史表标签不得被连带污染
+        zh = self.run_state("report")
+        self.assertIn("窗口注记", zh.stdout)
+        self.assertIn("已完成", zh.stdout)
+
+    def test_report_repo_line_basename_only(self):
+        # 报告/复盘随 run 归档进公开仓（docs/autopilot/），仓库行只落
+        # basename——原样落 str(repo) 会把本机绝对路径带进公开仓。
+        self.run_state("init")
+        report = self.run_state("report")
+        self.assertIn(self.repo.name, report.stdout)
+        self.assertNotIn(str(self.repo), report.stdout)
+
     def test_goal_met_no_auto_context_still_records_event(self):
         # wave18 candidate-441：--no-auto-context 跳的是自动上下文不是验证
         # 事件——与 --round 组合曾静默不落账，目标永久 unverified。

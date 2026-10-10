@@ -1883,7 +1883,8 @@ def build_report(repo, state, cfg, lang="en"):
 
     out.append("## {}".format(L["meta"]))
     out.append("")
-    out.append("- {}: `{}`".format(L["repo"], state.get("repo")))
+    # 报告会随 run 归档进公开仓库（docs/autopilot/），只落仓库名不落本机绝对路径。
+    out.append("- {}: `{}`".format(L["repo"], os.path.basename(state.get("repo") or "")))
     out.append("- run_id: `{}`".format(state.get("run_id")))
     # branch/origin_branch are only set in feature mode; in current mode both
     # are None and the report used to show 无 despite git knowing the branch.
@@ -1935,7 +1936,8 @@ def build_report(repo, state, cfg, lang="en"):
     out.append("")
     if len(history) >= io.HISTORY_LIMIT:
         # 窗口注记（wave17 残留）：计数器是全量的，表只是最近 100 条窗口。
-        zh = (cfg.get("report_lang") or "zh") == "zh"
+        # zh 只认 lang 参数派生值，不得在此用 cfg 重绑——否则复现 #440
+        # 同款「--lang en 报告自本行起反转成中文」。
         out.append("- {}".format(
             "（窗口注记：仅显示最近 {} 条；更早轮次已裁剪，以计数为准）".format(len(history))
             if zh else
