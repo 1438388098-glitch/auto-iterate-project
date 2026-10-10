@@ -1,6 +1,6 @@
 # 迭代复盘（Retrospective）
 
-- 仓库: `D:\Claudeworkspace\auto-iterate-project`
+- 仓库: `auto-iterate-project`
 - run_id: `044c9e6a558b`
 - 完成轮次: 48
 - 受阻轮次: 0

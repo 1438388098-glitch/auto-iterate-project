@@ -2,7 +2,7 @@
 
 ## 运行信息
 
-- 仓库: `D:\Claudeworkspace\auto-iterate-project`
+- 仓库: `auto-iterate-project`
 - run_id: `044c9e6a558b`
 - 活动分支: `autopilot/044c9e6a558b`
 - started_at: `2026-10-08T15:42:49.307856+00:00`
