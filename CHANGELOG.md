@@ -46,11 +46,26 @@ Leftover-fix batch closing out the 1.14 overnight run's preserved findings
 - Dashboard banner contract test; `goal-met` message regression; the check
   `--brief` contract key set gains `type_stats_drift`.
 
+### Docs
+
+- Corrected the 1.13/1.14 intro paragraphs: both were mid-run snapshots
+  ("16 rounds / 26 candidates", "rounds 26-41 / ~30 candidates") never
+  reconciled with the archived state ledgers. Authoritative counts now:
+  1.14 = 50 opened / 48 completed rounds, 80 candidates, 261 → 337;
+  1.13 = 39 opened / 38 completed, 108 candidates, 190 → 261.
+
 ## 1.14.0 (2026-10-09)
 
-Overnight self-iteration (16 rounds, waves 1-5: cross-command invariant and
-crash-atomicity audits, performance profiling, doc-accuracy review, plus one
-deterministic mine round). 26 implemented candidates, suite grown 261 → 302.
+Overnight self-iteration: 50 rounds opened, 48 completed (2 aborted zero-work
+cancels), 21 subagent audit waves, 80 implemented candidates (376-455, all
+landed), suite grown 261 → 337. Waves spanned cross-command invariant and
+crash-atomicity audits, performance profiling, ranking-math correction,
+doc-accuracy review, supply-side (miner/verify/agent) audits, and final
+test-gap sweeps; two adversarial reviews caught the run's own regressions.
+(The merge-commit title overcounted the rounds as 52; the archived state
+ledger and the finish-time retrospective agree on 50 opened / 48 completed.
+This intro originally said "16 rounds, waves 1-5, 26 candidates, 261 → 302"
+— a mid-run snapshot that was never updated as the run continued.)
 
 ### Fixed
 
@@ -235,9 +250,13 @@ deterministic mine round). 26 implemented candidates, suite grown 261 → 302.
 
 ## 1.13.0 (2026-10-08)
 
-Overnight self-iteration (rounds 26-41, 8 expansion waves, ~30 implemented
-candidates): field-test follow-through on waves 3-8 findings plus config-set
-completeness, decision-audit attribution, and bilingual copy coverage.
+Overnight self-iteration: 39 rounds opened, 38 completed (1 cancelled),
+8 expansion waves, 108 implemented candidates (268-375, all landed), suite
+grown 190 → 261. Field-test follow-through on waves 3-8 findings plus
+config-set completeness, decision-audit attribution, and bilingual copy
+coverage. (Earlier copy said "rounds 26-41 / ~30 implemented candidates" —
+a mid-run snapshot never reconciled with the archived state ledger; numbers
+above are the authoritative final counts.)
 
 ### Fixed
 
@@ -275,7 +294,7 @@ completeness, decision-audit attribution, and bilingual copy coverage.
   direct, lock token ownership / young grace / write-failure cleanup /
   stat-race retry, ReDoS fast-match acceptance, decision-audit via fields,
   en-branch coverage for the new bilingual pairs, config deadline/goals
-  guards (suite 190 → 262).
+  guards (suite 190 → 261).
 
 ### Docs
 
