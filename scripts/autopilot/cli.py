@@ -305,7 +305,7 @@ def build_parser():
 
     mine_parser = subparsers.add_parser(
         "mine",
-        help="Deterministic repo scan that yields backlog candidates (markers, swallowed, syntax, test-gap, hotspot, dead-export, docs-drift)",
+        help="Deterministic repo scan that yields backlog candidates (markers, swallowed, syntax, test-gap, hotspot, dead-export, docs-drift, user-gap)",
     )
     mine_parser.add_argument("--repo", default=".")
     mine_parser.add_argument(

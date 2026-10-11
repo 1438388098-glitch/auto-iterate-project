@@ -127,7 +127,7 @@ When nothing matches, run `detect-verify --repo <repo>` (`--apply` writes `check
 
 ### 3. Maintain the Backlog
 
-- **Supply first**: if the backlog is thin/empty or `action_hint` is `mine`, run `mine --repo <repo> --apply` (scanners: markers, swallowed, syntax, test-gap, hotspot, dead-export, docs-drift). It writes deduped, evidence-backed candidates. Judgment invention is the fallback, not the default.
+- **Supply first**: if the backlog is thin/empty or `action_hint` is `mine`, run `mine --repo <repo> --apply` (scanners: markers, swallowed, syntax, test-gap, hotspot, dead-export, docs-drift, user-gap). It writes deduped, evidence-backed candidates. Judgment invention is the fallback, not the default.
 - `backlog-add` with title, reason, `value` (1-5), `effort` (1-5), `type` (`bugfix|feature|refactor|perf|test|docs`), optional `risk` (1-5), optional `depends-on`.
 - `backlog-rank` sorts by expected value per round (`ranking_mode: expected` is **not** value/effort). Read `selected`, `below_floor`, `cut_reason`, `unlocks`, `ready`/`blocked_by`; `--brief` adds `score_breakdown`-free output and the loop should always pass `--pending-only --top 5 --brief` (the full ranking is ~18KB per round on a 30-round repo, mostly completed history). Add `--brief`-free full output only when debugging a score. `classic` is the legacy ratio.
 - Pick the `selected` batch (`candidates_per_round`, default 4). Diversity quota `max_same_type_per_round` (default 2), value floor `min_candidate_value` (default 3). Empty batch while ready entries exist → read `selected_empty_reason` (`quota`/`late_run`/`cutoff`/`floor`/`batch_full`/`type`) and choose Deep Expansion vs an explicit `--candidate-id` round.

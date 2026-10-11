@@ -2765,6 +2765,120 @@ class SupplyMixTests(RepoTest):
         self.assertIn("预测（种子/前瞻）（predicted）：1，占比 25%", retro)
 
 
+class UserGapScannerTests(RepoTest):
+    """1.16 机制一：user-gap 扫描器（文档宣称 vs 实际入口的确定性差集，
+    唯一产 feature 类型供给的扫描器）。核心风险是去重身份分叉导致的重复
+    入账（镜像分支静默落错分支）——反射守卫测试钉死全部 kind 的
+    _dedup_key → _candidate_dedup_keys round-trip。"""
+
+    T = chr(96)  # backtick，避免源码里出现裸反引号
+
+    def test_reflective_dedup_guard_all_kinds(self):
+        # 每个注册 kind：finding 侧 _dedup_key 必须出现在存储候选侧的镜像
+        # 集合中。docs-drift 的镜像曾缺 evidence 维度（wave14 只改了单侧），
+        # user-gap 若忘写镜像分支会静默落进 docs-drift else——此守卫让
+        # 「加第 9 个扫描器忘了镜像」直接变红。
+        from autopilot import miner
+        synth = {
+            "markers": ("TODO: refactor this", "src/a.py:12: TODO: refactor this", "src/a.py", 12),
+            "swallowed": ("swallowed in handler", "src/a.py:20: except: pass", "src/a.py", 20),
+            "syntax": ("syntax error", "src/bad.py:3: SyntaxError", "src/bad.py", 3),
+            "test-gap": ("no tests for " + self.T + "thing" + self.T,
+                         "no test references " + self.T + "thing" + self.T, "src/thing.py", None),
+            "hotspot": ("hot file", "git log --name-only: src/hot.py touched 30 of last 50 commits",
+                        "src/hot.py", None),
+            "dead-export": ("unused " + self.T + "legacy_fn" + self.T,
+                            "defined once, never imported", "src/legacy.py", None),
+            "docs-drift": ("missing file", "README.md: references scripts/gone.py", "README.md", None),
+            "user-gap": ("docs promise missing command " + self.T + "frobnicate" + self.T,
+                         "README.md:5: " + self.T + "autopilot_state.py frobnicate" + self.T,
+                         "README.md", 5),
+            "user-gap-roadmap": ("Support dark mode",
+                                 "README.md:40: [Roadmap] Support dark mode", "README.md", 40),
+        }
+        for label, (title, evidence, file, line) in synth.items():
+            kind = "user-gap" if label.startswith("user-gap") else label
+            finding = miner._finding(kind, title, "reason", evidence,
+                                     file=file, line=line)
+            key = miner._dedup_key(finding)
+            fields = miner.finding_to_candidate_fields(finding)
+            fields["from_mine"] = kind
+            fields["file"] = file  # cmd_mine apply 时另行附上
+            fields["line"] = line
+            self.assertIn(key, miner._candidate_dedup_keys(fields), label)
+
+    def test_user_gap_detects_missing_command_and_flag(self):
+        (self.repo / "README.md").write_text(
+            "# Demo\n\n" + self.T + "py -3 scripts/autopilot_state.py frobnicate" + self.T
+            + " and " + self.T + "autopilot_state.py mine --nope-flag" + self.T + "\n",
+            encoding="utf-8")
+        from autopilot import miner
+        findings = miner.scan_user_gap(str(self.repo))
+        titles = [f["title"] for f in findings]
+        self.assertTrue(any("frobnicate" in t for t in titles), titles)
+        self.assertTrue(any("--nope-flag" in t and "mine" in t for t in titles), titles)
+        for f in findings:
+            self.assertEqual(f["kind"], "user-gap")
+            self.assertEqual(f["suggested_type"], "feature")
+            self.assertEqual(f["effort"], 3)  # 设计 1-3：分级从紧
+            self.assertNotIn("README.md:", f["title"])  # 标题不含行号
+
+    def test_user_gap_roadmap_items_become_feature_findings(self):
+        (self.repo / "README.md").write_text(
+            "# Demo\n\n## Roadmap\n\n- Support dark mode everywhere\n"
+            "1. Add plugin API\n\n## Usage\n\n- run the tool\n",
+            encoding="utf-8")
+        from autopilot import miner
+        findings = miner.scan_user_gap(str(self.repo))
+        claims = {f["title"] for f in findings}
+        self.assertIn("Support dark mode everywhere", claims)
+        self.assertIn("Add plugin API", claims)
+        self.assertNotIn("run the tool", claims)  # Usage 小节不是路线图
+        for f in findings:
+            self.assertEqual(f["suggested_type"], "feature")
+
+    def test_user_gap_mine_apply_dedup_survives_line_drift(self):
+        # 端到端：apply 入库 → 重扫零新增 → 行号漂移后仍零新增
+        #（身份=宣称文本，不锚行号）。注意 init 先行：init 拒绝脏树，
+        # README 改写必须在 init 之后。
+        self.run_state("init")
+        readme = self.repo / "README.md"
+        readme.write_text(
+            "# Demo\n\n## Roadmap\n\n- Support dark mode everywhere\n",
+            encoding="utf-8")
+        first = self.run_state("mine", "--kind", "user-gap", "--apply", "--json")
+        self.assertEqual(first.returncode, 0, first.stderr + first.stdout)
+        backlog = json.loads(
+            (self.repo / ".autopilot" / "backlog.json").read_text(encoding="utf-8"))
+        gaps = [c for c in backlog["candidates"] if c.get("from_mine") == "user-gap"]
+        self.assertEqual(len(gaps), 1)
+        self.assertEqual(gaps[0]["type"], "feature")
+        self.assertEqual(gaps[0]["origin"], "observed")
+        self.assertEqual(gaps[0]["effort"], 3)
+        # 行号漂移：往上插 5 行正文，同宣称换位置
+        readme.write_text(
+            "# Demo\n\nSome intro line.\n" * 5 + "\n## Roadmap\n\n"
+            "- Support dark mode everywhere\n", encoding="utf-8")
+        second = self.run_state("mine", "--kind", "user-gap", "--apply", "--json")
+        self.assertEqual(second.returncode, 0, second.stderr)
+        backlog = json.loads(
+            (self.repo / ".autopilot" / "backlog.json").read_text(encoding="utf-8"))
+        gaps = [c for c in backlog["candidates"] if c.get("from_mine") == "user-gap"]
+        self.assertEqual(len(gaps), 1, "line drift must not duplicate supply")
+
+    def test_user_gap_yields_file_path_claims_to_docs_drift(self):
+        # 设计 1-2 职责让位：缺失的 scripts/*.py 路径归 docs-drift，
+        # user-gap 不对同一路径双计供给。
+        (self.repo / "README.md").write_text(
+            "# Demo\n\nRun " + self.T + "python scripts/gone.py" + self.T + " first.\n",
+            encoding="utf-8")
+        from autopilot import miner
+        gaps = miner.scan_user_gap(str(self.repo))
+        self.assertFalse(any("gone.py" in (f["title"] + f["reason"]) for f in gaps))
+        drift = miner.scan_docs_drift(str(self.repo))
+        self.assertTrue(any("gone.py" in f["title"] for f in drift))
+
+
 class BudgetAccountingTests(RepoTest):
     """P1 budget/round accounting: zero-work cancels do not consume a round,
     tokens are billed monotonically per run, blocked streaks and budgets are

@@ -26,7 +26,7 @@ The skill's entry point is [SKILL.md](SKILL.md) — the agent reads it, runs `de
 ## How a round works
 
 1. **check** — deterministic stop conditions, budget, and `action_hint` (work / mine / expand / stop).
-2. **mine** — seven scanners turn repository facts (markers, swallowed exceptions, syntax errors, test gaps, hotspots, dead exports, docs drift) into evidence-backed backlog candidates; judgment-based Deep Expansion across a rotating 16-lens set is the second wave, never the first.
+2. **mine** — eight scanners turn repository facts (markers, swallowed exceptions, syntax errors, test gaps, hotspots, dead exports, docs drift, user gaps) into evidence-backed backlog candidates; judgment-based Deep Expansion across a rotating 16-lens set is the second wave, never the first.
 3. **rank** — candidates scored by expected value per round with diversity quotas, a value floor, dependency unlocks, and a transparent `score_breakdown`.
 4. **implement → verify → commit** — each candidate is its own unit; full verification every N rounds and always before a commit; secret-scan on every staged diff.
 5. **record** — round history, token accounting, phase reports every 10 rounds, a retrospective at `finish`.

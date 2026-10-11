@@ -91,6 +91,7 @@ MINE_KINDS = (
     "hotspot",
     "dead-export",
     "docs-drift",
+    "user-gap",
 )
 
 
@@ -542,6 +543,205 @@ def scan_docs_drift(repo, limit=10):
     return findings
 
 
+# ---- user-gap（1.16 机制一）：文档宣称 vs 实际入口的确定性差集 ----
+# 前瞻供给的第一条确定性来源：产出 suggested_type=feature 的候选，补足
+# 「7 个回望式扫描器无一产 feature」的供给空洞。扫描器只供事实，分级从紧
+# （effort=3）——文档差集天然显得价值大，价值判断留给消费侧。
+
+USER_GAP_KIND = "user-gap"
+
+# 标题模板是身份的一半（镜像分支从标题反解宣称），改模板必须同步
+# _user_gap_identity 的解析。
+_CMD_CLAIM_RE = re.compile(r"^docs promise missing command `([^`]+)`$")
+_FLAG_CLAIM_RE = re.compile(r"^docs promise missing flag `([^`]+)`$")
+
+# 路线图类小节标题（收得很紧防误报）。
+_ROADMAP_HEADING_RE = re.compile(
+    r"^#{1,6}\s*(roadmap|planned(?:\s+(?:features?|work|improvements?))?|"
+    r"future\s+(?:work|plans?|directions?|ideas?)|coming\s+soon|todo|"
+    r"未来计划|后续计划|路线图|规划)\s*[:：]?\s*$",
+    re.I,
+)
+_BULLET_RE = re.compile(r"^\s*(?:[-*+]|\d+[.)])\s+(.+)$")
+
+
+def _gap_identity(raw):
+    """user-gap 去重身份（1.16 设计必修 1-1）：归一化宣称文本——大小写、
+    空白、列表标记、 emphasis 标记、首尾标点全不参与；**行号永不入身份**
+    （README 一编辑行号全漂）。_dedup_key 与 _candidate_dedup_keys 镜像
+    分支必须共用本函数，两边 key 规则分叉 = 每轮重复入账。"""
+    text = re.sub(r"^[\s>*+\-]+", "", raw or "")
+    text = re.sub(r"^\d+[.)]\s*", "", text)
+    text = re.sub(r"[`*_]", "", text)
+    text = re.sub(r"\s+", " ", text).strip().lower()
+    return text.strip(" .;:,，。；：")
+
+
+def _user_gap_identity_from_title(title):
+    """从标题反解身份（_dedup_key 与镜像分支同源）。探针 A 的标题带
+    模板前缀 + backtick 宣称；探针 B 的标题即宣称原文。"""
+    match = _CMD_CLAIM_RE.match(title or "")
+    if match:
+        return "cmd:{}".format(_gap_identity(match.group(1)))
+    match = _FLAG_CLAIM_RE.match(title or "")
+    if match:
+        return "flag:{}".format(_gap_identity(match.group(1)))
+    return "road:{}".format(_gap_identity(title))
+
+
+def _doc_files_for_gap(root):
+    """候选文档，按解析后的真实路径去重——Windows 的 exists() 大小写
+    不敏感，README.md 与 readme.md 会命中同一文件，不去重就双份发现。"""
+    seen = set()
+    for name in ("README.md", "readme.md", "SKILL.md"):
+        path = root / name
+        if not path.exists():
+            continue
+        try:
+            key = str(path.resolve()).casefold()
+        except OSError:
+            key = name.casefold()
+        if key in seen:
+            continue
+        seen.add(key)
+        yield path
+
+
+def _claimed_cli_usage(text):
+    """探针 A：backtick 里对 helper 子命令/旗标的宣称。返回
+    [(span_match, command, [flags])]。文件路径宣称归 docs-drift 管（设计
+    1-2 职责让位），这里只认命令与旗标。"""
+    claims = []
+    for match in re.finditer(r"`([^`\n]+)`", text):
+        tokens = match.group(1).split()
+        helper_idx = None
+        for idx, token in enumerate(tokens):
+            if "autopilot_state" in token:
+                helper_idx = idx
+                break
+        if helper_idx is None or helper_idx + 1 >= len(tokens):
+            continue
+        command = tokens[helper_idx + 1]
+        if not re.match(r"^[a-z][a-z0-9-]*$", command, re.I):
+            continue
+        flags = [t for t in tokens[helper_idx + 2:] if t.startswith("-")]
+        claims.append((match, command.lower(), flags))
+    return claims
+
+
+def _real_cli_surface():
+    """真实命令面。懒加载：cli 在模块层 import miner，反向 import 必须
+    延迟到扫描时。返回 (commands, {command: set(option strings)})；
+    argparse 不可用（理论路径）时返回空面，扫描器静默降级。"""
+    try:
+        import argparse
+        from . import cli as cli_module
+        parser = cli_module.build_parser()
+        commands = set()
+        flags = {}
+        for action in parser._actions:
+            if not isinstance(action, argparse._SubParsersAction):
+                continue
+            for name, sub in (getattr(action, "choices", None) or {}).items():
+                commands.add(str(name))
+                opts = set()
+                for sub_action in getattr(sub, "_actions", []):
+                    opts.update(sub_action.option_strings or [])
+                flags[str(name)] = opts
+        return commands, flags
+    except Exception:
+        return set(), {}
+
+
+def _roadmap_findings(text, rel, limit):
+    """探针 B：路线图小节下的列表项 = 有文档背书的前瞻意图。标题=宣称
+    原文（不含行号，身份才稳定）；effort=3 从紧（设计 1-3）。"""
+    findings = []
+    in_section = False
+    heading = ""
+    for idx, line in enumerate(text.splitlines()):
+        stripped = line.strip()
+        heading_match = _ROADMAP_HEADING_RE.match(stripped)
+        if heading_match:
+            in_section = True
+            heading = re.sub(r"^#+\s*", "", stripped)
+            continue
+        if in_section and re.match(r"^#{1,6}\s", stripped):
+            in_section = False
+            continue
+        if not in_section:
+            continue
+        bullet = _BULLET_RE.match(line)
+        if not bullet:
+            continue
+        claim = bullet.group(1).strip()
+        if len(_gap_identity(claim)) < 6:
+            continue
+        findings.append(_finding(
+            USER_GAP_KIND,
+            claim,
+            "Roadmap item under \"{}\" in {}: documented intent with no "
+            "implementation behind it — a feature candidate or an explicit "
+            "drop from the docs.".format(heading, rel),
+            "{}:{}: [{}] {}".format(rel, idx + 1, heading, claim),
+            file=rel,
+            line=idx + 1,
+            suggested_type="feature",
+            value=3,
+            effort=3,
+        ))
+        if len(findings) >= limit:
+            break
+    return findings
+
+
+def scan_user_gap(repo, limit=15):
+    """Docs promise vs shipped surface: claimed helper commands/flags that
+    do not exist, and roadmap/planned items with no implementation. The
+    forward-looking scanner (1.16 机制一) — the only kind that yields
+    feature-type supply from facts instead of judgment. Identity is the
+    normalized claim text, never the line number (see _gap_identity)."""
+    root = Path(repo)
+    findings = []
+    commands, flag_surface = _real_cli_surface()
+    for doc in _doc_files_for_gap(root):
+        try:
+            text = doc.read_text(encoding="utf-8", errors="replace")
+        except OSError:
+            continue
+        rel = _rel(repo, doc)
+        for span, command, flags in _claimed_cli_usage(text):
+            line = text[:span.start()].count("\n") + 1
+            evidence = "{}:{}: `{}`".format(rel, line, span.group(1))
+            if commands and command not in commands:
+                findings.append(_finding(
+                    USER_GAP_KIND,
+                    "docs promise missing command `{}`".format(command),
+                    "{} documents autopilot_state.py {} but the helper has no "
+                    "such command — either ship it or fix the doc.".format(rel, command),
+                    evidence, file=rel, line=line,
+                    suggested_type="feature", value=3, effort=3,
+                ))
+            else:
+                known = flag_surface.get(command) or set()
+                for flag in flags:
+                    if known and flag not in known:
+                        findings.append(_finding(
+                            USER_GAP_KIND,
+                            "docs promise missing flag `{} {}`".format(command, flag),
+                            "{} documents {} {} but the command does not accept "
+                            "it.".format(rel, command, flag),
+                            evidence, file=rel, line=line,
+                            suggested_type="feature", value=3, effort=3,
+                        ))
+            if len(findings) >= limit:
+                return findings
+        findings.extend(_roadmap_findings(text, rel, limit - len(findings)))
+        if len(findings) >= limit:
+            return findings[:limit]
+    return findings
+
+
 SCANNERS = {
     "markers": scan_markers,
     "swallowed": scan_swallowed,
@@ -550,6 +750,7 @@ SCANNERS = {
     "hotspot": scan_hotspot,
     "dead-export": scan_dead_export,
     "docs-drift": scan_docs_drift,
+    "user-gap": scan_user_gap,
 }
 
 
@@ -611,6 +812,12 @@ def _dedup_key(finding):
         return ("mine", kind, file, finding.get("evidence") or "")
     if kind in ("hotspot", "syntax"):
         return ("mine", kind, file)
+    if kind == "user-gap":
+        # 1.16 机制一：身份=归一化宣称文本（_user_gap_identity_from_title），
+        # 不含 file/line——同一缺口在 README 与 SKILL 重复宣称是同一条供给，
+        # README 行号漂移不改身份。与 _candidate_dedup_keys 镜像分支共用
+        # 同一解析，分叉即每轮重复入账。
+        return ("mine", kind, _user_gap_identity_from_title(finding.get("title")))
     if kind in ("test-gap", "dead-export"):
         match = re.search(r"`([^`]+)`", finding.get("title") or "")
         symbol = match.group(1) if match else (finding.get("title") or "")[:80]
@@ -653,12 +860,21 @@ def _candidate_dedup_keys(candidate):
             if match:
                 file = match.group(1)
         keys.add(("mine", kind, file))
+    elif kind == "user-gap":
+        # 1.16 机制一镜像分支：从标题反解宣称身份（模板见
+        # _user_gap_identity_from_title）。此分支若缺失会静默落进下面的
+        # docs-drift else——产出不匹配 key、每轮重复入账，反射守卫测试
+        # （每个 MINE_KINDS 成员）防的就是这个陷阱。
+        keys.add(("mine", kind, _user_gap_identity_from_title(candidate.get("title"))))
     else:  # docs-drift: evidence reads "{readme}: references {missing}"
         if file is None:
             match = re.match(r"(.+): references ", body)
             if match:
                 file = match.group(1)
-        keys.add(("mine", kind, file))
+        # wave14 在 finding 侧把 evidence 纳入 key（每条断链独立），镜像当时
+        # 没跟上——两侧 arity 不等，round-trip 永远 MISS，去重只剩标题兜底。
+        # 1.16 反射守卫顺手对齐：镜像用 body（= finding 侧的 evidence 本体）。
+        keys.add(("mine", kind, file, body))
     return keys
 
 
