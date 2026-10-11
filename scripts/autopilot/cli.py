@@ -7,7 +7,7 @@ import argparse
 import io
 import sys
 
-from . import agent, commands, miner
+from . import agent, commands, miner, state
 
 
 def _force_utf8_stdio():
@@ -446,6 +446,26 @@ def build_parser():
     add_json(expansion_record_parser)
     add_dry_run(expansion_record_parser)
     expansion_record_parser.set_defaults(func=commands.cmd_expansion_record)
+
+    field_test_parser = subparsers.add_parser(
+        "field-test-record",
+        help="Ledger one external field-test run (skill vs a target repo) and its outcome",
+    )
+    field_test_parser.add_argument("--repo", default=".")
+    field_test_parser.add_argument("--target-repo", required=True,
+                                   help="Path of the repo the skill ran against")
+    field_test_parser.add_argument("--rounds", type=int, default=0,
+                                   help="Rounds the unattended run completed")
+    field_test_parser.add_argument("--types-completed", default="",
+                                   help="Comma-separated candidate types completed (e.g. bugfix,feature)")
+    field_test_parser.add_argument("--verdict", required=True,
+                                   choices=list(state.FIELD_TEST_VERDICTS),
+                                   help="Overall outcome: passed | failed | mixed")
+    field_test_parser.add_argument("--notes", default=None,
+                                   help="Optional outcome notes (free text, truncated to 500 chars)")
+    add_json(field_test_parser)
+    add_dry_run(field_test_parser)
+    field_test_parser.set_defaults(func=commands.cmd_field_test_record)
 
     backlog_add_parser = subparsers.add_parser("backlog-add", help="Add a backlog candidate")
     backlog_add_parser.add_argument("--repo", default=".")

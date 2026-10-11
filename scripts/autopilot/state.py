@@ -67,6 +67,7 @@ def default_state(repo, goals=None, config_fingerprint=None):
         "goal_events": [],
         "goal_seeds": [],
         "expansion_waves": [],
+        "field_test_runs": [],
         "current_round": None,
         "history": [],
         "stop_reason": None,
@@ -96,6 +97,7 @@ def migrate_state(state):
         "goal_events": [],
         "goal_seeds": [],
         "expansion_waves": [],
+        "field_test_runs": [],
         "repo": None,
         "created_at": io.now_iso(),
         "started_at": None,
@@ -196,6 +198,8 @@ def _validate_state_types(repo, state):
         _state_type_error(path, "'mining_runs' must be an array")
     if not isinstance(state.get("expansion_waves", []), list):
         _state_type_error(path, "'expansion_waves' must be an array")
+    if not isinstance(state.get("field_test_runs", []), list):
+        _state_type_error(path, "'field_test_runs' must be an array")
     if not isinstance(state.get("deferred_paths", []), list):
         # Run 级 deferred 账本（wave11 candidate-402）：跨 history 窗口存续
         _state_type_error(path, "'deferred_paths' must be an array")
@@ -676,6 +680,36 @@ def expansion_wave_count(st):
     if isinstance(seq, int) and not isinstance(seq, bool):
         return seq
     return len(st.get("expansion_waves") or [])
+
+
+FIELD_TEST_VERDICTS = ("passed", "failed", "mixed")
+
+
+def append_field_test_run(st, record):
+    """Append one external field-test record (1.16 机制四): the skill run
+    unattended against a TARGET repo, with the outcome ledgered here so the
+    external fitness signal becomes routine instead of a one-off campaign.
+    Bounded like mining_runs/expansion_waves (oldest trimmed); NOT folded
+    into expansion_waves — lens validation, the `added` backfill (external
+    runs never touch this backlog, they would read as fake zero-yield
+    evidence for mining_exhausted) and the subagent-spend wave cap are all
+    the wrong semantics for a post-hoc ledger. `verdict` must be one of
+    FIELD_TEST_VERDICTS; free-text outcomes cannot be reconciled."""
+    if record.get("verdict") not in FIELD_TEST_VERDICTS:
+        raise ValueError("verdict must be one of: {}".format(", ".join(FIELD_TEST_VERDICTS)))
+    entry = {
+        "at": io.now_iso(),
+        "target_repo": str(record.get("target_repo") or ""),
+        "rounds": int(record.get("rounds") or 0),
+        "types_completed": list(record.get("types_completed") or []),
+        "verdict": record["verdict"],
+        "notes": str(record.get("notes") or "")[:500],
+    }
+    runs = st.setdefault("field_test_runs", [])
+    runs.append(entry)
+    if len(runs) > io.FIELD_TEST_RUNS_LIMIT:
+        del runs[: len(runs) - io.FIELD_TEST_RUNS_LIMIT]
+    return entry
 
 
 def resolve_seed(st, seed_id, status, notes=None, candidate_id=None):

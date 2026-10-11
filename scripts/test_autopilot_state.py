@@ -2963,6 +2963,84 @@ class PredictedRatchetTests(RepoTest):
         self.assertIsNotNone(data)
 
 
+class FieldTestLedgerTests(RepoTest):
+    """1.16 机制四：外部实测台账。把 1.12.x 一次性战役验证过的外部适应度
+    信号变成常规记账——独立于 expansion_waves（lens 校验/added 回填/wave cap
+    三处语义均为外测错误语义），事后记账无 cap、仅 20 条窗口。"""
+
+    def test_field_test_record_round_trip(self):
+        self.run_state("init")
+        result = self.run_state(
+            "field-test-record", "--target-repo", "/tmp/some-project",
+            "--rounds", "7", "--types-completed", "bugfix,feature",
+            "--verdict", "mixed", "--notes", "two rounds blocked on secrets",
+            "--json")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        payload = json.loads(result.stdout)
+        entry = payload["field_test_run"]
+        self.assertEqual(entry["target_repo"], "/tmp/some-project")
+        self.assertEqual(entry["rounds"], 7)
+        self.assertEqual(entry["types_completed"], ["bugfix", "feature"])
+        self.assertEqual(entry["verdict"], "mixed")
+        st = self.read_json("state.json")
+        self.assertEqual(len(st["field_test_runs"]), 1)
+        self.assertEqual(st["field_test_runs"][0]["verdict"], "mixed")
+        log = (self.repo / ".autopilot" / "log.jsonl").read_text(encoding="utf-8")
+        self.assertTrue(any(
+            '"field-test-record"' in line and '"success"' in line
+            for line in log.splitlines()))
+
+    def test_field_test_record_requires_target_repo(self):
+        self.run_state("init")
+        result = self.run_state("field-test-record", "--verdict", "passed")
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("--target-repo", result.stdout + result.stderr)
+
+    def test_field_test_record_rejects_bad_verdict(self):
+        self.run_state("init")
+        result = self.run_state(
+            "field-test-record", "--target-repo", "x", "--verdict", "kind-of-ok")
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("invalid choice", result.stderr)
+        # state 层防御（绕过 argparse 的直接调用方）
+        with self.assertRaises(ValueError):
+            ap_state.append_field_test_run(
+                self.read_json("state.json"),
+                {"target_repo": "x", "verdict": "kind-of-ok"})
+
+    def test_field_test_ledger_bounded_at_20(self):
+        self.run_state("init")
+        state_path = self.repo / ".autopilot" / "state.json"
+        st = json.loads(state_path.read_text(encoding="utf-8"))
+        st["field_test_runs"] = [
+            {"at": "2026-01-{:02d}T00:00:00+00:00".format(i + 1),
+             "target_repo": "old-{}".format(i + 1), "rounds": i,
+             "types_completed": [], "verdict": "passed", "notes": ""}
+            for i in range(20)
+        ]
+        state_path.write_text(json.dumps(st), encoding="utf-8")
+        result = self.run_state(
+            "field-test-record", "--target-repo", "newest", "--verdict", "failed")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        runs = self.read_json("state.json")["field_test_runs"]
+        self.assertEqual(len(runs), 20)
+        self.assertEqual(runs[0]["target_repo"], "old-2")   # 最老一条被裁
+        self.assertEqual(runs[-1]["target_repo"], "newest")
+
+    def test_field_test_migration_backfills_key(self):
+        # 旧 state 无该键：load 时 migrate 回填，记账路径全程可用。
+        self.run_state("init")
+        state_path = self.repo / ".autopilot" / "state.json"
+        st = json.loads(state_path.read_text(encoding="utf-8"))
+        st.pop("field_test_runs", None)
+        state_path.write_text(json.dumps(st), encoding="utf-8")
+        result = self.run_state(
+            "field-test-record", "--target-repo", "legacy", "--verdict", "passed")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        runs = self.read_json("state.json")["field_test_runs"]
+        self.assertEqual([r["target_repo"] for r in runs], ["legacy"])
+
+
 class BudgetAccountingTests(RepoTest):
     """P1 budget/round accounting: zero-work cancels do not consume a round,
     tokens are billed monotonically per run, blocked streaks and budgets are
@@ -3755,6 +3833,7 @@ class PredictedHardeningTests(RepoTest):
             ("history", {"history": ["junk"]}, "check", ("--brief",), "history"),
             ("current_round", {"current_round": {"title": "broken"}},
              "complete-round", ("--summary", "s"), "current_round.round"),
+            ("field_test_runs", {"field_test_runs": "oops"}, "check", ("--brief",), "field_test_runs"),
         ]
         for label, patch, cmd, args, needle in cases:
             path = self.repo / ".autopilot" / "state.json"

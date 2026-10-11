@@ -275,6 +275,7 @@ Unattended runs have nobody to ask: when one of the scenes above fires without a
 - `round-prep` — the loop's round start in one call (check fields + candidates + cached analysis + directives).
 - `detect-verify` — recommend `check_commands` (`--apply` writes them) and report `smoke_recommended` (record one with `config-set --smoke-commands`).
 - `mine [--apply] [--kind K] [--limit N]` — deterministic repo mining into backlog candidates (first move when you do not know what to do). Every non-dry-run invocation appends to `state.mining_runs`; exhaustion (`mining.exhausted` in check) = two consecutive runs with zero new findings AND, when expansion waves exist, the last two waves also added zero value-gated candidates — never-mined is not exhausted.
+- `field-test-record --target-repo <path> --verdict passed|failed|mixed [--rounds N] [--types-completed bugfix,feature] [--notes "..."]` — ledger an external field-test run (the skill run unattended against a fresh/target repo) into `state.field_test_runs`. Every few runs, validate the skill on a repo other than its own and record the verdict: the external fitness signal catches what self-iteration cannot see. Post-hoc bookkeeping, no cap; verdicts reconcile across runs.
 - Every state-changing command accepts `--dry-run`.
 
 ## Observation Dashboard

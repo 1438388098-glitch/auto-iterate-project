@@ -2939,6 +2939,54 @@ def cmd_expansion_record(args):
         return emit_result(args, True, message, data={"wave": wave})
 
 
+def cmd_field_test_record(args):
+    """External field-test ledger (1.16 机制四): record an unattended skill
+    run against a TARGET repo and its outcome. Post-hoc bookkeeping — no
+    subagent-spend cap (unlike expansion-record, whose cap gates the record
+    BEFORE the spend); the list is bounded for size only. Not folded into
+    expansion_waves: lens validation, the `added` backfill and the wave cap
+    are all wrong semantics for an external run (see append_field_test_run)."""
+    repo = Path(args.repo).resolve()
+    refused = _require_initialized(args, repo, message="[ERROR] Autopilot not initialized. Run init first.")
+    if refused is not None:
+        return refused
+    if not getattr(args, "target_repo", None):
+        io.append_log(repo, "field-test-record", "error", reason="target repo missing")
+        return emit_result(args, False, "[ERROR] --target-repo is required (the repo the skill ran against).")
+    with io.run_lock(repo):
+        st = state.load_state(repo)
+        types = [t.strip() for t in (args.types_completed or "").split(",") if t.strip()]
+        record = {
+            "target_repo": args.target_repo,
+            "rounds": args.rounds or 0,
+            "types_completed": types,
+            "verdict": args.verdict,
+            "notes": args.notes or "",
+        }
+        if getattr(args, "dry_run", False):
+            print("[DRY-RUN] Would record field test: {} ({} rounds, verdict: {}).".format(
+                args.target_repo, record["rounds"], args.verdict), file=sys.stderr)
+            return 0
+        try:
+            entry = state.append_field_test_run(st, record)
+        except ValueError as exc:
+            io.append_log(repo, "field-test-record", "error", reason=str(exc))
+            return emit_result(args, False, "[ERROR] {}".format(exc))
+        state.save_state(repo, st)
+        io.append_log(
+            repo, "field-test-record", "success",
+            target=entry["target_repo"], rounds=entry["rounds"],
+            verdict=entry["verdict"], types=entry["types_completed"],
+        )
+        return emit_result(
+            args, True,
+            "[OK] Field test recorded: {} ({} rounds, verdict: {}). Total on ledger: {}.".format(
+                entry["target_repo"], entry["rounds"], entry["verdict"],
+                len(st.get("field_test_runs") or [])),
+            data={"field_test_run": entry},
+        )
+
+
 def cmd_directive_add(args):
     repo = Path(args.repo).resolve()
     refused = _require_initialized(args, repo, message="[ERROR] Autopilot not initialized. Run init first.")
