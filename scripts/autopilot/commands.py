@@ -209,6 +209,8 @@ def cmd_init(args):
         cfg["type_saturation_threshold"] = args.type_saturation_threshold
     if args.ranking_mode is not None:
         cfg["ranking_mode"] = args.ranking_mode
+    if getattr(args, "predicted_ratchet", None) is not None:
+        cfg["predicted_ratchet"] = bool(args.predicted_ratchet)
     if args.min_candidate_value is not None:
         if args.min_candidate_value < 1 or args.min_candidate_value > 5:
             return emit_result(args, False, "[ERROR] --min-candidate-value must be an integer 1-5.")
@@ -2726,6 +2728,8 @@ def cmd_config_set(args):
             requested[name] = value
     if args.expand_after_goals is not None:
         requested["expand_after_goals"] = bool(args.expand_after_goals)
+    if getattr(args, "predicted_ratchet", None) is not None:
+        requested["predicted_ratchet"] = bool(args.predicted_ratchet)
     if getattr(args, "clear_max_expansion_waves", False):
         if getattr(args, "max_expansion_waves", None) is not None:
             return emit_result(
@@ -2788,6 +2792,7 @@ def cmd_config_set(args):
             "--check-commands/--clear-check-commands, --smoke-commands/--clear-smoke-commands, "
             "--max-expansion-waves/--clear-max-expansion-waves, "
             "--max-blocked-in-a-row/--clear-max-blocked-in-a-row, "
+            "--predicted-ratchet/--no-predicted-ratchet, "
             "--dashboard/--no-dashboard, --dashboard-port).",
         )
 

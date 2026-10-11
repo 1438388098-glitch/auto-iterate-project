@@ -476,6 +476,54 @@ def effective_saturation_threshold(cfg):
         return 2
 
 
+# 预测棘轮升档判据（1.16 机制二，模块常量——阈值不进 config，防配置面膨胀；
+# PREDICTED_SAMPLE_FLOOR 既有先例）。
+PREDICTED_RATCHET_TIER2_DONE = 3       # = PREDICTED_SAMPLE_FLOOR，样本足够才谈兑现
+PREDICTED_RATCHET_TIER2_SUCCESS = 0.6  # 兑现率 ≥0.6 且校准 ≥1.0 → 配额升到 2
+PREDICTED_RATCHET_TIER2_CALIBRATION = 1.0
+PREDICTED_RATCHET_TIER3_DONE = 8       # 样本 ≥8 且兑现率 ≥0.7 → 升到 3（封顶档）
+PREDICTED_RATCHET_TIER3_SUCCESS = 0.7
+
+
+def effective_predicted_quota(cfg, predicted_account):
+    """predicted 配额落地值（1.16 机制二）：静态 max_predicted_per_round 之上的
+    单出口。**棘轮只升不降**（审查必修 2-1）：
+    - 静态 null（不封顶）→ 恒 None——比任何档位都宽，降档违背只升不降；
+    - 静态 0（显式禁预测）→ 恒 0——用户禁令优先于任何自动行为；
+    - predicted_ratchet 关闭（默认）→ 恒静态值，行为与 1.15 逐位一致；
+    - 开启时按预测子账兑现率升档：done≥3 且 success_rate≥0.6 且
+      calibration≥1.0 → 至少 2；done≥8 且 success_rate≥0.7 → 至少 3。
+      样本不足（新 run done=0）回落静态值。"""
+    static = (cfg or {}).get("max_predicted_per_round")
+    if static is None:
+        return None
+    try:
+        static = max(0, int(static))
+    except (TypeError, ValueError):
+        static = 1
+    if static == 0 or not (cfg or {}).get("predicted_ratchet"):
+        return static
+    account = predicted_account or {}
+
+    def _num(key, fallback=0.0):
+        try:
+            return float(account.get(key) if account.get(key) is not None else fallback)
+        except (TypeError, ValueError):
+            return fallback
+
+    done = _num("done")
+    success = _num("success_rate")
+    calibration = _num("calibration", 1.0)
+    if (done >= PREDICTED_RATCHET_TIER3_DONE
+            and success >= PREDICTED_RATCHET_TIER3_SUCCESS):
+        return max(static, 3)
+    if (done >= PREDICTED_RATCHET_TIER2_DONE
+            and success >= PREDICTED_RATCHET_TIER2_SUCCESS
+            and calibration >= PREDICTED_RATCHET_TIER2_CALIBRATION):
+        return max(static, 2)
+    return static
+
+
 def saturated_types(state, threshold=2):
     """Types whose completed-candidate count reached the saturation threshold
     (from the state's type_stats snapshot). Deterministic order."""
@@ -1407,7 +1455,7 @@ def _risk_weight_for(cfg, progress):
     return 0.05 + 0.10 * max(0.0, min(1.0, progress))
 
 
-def _mark_selection(entries, cfg, progress=None):
+def _mark_selection(entries, cfg, progress=None, predicted_account=None):
     """Mark the recommended round batch (`selected: true`). Selection is a
     constrained pick over the ranked list, separate from scoring:
       - only pending + ready candidates are eligible
@@ -1437,7 +1485,11 @@ def _mark_selection(entries, cfg, progress=None):
         # 配额，不是折叠回默认 2（wave9 candidate-381）——与下面
         # max_predicted/max_expansion 的 None=不封顶同一条语义线。
         max_per_type = len(entries)
-    max_predicted = cfg.get("max_predicted_per_round")
+    # predicted 配额走 effective_predicted_quota 单出口（1.16 机制二）：
+    # 棘轮关闭/静态 0/null 时与旧 cfg.get 语义逐位一致（null→不封顶），
+    # 开启且兑现达标才升档。predicted_quota 变量被主池与 below-floor 回填
+    # 两条循环共用，升级自动作用于两处。
+    max_predicted = effective_predicted_quota(cfg, predicted_account)
     if max_predicted is None:
         max_predicted = len(entries)
     max_expansion = cfg.get("max_expansion_per_round")
@@ -1593,7 +1645,8 @@ def rank_candidates(backlog, cfg, progress=None, completed_goals=None):
         entries.append(entry)
     entries.sort(key=_rank_sort_key)
     if cfg.get("ranking_mode", "expected") != "classic":
-        _mark_selection(entries, cfg, progress=progress)
+        _mark_selection(entries, cfg, progress=progress,
+                        predicted_account=predicted_account)
     return entries
 
 

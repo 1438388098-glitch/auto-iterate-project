@@ -50,6 +50,9 @@ def default_config(repo):
         "max_same_type_per_round": 2,
         "min_pending_candidates": 3,
         "max_predicted_per_round": 1,
+        # 预测棘轮（1.16 机制二）：开启后 predicted 配额按兑现率升档
+        # （effective_predicted_quota 单出口），关闭=静态 max_predicted_per_round。
+        "predicted_ratchet": False,
         "max_expansion_per_round": None,
         "max_expansion_waves": None,
         "dashboard": {"enabled": False, "auto_open": True, "port": 0, "domain_map": None},
@@ -175,7 +178,7 @@ _CONFIG_FIELD_RULES = (
     (("branch_mode",), "choice", ("current", "feature")),
     (
         ("push", "allow_uncommitted_changes", "track_state", "scan_secrets",
-         "expand_after_goals"), "bool", None,
+         "expand_after_goals", "predicted_ratchet"), "bool", None,
     ),
     (("commit_message_prefix",), "string", None),
 )

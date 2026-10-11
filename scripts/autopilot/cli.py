@@ -78,6 +78,13 @@ def build_parser():
     init_expand_group.add_argument("--no-expand-after-goals", dest="expand_after_goals",
                                    action="store_false", default=None,
                                    help="Stop when all goals are met (disable the expansion phase)")
+    init_ratchet_group = init_parser.add_mutually_exclusive_group()
+    init_ratchet_group.add_argument("--predicted-ratchet", dest="predicted_ratchet",
+                                    action="store_true", default=None,
+                                    help="Escalate the predicted-origin quota (1→2→3) when the prediction account's hit rate earns it (default off; null/0 max_predicted_per_round stay authoritative)")
+    init_ratchet_group.add_argument("--no-predicted-ratchet", dest="predicted_ratchet",
+                                    action="store_false", default=None,
+                                    help="Keep the static max_predicted_per_round quota (default)")
     init_parser.add_argument("--review-threshold", type=int, default=None,
                              help="complete-round requires --review-score >= this (1-5) to pass")
     scan_group = init_parser.add_mutually_exclusive_group()
@@ -337,6 +344,13 @@ def build_parser():
     expand_group.add_argument("--no-expand-after-goals", dest="expand_after_goals",
                               action="store_false", default=None,
                               help="Stop when all goals are met (disable the expansion phase)")
+    ratchet_group = config_set_parser.add_mutually_exclusive_group()
+    ratchet_group.add_argument("--predicted-ratchet", dest="predicted_ratchet",
+                               action="store_true", default=None,
+                               help="Escalate the predicted-origin quota (1→2→3) when the prediction account's hit rate earns it")
+    ratchet_group.add_argument("--no-predicted-ratchet", dest="predicted_ratchet",
+                               action="store_false", default=None,
+                               help="Keep the static max_predicted_per_round quota (default)")
     dash_group = config_set_parser.add_mutually_exclusive_group()
     dash_group.add_argument("--dashboard", dest="dashboard_enabled", action="store_true", default=None,
                             help="enable the read-only observation dashboard")

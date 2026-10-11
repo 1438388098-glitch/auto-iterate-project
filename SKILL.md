@@ -203,7 +203,7 @@ After `goal-met`, consume direction seeds **before** any lens scanning. Full pro
 2. Verify evidence (reject dead seeds via `seed-reject`).
 3. Value-gate (`backlog-add --from-seed` + `backlog-rank`).
 4. Work 1-2 via `begin-round`; outcomes resolve seeds automatically.
-5. Anti-noise: `origin: predicted`, confidence discount, `max_predicted_per_round` (default 1), late-run cut of predicted work. Expansion-origin is a separate uncapped lane.
+5. Anti-noise: `origin: predicted`, confidence discount, `max_predicted_per_round` (default 1), late-run cut of predicted work. Expansion-origin is a separate uncapped lane. With `predicted_ratchet: true` the predicted quota escalates (1→2→3) when the prediction account's hit rate earns it — feed proven predictions back into supply instead of guessing blind.
 
 Wave 0 is mandatory on the first expand after a goal; lens-scan Deep Expansion is forbidden that wave unless every open seed died in the evidence check.
 

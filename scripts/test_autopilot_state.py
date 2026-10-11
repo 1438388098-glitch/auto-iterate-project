@@ -2879,6 +2879,90 @@ class UserGapScannerTests(RepoTest):
         self.assertTrue(any("gone.py" in f["title"] for f in drift))
 
 
+class PredictedRatchetTests(RepoTest):
+    """1.16 机制二：预测棘轮。兑现率驱动的 predicted 配额升级（1→2→3），
+    只升不降（null/0 静态配额恒权威），默认关闭=与 1.15 行为逐位一致；
+    late_run 安全阀正交不受影响。"""
+
+    @staticmethod
+    def _account(**overrides):
+        account = {"done": 4, "success_rate": 0.75, "calibration": 1.1}
+        account.update(overrides)
+        return account
+
+    def test_quota_default_off_matches_static(self):
+        cfg = {"max_predicted_per_round": 1}
+        self.assertEqual(
+            ap_state.effective_predicted_quota(cfg, self._account()), 1)
+        self.assertIsNone(
+            ap_state.effective_predicted_quota(
+                {"max_predicted_per_round": None}, self._account()))
+
+    def test_quota_null_and_zero_stay_authoritative(self):
+        # 棘轮只升不降：null（不封顶）不被降到任何档；0（显式禁）不被推翻。
+        good = self._account(done=20, success_rate=0.95, calibration=1.4)
+        self.assertIsNone(ap_state.effective_predicted_quota(
+            {"max_predicted_per_round": None, "predicted_ratchet": True}, good))
+        self.assertEqual(ap_state.effective_predicted_quota(
+            {"max_predicted_per_round": 0, "predicted_ratchet": True}, good), 0)
+
+    def test_quota_tiers(self):
+        cfg = {"max_predicted_per_round": 1, "predicted_ratchet": True}
+        # 冷启动：样本不足回落静态
+        self.assertEqual(ap_state.effective_predicted_quota(
+            cfg, self._account(done=0, success_rate=0.0)), 1)
+        # 兑现差：维持静态（打分层已有折扣，不重复罚）
+        self.assertEqual(ap_state.effective_predicted_quota(
+            cfg, self._account(done=6, success_rate=0.3, calibration=0.8)), 1)
+        # 二档：done≥3 + success≥0.6 + calibration≥1.0
+        self.assertEqual(ap_state.effective_predicted_quota(
+            cfg, self._account(done=3, success_rate=0.6, calibration=1.0)), 2)
+        # 三档：done≥8 + success≥0.7（封顶档）
+        self.assertEqual(ap_state.effective_predicted_quota(
+            cfg, self._account(done=8, success_rate=0.7, calibration=1.0)), 3)
+        # 静态更高时取 max（棘轮不降）
+        self.assertEqual(ap_state.effective_predicted_quota(
+            {"max_predicted_per_round": 2, "predicted_ratchet": True},
+            self._account(done=3, success_rate=0.6, calibration=1.0)), 2)
+
+    def test_mark_selection_uses_ratcheted_quota(self):
+        entries = [
+            {"id": "p1", "title": "p1", "type": "feature", "status": "pending",
+             "ready": True, "score": 5.0, "below_floor": False, "origin": "predicted"},
+            {"id": "p2", "title": "p2", "type": "test", "status": "pending",
+             "ready": True, "score": 4.0, "below_floor": False, "origin": "predicted"},
+        ]
+        cfg = {"candidates_per_round": 2, "max_same_type_per_round": 2,
+               "max_predicted_per_round": 1, "predicted_ratchet": True}
+        ap_state._mark_selection(entries, cfg, predicted_account=self._account())
+        self.assertEqual([e["id"] for e in entries if e.get("selected")],
+                         ["p1", "p2"])
+        # 对照：默认关闭 → 静态 1，第二条 predicted 标 quota 落选
+        cfg_off = dict(cfg, predicted_ratchet=False)
+        for e in entries:
+            e["selected"] = False
+            e.pop("cut_reason", None)
+        ap_state._mark_selection(entries, cfg_off)
+        self.assertEqual([e["id"] for e in entries if e.get("selected")], ["p1"])
+        self.assertEqual(
+            [e.get("cut_reason") for e in entries if e["id"] == "p2"][0], "quota")
+
+    def test_config_round_trip_init_and_config_set(self):
+        self.run_state("init", "--goal", "G", "--predicted-ratchet")
+        cfg = json.loads(
+            (self.repo / ".autopilot" / "config.json").read_text(encoding="utf-8"))
+        self.assertTrue(cfg["predicted_ratchet"])
+        result = self.run_state("config-set", "--no-predicted-ratchet")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        cfg = json.loads(
+            (self.repo / ".autopilot" / "config.json").read_text(encoding="utf-8"))
+        self.assertFalse(cfg["predicted_ratchet"])
+        # 注册表守卫的镜像断言：新键必须已注册（漏注册时 test_registry_
+        # covers_every_default_field 直接红，此处再钉 bool 语义穿透）
+        data = json.loads(self.run_state("check", "--brief").stdout)
+        self.assertIsNotNone(data)
+
+
 class BudgetAccountingTests(RepoTest):
     """P1 budget/round accounting: zero-work cancels do not consume a round,
     tokens are billed monotonically per run, blocked streaks and budgets are
