@@ -2642,6 +2642,129 @@ class TypeStatsDriftTests(RepoTest):
         self.assertRegex(retro, r"\| bugfix \| 2 \| 0 \|")
 
 
+class SupplyMixTests(RepoTest):
+    """1.16 机制三：供给配比可见性。三件套——_close_round 的
+    candidate_types 快照（事后 backlog 编辑不可篡改）、check 的滚动 8 轮
+    feature 零产出告警、retro 的全 run origin 结算段。"""
+
+    def _seed_completed_history(self, window_types, with_pending=True):
+        """手写 history：window_types 是每条 completed 条目的候选类型快照
+        （None=旧条目无快照，走 candidate_ids 回退）。"""
+        self.run_state("init", "--goal", "G")
+        state_path = self.repo / ".autopilot" / "state.json"
+        st = json.loads(state_path.read_text(encoding="utf-8"))
+        st["history"] = [
+            {"round": i + 1, "status": "completed", "title": "r{}".format(i + 1),
+             "summary": "s", "candidate_types": types}
+            if types is not None else
+            {"round": i + 1, "status": "completed", "title": "r{}".format(i + 1),
+             "summary": "s"}
+            for i, types in enumerate(window_types)
+        ]
+        state_path.write_text(json.dumps(st), encoding="utf-8")
+        if with_pending:
+            added = self.run_state(
+                "backlog-add", "--title", "more patching", "--value", "3",
+                "--effort", "1", "--type", "bugfix", "--evidence", "docs/x.md:1")
+            self.assertEqual(added.returncode, 0, added.stderr)
+
+    def test_close_round_snapshots_candidate_types(self):
+        self.run_state("init", "--goal", "G")
+        for title, ctype in (("fix a", "bugfix"), ("grow b", "feature")):
+            added = self.run_state(
+                "backlog-add", "--title", title, "--value", "3", "--effort", "1",
+                "--type", ctype, "--evidence", "docs/x.md:1")
+            self.assertEqual(added.returncode, 0, added.stderr)
+        self.run_state("begin-round", "--title", "r", "--reason", "x",
+                       "--candidate-id", "candidate-001", "--candidate-id", "candidate-002")
+        self.add_file()
+        self.run_state("commit", "--summary", "w")
+        self.run_state("complete-round", "--summary", "done")
+        st = json.loads(
+            (self.repo / ".autopilot" / "state.json").read_text(encoding="utf-8"))
+        self.assertEqual(
+            set(st["history"][-1]["candidate_types"]), {"bugfix", "feature"})
+
+    def test_supply_mix_warning_triggers_on_featureless_window(self):
+        self._seed_completed_history([["bugfix"]] * 8)
+        data = json.loads(self.run_state("check", "--brief").stdout)
+        self.assertTrue(any("user-gap" in w for w in data["warnings"]))
+
+    def test_supply_mix_warning_cleared_by_feature_in_window(self):
+        self._seed_completed_history(
+            [["bugfix"]] * 7 + [["bugfix", "feature"]])
+        data = json.loads(self.run_state("check", "--brief").stdout)
+        self.assertFalse(any("user-gap" in w for w in data["warnings"]))
+
+    def test_supply_mix_warning_needs_full_window(self):
+        # 不足 8 个 completed 轮不告警——新 run 开局不挨骂。
+        self._seed_completed_history([["bugfix"]] * 3)
+        data = json.loads(self.run_state("check", "--brief").stdout)
+        self.assertFalse(any("user-gap" in w for w in data["warnings"]))
+
+    def test_supply_mix_warning_suppressed_when_no_pending(self):
+        # pending==0 时让位给既有的 Deep Expansion 告警，不双响。
+        self._seed_completed_history([["bugfix"]] * 8, with_pending=False)
+        data = json.loads(self.run_state("check", "--brief").stdout)
+        self.assertFalse(any("user-gap" in w for w in data["warnings"]))
+
+    def test_supply_mix_fallback_resolves_old_entries_then_excludes_removed(self):
+        # 旧条目（无 candidate_types）回退 candidate_ids + backlog 现查：
+        # 候选在 → 解析出 feature，不告警；候选被删 → unknown 排除，告警。
+        self.run_state("init", "--goal", "G")
+        added = self.run_state(
+            "backlog-add", "--title", "feature thing", "--value", "3",
+            "--effort", "1", "--type", "feature", "--evidence", "docs/x.md:1")
+        self.assertEqual(added.returncode, 0, added.stderr)
+        state_path = self.repo / ".autopilot" / "state.json"
+        st = json.loads(state_path.read_text(encoding="utf-8"))
+        st["history"] = [{"round": i + 1, "status": "completed",
+                          "title": "r{}".format(i + 1), "summary": "s",
+                          "candidate_types": ["bugfix"]} for i in range(7)]
+        st["history"].append({"round": 8, "status": "completed",
+                              "title": "r8", "summary": "s",
+                              "candidate_ids": ["candidate-001"]})
+        state_path.write_text(json.dumps(st), encoding="utf-8")
+        added = self.run_state(
+            "backlog-add", "--title", "pending patch", "--value", "3",
+            "--effort", "1", "--type", "bugfix", "--evidence", "docs/x.md:1")
+        self.assertEqual(added.returncode, 0, added.stderr)
+        data = json.loads(self.run_state("check", "--brief").stdout)
+        self.assertFalse(any("user-gap" in w for w in data["warnings"]))
+        # 对照：feature 候选被删后，旧条目解析不出 → 排除 → 窗口纯 bugfix
+        backlog_path = self.repo / ".autopilot" / "backlog.json"
+        backlog = json.loads(backlog_path.read_text(encoding="utf-8"))
+        backlog["candidates"] = [
+            c for c in backlog["candidates"] if c["id"] != "candidate-001"]
+        backlog_path.write_text(json.dumps(backlog), encoding="utf-8")
+        data = json.loads(self.run_state("check", "--brief").stdout)
+        self.assertTrue(any("user-gap" in w for w in data["warnings"]))
+
+    def test_retro_origin_settlement(self):
+        # 三桶并报：2 observed + 1 expansion + 1 predicted，占比 50%/25%/25%。
+        # predicted 被 type_stats 排除，必须在此段可见。
+        self.run_state("init", "--goal", "G")
+        seeds = [("observed thing", "bugfix", "--origin", "observed"),
+                 ("observed two", "docs", "--origin", "observed"),
+                 ("expansion thing", "feature", "--origin", "expansion"),
+                 ("predicted thing", "feature", "--origin", "predicted")]
+        for title, ctype, flag, origin in seeds:
+            added = self.run_state(
+                "backlog-add", "--title", title, "--value", "3", "--effort", "1",
+                "--type", ctype, flag, origin, "--evidence", "docs/x.md:1")
+            self.assertEqual(added.returncode, 0, added.stderr)
+        backlog_path = self.repo / ".autopilot" / "backlog.json"
+        backlog = json.loads(backlog_path.read_text(encoding="utf-8"))
+        for candidate in backlog["candidates"]:
+            candidate["status"] = "completed"
+        backlog_path.write_text(json.dumps(backlog), encoding="utf-8")
+        retro = self.run_state("retrospective", "--lang", "zh").stdout
+        self.assertIn("按 origin 结算", retro)
+        self.assertIn("观测（mine/日常）（observed）：2，占比 50%", retro)
+        self.assertIn("扩展（视角扫描）（expansion）：1，占比 25%", retro)
+        self.assertIn("预测（种子/前瞻）（predicted）：1，占比 25%", retro)
+
+
 class BudgetAccountingTests(RepoTest):
     """P1 budget/round accounting: zero-work cancels do not consume a round,
     tokens are billed monotonically per run, blocked streaks and budgets are

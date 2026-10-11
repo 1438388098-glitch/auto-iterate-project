@@ -800,13 +800,24 @@ def _close_round(repo, st, current, status, counter_key, tokens, history_entry,
     history_entry.setdefault(
         "candidate_ids", list(current.get("candidate_ids") or []) if isinstance(current, dict) else []
     )
-    state.append_history(st, history_entry)
-    st["current_round"] = None
     # 单次 backlog 读（wave10 candidate-391）：候选状态更新与 type_stats 共用
     # 同一份内存 dict——此前 update_candidates_status 内部 load+save，紧接着
     # _refresh_type_stats 再 load 刚写回的同一文件，两 parse 一多余 .bak，
     # 还留有写后读的 type_stats 失效窗口。
     backlog = state.load_backlog(repo)
+    # 供给配比告警的数据基座（1.16 机制三）：类型随轮快照——事后
+    # backlog-update --type / backlog-remove 改写不了「当时完成的是什么」，
+    # 告警口径才不被历史编辑操纵。查无此 id（收轮后候选被删的极端窗）直接
+    # 不入快照，消费侧同款排除语义。
+    if isinstance(current, dict):
+        _close_by_id = {
+            c.get("id"): c for c in reversed(backlog.get("candidates") or [])}
+        history_entry["candidate_types"] = [
+            (_close_by_id.get(cid) or {}).get("type") or "feature"
+            for cid in state.round_candidate_ids(current) if cid in _close_by_id
+        ]
+    state.append_history(st, history_entry)
+    st["current_round"] = None
     state.update_candidates_status(
         repo, state.round_candidate_ids(current), candidate_status, candidate_round,
         extra_fields=candidate_extra, backlog=backlog,

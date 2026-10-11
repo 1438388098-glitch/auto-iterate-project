@@ -1794,6 +1794,33 @@ def build_retrospective(repo, state, cfg, lang="zh"):
             ))
     out.append("")
 
+    # origin 结算段（1.16 机制三）：全 run 口径、从 backlog 现算（真值层原则
+    # 同上）；predicted 被 type_stats 排除，这里三桶并报，让「只补不长」在
+    # 复盘里可对账。与 check 供给配比告警的滚动 8 轮口径**故意不同**：
+    # 告警看近况，这里看全量（候选永不从 backlog 剪除）。
+    origin_counts = {"observed": 0, "expansion": 0, "predicted": 0}
+    for candidate in backlog.get("candidates") or []:
+        if candidate.get("status") != "completed":
+            continue
+        origin = candidate.get("origin") or "observed"
+        if origin in origin_counts:
+            origin_counts[origin] += 1
+    origin_completed = sum(origin_counts.values())
+    out.append("## {}".format("按 origin 结算（全 run）" if zh else "Settlement by origin (whole run)"))
+    out.append("")
+    origin_labels = {
+        "observed": "观测（mine/日常）" if zh else "observed (mine/routine)",
+        "expansion": "扩展（视角扫描）" if zh else "expansion (lens scan)",
+        "predicted": "预测（种子/前瞻）" if zh else "predicted (seeds/foresight)",
+    }
+    for origin in ("observed", "expansion", "predicted"):
+        share = "—"
+        if origin_completed:
+            share = "{:.0%}".format(origin_counts[origin] / origin_completed)
+        out.append("- {}（{}）：{}，占比 {}".format(
+            origin_labels[origin], origin, origin_counts[origin], share))
+    out.append("")
+
     blocked = [h for h in state.get("history", []) if h.get("status") == "blocked"]
     out.append("## {}".format("受阻轮次" if zh else "Blocked rounds"))
     out.append("")

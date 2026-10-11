@@ -41,6 +41,42 @@ def mining_exhausted(st):
     return True
 
 
+# 供给配比告警窗口（1.16 机制三）：滚动统计的 completed 轮数。口径故意与
+# retro 的 origin 结算段不同——告警看近况，结算看全 run（候选永不从 backlog
+# 剪除，全量账始终可得）。
+SUPPLY_GAP_ROUNDS = 8
+
+
+def _round_candidate_types(history_entry, by_id):
+    """一轮完成时的候选类型列表：优先 _close_round 落盘的 candidate_types
+    快照（事后 backlog 编辑不可篡改）；旧条目（1.16 前的 run）回退
+    round_candidate_ids + backlog 现查，查无此 id 计 unknown、直接排除——
+    排除而非计 0，被删候选不得伪造「该轮没有 feature」。"""
+    types = history_entry.get("candidate_types")
+    if isinstance(types, list):
+        return [t for t in types if isinstance(t, str)]
+    resolved = []
+    for cid in state.round_candidate_ids(history_entry):
+        candidate = by_id.get(cid)
+        if candidate is not None:
+            resolved.append(candidate.get("type") or "feature")
+    return resolved
+
+
+def _recent_rounds_completed_feature(st, backlog):
+    """最近 SUPPLY_GAP_ROUNDS 个 completed 轮里是否完成了至少一个 feature
+    候选。调用方已保证 history 条目数充足；类型以快照为准（见
+    _round_candidate_types）。"""
+    by_id = state.candidates_by_id(backlog)
+    completed = [h for h in (st.get("history") or [])
+                 if isinstance(h, dict) and h.get("status") == "completed"]
+    for history_entry in completed[-SUPPLY_GAP_ROUNDS:]:
+        if any((t or "feature") == "feature"
+               for t in _round_candidate_types(history_entry, by_id)):
+            return True
+    return False
+
+
 def brief_rank_entry(entry):
     """Compact one ranked backlog entry for the loop's per-round read. Ranking
     keeps score_breakdown and provenance because they explain a score to a
@@ -293,6 +329,26 @@ def build_check_payload(repo, full=False):
             "begin-round recomputes it, or refresh now via backlog-update".format(detail),
         ))
     candidates_per_round = cfg.get("candidates_per_round") or 1
+    # 供给配比告警（1.16 机制三）：滚动 M 个 completed 轮 feature 零产出 =
+    # 循环在修补而非生长。类型以 _close_round 落盘的 candidate_types 快照为
+    # 准（backlog-update --type / backlog-remove 事后改写不了历史）；旧条目
+    # 回退 round_candidate_ids + backlog 现查，查无此 id 计 unknown 排除。
+    # pending==0 时让位给既有的 Deep Expansion 告警，不双响。
+    if (
+        len(st.get("history") or []) >= SUPPLY_GAP_ROUNDS
+        and not _recent_rounds_completed_feature(st, backlog)
+        and backlog_watch["pending"] > 0
+    ):
+        warnings.append(_check_text(
+            cfg,
+            "最近 {} 个完成轮中 feature 类型零产出——循环在修补而非生长。两条补救路："
+            "mine 的 user-gap 扫描器（确定性能力差集）或 Deep Expansion（视角扫描）；"
+            "不要硬磨既有类型。".format(SUPPLY_GAP_ROUNDS),
+            "No feature-type candidate completed in the last {} completed rounds — the "
+            "loop is patching, not growing. Two supply paths: mine's user-gap scanner "
+            "(deterministic capability gaps) or Deep Expansion (lens scan); do not "
+            "grind existing types.".format(SUPPLY_GAP_ROUNDS),
+        ))
     if backlog_watch["pending"] >= 2 * candidates_per_round:
         warnings.append(
             "Backlog pending ({}) is at least twice the batch width ({}); consider raising "
