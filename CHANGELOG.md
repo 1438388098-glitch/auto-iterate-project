@@ -2,6 +2,64 @@
 
 All notable changes to auto-iterate-project are documented here.
 
+## 1.16.0 (2026-10-10)
+
+"Forward growth" release (1.16 direction doc, dual-subagent audited before
+implementation): turn the loop from a patch supplier into a direction
+finder. Suite 349 → 373.
+
+### Added
+
+- **Supply-mix visibility (机制三)**: `_close_round` snapshots each round's
+  candidate types onto the history entry (`candidate_types`) so post-hoc
+  backlog edits cannot rewrite what a round completed; `check` warns when the
+  last 8 completed rounds finished zero feature-type candidates ("patching,
+  not growing" — suppressed while pending is 0 so the Deep Expansion warning
+  stays alone, falling back to `candidate_ids` + backlog lookup for pre-1.16
+  entries with removed candidates excluded); the retrospective gains a
+  whole-run settlement section by origin (observed / expansion / predicted
+  with shares — the 9%-feature reality is now on every retro).
+- **`user-gap` scanner (机制一)**: mine's 8th scanner and the only one
+  yielding `feature`-type supply from facts — claimed helper commands/flags
+  that do not exist (parsed from docs backticks vs the real argparse surface)
+  and roadmap/planned items with no implementation. Dedup identity is the
+  normalized claim text, never the line number; the mirror branch shares the
+  same parser, and a new reflective guard test pins the
+  `_dedup_key` → `_candidate_dedup_keys` round-trip for every registered kind
+  (the failure mode it catches: a new kind silently falling into the
+  docs-drift else-branch re-records the same finding every mine run). Effort
+  defaults to 3 — the scanner supplies facts; grading stays with judgment.
+  `docs-drift` keeps file-path claims (user-gap yields to it); its mirror
+  branch was missing the wave14 evidence dimension and is aligned now.
+- **Prediction ratchet (机制二)**: `predicted_ratchet` (default false) lets
+  the predicted-origin quota escalate with the prediction account's proven
+  hit rate via a single outlet, `effective_predicted_quota`: done ≥ 3 with
+  success ≥ 0.6 and calibration ≥ 1.0 → quota at least 2; done ≥ 8 with
+  success ≥ 0.7 → at least 3. Ratchet-only: static `null` stays uncapped and
+  static `0` stays an explicit ban; thresholds are module constants, not
+  config. Default off is bit-identical to 1.15; the late-run valve stays
+  orthogonal. Init flags `--predicted-ratchet/--no-predicted-ratchet`,
+  runtime `config-set`.
+- **External field-test ledger (机制四)**: `field-test-record --target-repo
+  --verdict passed|failed|mixed [--rounds] [--types-completed] [--notes]`
+  ledgers unattended runs against target repos in `state.field_test_runs`
+  (bounded at 20). Deliberately not part of `expansion_waves` — lens
+  validation, the `added` backfill (an external run never touches this
+  backlog; folding it in would read as fake zero-yield evidence for
+  `mining.exhausted`) and the subagent-spend wave cap are all wrong
+  semantics for a post-hoc ledger. The routine form of the 1.12.x campaign.
+
+### Fixed
+
+- `mine` scanned README twice on Windows (case-insensitive `exists()` made
+  `README.md` and `readme.md` the same file) — duplicate findings per doc.
+
+### Tests
+
+- `SupplyMixTests` (7), `UserGapScannerTests` (5), `PredictedRatchetTests`
+  (5), `FieldTestLedgerTests` (5); the corrupt-state clean-error table gains
+  a `field_test_runs` row. Suite 349 → 373, all green.
+
 ## 1.15.0 (2026-10-10)
 
 Leftover-fix batch closing out the 1.14 overnight run's preserved findings
